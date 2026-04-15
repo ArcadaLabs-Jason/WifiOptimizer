@@ -360,12 +360,13 @@ function Content() {
         status?.live?.dispatcher_installed &&
         status?.live?.buffer_tuning_applied &&
         !status?.drift?.buffer_tuning;
-    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: [SP_JSX.jsxs("span", { style: {
-                                        background: "rgba(255,255,255,0.06)",
-                                        padding: "2px 8px",
-                                        borderRadius: "10px",
-                                        color: "#8a8a9a",
-                                    }, children: ["Device: ", modelLabel] }), SP_JSX.jsx("br", {}), "Tap (i) on any toggle for details"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: ["Last changed: ", timeAgo(s?.last_applied ?? 0), status?.live?.last_enforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(status.live.last_enforced)] })) : ""] }) })] }), connected && !s?.last_applied && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("span", { style: {
+                                fontSize: "10px",
+                                background: "rgba(255,255,255,0.06)",
+                                padding: "2px 8px",
+                                borderRadius: "10px",
+                                color: "#8a8a9a",
+                            }, children: ["Device: ", modelLabel] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: "Tap (i) on any toggle for details" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: ["Last changed: ", timeAgo(s?.last_applied ?? 0), status?.live?.last_enforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(status.live.last_enforced)] })) : ""] }) })] }), connected && !s?.last_applied && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                             display: "flex",
                             alignItems: "center",
                             gap: "6px",
@@ -435,10 +436,7 @@ function Content() {
                                         } }) }))] })) }), SP_JSX.jsx(InfoRow, { label: "Disable IPv6", subtitle: "Use IPv4 only on this network", explanation: "Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine.", ...getBadge(s?.ipv6_disabled ?? false, undefined, status, errors.ipv6 ?? null), checked: s?.ipv6_disabled ?? false, disabled: !connected && !s?.ipv6_disabled, error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) })] }), SP_JSX.jsx(DFL.PanelSection, { title: "Live status", children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
                                 await resetSettings();
                                 await refreshStatus();
-                            }, children: "Reset Settings" }) })] }), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
-                            fontSize: "10px",
-                            color: "#4a4a5a",
-                        }, children: ["v0.3.1 - by jasonridesabike", SP_JSX.jsx("br", {}), SP_JSX.jsx("br", {}), "If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) }) })] }));
+                            }, children: "Reset Settings" }) })] }), SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "10px", color: "#4a4a5a" }, children: "v0.3.1 - by jasonridesabike" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#4a4a5a" }, children: ["If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) })] })] }));
 }
 var index = definePlugin(() => {
     return {

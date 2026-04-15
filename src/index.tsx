@@ -175,18 +175,20 @@ function Content() {
       {/* Header */}
       <PanelSection>
         <PanelSectionRow>
+          <span
+            style={{
+              fontSize: "10px",
+              background: "rgba(255,255,255,0.06)",
+              padding: "2px 8px",
+              borderRadius: "10px",
+              color: "#8a8a9a",
+            }}
+          >
+            Device: {modelLabel}
+          </span>
+        </PanelSectionRow>
+        <PanelSectionRow>
           <div style={{ fontSize: "10px", color: "#6a6a7a" }}>
-            <span
-              style={{
-                background: "rgba(255,255,255,0.06)",
-                padding: "2px 8px",
-                borderRadius: "10px",
-                color: "#8a8a9a",
-              }}
-            >
-              Device: {modelLabel}
-            </span>
-            <br />
             Tap (i) on any toggle for details
           </div>
         </PanelSectionRow>
@@ -512,15 +514,12 @@ function Content() {
       {/* Footer */}
       <PanelSection>
         <PanelSectionRow>
-          <div
-            style={{
-              fontSize: "10px",
-              color: "#4a4a5a",
-            }}
-          >
+          <div style={{ fontSize: "10px", color: "#4a4a5a" }}>
             v0.3.1 - by jasonridesabike
-            <br />
-            <br />
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ fontSize: "10px", color: "#4a4a5a" }}>
             If WiFi won't reconnect, a reboot usually fixes it.
             <br />
             Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer
