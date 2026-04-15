@@ -102,6 +102,10 @@ pnpm run build
 
 To deploy to your Deck, copy `.vscode/defsettings.json` to `.vscode/settings.json`, fill in your Deck's IP and password, then use the VS Code **builddeploy** task (Terminal > Run Task).
 
+## Contact
+
+Follow development on [Bluesky](https://bsky.app/profile/thefanciestpeanut.bsky.social).
+
 ## License
 
 BSD 3-Clause. See [LICENSE](LICENSE).
