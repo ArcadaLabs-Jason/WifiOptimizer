@@ -36,6 +36,7 @@ export interface LiveStatus {
 export interface PluginStatus {
   success: boolean;
   connected: boolean;
+  supported: boolean;
   settings: PluginSettings;
   live: LiveStatus;
   drift: Record<string, boolean>;

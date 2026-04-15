@@ -152,6 +152,7 @@ function Content() {
 
   const s = status?.settings;
   const connected = status?.connected ?? false;
+  const supported = status?.supported ?? true;
   const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
   const isOled = s?.model === "oled";
 
@@ -199,6 +200,31 @@ function Content() {
           </div>
         </PanelSectionRow>
       </PanelSection>
+
+      {/* Unsupported device */}
+      {!supported && (
+        <PanelSection>
+          <PanelSectionRow>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "8px 12px",
+                background: "rgba(211,36,43,0.08)",
+                border: "0.5px solid rgba(211,36,43,0.2)",
+                borderRadius: "8px",
+                fontSize: "12px",
+                color: "#ff878c",
+                width: "100%",
+                boxSizing: "border-box",
+              }}
+            >
+              <span>This plugin is designed for Steam Deck only. Unsupported device detected.</span>
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
 
       {/* First-run prompt */}
       {connected && !s?.last_applied && (
@@ -329,7 +355,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected || applyingAll}
+            disabled={!connected || !supported || applyingAll}
             onClick={handleOptimize}
           >
             {applyingAll
@@ -492,7 +518,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected}
+            disabled={!connected || !supported}
             onClick={() => handleToggle("reapply", () => backend.reapplyAll())}
           >
             Force Reapply All
@@ -515,7 +541,7 @@ function Content() {
       <PanelSection>
         <PanelSectionRow>
           <div style={{ fontSize: "10px", color: "#4a4a5a" }}>
-            v0.3.1 - by jasonridesabike
+            v0.4.0 - by jasonridesabike
           </div>
         </PanelSectionRow>
         <PanelSectionRow>

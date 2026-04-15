@@ -1,4 +1,4 @@
-# WiFi Optimizer v0.3.1
+# WiFi Optimizer v0.4.0
 
 > **BETA - USE AT YOUR OWN RISK.** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings. Testing has been done exclusively on the OLED model. LCD support is built in but untested - bug reports and feedback from LCD owners are especially welcome.
 

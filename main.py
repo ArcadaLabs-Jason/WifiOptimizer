@@ -245,7 +245,7 @@ class Plugin:
             settings["driver"] = info.get("driver", "unknown")
             _save_settings(settings)
 
-            if settings.get("auto_fix_on_wake", True):
+            if settings.get("model") in ("lcd", "oled") and settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
 
             decky.logger.info(
@@ -321,6 +321,11 @@ class Plugin:
                 "bands": ["2.4 GHz", "5 GHz"],
             }
 
+    def _is_supported_device(self) -> bool:
+        """Check if this is a Steam Deck (Jupiter or Galileo)."""
+        settings = _load_settings()
+        return settings.get("model") in ("lcd", "oled")
+
     # ---- Status ----
 
     async def get_status(self) -> dict:
@@ -333,10 +338,12 @@ class Plugin:
             iface = self._get_wifi_interface()
             uuid = self._get_active_connection_uuid()
             connected = iface is not None and uuid is not None
+            supported = settings.get("model") in ("lcd", "oled")
 
             status = {
                 "success": True,
                 "connected": connected,
+                "supported": supported,
                 "settings": settings,
                 "live": {},
                 "drift": {},
@@ -506,6 +513,8 @@ class Plugin:
 
     async def set_power_save(self, disabled: bool) -> dict:
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             iface = self._get_wifi_interface()
 
             # Apply immediately if connected — verify before saving
@@ -548,6 +557,8 @@ class Plugin:
 
     async def set_auto_fix(self, enabled: bool) -> dict:
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             settings = _load_settings()
             settings["auto_fix_on_wake"] = enabled
 
@@ -567,6 +578,8 @@ class Plugin:
 
     async def set_bssid_lock(self, enabled: bool) -> dict:
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             if enabled:
                 # Enabling requires active WiFi to read current BSSID
                 iface, uuid, err = self._require_wifi()
@@ -660,6 +673,8 @@ class Plugin:
 
     async def set_band_preference(self, enabled: bool, band: str = "a") -> dict:
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             if enabled and band not in ("a", "bg"):
                 return {
                     "success": False,
@@ -718,6 +733,8 @@ class Plugin:
         self, enabled: bool, provider: str = "cloudflare", custom_servers: str = ""
     ) -> dict:
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             iface, uuid, _ = self._require_wifi()
             if enabled and not uuid:
                 return {
@@ -828,6 +845,8 @@ class Plugin:
 
     async def set_ipv6(self, disabled: bool) -> dict:
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             iface, uuid, _ = self._require_wifi()
             if disabled and not uuid:
                 return {
@@ -876,6 +895,8 @@ class Plugin:
 
     async def set_buffer_tuning(self, enabled: bool) -> dict:
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             params = SYSCTL_PARAMS if enabled else SYSCTL_DEFAULTS
             for key, value in params.items():
                 result = self._run_cmd(
@@ -903,6 +924,8 @@ class Plugin:
     async def optimize_safe(self) -> dict:
         """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning."""
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             results = {}
             applied = 0
             total = 4
@@ -949,6 +972,8 @@ class Plugin:
     async def reapply_all(self) -> dict:
         """Force reapply all enabled optimizations."""
         try:
+            if not self._is_supported_device():
+                return {"success": False, "error": "unexpected", "message": "Unsupported device. This plugin is designed for Steam Deck only."}
             settings = _load_settings()
             results = {}
             applied = 0
