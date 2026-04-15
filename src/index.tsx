@@ -186,7 +186,8 @@ function Content() {
             >
               {modelLabel}
             </span>
-            {" "}Tap (i) on any toggle for details
+            <br />
+            Tap (i) on any toggle for details
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
