@@ -2,7 +2,7 @@
 
 > **BETA - USE AT YOUR OWN RISK.** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings. Testing has been done exclusively on the OLED model. LCD support is built in but untested - bug reports and feedback from LCD owners are especially welcome.
 
-A [Decky Loader](https://decky.xyz/) plugin for Steam Deck that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. Works great with [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), but improves WiFi for any use case.
+A [Decky Loader](https://decky.xyz/) plugin for Steam Deck that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. Works with Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki, and any other streaming setup over WiFi.
 
 ## The problem
 
