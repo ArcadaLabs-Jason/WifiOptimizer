@@ -175,17 +175,25 @@ function Content() {
       {/* Header */}
       <PanelSection>
         <PanelSectionRow>
-          <span
-            style={{
-              fontSize: "11px",
-              color: "#8a8a9a",
-              background: "rgba(255,255,255,0.06)",
-              padding: "2px 8px",
-              borderRadius: "10px",
-            }}
-          >
-            {modelLabel}
-          </span>
+          <div style={{ fontSize: "10px", color: "#6a6a7a" }}>
+            <span
+              style={{
+                background: "rgba(255,255,255,0.06)",
+                padding: "2px 8px",
+                borderRadius: "10px",
+                color: "#8a8a9a",
+              }}
+            >
+              {modelLabel}
+            </span>
+            {" "}Tap (i) on any toggle for details
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ fontSize: "10px", color: "#6a6a7a" }}>
+            Last changed: {timeAgo(s?.last_applied ?? 0)}
+            {status?.live?.last_enforced ? (<><br />Auto-applied: {timeAgo(status.live.last_enforced)}</>) : ""}
+          </div>
         </PanelSectionRow>
       </PanelSection>
 
@@ -472,11 +480,6 @@ function Content() {
       {/* Live status */}
       <PanelSection title="Live status">
         <PanelSectionRow>
-          <div style={{ fontSize: "10px", color: "#6a6a7a", marginBottom: "4px" }}>
-            Tap (i) on any toggle above for details
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
           <StatsGrid live={status?.live ?? {}} connected={connected} />
         </PanelSectionRow>
       </PanelSection>
@@ -516,10 +519,7 @@ function Content() {
               width: "100%",
             }}
           >
-            v0.3.1 - Last changed: {timeAgo(s?.last_applied ?? 0)}
-            {status?.live?.last_enforced ? ` - Auto-applied: ${timeAgo(status.live.last_enforced)}` : ""}
-            <br />
-            by jasonridesabike
+            v0.3.1 - by jasonridesabike
             <br />
             <br />
             If WiFi won't reconnect, a reboot usually fixes it.
