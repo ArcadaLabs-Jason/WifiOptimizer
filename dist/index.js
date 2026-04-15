@@ -360,12 +360,12 @@ function Content() {
         status?.live?.dispatcher_installed &&
         status?.live?.buffer_tuning_applied &&
         !status?.drift?.buffer_tuning;
-    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: [SP_JSX.jsx("span", { style: {
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: [SP_JSX.jsxs("span", { style: {
                                         background: "rgba(255,255,255,0.06)",
                                         padding: "2px 8px",
                                         borderRadius: "10px",
                                         color: "#8a8a9a",
-                                    }, children: modelLabel }), SP_JSX.jsx("br", {}), "Tap (i) on any toggle for details"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: ["Last changed: ", timeAgo(s?.last_applied ?? 0), status?.live?.last_enforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(status.live.last_enforced)] })) : ""] }) })] }), connected && !s?.last_applied && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                                    }, children: ["Device: ", modelLabel] }), SP_JSX.jsx("br", {}), "Tap (i) on any toggle for details"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: ["Last changed: ", timeAgo(s?.last_applied ?? 0), status?.live?.last_enforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(status.live.last_enforced)] })) : ""] }) })] }), connected && !s?.last_applied && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                             display: "flex",
                             alignItems: "center",
                             gap: "6px",

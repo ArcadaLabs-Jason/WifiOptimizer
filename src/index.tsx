@@ -184,7 +184,7 @@ function Content() {
                 color: "#8a8a9a",
               }}
             >
-              {modelLabel}
+              Device: {modelLabel}
             </span>
             <br />
             Tap (i) on any toggle for details
