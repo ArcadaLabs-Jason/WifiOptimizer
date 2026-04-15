@@ -1,0 +1,107 @@
+# WiFi Optimizer
+
+> **BETA - USE AT YOUR OWN RISK.** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings. Testing has been done exclusively on the OLED model. LCD support is built in but untested - bug reports and feedback from LCD owners are especially welcome.
+
+A [Decky Loader](https://decky.xyz/) plugin for Steam Deck that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. Works great with [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), but improves WiFi for any use case.
+
+## The problem
+
+SteamOS resets WiFi settings after every system update and sleep/wake cycle. Power management gets re-enabled and network buffers reset to defaults. The result: latency spikes, connection drops, and degraded streaming quality - and the only fix is a trip to Desktop Mode.
+
+WiFi Optimizer fixes this from Game Mode. One tap, and it stays fixed.
+
+## Install / Update
+
+[Decky Loader](https://decky.xyz/) must be installed first. Then open Desktop Mode > Konsole and run:
+
+```bash
+curl -sL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
+```
+
+This requires a user password - set one with `passwd` in Konsole if you haven't already.
+
+Run the same command to update to the latest version. Your settings are preserved.
+
+Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
+
+## Getting started
+
+1. Open WiFi Optimizer from the Decky sidebar
+2. Tap **Optimize Safe** - this applies the four no-brainer optimizations that are always beneficial:
+   - Disables WiFi power save (prevents lag spikes)
+   - Locks your BSSID (stops background scanning interruptions)
+   - Enables auto-fix on wake (reapplies settings after sleep)
+   - Tunes network buffers (handles streaming traffic bursts)
+3. That's it. The plugin maintains these settings automatically, even after sleep/wake and SteamOS updates.
+
+Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs.
+
+## All optimizations
+
+**Safe tier (applied by Optimize Safe)**
+
+| Optimization | What it does |
+|---|---|
+| Prevent lag spikes | Disables WiFi power management that causes packet batching and latency spikes. On LCD, also disables deep power save and PCIe ASPM that cause firmware lockups. |
+| Stop background scanning | Locks to your current access point so the Deck stops scanning for other networks every 2 minutes |
+| Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects - works even if Decky isn't running |
+| Network buffer tuning | Increases kernel buffer sizes and TX queue length to handle bursty streaming traffic without dropping packets |
+
+**Manual opt-in (require configuration or have tradeoffs)**
+
+| Optimization | What it does | Why it's manual |
+|---|---|---|
+| Prefer 5 GHz / 6 GHz | Forces the higher-frequency band to avoid Bluetooth interference | Won't connect if your network is 2.4 GHz only |
+| Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
+| Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
+
+## Hardware support
+
+Works on both Steam Deck models. The OLED model benefits more because its WiFi degrades severely after sleep/wake without these fixes.
+
+| | LCD | OLED |
+|---|---|---|
+| WiFi | WiFi 5 (RTL8822CE) | WiFi 6E (QCA206X) |
+| Driver | rtw88 | ath11k_pci |
+| Post-wake degradation | Mild | Severe |
+
+## How it works
+
+The plugin has two parts:
+
+1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It detects when settings have drifted after wake and lets you fix them with one tap.
+
+2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, buffers). If you uninstall the plugin, the script removes itself.
+
+No background processes, no polling, no battery impact.
+
+## Uninstall
+
+From Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
+
+```bash
+rm -rf ~/homebrew/plugins/WiFi\ Optimizer
+sudo rm -f /etc/NetworkManager/dispatcher.d/99-wifi-optimizer
+sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
+sudo rm -f /etc/modprobe.d/99-wifi-optimizer.conf
+sudo systemctl restart plugin_loader
+```
+
+Per-connection settings (BSSID lock, band preference, DNS, IPv6) persist in NetworkManager. To reset them, forget and rejoin your WiFi network.
+
+## Building from source
+
+Requires Node.js and pnpm v9.
+
+```bash
+git clone https://github.com/ArcadaLabs-Jason/WifiOptimizer.git
+cd WifiOptimizer
+pnpm i
+pnpm run build
+```
+
+To deploy to your Deck, copy `.vscode/defsettings.json` to `.vscode/settings.json`, fill in your Deck's IP and password, then use the VS Code **builddeploy** task (Terminal > Run Task).
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).

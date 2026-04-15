@@ -1,0 +1,11 @@
+{
+  "name": "WiFi Optimizer",
+  "author": "Arcada Labs",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["wifi", "network", "optimization", "streaming", "moonlight"],
+    "description": "Automatically apply and maintain WiFi optimizations that survive sleep and updates.",
+    "image": ""
+  }
+}

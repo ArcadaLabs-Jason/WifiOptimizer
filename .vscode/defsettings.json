@@ -1,0 +1,8 @@
+{
+  "deckip": "steamdeck",
+  "deckport": "22",
+  "deckuser": "deck",
+  "deckpass": "your-password-here",
+  "deckdir": "/home/deck",
+  "pluginname": "WiFi Optimizer"
+}

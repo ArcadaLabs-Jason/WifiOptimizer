@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "pnpmsetup",
+      "type": "shell",
+      "group": "none",
+      "detail": "Install pnpm",
+      "command": "which pnpm || npm i -g pnpm@9"
+    },
+    {
+      "label": "depsetup",
+      "type": "shell",
+      "group": "none",
+      "detail": "Install dependencies",
+      "command": "pnpm i",
+      "dependsOn": ["pnpmsetup"]
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "group": "build",
+      "detail": "Build plugin",
+      "command": "pnpm run build",
+      "dependsOn": ["depsetup"],
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "deploy",
+      "type": "shell",
+      "group": "none",
+      "detail": "Deploy to Steam Deck",
+      "command": "rsync -azp --delete --exclude node_modules --exclude .git --exclude .vscode/settings.json . ${config:deckuser}@${config:deckip}:${config:deckdir}/homebrew/plugins/${config:pluginname}/",
+      "dependsOn": ["build"]
+    },
+    {
+      "label": "restartdecky",
+      "type": "shell",
+      "group": "none",
+      "detail": "Restart Decky on Steam Deck",
+      "command": "ssh ${config:deckuser}@${config:deckip} 'sudo systemctl restart plugin_loader'",
+      "dependsOn": ["deploy"]
+    },
+    {
+      "label": "builddeploy",
+      "type": "shell",
+      "group": "build",
+      "detail": "Build, deploy, and restart Decky",
+      "dependsOn": ["restartdecky"]
+    }
+  ]
+}
