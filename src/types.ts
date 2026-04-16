@@ -34,6 +34,8 @@ export interface LiveStatus {
   buffer_tuning_applied?: boolean;
   dispatcher_installed?: boolean;
   last_enforced?: number;
+  wifi_backend?: string;
+  backend_tool_available?: boolean;
 }
 
 export interface PluginStatus {
@@ -61,6 +63,43 @@ export interface OptimizeSafeResult extends MethodResult {
   total: number;
   applied: number;
   results: Record<string, MethodResult>;
+}
+
+export type BackendSwitchPhase =
+  | "idle"
+  | "switching"
+  | "recovering_interface"
+  | "reconnecting"
+  | "done"
+  | "failed";
+
+export interface BackendSwitchResult {
+  success: boolean;
+  backend?: string | null;
+  target: string;
+  recovery_performed?: boolean;
+  needs_reboot?: boolean;
+  message?: string;
+  detail?: string;
+}
+
+export interface BackendSwitchStatus {
+  success: boolean;
+  in_progress: boolean;
+  phase: BackendSwitchPhase;
+  target: string | null;
+  started_at: number;
+  result: BackendSwitchResult | null;
+  message?: string;
+}
+
+export interface BackendSwitchStartResult {
+  accepted: boolean;
+  reason?: string;
+  message?: string;
+  target?: string;
+  from?: string | null;
+  backend?: string;
 }
 
 export interface UpdateCheckResult {

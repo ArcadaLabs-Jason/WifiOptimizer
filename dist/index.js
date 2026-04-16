@@ -98,6 +98,8 @@ const resetSettings = callable("reset_settings");
 const setUpdateChannel = callable("set_update_channel");
 const checkForUpdate = callable("check_for_update");
 const applyUpdate = callable("apply_update");
+const startBackendSwitch = callable("start_backend_switch");
+const getBackendSwitchStatus = callable("get_backend_switch_status");
 
 const ERROR_MESSAGES = {
     no_wifi: "Not connected to WiFi. Connect first, then optimize.",
@@ -225,6 +227,15 @@ function StatsGrid({ live, connected }) {
 
 const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
+const BACKEND_POLL_INTERVAL = 750;
+const BACKEND_PHASE_TEXT = {
+    idle: "",
+    switching: "Switching backend…",
+    recovering_interface: "Recreating wlan0 interface…",
+    reconnecting: "Reconnecting…",
+    done: "",
+    failed: "",
+};
 function timeAgo(ts) {
     if (!ts)
         return "never";
@@ -263,7 +274,9 @@ function Content() {
     const [updateInfo, setUpdateInfo] = SP_REACT.useState(null);
     const [checkingUpdate, setCheckingUpdate] = SP_REACT.useState(false);
     const [updating, setUpdating] = SP_REACT.useState(false);
+    const [backendSwitch, setBackendSwitch] = SP_REACT.useState(null);
     const intervalRef = SP_REACT.useRef(null);
+    const backendPollRef = SP_REACT.useRef(null);
     const busyRef = SP_REACT.useRef(false);
     const refreshStatus = SP_REACT.useCallback(async () => {
         if (busyRef.current)
@@ -281,16 +294,94 @@ function Content() {
             console.error("WiFi Optimizer: failed to get status", e);
         }
     }, []);
+    const stopBackendPoll = () => {
+        if (backendPollRef.current) {
+            clearInterval(backendPollRef.current);
+            backendPollRef.current = null;
+        }
+    };
+    const beginBackendPoll = SP_REACT.useCallback(() => {
+        stopBackendPoll();
+        backendPollRef.current = setInterval(async () => {
+            try {
+                const s = await getBackendSwitchStatus();
+                setBackendSwitch(s);
+                if (!s.in_progress) {
+                    stopBackendPoll();
+                    busyRef.current = false;
+                    if (s.result && !s.result.success && s.result.message) {
+                        setErrors((prev) => ({ ...prev, wifi_backend: s.result.message }));
+                    }
+                    await refreshStatus();
+                }
+            }
+            catch (e) {
+                stopBackendPoll();
+                busyRef.current = false;
+                console.error("backend switch poll error", e);
+            }
+        }, BACKEND_POLL_INTERVAL);
+    }, [refreshStatus]);
     SP_REACT.useEffect(() => {
         refreshStatus();
         intervalRef.current = setInterval(refreshStatus, REFRESH_INTERVAL);
         // One-time update check on panel open
         checkForUpdate().then(setUpdateInfo).catch(() => { });
+        // Resume backend-switch polling if one is in flight (panel was reopened mid-switch)
+        getBackendSwitchStatus()
+            .then((s) => {
+            if (s.in_progress) {
+                setBackendSwitch(s);
+                busyRef.current = true;
+                beginBackendPoll();
+            }
+        })
+            .catch(() => { });
         return () => {
             if (intervalRef.current)
                 clearInterval(intervalRef.current);
+            if (backendPollRef.current)
+                clearInterval(backendPollRef.current);
         };
-    }, [refreshStatus]);
+    }, [refreshStatus, beginBackendPoll]);
+    const handleBackendToggle = async (on) => {
+        const target = on ? "wpa_supplicant" : "iwd";
+        busyRef.current = true;
+        setErrors((prev) => {
+            const next = { ...prev };
+            delete next.wifi_backend;
+            return next;
+        });
+        setOptimizeResult(null);
+        try {
+            const res = await startBackendSwitch(target);
+            if (!res.accepted) {
+                setErrors((prev) => ({
+                    ...prev,
+                    wifi_backend: res.message ?? "Could not start backend switch",
+                }));
+                busyRef.current = false;
+                return;
+            }
+            setBackendSwitch({
+                success: true,
+                in_progress: true,
+                phase: "switching",
+                target,
+                started_at: Math.floor(Date.now() / 1000),
+                result: null,
+            });
+            beginBackendPoll();
+        }
+        catch (e) {
+            busyRef.current = false;
+            setErrors((prev) => ({
+                ...prev,
+                wifi_backend: "Failed to start backend switch",
+            }));
+            console.error("startBackendSwitch error", e);
+        }
+    };
     const handleToggle = async (key, fn) => {
         busyRef.current = true;
         setErrors((prev) => {
@@ -429,7 +520,29 @@ function Content() {
                             color: "#ff878c",
                             width: "100%",
                             boxSizing: "border-box",
-                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u2715" }), SP_JSX.jsx("span", { children: "Not connected to WiFi. Connect first, then optimize." })] }) }) })), optimizeResult && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u2715" }), SP_JSX.jsx("span", { children: "Not connected to WiFi. Connect first, then optimize." })] }) }) })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            padding: "8px 12px",
+                            background: backendSwitch.result.success
+                                ? "rgba(29,158,117,0.08)"
+                                : "rgba(223,138,0,0.08)",
+                            border: `0.5px solid ${backendSwitch.result.success
+                                ? "rgba(29,158,117,0.2)"
+                                : "rgba(223,138,0,0.2)"}`,
+                            borderRadius: "8px",
+                            fontSize: "12px",
+                            color: backendSwitch.result.success ? "#3fc56e" : "#ffc669",
+                            width: "100%",
+                            boxSizing: "border-box",
+                        }, children: SP_JSX.jsx("span", { children: backendSwitch.result.needs_reboot
+                                ? `Backend switched to ${backendSwitch.result.target}, but wlan0 didn't come back — reboot required`
+                                : backendSwitch.result.success
+                                    ? backendSwitch.result.recovery_performed
+                                        ? `Switched to ${backendSwitch.result.backend} · recreated wlan0 interface`
+                                        : `Switched to ${backendSwitch.result.backend}`
+                                    : (backendSwitch.result.message ?? "Backend switch failed") }) }) }) })), optimizeResult && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                             display: "flex",
                             alignItems: "center",
                             gap: "6px",
@@ -460,7 +573,24 @@ function Content() {
                                             if (customDnsInput) {
                                                 handleToggle("dns", () => setDns(true, "custom", customDnsInput));
                                             }
-                                        } }) }))] })) }), SP_JSX.jsx(InfoRow, { label: "Disable IPv6", subtitle: "Use IPv4 only on this network", explanation: "Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine.", ...getBadge(s?.ipv6_disabled ?? false, undefined, status, errors.ipv6 ?? null), checked: s?.ipv6_disabled ?? false, disabled: !connected && !s?.ipv6_disabled, error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#8a8a9a" }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                                        } }) }))] })) }), SP_JSX.jsx(InfoRow, { label: "Disable IPv6", subtitle: "Use IPv4 only on this network", explanation: "Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine.", ...getBadge(s?.ipv6_disabled ?? false, undefined, status, errors.ipv6 ?? null), checked: s?.ipv6_disabled ?? false, disabled: !connected && !s?.ipv6_disabled, error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), status?.live?.backend_tool_available && (() => {
+                        const currentBackend = status?.live?.wifi_backend || "iwd";
+                        const isWpa = currentBackend === "wpa_supplicant";
+                        const switching = backendSwitch?.in_progress ?? false;
+                        const phaseText = switching
+                            ? BACKEND_PHASE_TEXT[backendSwitch.phase] || "Working…"
+                            : null;
+                        const backendBadge = errors.wifi_backend
+                            ? { badge: "error", text: "failed" }
+                            : switching
+                                ? { badge: "unknown", text: "…" }
+                                : isWpa
+                                    ? { badge: "active", text: "wpa_supplicant" }
+                                    : { badge: "off", text: "iwd" };
+                        return (SP_JSX.jsx(InfoRow, { label: "Use wpa_supplicant backend", subtitle: phaseText
+                                ? phaseText
+                                : "Alternate WiFi backend — can fix OLED sleep/wake issues", explanation: "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface \u2014 the plugin automatically recreates it, but a reboot is needed as a last resort.", badge: backendBadge.badge, text: backendBadge.text, checked: isWpa, disabled: switching, error: errors.wifi_backend, onChange: handleBackendToggle }));
+                    })()] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#8a8a9a" }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
                                 await resetSettings();
                                 await refreshStatus();
                             }, children: "Reset Settings" }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Updates", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Update channel", rgOptions: [

@@ -11,13 +11,31 @@ import { definePlugin } from "@decky/api";
 import { FaWifi } from "react-icons/fa";
 
 import * as backend from "./backend";
-import type { PluginStatus, MethodResult, OptimizeSafeResult, UpdateCheckResult, BadgeStatus } from "./types";
+import type {
+  PluginStatus,
+  MethodResult,
+  OptimizeSafeResult,
+  UpdateCheckResult,
+  BadgeStatus,
+  BackendSwitchStatus,
+  BackendSwitchPhase,
+} from "./types";
 import { ERROR_MESSAGES } from "./types";
 import { InfoRow } from "./components/InfoRow";
 import { StatsGrid } from "./components/StatsGrid";
 
 const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
+const BACKEND_POLL_INTERVAL = 750;
+
+const BACKEND_PHASE_TEXT: Record<BackendSwitchPhase, string> = {
+  idle: "",
+  switching: "Switching backend…",
+  recovering_interface: "Recreating wlan0 interface…",
+  reconnecting: "Reconnecting…",
+  done: "",
+  failed: "",
+};
 
 function timeAgo(ts: number): string {
   if (!ts) return "never";
@@ -58,7 +76,9 @@ function Content() {
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
+  const [backendSwitch, setBackendSwitch] = useState<BackendSwitchStatus | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const busyRef = useRef(false);
 
   const refreshStatus = useCallback(async () => {
@@ -76,15 +96,95 @@ function Content() {
     }
   }, []);
 
+  const stopBackendPoll = () => {
+    if (backendPollRef.current) {
+      clearInterval(backendPollRef.current);
+      backendPollRef.current = null;
+    }
+  };
+
+  const beginBackendPoll = useCallback(() => {
+    stopBackendPoll();
+    backendPollRef.current = setInterval(async () => {
+      try {
+        const s = await backend.getBackendSwitchStatus();
+        setBackendSwitch(s);
+        if (!s.in_progress) {
+          stopBackendPoll();
+          busyRef.current = false;
+          if (s.result && !s.result.success && s.result.message) {
+            setErrors((prev) => ({ ...prev, wifi_backend: s.result!.message! }));
+          }
+          await refreshStatus();
+        }
+      } catch (e) {
+        stopBackendPoll();
+        busyRef.current = false;
+        console.error("backend switch poll error", e);
+      }
+    }, BACKEND_POLL_INTERVAL);
+  }, [refreshStatus]);
+
   useEffect(() => {
     refreshStatus();
     intervalRef.current = setInterval(refreshStatus, REFRESH_INTERVAL);
     // One-time update check on panel open
     backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
+    // Resume backend-switch polling if one is in flight (panel was reopened mid-switch)
+    backend
+      .getBackendSwitchStatus()
+      .then((s) => {
+        if (s.in_progress) {
+          setBackendSwitch(s);
+          busyRef.current = true;
+          beginBackendPoll();
+        }
+      })
+      .catch(() => {});
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
+      if (backendPollRef.current) clearInterval(backendPollRef.current);
     };
-  }, [refreshStatus]);
+  }, [refreshStatus, beginBackendPoll]);
+
+  const handleBackendToggle = async (on: boolean) => {
+    const target = on ? "wpa_supplicant" : "iwd";
+    busyRef.current = true;
+    setErrors((prev) => {
+      const next = { ...prev };
+      delete next.wifi_backend;
+      return next;
+    });
+    setOptimizeResult(null);
+
+    try {
+      const res = await backend.startBackendSwitch(target);
+      if (!res.accepted) {
+        setErrors((prev) => ({
+          ...prev,
+          wifi_backend: res.message ?? "Could not start backend switch",
+        }));
+        busyRef.current = false;
+        return;
+      }
+      setBackendSwitch({
+        success: true,
+        in_progress: true,
+        phase: "switching",
+        target,
+        started_at: Math.floor(Date.now() / 1000),
+        result: null,
+      });
+      beginBackendPoll();
+    } catch (e) {
+      busyRef.current = false;
+      setErrors((prev) => ({
+        ...prev,
+        wifi_backend: "Failed to start backend switch",
+      }));
+      console.error("startBackendSwitch error", e);
+    }
+  };
 
   const handleToggle = async (key: string, fn: () => Promise<MethodResult>) => {
     busyRef.current = true;
@@ -342,6 +442,45 @@ function Content() {
         </PanelSection>
       )}
 
+      {/* Backend switch result banner */}
+      {backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (
+        <PanelSection>
+          <PanelSectionRow>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "8px 12px",
+                background: backendSwitch.result.success
+                  ? "rgba(29,158,117,0.08)"
+                  : "rgba(223,138,0,0.08)",
+                border: `0.5px solid ${
+                  backendSwitch.result.success
+                    ? "rgba(29,158,117,0.2)"
+                    : "rgba(223,138,0,0.2)"
+                }`,
+                borderRadius: "8px",
+                fontSize: "12px",
+                color: backendSwitch.result.success ? "#3fc56e" : "#ffc669",
+                width: "100%",
+                boxSizing: "border-box",
+              }}
+            >
+              <span>
+                {backendSwitch.result.needs_reboot
+                  ? `Backend switched to ${backendSwitch.result.target}, but wlan0 didn't come back — reboot required`
+                  : backendSwitch.result.success
+                    ? backendSwitch.result.recovery_performed
+                      ? `Switched to ${backendSwitch.result.backend} · recreated wlan0 interface`
+                      : `Switched to ${backendSwitch.result.backend}`
+                    : (backendSwitch.result.message ?? "Backend switch failed")}
+              </span>
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+
       {/* Optimize result banner */}
       {optimizeResult && (
         <PanelSection>
@@ -535,6 +674,39 @@ function Content() {
             handleToggle("ipv6", () => backend.setIpv6(val))
           }
         />
+        {status?.live?.backend_tool_available && (() => {
+          const currentBackend = status?.live?.wifi_backend || "iwd";
+          const isWpa = currentBackend === "wpa_supplicant";
+          const switching = backendSwitch?.in_progress ?? false;
+          const phaseText = switching
+            ? BACKEND_PHASE_TEXT[backendSwitch!.phase] || "Working…"
+            : null;
+          const backendBadge: { badge: BadgeStatus; text: string } =
+            errors.wifi_backend
+              ? { badge: "error", text: "failed" }
+              : switching
+                ? { badge: "unknown", text: "…" }
+                : isWpa
+                  ? { badge: "active", text: "wpa_supplicant" }
+                  : { badge: "off", text: "iwd" };
+          return (
+            <InfoRow
+              label="Use wpa_supplicant backend"
+              subtitle={
+                phaseText
+                  ? phaseText
+                  : "Alternate WiFi backend — can fix OLED sleep/wake issues"
+              }
+              explanation="SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface — the plugin automatically recreates it, but a reboot is needed as a last resort."
+              badge={backendBadge.badge}
+              text={backendBadge.text}
+              checked={isWpa}
+              disabled={switching}
+              error={errors.wifi_backend}
+              onChange={handleBackendToggle}
+            />
+          );
+        })()}
       </PanelSection>
 
       {/* Live status */}

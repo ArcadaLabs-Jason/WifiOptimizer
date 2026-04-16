@@ -1,5 +1,12 @@
 import { callable } from "@decky/api";
-import type { PluginStatus, MethodResult, OptimizeSafeResult, UpdateCheckResult } from "./types";
+import type {
+  PluginStatus,
+  MethodResult,
+  OptimizeSafeResult,
+  UpdateCheckResult,
+  BackendSwitchStartResult,
+  BackendSwitchStatus,
+} from "./types";
 
 export const getStatus = callable<[], PluginStatus>("get_status");
 export const setPowerSave = callable<[disabled: boolean], MethodResult>("set_power_save");
@@ -15,3 +22,5 @@ export const resetSettings = callable<[], MethodResult>("reset_settings");
 export const setUpdateChannel = callable<[channel: string], MethodResult>("set_update_channel");
 export const checkForUpdate = callable<[], UpdateCheckResult>("check_for_update");
 export const applyUpdate = callable<[], MethodResult>("apply_update");
+export const startBackendSwitch = callable<[backend: string], BackendSwitchStartResult>("start_backend_switch");
+export const getBackendSwitchStatus = callable<[], BackendSwitchStatus>("get_backend_switch_status");

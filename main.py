@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import asyncio
 import subprocess
 
 try:
@@ -20,6 +21,8 @@ except ImportError:
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
+BACKEND_TOOL = "/usr/bin/steamos-wifi-set-backend"
+WIFI_BACKEND_CONF = "/etc/NetworkManager/conf.d/wifi_backend.conf"
 
 # LCD (RTL8822CE) has firmware bugs with deep power save and PCIe ASPM.
 # These sysfs paths let us disable them at runtime (no module reload needed).
@@ -175,6 +178,55 @@ class Plugin:
                 return parts[0]
         return None
 
+    def _has_backend_tool(self) -> bool:
+        return os.path.isfile(BACKEND_TOOL) and os.access(BACKEND_TOOL, os.X_OK)
+
+    def _get_current_backend(self) -> str | None:
+        """Return 'iwd', 'wpa_supplicant', or None if unknown."""
+        if self._has_backend_tool():
+            result = self._run_cmd([BACKEND_TOOL, "--check"], timeout=3)
+            if result["success"]:
+                out = result["stdout"].strip().lower()
+                if "wpa_supplicant" in out:
+                    return "wpa_supplicant"
+                if "iwd" in out:
+                    return "iwd"
+        # Fallback: read the conf file (absence means the system default, iwd on SteamOS 3.6+)
+        try:
+            with open(WIFI_BACKEND_CONF, "r") as f:
+                content = f.read().lower()
+            if "wpa_supplicant" in content:
+                return "wpa_supplicant"
+            if "iwd" in content:
+                return "iwd"
+            return None
+        except FileNotFoundError:
+            return "iwd"
+        except Exception:
+            return None
+
+    def _get_wifi_phy(self) -> str | None:
+        """Return the first wiphy name (e.g. 'phy0')."""
+        result = self._run_cmd(["/usr/bin/iw", "phy"], timeout=3)
+        if result["success"]:
+            for line in result["stdout"].split("\n"):
+                line = line.strip()
+                if line.startswith("Wiphy "):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return parts[1]
+        return None
+
+    def _ensure_backend_switch_state(self):
+        if not hasattr(self, "_backend_switch"):
+            self._backend_switch = {
+                "in_progress": False,
+                "phase": "idle",
+                "target": None,
+                "started_at": 0,
+                "result": None,
+            }
+
     def _require_wifi(self) -> tuple:
         iface = self._get_wifi_interface()
         if not iface:
@@ -302,6 +354,7 @@ class Plugin:
     async def _main(self):
         try:
             decky.logger.info("WiFi Optimizer starting")
+            self._ensure_backend_switch_state()
             info = await self.get_device_info()
             settings = _load_settings()
             settings["model"] = info.get("model", "unknown")
@@ -320,6 +373,9 @@ class Plugin:
     async def _unload(self):
         try:
             decky.logger.info("WiFi Optimizer unloading")
+            task = getattr(self, "_backend_switch_task", None)
+            if task and not task.done():
+                task.cancel()
         except Exception as e:
             decky.logger.error(f"_unload error: {e}")
 
@@ -412,6 +468,12 @@ class Plugin:
                 "live": {},
                 "drift": {},
             }
+
+            # Backend info is system-wide; populate regardless of connection state
+            backend_available = self._has_backend_tool()
+            status["live"]["backend_tool_available"] = backend_available
+            if backend_available:
+                status["live"]["wifi_backend"] = self._get_current_backend() or ""
 
             if not connected:
                 status["live"]["dispatcher_installed"] = os.path.isfile(
@@ -1356,3 +1418,192 @@ systemctl restart plugin_loader 2>/dev/null || true
         except Exception as e:
             decky.logger.error(f"apply_update error: {e}")
             return {"success": False, "error": "unexpected", "message": str(e)}
+
+    # ---- WiFi backend switch (iwd / wpa_supplicant) ----
+
+    async def _backend_switch_worker(self, target: str):
+        """Background task that switches the WiFi backend with phase transitions.
+
+        Phases: switching → (recovering_interface)? → reconnecting → done/failed.
+        Uses asyncio.to_thread for blocking subprocess calls so the event loop
+        stays responsive to get_backend_switch_status polling.
+        """
+        try:
+            settings = _load_settings()
+            is_oled = settings.get("model") == "oled"
+
+            # Phase: switching — run the backend switch command
+            self._backend_switch["phase"] = "switching"
+            switch_result = await asyncio.to_thread(
+                self._run_cmd, [BACKEND_TOOL, target], 30, False
+            )
+            await asyncio.sleep(2)
+
+            # Phase: recovering_interface — OLED + iwd→wpa_supplicant can destroy wlan0
+            recovery_performed = False
+            needs_reboot = False
+            if is_oled and target == "wpa_supplicant":
+                iface = await asyncio.to_thread(self._get_wifi_interface)
+                if not iface or iface != "wlan0":
+                    self._backend_switch["phase"] = "recovering_interface"
+                    phy = await asyncio.to_thread(self._get_wifi_phy) or "phy0"
+                    await asyncio.to_thread(
+                        self._run_cmd,
+                        ["/usr/bin/iw", "phy", phy, "interface", "add",
+                         "wlan0", "type", "station"],
+                        5, False,
+                    )
+                    await asyncio.sleep(2)
+                    iface = await asyncio.to_thread(self._get_wifi_interface)
+                    if iface == "wlan0":
+                        recovery_performed = True
+                    else:
+                        needs_reboot = True
+
+            # Phase: reconnecting — poll for wifi interface + active connection
+            if not needs_reboot:
+                self._backend_switch["phase"] = "reconnecting"
+                elapsed = 0
+                while elapsed < 15:
+                    iface = await asyncio.to_thread(self._get_wifi_interface)
+                    uuid = None
+                    if iface:
+                        uuid = await asyncio.to_thread(self._get_active_connection_uuid)
+                    if iface and uuid:
+                        break
+                    await asyncio.sleep(1)
+                    elapsed += 1
+
+            # Verify final system state
+            final_backend = await asyncio.to_thread(self._get_current_backend)
+
+            if needs_reboot:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": False,
+                    "needs_reboot": True,
+                    "message": "Backend switched but wlan0 didn't come back. Reboot required.",
+                }
+            elif not switch_result["success"] or final_backend != target:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": recovery_performed,
+                    "needs_reboot": False,
+                    "message": "Backend switch did not take effect.",
+                    "detail": switch_result.get("stderr", "")[:200],
+                }
+            else:
+                self._backend_switch["phase"] = "done"
+                self._backend_switch["result"] = {
+                    "success": True,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": recovery_performed,
+                    "needs_reboot": False,
+                }
+            decky.logger.info(
+                f"backend switch: target={target}, final={final_backend}, "
+                f"recovery={recovery_performed}, needs_reboot={needs_reboot}"
+            )
+        except asyncio.CancelledError:
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": "Backend switch cancelled",
+            }
+            raise
+        except Exception as e:
+            decky.logger.error(f"_backend_switch_worker error: {e}")
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": str(e),
+            }
+        finally:
+            self._backend_switch["in_progress"] = False
+
+    async def start_backend_switch(self, backend: str) -> dict:
+        """Kick off a backend switch. Returns immediately; poll get_backend_switch_status for progress."""
+        try:
+            self._ensure_backend_switch_state()
+            if not self._is_supported_device():
+                return {
+                    "accepted": False,
+                    "reason": "unsupported_device",
+                    "message": "Unsupported device. This plugin is designed for Steam Deck only.",
+                }
+            if backend not in ("iwd", "wpa_supplicant"):
+                return {
+                    "accepted": False,
+                    "reason": "invalid_backend",
+                    "message": "Backend must be 'iwd' or 'wpa_supplicant'.",
+                }
+            if not self._has_backend_tool():
+                return {
+                    "accepted": False,
+                    "reason": "tool_missing",
+                    "message": "steamos-wifi-set-backend not found. Requires SteamOS 3.6 or later.",
+                }
+            if self._backend_switch.get("in_progress"):
+                return {
+                    "accepted": False,
+                    "reason": "in_progress",
+                    "message": "Backend switch already in progress.",
+                }
+            current = await asyncio.to_thread(self._get_current_backend)
+            if current == backend:
+                return {
+                    "accepted": False,
+                    "reason": "already_set",
+                    "message": f"Backend is already {backend}.",
+                    "backend": current,
+                }
+
+            self._backend_switch.update({
+                "in_progress": True,
+                "phase": "switching",
+                "target": backend,
+                "started_at": int(time.time()),
+                "result": None,
+            })
+            # Keep a reference so the task isn't garbage-collected mid-run
+            self._backend_switch_task = asyncio.create_task(
+                self._backend_switch_worker(backend)
+            )
+            decky.logger.info(f"backend switch started: {current} -> {backend}")
+            return {
+                "accepted": True,
+                "target": backend,
+                "from": current,
+            }
+        except Exception as e:
+            decky.logger.error(f"start_backend_switch error: {e}")
+            return {
+                "accepted": False,
+                "reason": "unexpected",
+                "message": str(e),
+            }
+
+    async def get_backend_switch_status(self) -> dict:
+        """Return current phase and, when terminal, the final result."""
+        try:
+            self._ensure_backend_switch_state()
+            return {
+                "success": True,
+                "in_progress": self._backend_switch["in_progress"],
+                "phase": self._backend_switch["phase"],
+                "target": self._backend_switch["target"],
+                "started_at": self._backend_switch["started_at"],
+                "result": self._backend_switch["result"],
+            }
+        except Exception as e:
+            decky.logger.error(f"get_backend_switch_status error: {e}")
+            return {"success": False, "message": str(e)}
