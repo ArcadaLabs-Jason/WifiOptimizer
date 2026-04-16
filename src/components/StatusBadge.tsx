@@ -26,7 +26,6 @@ export function StatusBadge({ badge, text }: StatusBadgeProps) {
         whiteSpace: "nowrap",
         background: style.background,
         color: style.color,
-        marginLeft: "6px",
       }}
     >
       {text}
