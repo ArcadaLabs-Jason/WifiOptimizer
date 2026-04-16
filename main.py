@@ -1257,13 +1257,15 @@ class Plugin:
                 }
 
             # Beta: update if versions differ (allows downgrade back to stable)
-            # Stable: update only if newer
+            # Stable: update only if newer (strip -beta suffix for comparison)
             if channel == "beta":
                 update_available = latest != current
             else:
-                current_tuple = tuple(int(x) for x in current.split("."))
-                latest_tuple = tuple(int(x) for x in latest.split("."))
-                update_available = latest_tuple > current_tuple
+                current_clean = current.split("-")[0]
+                latest_clean = latest.split("-")[0]
+                current_tuple = tuple(int(x) for x in current_clean.split("."))
+                latest_tuple = tuple(int(x) for x in latest_clean.split("."))
+                update_available = latest_tuple > current_tuple or "-beta" in current
 
             decky.logger.info(f"Update check: current={current}, latest={latest}, channel={channel}, update={update_available}")
 

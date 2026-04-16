@@ -437,7 +437,7 @@ function Content() {
         <InfoRow
           label="Network buffer tuning"
           subtitle="Optimize UDP buffers and TX queue for streaming"
-          explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings reset on every reboot."
+          explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
           {...getBadge(s?.buffer_tuning_enabled ?? false, "buffer_tuning", status, errors.buffer_tuning ?? null)}
           checked={s?.buffer_tuning_enabled ?? false}
           error={errors.buffer_tuning}
