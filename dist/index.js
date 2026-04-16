@@ -152,12 +152,11 @@ function InfoRow({ label, subtitle, explanation, badge, text, checked, disabled 
                                     fontWeight: 700,
                                     cursor: "pointer",
                                     flexShrink: 0,
-                                }, children: "i" }), SP_JSX.jsx("span", { children: label })] }), description: error ? (SP_JSX.jsx("span", { style: { color: "#ff878c" }, children: error })) : (SP_JSX.jsx("span", { style: { color: "#7a7a8a", fontSize: "11px" }, children: subtitle })), checked: checked, disabled: disabled, onChange: onChange }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
-                        display: "flex",
-                        justifyContent: "flex-end",
-                        padding: "0 0 4px 0",
-                        marginTop: "-6px",
-                    }, children: SP_JSX.jsx(StatusBadge, { badge: badge, text: text }) }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                                }, children: "i" }), SP_JSX.jsx("span", { children: label })] }), description: SP_JSX.jsxs("span", { style: { display: "block" }, children: [SP_JSX.jsx("span", { style: {
+                                    display: "flex",
+                                    justifyContent: "flex-end",
+                                    marginBottom: "4px",
+                                }, children: SP_JSX.jsx(StatusBadge, { badge: badge, text: text }) }), error ? (SP_JSX.jsx("span", { style: { color: "#ff878c" }, children: error })) : (SP_JSX.jsx("span", { style: { color: "#7a7a8a", fontSize: "11px" }, children: subtitle }))] }), checked: checked, disabled: disabled, onChange: onChange }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                         padding: "8px 12px",
                         background: "rgba(255,255,255,0.02)",
                         borderRadius: "6px",

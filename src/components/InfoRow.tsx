@@ -64,28 +64,27 @@ export function InfoRow({
             </span>
           }
           description={
-            error ? (
-              <span style={{ color: "#ff878c" }}>{error}</span>
-            ) : (
-              <span style={{ color: "#7a7a8a", fontSize: "11px" }}>{subtitle}</span>
-            )
+            <span style={{ display: "block" }}>
+              <span
+                style={{
+                  display: "flex",
+                  justifyContent: "flex-end",
+                  marginBottom: "4px",
+                }}
+              >
+                <StatusBadge badge={badge} text={text} />
+              </span>
+              {error ? (
+                <span style={{ color: "#ff878c" }}>{error}</span>
+              ) : (
+                <span style={{ color: "#7a7a8a", fontSize: "11px" }}>{subtitle}</span>
+              )}
+            </span>
           }
           checked={checked}
           disabled={disabled}
           onChange={onChange}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "flex-end",
-            padding: "0 0 4px 0",
-            marginTop: "-6px",
-          }}
-        >
-          <StatusBadge badge={badge} text={text} />
-        </div>
       </PanelSectionRow>
       {expanded && (
         <PanelSectionRow>
