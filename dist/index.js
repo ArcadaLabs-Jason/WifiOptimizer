@@ -306,19 +306,26 @@ function Content() {
         backendPollRef.current = setInterval(async () => {
             try {
                 const s = await getBackendSwitchStatus();
-                setBackendSwitch(s);
-                if (!s.in_progress) {
-                    stopBackendPoll();
-                    busyRef.current = false;
-                    if (s.result && !s.result.success && s.result.message) {
-                        const detail = s.result.detail ? ` (${s.result.detail})` : "";
-                        setErrors((prev) => ({
-                            ...prev,
-                            wifi_backend: s.result.message + detail,
-                        }));
-                    }
-                    await refreshStatus();
+                if (s.in_progress) {
+                    // Mid-switch: update so the subtitle can show the current phase.
+                    setBackendSwitch(s);
+                    return;
                 }
+                // Terminal. Stop polling, then refresh status BEFORE clearing the
+                // in_progress flag — this keeps the optimistic toggle position steady
+                // until live.wifi_backend has caught up, avoiding a toggle/untoggle
+                // flicker at the end of the switch.
+                stopBackendPoll();
+                busyRef.current = false;
+                if (s.result && !s.result.success && s.result.message) {
+                    const detail = s.result.detail ? ` (${s.result.detail})` : "";
+                    setErrors((prev) => ({
+                        ...prev,
+                        wifi_backend: s.result.message + detail,
+                    }));
+                }
+                await refreshStatus();
+                setBackendSwitch(s);
             }
             catch (e) {
                 stopBackendPoll();
