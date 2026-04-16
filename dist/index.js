@@ -234,6 +234,7 @@ const RECONNECT_DELAY = 4000;
 const BACKEND_POLL_INTERVAL = 750;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
 const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
+const UPDATE_TIMEOUT_MS = 60 * 1000;
 const BACKEND_PHASE_TEXT = {
     idle: "",
     switching: "Switching backend…",
@@ -278,6 +279,7 @@ function Content() {
     const [updateInfo, setUpdateInfo] = SP_REACT.useState(null);
     const [checkingUpdate, setCheckingUpdate] = SP_REACT.useState(false);
     const [updating, setUpdating] = SP_REACT.useState(false);
+    const [updateError, setUpdateError] = SP_REACT.useState(null);
     const [backendSwitch, setBackendSwitch] = SP_REACT.useState(null);
     const intervalRef = SP_REACT.useRef(null);
     const backendPollRef = SP_REACT.useRef(null);
@@ -388,6 +390,20 @@ function Content() {
             runUpdateCheck();
         }
     }, [status?.connected, runUpdateCheck]);
+    // Safety timeout: if an update was initiated but plugin_loader hasn't killed
+    // us within 60s, the detached update script probably failed (network drop,
+    // tarball corruption, etc.). Revert the UI so the user isn't stuck staring
+    // at "Updating..." forever, and surface a message they can act on.
+    SP_REACT.useEffect(() => {
+        if (!updating)
+            return;
+        const id = setTimeout(() => {
+            console.error("WiFi Optimizer: update didn't complete within 60s");
+            setUpdating(false);
+            setUpdateError("Update didn't complete. Try again, or reinstall manually from Konsole.");
+        }, UPDATE_TIMEOUT_MS);
+        return () => clearTimeout(id);
+    }, [updating]);
     // Periodic update re-check - QAM often caches the panel across close/reopen,
     // so the mount-effect check doesn't re-fire. This heartbeat catches new
     // releases when the panel has been left open for a while. Paused when the
@@ -561,6 +577,7 @@ function Content() {
                             width: "100%",
                             boxSizing: "border-box",
                         }, children: SP_JSX.jsx("span", { children: "This plugin is designed for Steam Deck only. Unsupported device detected." }) }) }) })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                            setUpdateError(null);
                             setUpdating(true);
                             try {
                                 await applyUpdate();
@@ -724,7 +741,8 @@ function Content() {
                                 await setUpdateChannel(option.data);
                                 setUpdateInfo(null);
                                 await refreshStatus();
-                            } }) }), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "12px", color: "#60baff" }, children: "Updating... plugin will restart momentarily." }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", color: "#3fc56e" }, children: ["v", updateInfo.latest_version, " available (you have v", updateInfo.current_version, ")"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                            } }) }), updateError && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", color: "#ffc669" }, children: ["\u26A0 ", updateError] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "12px", color: "#60baff" }, children: "Updating... plugin will restart momentarily." }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", color: "#3fc56e" }, children: ["v", updateInfo.latest_version, " available (you have v", updateInfo.current_version, ")"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                                        setUpdateError(null);
                                         setUpdating(true);
                                         try {
                                             await applyUpdate();
@@ -732,6 +750,7 @@ function Content() {
                                         catch { /* restart killed connection */ }
                                     }, children: "Update Now" }) })] })) : (SP_JSX.jsxs(SP_JSX.Fragment, { children: [updateInfo && updateInfo.success === false && updateInfo.message && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "10px", color: "#ff878c" }, children: updateInfo.message }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: checkingUpdate, onClick: async () => {
                                         setCheckingUpdate(true);
+                                        setUpdateError(null);
                                         lastUpdateCheckAtRef.current = Date.now();
                                         try {
                                             const result = await checkForUpdate();

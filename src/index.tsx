@@ -29,6 +29,7 @@ const RECONNECT_DELAY = 4000;
 const BACKEND_POLL_INTERVAL = 750;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
 const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
+const UPDATE_TIMEOUT_MS = 60 * 1000;
 
 const BACKEND_PHASE_TEXT: Record<BackendSwitchPhase, string> = {
   idle: "",
@@ -76,6 +77,7 @@ function Content() {
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
   const [backendSwitch, setBackendSwitch] = useState<BackendSwitchStatus | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -187,6 +189,22 @@ function Content() {
       runUpdateCheck();
     }
   }, [status?.connected, runUpdateCheck]);
+
+  // Safety timeout: if an update was initiated but plugin_loader hasn't killed
+  // us within 60s, the detached update script probably failed (network drop,
+  // tarball corruption, etc.). Revert the UI so the user isn't stuck staring
+  // at "Updating..." forever, and surface a message they can act on.
+  useEffect(() => {
+    if (!updating) return;
+    const id = setTimeout(() => {
+      console.error("WiFi Optimizer: update didn't complete within 60s");
+      setUpdating(false);
+      setUpdateError(
+        "Update didn't complete. Try again, or reinstall manually from Konsole."
+      );
+    }, UPDATE_TIMEOUT_MS);
+    return () => clearTimeout(id);
+  }, [updating]);
 
   // Periodic update re-check - QAM often caches the panel across close/reopen,
   // so the mount-effect check doesn't re-fire. This heartbeat catches new
@@ -413,6 +431,7 @@ function Content() {
             <ButtonItem
               layout="below"
               onClick={async () => {
+                setUpdateError(null);
                 setUpdating(true);
                 try { await backend.applyUpdate(); } catch { /* restart killed connection */ }
               }}
@@ -881,6 +900,13 @@ function Content() {
             }}
           />
         </PanelSectionRow>
+        {updateError && !updating && (
+          <PanelSectionRow>
+            <div style={{ fontSize: "12px", color: "#ffc669" }}>
+              &#9888; {updateError}
+            </div>
+          </PanelSectionRow>
+        )}
         {updating ? (
           <PanelSectionRow>
             <div style={{ fontSize: "12px", color: "#60baff" }}>
@@ -898,6 +924,7 @@ function Content() {
               <ButtonItem
                 layout="below"
                 onClick={async () => {
+                  setUpdateError(null);
                   setUpdating(true);
                   try { await backend.applyUpdate(); } catch { /* restart killed connection */ }
                 }}
@@ -921,6 +948,7 @@ function Content() {
                 disabled={checkingUpdate}
                 onClick={async () => {
                   setCheckingUpdate(true);
+                  setUpdateError(null);
                   lastUpdateCheckAtRef.current = Date.now();
                   try {
                     const result = await backend.checkForUpdate();
