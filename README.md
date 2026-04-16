@@ -1,4 +1,4 @@
-# WiFi Optimizer v0.6.1
+# WiFi Optimizer v0.6.2
 
 > **BETA - USE AT YOUR OWN RISK.** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings. Testing has been done exclusively on the OLED model. LCD support is built in but untested - bug reports and feedback from LCD owners are especially welcome.
 
@@ -20,9 +20,9 @@ curl -sL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -
 
 This requires a user password - set one with `passwd` in Konsole if you haven't already.
 
-Run the same command to update to the latest version. Your settings are preserved.
-
 Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
+
+**Updating:** The plugin checks for updates automatically when you open it. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and restarts itself. You can also update manually by running the install command above again.
 
 ## Getting started
 

@@ -81,6 +81,8 @@ function Content() {
   useEffect(() => {
     refreshStatus().finally(() => setLoading(false));
     intervalRef.current = setInterval(refreshStatus, REFRESH_INTERVAL);
+    // One-time update check on panel open
+    backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
@@ -224,6 +226,34 @@ function Content() {
               }}
             >
               <span>This plugin is designed for Steam Deck only. Unsupported device detected.</span>
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+
+      {/* Update available */}
+      {updateInfo?.update_available && !updating && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              onClick={async () => {
+                setUpdating(true);
+                try { await backend.applyUpdate(); } catch { /* restart killed connection */ }
+              }}
+            >
+              Update to v{updateInfo.latest_version}
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+
+      {/* Updating */}
+      {updating && (
+        <PanelSection>
+          <PanelSectionRow>
+            <div style={{ fontSize: "12px", color: "#60baff" }}>
+              Updating... plugin will restart momentarily.
             </div>
           </PanelSectionRow>
         </PanelSection>

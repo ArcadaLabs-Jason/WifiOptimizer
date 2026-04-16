@@ -284,6 +284,8 @@ function Content() {
     SP_REACT.useEffect(() => {
         refreshStatus().finally(() => setLoading(false));
         intervalRef.current = setInterval(refreshStatus, REFRESH_INTERVAL);
+        // One-time update check on panel open
+        checkForUpdate().then(setUpdateInfo).catch(() => { });
         return () => {
             if (intervalRef.current)
                 clearInterval(intervalRef.current);
@@ -384,7 +386,13 @@ function Content() {
                             color: "#ff878c",
                             width: "100%",
                             boxSizing: "border-box",
-                        }, children: SP_JSX.jsx("span", { children: "This plugin is designed for Steam Deck only. Unsupported device detected." }) }) }) })), connected && !s?.last_applied && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                        }, children: SP_JSX.jsx("span", { children: "This plugin is designed for Steam Deck only. Unsupported device detected." }) }) }) })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                            setUpdating(true);
+                            try {
+                                await applyUpdate();
+                            }
+                            catch { /* restart killed connection */ }
+                        }, children: ["Update to v", updateInfo.latest_version] }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "12px", color: "#60baff" }, children: "Updating... plugin will restart momentarily." }) }) })), connected && !s?.last_applied && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                             display: "flex",
                             alignItems: "center",
                             gap: "6px",
