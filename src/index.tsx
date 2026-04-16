@@ -488,6 +488,9 @@ function Content() {
                 boxSizing: "border-box",
               }}
             >
+              <span style={{ fontSize: "14px" }}>
+                {backendSwitch.result.success ? "✓" : "⚠"}
+              </span>
               <span>
                 {backendSwitch.result.needs_reboot
                   ? `Backend switched to ${backendSwitch.result.target}, but wlan0 didn't come back — reboot required`
@@ -716,6 +719,16 @@ function Content() {
                 : isWpa
                   ? { badge: "active", text: "wpa_supplicant" }
                   : { badge: "off", text: "iwd" };
+          // Inline result shown right under the toggle so it's visible where the
+          // user clicked — the top-of-panel banner is often off-screen when the
+          // user is scrolled down to the Advanced section.
+          const lastResult =
+            !switching &&
+            !errors.wifi_backend &&
+            backendSwitch?.result &&
+            !backendSwitch.result.needs_reboot
+              ? backendSwitch.result
+              : null;
           return (
             <InfoRow
               label="Use wpa_supplicant backend"
@@ -731,7 +744,24 @@ function Content() {
               disabled={switching}
               error={errors.wifi_backend}
               onChange={handleBackendToggle}
-            />
+            >
+              {lastResult?.success && (
+                <PanelSectionRow>
+                  <div
+                    style={{
+                      fontSize: "11px",
+                      color: "#3fc56e",
+                      padding: "2px 0",
+                    }}
+                  >
+                    ✓ Switched to {lastResult.backend}
+                    {lastResult.recovery_performed
+                      ? " · wlan0 interface recreated"
+                      : ""}
+                  </div>
+                </PanelSectionRow>
+              )}
+            </InfoRow>
           );
         })()}
       </PanelSection>

@@ -541,7 +541,7 @@ function Content() {
                             color: "#ff878c",
                             width: "100%",
                             boxSizing: "border-box",
-                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u2715" }), SP_JSX.jsx("span", { children: "Not connected to WiFi. Connect first, then optimize." })] }) }) })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u2715" }), SP_JSX.jsx("span", { children: "Not connected to WiFi. Connect first, then optimize." })] }) }) })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
                             display: "flex",
                             alignItems: "center",
                             gap: "6px",
@@ -557,13 +557,13 @@ function Content() {
                             color: backendSwitch.result.success ? "#3fc56e" : "#ffc669",
                             width: "100%",
                             boxSizing: "border-box",
-                        }, children: SP_JSX.jsx("span", { children: backendSwitch.result.needs_reboot
-                                ? `Backend switched to ${backendSwitch.result.target}, but wlan0 didn't come back — reboot required`
-                                : backendSwitch.result.success
-                                    ? backendSwitch.result.recovery_performed
-                                        ? `Switched to ${backendSwitch.result.backend} · recreated wlan0 interface`
-                                        : `Switched to ${backendSwitch.result.backend}`
-                                    : (backendSwitch.result.message ?? "Backend switch failed") }) }) }) })), optimizeResult && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: backendSwitch.result.success ? "✓" : "⚠" }), SP_JSX.jsx("span", { children: backendSwitch.result.needs_reboot
+                                    ? `Backend switched to ${backendSwitch.result.target}, but wlan0 didn't come back — reboot required`
+                                    : backendSwitch.result.success
+                                        ? backendSwitch.result.recovery_performed
+                                            ? `Switched to ${backendSwitch.result.backend} · recreated wlan0 interface`
+                                            : `Switched to ${backendSwitch.result.backend}`
+                                        : (backendSwitch.result.message ?? "Backend switch failed") })] }) }) })), optimizeResult && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                             display: "flex",
                             alignItems: "center",
                             gap: "6px",
@@ -614,9 +614,24 @@ function Content() {
                                 : isWpa
                                     ? { badge: "active", text: "wpa_supplicant" }
                                     : { badge: "off", text: "iwd" };
+                        // Inline result shown right under the toggle so it's visible where the
+                        // user clicked — the top-of-panel banner is often off-screen when the
+                        // user is scrolled down to the Advanced section.
+                        const lastResult = !switching &&
+                            !errors.wifi_backend &&
+                            backendSwitch?.result &&
+                            !backendSwitch.result.needs_reboot
+                            ? backendSwitch.result
+                            : null;
                         return (SP_JSX.jsx(InfoRow, { label: "Use wpa_supplicant backend", subtitle: phaseText
                                 ? phaseText
-                                : "Alternate WiFi backend — can fix OLED sleep/wake issues", explanation: "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface \u2014 the plugin automatically recreates it, but a reboot is needed as a last resort.", badge: backendBadge.badge, text: backendBadge.text, checked: checkedVal, disabled: switching, error: errors.wifi_backend, onChange: handleBackendToggle }));
+                                : "Alternate WiFi backend — can fix OLED sleep/wake issues", explanation: "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface \u2014 the plugin automatically recreates it, but a reboot is needed as a last resort.", badge: backendBadge.badge, text: backendBadge.text, checked: checkedVal, disabled: switching, error: errors.wifi_backend, onChange: handleBackendToggle, children: lastResult?.success && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+                                        fontSize: "11px",
+                                        color: "#3fc56e",
+                                        padding: "2px 0",
+                                    }, children: ["\u2713 Switched to ", lastResult.backend, lastResult.recovery_performed
+                                            ? " · wlan0 interface recreated"
+                                            : ""] }) })) }));
                     })()] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#8a8a9a" }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
                                 await resetSettings();
                                 await refreshStatus();
