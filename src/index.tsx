@@ -28,6 +28,7 @@ const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
 const BACKEND_POLL_INTERVAL = 750;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
+const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 
 const BACKEND_PHASE_TEXT: Record<BackendSwitchPhase, string> = {
   idle: "",
@@ -83,6 +84,19 @@ function Content() {
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const busyRef = useRef(false);
   const prevConnectedRef = useRef<boolean | null>(null);
+  const lastUpdateCheckAtRef = useRef<number>(0);
+
+  // Runs checkForUpdate with dedupe — skips if a check was issued within the
+  // dedupe window. Lowers GitHub API pressure in CGNAT/dorm scenarios where
+  // many Decks share an IP. Manual button bypasses this (force=true).
+  const runUpdateCheck = useCallback((force: boolean = false) => {
+    const now = Date.now();
+    if (!force && now - lastUpdateCheckAtRef.current < UPDATE_CHECK_DEDUPE_MS) {
+      return;
+    }
+    lastUpdateCheckAtRef.current = now;
+    backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
+  }, []);
 
   const refreshStatus = useCallback(async () => {
     if (busyRef.current) return;
@@ -145,7 +159,7 @@ function Content() {
     // Initial update check. If it fails (e.g., no network yet), the effect
     // below retries on connectivity recovery. QAM tends to cache the panel
     // across close/open, so we can't rely on remount to retry.
-    backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
+    runUpdateCheck();
     // Resume backend-switch polling if one is in flight (panel was reopened mid-switch)
     backend
       .getBackendSwitchStatus()
@@ -161,7 +175,7 @@ function Content() {
       if (intervalRef.current) clearInterval(intervalRef.current);
       if (backendPollRef.current) clearInterval(backendPollRef.current);
     };
-  }, [refreshStatus, beginBackendPoll]);
+  }, [refreshStatus, beginBackendPoll, runUpdateCheck]);
 
   // Retry update check when connectivity recovers — the initial one-shot check
   // in the mount effect misses the case where the panel was already open when
@@ -173,19 +187,17 @@ function Content() {
     const prev = prevConnectedRef.current;
     prevConnectedRef.current = connected;
     if (prev === false && connected === true) {
-      backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
+      runUpdateCheck();
     }
-  }, [status?.connected]);
+  }, [status?.connected, runUpdateCheck]);
 
   // Periodic update re-check — QAM often caches the panel across close/reopen,
   // so the mount-effect check doesn't re-fire. This heartbeat catches new
   // releases when the panel has been left open for a while.
   useEffect(() => {
-    const id = setInterval(() => {
-      backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
-    }, UPDATE_CHECK_INTERVAL);
+    const id = setInterval(() => runUpdateCheck(), UPDATE_CHECK_INTERVAL);
     return () => clearInterval(id);
-  }, []);
+  }, [runUpdateCheck]);
 
   const handleBackendToggle = async (on: boolean) => {
     const target = on ? "wpa_supplicant" : "iwd";
@@ -483,46 +495,53 @@ function Content() {
       )}
 
       {/* Backend switch result banner */}
-      {backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (
-        <PanelSection>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                padding: "8px 12px",
-                background: backendSwitch.result.success
-                  ? "rgba(29,158,117,0.08)"
-                  : "rgba(223,138,0,0.08)",
-                border: `0.5px solid ${
-                  backendSwitch.result.success
-                    ? "rgba(29,158,117,0.2)"
-                    : "rgba(223,138,0,0.2)"
-                }`,
-                borderRadius: "8px",
-                fontSize: "12px",
-                color: backendSwitch.result.success ? "#3fc56e" : "#ffc669",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
-            >
-              <span style={{ fontSize: "14px" }}>
-                {backendSwitch.result.success ? "✓" : "⚠"}
-              </span>
-              <span>
-                {backendSwitch.result.needs_reboot
-                  ? `Backend switched to ${backendSwitch.result.target}, but wlan0 didn't come back — reboot required`
-                  : backendSwitch.result.success
-                    ? backendSwitch.result.recovery_performed
-                      ? `Switched to ${backendSwitch.result.backend} · recreated wlan0 interface`
-                      : `Switched to ${backendSwitch.result.backend}`
-                    : (backendSwitch.result.message ?? "Backend switch failed")}
-              </span>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
-      )}
+      {backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
+        const r = backendSwitch.result;
+        // Treat reconnect timeout as a warning even when the backend-level
+        // switch succeeded — the system is switched but WiFi didn't come back.
+        const isWarning = !r.success || r.needs_reboot || r.reconnect_timed_out;
+        let text: string;
+        if (r.needs_reboot) {
+          text = `Backend switched to ${r.target}, but wlan0 didn't come back — reboot required`;
+        } else if (!r.success) {
+          text = r.message ?? "Backend switch failed";
+        } else {
+          const parts = [`Switched to ${r.backend}`];
+          if (r.recovery_performed) parts.push("recreated wlan0 interface");
+          if (r.reconnect_timed_out) parts.push("WiFi didn't reconnect");
+          text = parts.join(" · ");
+        }
+        return (
+          <PanelSection>
+            <PanelSectionRow>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  padding: "8px 12px",
+                  background: isWarning
+                    ? "rgba(223,138,0,0.08)"
+                    : "rgba(29,158,117,0.08)",
+                  border: `0.5px solid ${
+                    isWarning
+                      ? "rgba(223,138,0,0.2)"
+                      : "rgba(29,158,117,0.2)"
+                  }`,
+                  borderRadius: "8px",
+                  fontSize: "12px",
+                  color: isWarning ? "#ffc669" : "#3fc56e",
+                  width: "100%",
+                  boxSizing: "border-box",
+                }}
+              >
+                <span style={{ fontSize: "14px" }}>{isWarning ? "⚠" : "✓"}</span>
+                <span>{text}</span>
+              </div>
+            </PanelSectionRow>
+          </PanelSection>
+        );
+      })()}
 
       {/* Optimize result banner */}
       {optimizeResult && (
@@ -764,22 +783,25 @@ function Content() {
               error={errors.wifi_backend}
               onChange={handleBackendToggle}
             >
-              {lastResult?.success && (
-                <PanelSectionRow>
-                  <div
-                    style={{
-                      fontSize: "11px",
-                      color: "#3fc56e",
-                      padding: "2px 0",
-                    }}
-                  >
-                    ✓ Switched to {lastResult.backend}
-                    {lastResult.recovery_performed
-                      ? " · wlan0 interface recreated"
-                      : ""}
-                  </div>
-                </PanelSectionRow>
-              )}
+              {lastResult?.success && (() => {
+                const timedOut = lastResult.reconnect_timed_out;
+                const parts: string[] = [`Switched to ${lastResult.backend}`];
+                if (lastResult.recovery_performed) parts.push("wlan0 interface recreated");
+                if (timedOut) parts.push("WiFi didn't reconnect");
+                return (
+                  <PanelSectionRow>
+                    <div
+                      style={{
+                        fontSize: "11px",
+                        color: timedOut ? "#ffc669" : "#3fc56e",
+                        padding: "2px 0",
+                      }}
+                    >
+                      {timedOut ? "⚠" : "✓"} {parts.join(" · ")}
+                    </div>
+                  </PanelSectionRow>
+                );
+              })()}
             </InfoRow>
           );
         })()}
@@ -880,6 +902,7 @@ function Content() {
                 disabled={checkingUpdate}
                 onClick={async () => {
                   setCheckingUpdate(true);
+                  lastUpdateCheckAtRef.current = Date.now();
                   try {
                     const result = await backend.checkForUpdate();
                     setUpdateInfo(result);

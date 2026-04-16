@@ -1478,18 +1478,22 @@ systemctl restart plugin_loader 2>/dev/null || true
                     needs_reboot = True
 
             # Phase: reconnecting — wait for NM to reconnect to WiFi
+            reconnect_timed_out = False
             if not needs_reboot:
                 self._backend_switch["phase"] = "reconnecting"
                 elapsed = 0
+                reconnected = False
                 while elapsed < 15:
                     iface = await asyncio.to_thread(self._get_wifi_interface)
                     uuid = None
                     if iface:
                         uuid = await asyncio.to_thread(self._get_active_connection_uuid)
                     if iface and uuid:
+                        reconnected = True
                         break
                     await asyncio.sleep(1)
                     elapsed += 1
+                reconnect_timed_out = not reconnected
 
             # Verify final system state
             final_backend = await asyncio.to_thread(self._get_current_backend)
@@ -1512,6 +1516,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "target": target,
                     "recovery_performed": recovery_performed,
                     "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
                     "message": "Backend switch did not take effect.",
                     "detail": rs_stderr[:200] or rs_stdout[:200],
                 }
@@ -1523,10 +1528,12 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "target": target,
                     "recovery_performed": recovery_performed,
                     "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
                 }
             decky.logger.info(
                 f"backend switch: target={target}, final={final_backend}, "
-                f"recovery={recovery_performed}, needs_reboot={needs_reboot}"
+                f"recovery={recovery_performed}, needs_reboot={needs_reboot}, "
+                f"reconnect_timed_out={reconnect_timed_out}"
             )
         except asyncio.CancelledError:
             self._backend_switch["phase"] = "failed"

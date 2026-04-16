@@ -233,6 +233,7 @@ const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
 const BACKEND_POLL_INTERVAL = 750;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
+const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 const BACKEND_PHASE_TEXT = {
     idle: "",
     switching: "Switching backend…",
@@ -283,6 +284,18 @@ function Content() {
     const backendPollRef = SP_REACT.useRef(null);
     const busyRef = SP_REACT.useRef(false);
     const prevConnectedRef = SP_REACT.useRef(null);
+    const lastUpdateCheckAtRef = SP_REACT.useRef(0);
+    // Runs checkForUpdate with dedupe — skips if a check was issued within the
+    // dedupe window. Lowers GitHub API pressure in CGNAT/dorm scenarios where
+    // many Decks share an IP. Manual button bypasses this (force=true).
+    const runUpdateCheck = SP_REACT.useCallback((force = false) => {
+        const now = Date.now();
+        if (!force && now - lastUpdateCheckAtRef.current < UPDATE_CHECK_DEDUPE_MS) {
+            return;
+        }
+        lastUpdateCheckAtRef.current = now;
+        checkForUpdate().then(setUpdateInfo).catch(() => { });
+    }, []);
     const refreshStatus = SP_REACT.useCallback(async () => {
         if (busyRef.current)
             return;
@@ -344,7 +357,7 @@ function Content() {
         // Initial update check. If it fails (e.g., no network yet), the effect
         // below retries on connectivity recovery. QAM tends to cache the panel
         // across close/open, so we can't rely on remount to retry.
-        checkForUpdate().then(setUpdateInfo).catch(() => { });
+        runUpdateCheck();
         // Resume backend-switch polling if one is in flight (panel was reopened mid-switch)
         getBackendSwitchStatus()
             .then((s) => {
@@ -361,7 +374,7 @@ function Content() {
             if (backendPollRef.current)
                 clearInterval(backendPollRef.current);
         };
-    }, [refreshStatus, beginBackendPoll]);
+    }, [refreshStatus, beginBackendPoll, runUpdateCheck]);
     // Retry update check when connectivity recovers — the initial one-shot check
     // in the mount effect misses the case where the panel was already open when
     // the network came back. Skip until status has loaded to avoid a spurious
@@ -373,18 +386,16 @@ function Content() {
         const prev = prevConnectedRef.current;
         prevConnectedRef.current = connected;
         if (prev === false && connected === true) {
-            checkForUpdate().then(setUpdateInfo).catch(() => { });
+            runUpdateCheck();
         }
-    }, [status?.connected]);
+    }, [status?.connected, runUpdateCheck]);
     // Periodic update re-check — QAM often caches the panel across close/reopen,
     // so the mount-effect check doesn't re-fire. This heartbeat catches new
     // releases when the panel has been left open for a while.
     SP_REACT.useEffect(() => {
-        const id = setInterval(() => {
-            checkForUpdate().then(setUpdateInfo).catch(() => { });
-        }, UPDATE_CHECK_INTERVAL);
+        const id = setInterval(() => runUpdateCheck(), UPDATE_CHECK_INTERVAL);
         return () => clearInterval(id);
-    }, []);
+    }, [runUpdateCheck]);
     const handleBackendToggle = async (on) => {
         const target = on ? "wpa_supplicant" : "iwd";
         busyRef.current = true;
@@ -561,29 +572,44 @@ function Content() {
                             color: "#ff878c",
                             width: "100%",
                             boxSizing: "border-box",
-                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u2715" }), SP_JSX.jsx("span", { children: "Not connected to WiFi. Connect first, then optimize." })] }) }) })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "6px",
-                            padding: "8px 12px",
-                            background: backendSwitch.result.success
-                                ? "rgba(29,158,117,0.08)"
-                                : "rgba(223,138,0,0.08)",
-                            border: `0.5px solid ${backendSwitch.result.success
-                                ? "rgba(29,158,117,0.2)"
-                                : "rgba(223,138,0,0.2)"}`,
-                            borderRadius: "8px",
-                            fontSize: "12px",
-                            color: backendSwitch.result.success ? "#3fc56e" : "#ffc669",
-                            width: "100%",
-                            boxSizing: "border-box",
-                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: backendSwitch.result.success ? "✓" : "⚠" }), SP_JSX.jsx("span", { children: backendSwitch.result.needs_reboot
-                                    ? `Backend switched to ${backendSwitch.result.target}, but wlan0 didn't come back — reboot required`
-                                    : backendSwitch.result.success
-                                        ? backendSwitch.result.recovery_performed
-                                            ? `Switched to ${backendSwitch.result.backend} · recreated wlan0 interface`
-                                            : `Switched to ${backendSwitch.result.backend}`
-                                        : (backendSwitch.result.message ?? "Backend switch failed") })] }) }) })), optimizeResult && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u2715" }), SP_JSX.jsx("span", { children: "Not connected to WiFi. Connect first, then optimize." })] }) }) })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
+                const r = backendSwitch.result;
+                // Treat reconnect timeout as a warning even when the backend-level
+                // switch succeeded — the system is switched but WiFi didn't come back.
+                const isWarning = !r.success || r.needs_reboot || r.reconnect_timed_out;
+                let text;
+                if (r.needs_reboot) {
+                    text = `Backend switched to ${r.target}, but wlan0 didn't come back — reboot required`;
+                }
+                else if (!r.success) {
+                    text = r.message ?? "Backend switch failed";
+                }
+                else {
+                    const parts = [`Switched to ${r.backend}`];
+                    if (r.recovery_performed)
+                        parts.push("recreated wlan0 interface");
+                    if (r.reconnect_timed_out)
+                        parts.push("WiFi didn't reconnect");
+                    text = parts.join(" · ");
+                }
+                return (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "6px",
+                                padding: "8px 12px",
+                                background: isWarning
+                                    ? "rgba(223,138,0,0.08)"
+                                    : "rgba(29,158,117,0.08)",
+                                border: `0.5px solid ${isWarning
+                                    ? "rgba(223,138,0,0.2)"
+                                    : "rgba(29,158,117,0.2)"}`,
+                                borderRadius: "8px",
+                                fontSize: "12px",
+                                color: isWarning ? "#ffc669" : "#3fc56e",
+                                width: "100%",
+                                boxSizing: "border-box",
+                            }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: isWarning ? "⚠" : "✓" }), SP_JSX.jsx("span", { children: text })] }) }) }));
+            })(), optimizeResult && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                             display: "flex",
                             alignItems: "center",
                             gap: "6px",
@@ -645,13 +671,19 @@ function Content() {
                             : null;
                         return (SP_JSX.jsx(InfoRow, { label: "Use wpa_supplicant backend", subtitle: phaseText
                                 ? phaseText
-                                : "Alternate WiFi backend — can fix OLED sleep/wake issues", explanation: "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface \u2014 the plugin automatically recreates it, but a reboot is needed as a last resort.", badge: backendBadge.badge, text: backendBadge.text, checked: checkedVal, disabled: switching, error: errors.wifi_backend, onChange: handleBackendToggle, children: lastResult?.success && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
-                                        fontSize: "11px",
-                                        color: "#3fc56e",
-                                        padding: "2px 0",
-                                    }, children: ["\u2713 Switched to ", lastResult.backend, lastResult.recovery_performed
-                                            ? " · wlan0 interface recreated"
-                                            : ""] }) })) }));
+                                : "Alternate WiFi backend — can fix OLED sleep/wake issues", explanation: "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface \u2014 the plugin automatically recreates it, but a reboot is needed as a last resort.", badge: backendBadge.badge, text: backendBadge.text, checked: checkedVal, disabled: switching, error: errors.wifi_backend, onChange: handleBackendToggle, children: lastResult?.success && (() => {
+                                const timedOut = lastResult.reconnect_timed_out;
+                                const parts = [`Switched to ${lastResult.backend}`];
+                                if (lastResult.recovery_performed)
+                                    parts.push("wlan0 interface recreated");
+                                if (timedOut)
+                                    parts.push("WiFi didn't reconnect");
+                                return (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+                                            fontSize: "11px",
+                                            color: timedOut ? "#ffc669" : "#3fc56e",
+                                            padding: "2px 0",
+                                        }, children: [timedOut ? "⚠" : "✓", " ", parts.join(" · ")] }) }));
+                            })() }));
                     })()] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#8a8a9a" }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
                                 await resetSettings();
                                 await refreshStatus();
@@ -670,6 +702,7 @@ function Content() {
                                         catch { /* restart killed connection */ }
                                     }, children: "Update Now" }) })] })) : (SP_JSX.jsxs(SP_JSX.Fragment, { children: [updateInfo && updateInfo.success === false && updateInfo.message && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "10px", color: "#ff878c" }, children: updateInfo.message }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: checkingUpdate, onClick: async () => {
                                         setCheckingUpdate(true);
+                                        lastUpdateCheckAtRef.current = Date.now();
                                         try {
                                             const result = await checkForUpdate();
                                             setUpdateInfo(result);

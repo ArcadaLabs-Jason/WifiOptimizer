@@ -79,6 +79,7 @@ export interface BackendSwitchResult {
   target: string;
   recovery_performed?: boolean;
   needs_reboot?: boolean;
+  reconnect_timed_out?: boolean;
   message?: string;
   detail?: string;
 }
