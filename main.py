@@ -385,11 +385,47 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"Failed to remove dispatcher: {e}")
 
+    def _rotate_logs(self, keep: int = 10):
+        """Prune old log files on plugin startup. Decky does not rotate plugin
+        logs automatically; each plugin load creates a new timestamped file in
+        DECKY_PLUGIN_LOG_DIR, so without pruning they accumulate forever.
+        Keep the newest `keep` files (typical size ~2-3 KB each, so bounded at
+        roughly 30 KB total).
+        """
+        try:
+            log_dir = getattr(decky, "DECKY_PLUGIN_LOG_DIR", None)
+            if not log_dir or not os.path.isdir(log_dir):
+                return
+            files = [
+                os.path.join(log_dir, f)
+                for f in os.listdir(log_dir)
+                if f.endswith(".log")
+            ]
+            if len(files) <= keep:
+                return
+            files.sort(key=os.path.getmtime, reverse=True)
+            current_log = getattr(decky, "DECKY_PLUGIN_LOG", None)
+            removed = 0
+            for path in files[keep:]:
+                # Paranoia: never delete the file we're currently writing to.
+                if current_log and os.path.realpath(path) == os.path.realpath(current_log):
+                    continue
+                try:
+                    os.remove(path)
+                    removed += 1
+                except Exception:
+                    pass
+            if removed:
+                decky.logger.info(f"Rotated logs: removed {removed} old file(s), kept {keep} newest")
+        except Exception as e:
+            decky.logger.error(f"Log rotation error: {e}")
+
     # ---- Lifecycle ----
 
     async def _main(self):
         try:
             decky.logger.info("WiFi Optimizer starting")
+            self._rotate_logs()
             self._ensure_backend_switch_state()
             info = await self.get_device_info()
             settings = _load_settings()
