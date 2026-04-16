@@ -33,6 +33,9 @@ import { StatsGrid } from "./components/StatsGrid";
 import { Banner } from "./components/Banner";
 import { BackendToggleRow } from "./components/BackendToggleRow";
 import { UpdatesSection } from "./components/UpdatesSection";
+import { PanelHeader } from "./components/PanelHeader";
+import { PanelFooter } from "./components/PanelFooter";
+import { ActionsSection } from "./components/ActionsSection";
 import { theme } from "./theme";
 
 const REFRESH_INTERVAL = 3000;
@@ -41,15 +44,6 @@ const BACKEND_POLL_INTERVAL = 750;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
 const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 const UPDATE_TIMEOUT_MS = 60 * 1000;
-
-function timeAgo(ts: number): string {
-  if (!ts) return "never";
-  const diff = Math.floor(Date.now() / 1000) - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)} min ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)} hr ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
 
 function getBadge(
   driftKey: string | undefined,
@@ -342,6 +336,22 @@ function Content() {
     await refreshStatus();
   };
 
+  const handleResetSettings = async () => {
+    if (busyRef.current) return;
+    setBusy(true);
+    setOptimizeResult(null);
+    setErrors({});
+    try {
+      await backend.resetSettings();
+    } finally {
+      await refreshStatus(true);
+      setBusy(false);
+    }
+  };
+
+  const handleForceReapply = () =>
+    handleToggle("reapply", () => backend.reapplyAll());
+
   const handleBackendToggle = async (on: boolean) => {
     // Re-entrancy guard: drop rapid clicks or clicks that land while another
     // operation is already running. Protects against duplicate backend calls
@@ -463,10 +473,6 @@ function Content() {
   const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
   const isOled = s?.model === "oled";
 
-  const modelLabel = s
-    ? `${(s.model || "unknown").toUpperCase()} - ${s.driver || "?"}`
-    : "";
-
   // Check if all safe optimizations are already active
   const allSafeActive =
     connected &&
@@ -480,38 +486,13 @@ function Content() {
 
   return (
     <>
-      {/* Header */}
-      <PanelSection>
-        <PanelSectionRow>
-          <span
-            style={{
-              fontSize: theme.fontSize.tiny,
-              background: theme.surface.md,
-              padding: "2px 8px",
-              borderRadius: theme.radius.pill,
-              color: theme.text.tertiary,
-            }}
-          >
-            Device: {modelLabel}
-          </span>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted }}>
-            Version: {status?.version ?? "?"}
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted }}>
-            Tap (i) on any toggle for details
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted }}>
-            Last changed: {timeAgo(s?.last_applied ?? 0)}
-            {status?.live?.last_enforced ? (<><br />Auto-applied: {timeAgo(status.live.last_enforced)}</>) : ""}
-          </div>
-        </PanelSectionRow>
-      </PanelSection>
+      <PanelHeader
+        model={s?.model ?? "unknown"}
+        driver={s?.driver ?? ""}
+        version={status?.version ?? "?"}
+        lastApplied={s?.last_applied ?? 0}
+        lastEnforced={status?.live?.last_enforced}
+      />
 
       {/* Unsupported device */}
       {!supported && (
@@ -782,38 +763,13 @@ function Content() {
         </PanelSectionRow>
       </PanelSection>
 
-      {/* Actions */}
-      <PanelSection title="Actions">
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={!connected || !supported || isBusy}
-            onClick={() => handleToggle("reapply", () => backend.reapplyAll())}
-          >
-            Force Reapply All
-          </ButtonItem>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={isBusy}
-            onClick={async () => {
-              if (busyRef.current) return;
-              setBusy(true);
-              setOptimizeResult(null);
-              setErrors({});
-              try {
-                await backend.resetSettings();
-              } finally {
-                await refreshStatus(true);
-                setBusy(false);
-              }
-            }}
-          >
-            Reset Settings
-          </ButtonItem>
-        </PanelSectionRow>
-      </PanelSection>
+      <ActionsSection
+        connected={connected}
+        supported={supported}
+        isBusy={isBusy}
+        onForceReapply={handleForceReapply}
+        onReset={handleResetSettings}
+      />
 
       <UpdatesSection
         channel={s?.update_channel ?? "stable"}
@@ -826,21 +782,7 @@ function Content() {
         onCheck={handleCheckForUpdate}
       />
 
-      {/* Footer */}
-      <PanelSection>
-        <PanelSectionRow>
-          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.dim }}>
-            v{status?.version ?? "?"} - by jasonridesabike
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.dim }}>
-            If WiFi won't reconnect, a reboot usually fixes it.
-            <br />
-            Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer
-          </div>
-        </PanelSectionRow>
-      </PanelSection>
+      <PanelFooter version={status?.version ?? "?"} />
     </>
   );
 }

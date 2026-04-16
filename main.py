@@ -492,6 +492,33 @@ class Plugin:
             timeout=timeout,
         )
 
+    def _resolve_uuid(self, active_required_msg: str | None = None) -> tuple:
+        """Resolve a WiFi connection UUID for a setter. Returns (uuid, None)
+        on success or (None, error_dict) on failure.
+
+        If active_required_msg is provided and there's no active WiFi
+        connection, fails with that specific message (e.g., "Connect to WiFi
+        first to disable IPv6"). Otherwise falls back to the most recently
+        saved connection UUID so setters can still modify a saved profile
+        while disconnected.
+        """
+        _iface, uuid, _err = self._require_wifi()
+        if active_required_msg and not uuid:
+            return None, {
+                "success": False,
+                "error": "no_wifi",
+                "message": active_required_msg,
+            }
+        if not uuid:
+            uuid = self._get_saved_connection_uuid()
+        if not uuid:
+            return None, {
+                "success": False,
+                "error": "nmcli_failed",
+                "message": "No connection UUID found. Connect to WiFi first.",
+            }
+        return uuid, None
+
     # ---- Status ----
 
     async def get_status(self) -> dict:
@@ -858,21 +885,11 @@ class Plugin:
                     "message": f"Invalid band '{band}'. Must be 'a' (5 GHz) or 'bg' (2.4 GHz).",
                 }
 
-            iface, uuid, _ = self._require_wifi()
-            if enabled and not uuid:
-                return {
-                    "success": False,
-                    "error": "no_wifi",
-                    "message": "Connect to WiFi first to set band preference",
-                }
-            if not uuid:
-                uuid = self._get_saved_connection_uuid()
-            if not uuid:
-                return {
-                    "success": False,
-                    "error": "nmcli_failed",
-                    "message": "No connection UUID found. Connect to WiFi first.",
-                }
+            uuid, err = self._resolve_uuid(
+                "Connect to WiFi first to set band preference" if enabled else None
+            )
+            if err:
+                return err
 
             value = band if enabled else ""
             result = self._nmcli_modify(uuid, "802-11-wireless.band", value)
@@ -901,21 +918,11 @@ class Plugin:
         try:
             if not self._is_supported_device():
                 return self._unsupported_response()
-            iface, uuid, _ = self._require_wifi()
-            if enabled and not uuid:
-                return {
-                    "success": False,
-                    "error": "no_wifi",
-                    "message": "Connect to WiFi first to set DNS",
-                }
-            if not uuid:
-                uuid = self._get_saved_connection_uuid()
-            if not uuid:
-                return {
-                    "success": False,
-                    "error": "nmcli_failed",
-                    "message": "No connection UUID found. Connect to WiFi first.",
-                }
+            uuid, err = self._resolve_uuid(
+                "Connect to WiFi first to set DNS" if enabled else None
+            )
+            if err:
+                return err
 
             if enabled:
                 if provider == "custom":
@@ -973,21 +980,11 @@ class Plugin:
         try:
             if not self._is_supported_device():
                 return self._unsupported_response()
-            iface, uuid, _ = self._require_wifi()
-            if disabled and not uuid:
-                return {
-                    "success": False,
-                    "error": "no_wifi",
-                    "message": "Connect to WiFi first to disable IPv6",
-                }
-            if not uuid:
-                uuid = self._get_saved_connection_uuid()
-            if not uuid:
-                return {
-                    "success": False,
-                    "error": "nmcli_failed",
-                    "message": "No connection UUID found. Connect to WiFi first.",
-                }
+            uuid, err = self._resolve_uuid(
+                "Connect to WiFi first to disable IPv6" if disabled else None
+            )
+            if err:
+                return err
 
             method = "disabled" if disabled else "auto"
             result = self._nmcli_modify(uuid, "ipv6.method", method)
