@@ -347,6 +347,10 @@ function Content() {
         }
         await refreshStatus();
     };
+    // Don't render content until first status arrives (prevents disconnect flash)
+    if (!status) {
+        return SP_JSX.jsx(DFL.PanelSection, { title: "WiFi Optimizer" });
+    }
     const s = status?.settings;
     const connected = status?.connected ?? false;
     const supported = status?.supported ?? true;
