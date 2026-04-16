@@ -1427,17 +1427,31 @@ systemctl restart plugin_loader 2>/dev/null || true
 
             # Phase: switching — write config then restart services
             self._backend_switch["phase"] = "switching"
+            decky.logger.info(
+                f"backend switch: calling helper write_config target={target} "
+                f"(euid={os.geteuid()}, helper={BACKEND_HELPER})"
+            )
             write_result = await asyncio.to_thread(
                 self._run_cmd, [BACKEND_HELPER, "write_config", target], 5, False
             )
+            decky.logger.info(
+                f"backend switch: write_config result rc={write_result.get('returncode')} "
+                f"stdout={write_result.get('stdout', '')[:200]!r} "
+                f"stderr={write_result.get('stderr', '')[:200]!r}"
+            )
             if not write_result["success"]:
+                detail = (write_result.get("stderr") or write_result.get("stdout") or "")[:200]
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
-                    "message": "Couldn't write WiFi backend config.",
-                    "detail": write_result.get("stderr", "")[:200],
+                    "message": f"Couldn't write WiFi backend config (rc={write_result.get('returncode')}).",
+                    "detail": detail,
                 }
+                decky.logger.error(
+                    f"backend switch failed at write_config: rc={write_result.get('returncode')}, "
+                    f"detail={detail!r}"
+                )
                 return
 
             restart_result = await asyncio.to_thread(

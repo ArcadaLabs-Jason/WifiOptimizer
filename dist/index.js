@@ -310,7 +310,11 @@ function Content() {
                     stopBackendPoll();
                     busyRef.current = false;
                     if (s.result && !s.result.success && s.result.message) {
-                        setErrors((prev) => ({ ...prev, wifi_backend: s.result.message }));
+                        const detail = s.result.detail ? ` (${s.result.detail})` : "";
+                        setErrors((prev) => ({
+                            ...prev,
+                            wifi_backend: s.result.message + detail,
+                        }));
                     }
                     await refreshStatus();
                 }
