@@ -53,7 +53,7 @@ Want to go further? The remaining optimizations are available as individual togg
 
 | Optimization | What it does | Why it's manual |
 |---|---|---|
-| Prefer 5 GHz / 6 GHz | Forces the higher-frequency band to avoid Bluetooth interference | Won't connect if your network is 2.4 GHz only |
+| Force 5 GHz / 6 GHz | Locks WiFi to the higher-frequency band to avoid Bluetooth interference | Won't connect if your network is 2.4 GHz only |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
 

@@ -237,7 +237,6 @@ const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 const BACKEND_PHASE_TEXT = {
     idle: "",
     switching: "Switching backend…",
-    recovering_interface: "Recreating wlan0 interface…",
     reconnecting: "Reconnecting…",
     done: "",
     failed: "",
@@ -391,10 +390,38 @@ function Content() {
     }, [status?.connected, runUpdateCheck]);
     // Periodic update re-check — QAM often caches the panel across close/reopen,
     // so the mount-effect check doesn't re-fire. This heartbeat catches new
-    // releases when the panel has been left open for a while.
+    // releases when the panel has been left open for a while. Paused when the
+    // panel/tab is hidden to avoid pointless GitHub calls accumulating while the
+    // user isn't looking; re-fires one check immediately on visibility return.
     SP_REACT.useEffect(() => {
-        const id = setInterval(() => runUpdateCheck(), UPDATE_CHECK_INTERVAL);
-        return () => clearInterval(id);
+        let id = null;
+        const start = () => {
+            if (id)
+                return;
+            id = setInterval(() => runUpdateCheck(), UPDATE_CHECK_INTERVAL);
+        };
+        const stop = () => {
+            if (id) {
+                clearInterval(id);
+                id = null;
+            }
+        };
+        const onVis = () => {
+            if (document.hidden) {
+                stop();
+            }
+            else {
+                runUpdateCheck();
+                start();
+            }
+        };
+        if (!document.hidden)
+            start();
+        document.addEventListener("visibilitychange", onVis);
+        return () => {
+            document.removeEventListener("visibilitychange", onVis);
+            stop();
+        };
     }, [runUpdateCheck]);
     const handleBackendToggle = async (on) => {
         const target = on ? "wpa_supplicant" : "iwd";
@@ -412,6 +439,9 @@ function Content() {
                     ...prev,
                     wifi_backend: res.message ?? "Could not start backend switch",
                 }));
+                // Clear any stale result banner/inline from a prior switch so we don't
+                // render old success + new error side-by-side.
+                setBackendSwitch(null);
                 busyRef.current = false;
                 return;
             }
@@ -633,7 +663,7 @@ function Content() {
                             ? "Applying..."
                             : allSafeActive
                                 ? "All good"
-                                : "Optimize Safe" }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Power & stability", children: [SP_JSX.jsx(InfoRow, { label: "Prevent lag spikes", subtitle: "Disables WiFi power save and PCIe power states", explanation: "SteamOS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal.", ...getBadge(s?.power_save_disabled ?? false, "power_save", status, errors.power_save ?? null), checked: s?.power_save_disabled ?? false, error: errors.power_save, onChange: (val) => handleToggle("power_save", () => setPowerSave(val)) }), SP_JSX.jsx(InfoRow, { label: "Stop background scanning", subtitle: "Locks to current AP - disable to switch networks or roam", explanation: "Your Steam Deck scans for other WiFi networks every 2 minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point.", ...getBadge(s?.bssid_lock_enabled ?? false, "bssid_lock", status, errors.bssid_lock ?? null, "locked"), checked: s?.bssid_lock_enabled ?? false, disabled: !connected && !s?.bssid_lock_enabled, error: errors.bssid_lock, onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "SteamOS often resets WiFi settings when the Deck wakes from sleep. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(s?.auto_fix_on_wake ?? false, undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...getBadge(s?.buffer_tuning_enabled ?? false, "buffer_tuning", status, errors.buffer_tuning ?? null), checked: s?.buffer_tuning_enabled ?? false, error: errors.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [SP_JSX.jsx(InfoRow, { label: isOled ? "Prefer 5 GHz / 6 GHz" : "Prefer 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${!isOled ? ", and on the LCD model the antennas are shared" : ""}. Using 5 GHz${isOled ? " or 6 GHz" : ""} for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`, ...getBadge(s?.band_preference_enabled ?? false, undefined, status, errors.band_preference ?? null, "5 GHz"), checked: s?.band_preference_enabled ?? false, disabled: !connected && !s?.band_preference_enabled, error: errors.band_preference, onChange: (val) => handleToggle("band_preference", () => setBandPreference(val, s?.band_preference ?? "a")) }), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names (like store.steampowered.com) into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge(s?.dns_enabled ?? false, undefined, status, errors.dns ?? null, "set"), checked: s?.dns_enabled ?? false, disabled: !connected && !s?.dns_enabled, error: errors.dns, onChange: (val) => handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput)), children: s?.dns_enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "DNS Provider", rgOptions: DNS_OPTIONS, selectedOption: s?.dns_provider ?? "cloudflare", onChange: (option) => {
+                                : "Optimize Safe" }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Power & stability", children: [SP_JSX.jsx(InfoRow, { label: "Prevent lag spikes", subtitle: "Disables WiFi power save and PCIe power states", explanation: "SteamOS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal.", ...getBadge(s?.power_save_disabled ?? false, "power_save", status, errors.power_save ?? null), checked: s?.power_save_disabled ?? false, error: errors.power_save, onChange: (val) => handleToggle("power_save", () => setPowerSave(val)) }), SP_JSX.jsx(InfoRow, { label: "Stop background scanning", subtitle: "Locks to current AP - disable to switch networks or roam", explanation: "Your Steam Deck scans for other WiFi networks every 2 minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point.", ...getBadge(s?.bssid_lock_enabled ?? false, "bssid_lock", status, errors.bssid_lock ?? null, "locked"), checked: s?.bssid_lock_enabled ?? false, disabled: !connected && !s?.bssid_lock_enabled, error: errors.bssid_lock, onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "SteamOS often resets WiFi settings when the Deck wakes from sleep. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(s?.auto_fix_on_wake ?? false, undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...getBadge(s?.buffer_tuning_enabled ?? false, "buffer_tuning", status, errors.buffer_tuning ?? null), checked: s?.buffer_tuning_enabled ?? false, error: errors.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [SP_JSX.jsx(InfoRow, { label: isOled ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${!isOled ? ", and on the LCD model the antennas are shared" : ""}. Using 5 GHz${isOled ? " or 6 GHz" : ""} for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`, ...getBadge(s?.band_preference_enabled ?? false, undefined, status, errors.band_preference ?? null, "5 GHz"), checked: s?.band_preference_enabled ?? false, disabled: !connected && !s?.band_preference_enabled, error: errors.band_preference, onChange: (val) => handleToggle("band_preference", () => setBandPreference(val, s?.band_preference ?? "a")) }), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names (like store.steampowered.com) into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge(s?.dns_enabled ?? false, undefined, status, errors.dns ?? null, "set"), checked: s?.dns_enabled ?? false, disabled: !connected && !s?.dns_enabled, error: errors.dns, onChange: (val) => handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput)), children: s?.dns_enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "DNS Provider", rgOptions: DNS_OPTIONS, selectedOption: s?.dns_provider ?? "cloudflare", onChange: (option) => {
                                             const custom = option.data === "custom" ? customDnsInput : "";
                                             handleToggle("dns", () => setDns(true, option.data, custom));
                                         } }) }), s?.dns_provider === "custom" && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "DNS servers (space-separated)", value: customDnsInput, onChange: (e) => setCustomDnsInput(e.target.value), onBlur: () => {

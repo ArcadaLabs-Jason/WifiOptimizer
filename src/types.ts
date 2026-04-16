@@ -68,7 +68,6 @@ export interface OptimizeSafeResult extends MethodResult {
 export type BackendSwitchPhase =
   | "idle"
   | "switching"
-  | "recovering_interface"
   | "reconnecting"
   | "done"
   | "failed";

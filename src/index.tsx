@@ -33,7 +33,6 @@ const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 const BACKEND_PHASE_TEXT: Record<BackendSwitchPhase, string> = {
   idle: "",
   switching: "Switching backend…",
-  recovering_interface: "Recreating wlan0 interface…",
   reconnecting: "Reconnecting…",
   done: "",
   failed: "",
@@ -193,10 +192,35 @@ function Content() {
 
   // Periodic update re-check — QAM often caches the panel across close/reopen,
   // so the mount-effect check doesn't re-fire. This heartbeat catches new
-  // releases when the panel has been left open for a while.
+  // releases when the panel has been left open for a while. Paused when the
+  // panel/tab is hidden to avoid pointless GitHub calls accumulating while the
+  // user isn't looking; re-fires one check immediately on visibility return.
   useEffect(() => {
-    const id = setInterval(() => runUpdateCheck(), UPDATE_CHECK_INTERVAL);
-    return () => clearInterval(id);
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (id) return;
+      id = setInterval(() => runUpdateCheck(), UPDATE_CHECK_INTERVAL);
+    };
+    const stop = () => {
+      if (id) {
+        clearInterval(id);
+        id = null;
+      }
+    };
+    const onVis = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        runUpdateCheck();
+        start();
+      }
+    };
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      stop();
+    };
   }, [runUpdateCheck]);
 
   const handleBackendToggle = async (on: boolean) => {
@@ -216,6 +240,9 @@ function Content() {
           ...prev,
           wifi_backend: res.message ?? "Could not start backend switch",
         }));
+        // Clear any stale result banner/inline from a prior switch so we don't
+        // render old success + new error side-by-side.
+        setBackendSwitch(null);
         busyRef.current = false;
         return;
       }
@@ -651,7 +678,7 @@ function Content() {
       {/* Advanced */}
       <PanelSection title="Advanced">
         <InfoRow
-          label={isOled ? "Prefer 5 GHz / 6 GHz" : "Prefer 5 GHz band"}
+          label={isOled ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band"}
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             !isOled ? ", and on the LCD model the antennas are shared" : ""
