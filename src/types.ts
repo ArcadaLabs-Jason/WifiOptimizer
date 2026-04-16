@@ -14,6 +14,7 @@ export interface PluginSettings {
   ipv6_disabled: boolean;
   buffer_tuning_enabled: boolean;
   last_connection_uuid: string;
+  priority_set: boolean;
   last_applied: number;
 }
 

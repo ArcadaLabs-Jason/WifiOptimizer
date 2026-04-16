@@ -61,6 +61,7 @@ DEFAULT_SETTINGS = {
     "ipv6_disabled": False,
     "buffer_tuning_enabled": False,
     "last_connection_uuid": "",
+    "priority_set": False,
     "last_applied": 0,
 }
 
@@ -395,9 +396,20 @@ class Plugin:
                 )
                 return status
 
-            # Remember UUID for use when disconnected later
+            # Remember UUID and ensure high autoconnect-priority so NM
+            # prefers this profile over duplicates on boot (fixes 2.4GHz issue)
             if uuid and uuid != settings.get("last_connection_uuid"):
                 settings["last_connection_uuid"] = uuid
+                settings["priority_set"] = False
+                _save_settings(settings)
+
+            if uuid and not settings.get("priority_set"):
+                self._run_cmd(
+                    ["/usr/bin/nmcli", "con", "mod", "uuid", uuid,
+                     "connection.autoconnect-priority", "100"],
+                    timeout=T,
+                )
+                settings["priority_set"] = True
                 _save_settings(settings)
 
             # Power save
