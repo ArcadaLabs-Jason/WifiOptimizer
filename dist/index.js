@@ -111,21 +111,86 @@ const ERROR_MESSAGES = {
     unexpected: "Something went wrong. Check the Decky log for details.",
 };
 
+// Design tokens for the WiFi Optimizer panel. Keep this in sync with the
+// palette used in the README mockup and the four semantic banner colors
+// (success/warning/error/info) that Decky's Quick Access Menu supports well
+// against its dark background.
+const theme = {
+    // Status colors - used for banners, badges, and text callouts.
+    // Each family has text (solid), bg (panel background at ~8% alpha),
+    // badgeBg (chip/pill background at ~15% alpha), and border (~20% alpha).
+    success: {
+        text: "#3fc56e",
+        bg: "rgba(29,158,117,0.08)",
+        badgeBg: "rgba(29,158,117,0.15)",
+        border: "rgba(29,158,117,0.2)",
+    },
+    warning: {
+        text: "#ffc669",
+        bg: "rgba(223,138,0,0.08)",
+        badgeBg: "rgba(223,138,0,0.15)",
+        border: "rgba(223,138,0,0.2)",
+    },
+    error: {
+        text: "#ff878c",
+        bg: "rgba(211,36,43,0.08)",
+        badgeBg: "rgba(211,36,43,0.15)",
+        border: "rgba(211,36,43,0.2)",
+    },
+    info: {
+        text: "#60baff",
+        bg: "rgba(55,138,221,0.08)",
+        border: "rgba(55,138,221,0.2)",
+        accentBg: "rgba(55,138,221,0.2)",
+    },
+    // Neutral text scale, lightest to darkest.
+    text: {
+        primary: "#e0e0e0",
+        secondary: "#9a9aaa",
+        tertiary: "#8a8a9a",
+        subtitle: "#7a7a8a",
+        muted: "#6a6a7a",
+        dim: "#4a4a5a",
+    },
+    // White-alpha surfaces used for layered backgrounds.
+    surface: {
+        xs: "rgba(255,255,255,0.02)",
+        sm: "rgba(255,255,255,0.04)",
+        md: "rgba(255,255,255,0.06)",
+        lg: "rgba(255,255,255,0.08)",
+    },
+    // Consistent sizing tokens reused across the panel.
+    radius: {
+        sm: "4px",
+        md: "6px",
+        lg: "8px",
+        pill: "10px",
+    },
+    fontSize: {
+        label: "9px",
+        tiny: "10px",
+        small: "11px",
+        body: "12px",
+        heading: "13px",
+        icon: "14px",
+    },
+};
+
 const BADGE_STYLES = {
-    active: { background: "rgba(29,158,117,0.15)", color: "#3fc56e" },
-    locked: { background: "rgba(29,158,117,0.15)", color: "#3fc56e" },
-    set: { background: "rgba(29,158,117,0.15)", color: "#3fc56e" },
-    drifted: { background: "rgba(223,138,0,0.15)", color: "#ffc669" },
-    off: { background: "rgba(255,255,255,0.06)", color: "#6a6a7a" },
-    error: { background: "rgba(211,36,43,0.15)", color: "#ff878c" },
-    unknown: { background: "rgba(255,255,255,0.06)", color: "#8a8a9a" },
+    active: { background: theme.success.badgeBg, color: theme.success.text },
+    locked: { background: theme.success.badgeBg, color: theme.success.text },
+    set: { background: theme.success.badgeBg, color: theme.success.text },
+    drifted: { background: theme.warning.badgeBg, color: theme.warning.text },
+    off: { background: theme.surface.md, color: theme.text.muted },
+    error: { background: theme.error.badgeBg, color: theme.error.text },
+    unknown: { background: theme.surface.md, color: theme.text.tertiary },
 };
 function StatusBadge({ badge, text }) {
     const style = BADGE_STYLES[badge];
     return (SP_JSX.jsx("span", { style: {
-            fontSize: "11px",
+            fontSize: theme.fontSize.small,
             padding: "2px 6px",
-            borderRadius: "4px",
+            borderRadius: theme.radius.sm,
             whiteSpace: "nowrap",
             background: style.background,
             color: style.color,
@@ -145,11 +210,9 @@ function InfoRow({ label, subtitle, explanation, badge, text, checked, disabled 
                                     width: "16px",
                                     height: "16px",
                                     borderRadius: "50%",
-                                    background: expanded
-                                        ? "rgba(55,138,221,0.2)"
-                                        : "rgba(255,255,255,0.08)",
-                                    color: expanded ? "#60baff" : "#8a8a9a",
-                                    fontSize: "10px",
+                                    background: expanded ? theme.info.accentBg : theme.surface.lg,
+                                    color: expanded ? theme.info.text : theme.text.tertiary,
+                                    fontSize: theme.fontSize.tiny,
                                     fontWeight: 700,
                                     cursor: "pointer",
                                     flexShrink: 0,
@@ -157,29 +220,29 @@ function InfoRow({ label, subtitle, explanation, badge, text, checked, disabled 
                                     display: "flex",
                                     justifyContent: "flex-end",
                                     marginBottom: "4px",
-                                }, children: SP_JSX.jsx(StatusBadge, { badge: badge, text: text }) })), error ? (SP_JSX.jsx("span", { style: { color: "#ff878c" }, children: error })) : (SP_JSX.jsx("span", { style: { color: "#7a7a8a", fontSize: "11px" }, children: subtitle }))] }), checked: checked, disabled: disabled, onChange: onChange }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                                }, children: SP_JSX.jsx(StatusBadge, { badge: badge, text: text }) })), error ? (SP_JSX.jsx("span", { style: { color: theme.error.text }, children: error })) : (SP_JSX.jsx("span", { style: { color: theme.text.subtitle, fontSize: theme.fontSize.small }, children: subtitle }))] }), checked: checked, disabled: disabled, onChange: onChange }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                         padding: "8px 12px",
-                        background: "rgba(255,255,255,0.02)",
-                        borderRadius: "6px",
-                        fontSize: "11px",
+                        background: theme.surface.xs,
+                        borderRadius: theme.radius.md,
+                        fontSize: theme.fontSize.small,
                         lineHeight: "1.5",
-                        color: "#9a9aaa",
+                        color: theme.text.secondary,
                     }, children: explanation }) })), children] }));
 }
 
 function signalColor(dbm) {
     if (!dbm)
-        return "#6a6a7a";
+        return theme.text.muted;
     const val = parseInt(dbm);
     if (isNaN(val))
-        return "#6a6a7a";
+        return theme.text.muted;
     if (val > -50)
-        return "#3fc56e";
+        return theme.success.text;
     if (val > -70)
-        return "#e0e0e0";
+        return theme.text.primary;
     if (val > -80)
-        return "#ffc669";
-    return "#ff878c";
+        return theme.warning.text;
+    return theme.error.text;
 }
 function bandLabel(freqStr) {
     if (!freqStr)
@@ -195,13 +258,13 @@ function bandLabel(freqStr) {
 }
 function bandColor(freqStr) {
     if (!freqStr)
-        return "#6a6a7a";
+        return theme.text.muted;
     const mhz = parseInt(freqStr);
     if (isNaN(mhz))
-        return "#e0e0e0";
+        return theme.text.primary;
     if (mhz < 3000)
-        return "#ffc669"; // yellow - 2.4 GHz (suboptimal)
-    return "#3fc56e"; // green - 5/6 GHz (good)
+        return theme.warning.text; // 2.4 GHz (suboptimal)
+    return theme.success.text; // 5/6 GHz (good)
 }
 function StatsGrid({ live, connected }) {
     const na = "--";
@@ -211,22 +274,43 @@ function StatsGrid({ live, connected }) {
     const freq = connected ? live.frequency ?? "" : "";
     const channel = connected ? live.channel ?? na : na;
     const cell = {
-        background: "rgba(255,255,255,0.04)",
-        borderRadius: "4px",
+        background: theme.surface.sm,
+        borderRadius: theme.radius.sm,
         padding: "4px 8px",
     };
     const lbl = {
-        fontSize: "9px",
-        color: "#6a6a7a",
+        fontSize: theme.fontSize.label,
+        color: theme.text.muted,
         textTransform: "uppercase",
         letterSpacing: "0.5px",
     };
     const val = (color) => ({
-        fontSize: "13px",
+        fontSize: theme.fontSize.heading,
         fontWeight: 500,
-        color: connected ? color : "#6a6a7a",
+        color: connected ? color : theme.text.muted,
     });
-    return (SP_JSX.jsxs(DFL.Focusable, { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px" }, children: [SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Signal" }), SP_JSX.jsx("div", { style: val(signalColor(live.signal_dbm)), children: signal })] }), SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Speed" }), SP_JSX.jsx("div", { style: val("#e0e0e0"), children: speed })] }), SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Band" }), SP_JSX.jsx("div", { style: val(bandColor(live.frequency)), children: band }), freq && SP_JSX.jsxs("div", { style: { fontSize: "9px", color: "#6a6a7a" }, children: [freq, " MHz"] })] }), SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Channel" }), SP_JSX.jsx("div", { style: val("#e0e0e0"), children: channel })] })] }));
+    return (SP_JSX.jsxs(DFL.Focusable, { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px" }, children: [SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Signal" }), SP_JSX.jsx("div", { style: val(signalColor(live.signal_dbm)), children: signal })] }), SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Speed" }), SP_JSX.jsx("div", { style: val(theme.text.primary), children: speed })] }), SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Band" }), SP_JSX.jsx("div", { style: val(bandColor(live.frequency)), children: band }), freq && (SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.label, color: theme.text.muted }, children: [freq, " MHz"] }))] }), SP_JSX.jsxs("div", { style: cell, children: [SP_JSX.jsx("div", { style: lbl, children: "Channel" }), SP_JSX.jsx("div", { style: val(theme.text.primary), children: channel })] })] }));
+}
+
+// Shared banner styling for the panel's many inline notifications
+// (unsupported device, drift alert, optimize result, backend switch
+// result, update errors, etc.). Each banner sits in its own
+// PanelSection so Decky's QAM can focus it with gamepad navigation.
+function Banner({ variant, icon, children }) {
+    const palette = theme[variant];
+    return (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    padding: "8px 12px",
+                    background: palette.bg,
+                    border: `0.5px solid ${palette.border}`,
+                    borderRadius: theme.radius.lg,
+                    fontSize: theme.fontSize.body,
+                    color: palette.text,
+                    width: "100%",
+                    boxSizing: "border-box",
+                }, children: [icon !== undefined && (SP_JSX.jsx("span", { style: { fontSize: theme.fontSize.icon }, children: icon })), SP_JSX.jsx("span", { children: children })] }) }) }));
 }
 
 const REFRESH_INTERVAL = 3000;
@@ -287,18 +371,7 @@ class ErrorBoundary extends SP_REACT.Component {
     }
     render() {
         if (this.state.err) {
-            return (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
-                            display: "flex",
-                            gap: "6px",
-                            padding: "8px 12px",
-                            background: "rgba(211,36,43,0.08)",
-                            border: "0.5px solid rgba(211,36,43,0.2)",
-                            borderRadius: "8px",
-                            fontSize: "12px",
-                            color: "#ff878c",
-                            width: "100%",
-                            boxSizing: "border-box",
-                        }, children: SP_JSX.jsx("span", { children: "WiFi Optimizer hit an unexpected error. Close and reopen the panel to recover. If it keeps happening, please report at github.com/ArcadaLabs-Jason/WifiOptimizer." }) }) }) }));
+            return (SP_JSX.jsx(Banner, { variant: "error", children: "WiFi Optimizer hit an unexpected error. Close and reopen the panel to recover. If it keeps happening, please report at github.com/ArcadaLabs-Jason/WifiOptimizer." }));
         }
         return this.props.children;
     }
@@ -646,67 +719,19 @@ function Content() {
         status?.live?.buffer_tuning_applied &&
         !status?.drift?.buffer_tuning;
     return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("span", { style: {
-                                fontSize: "10px",
-                                background: "rgba(255,255,255,0.06)",
+                                fontSize: theme.fontSize.tiny,
+                                background: theme.surface.md,
                                 padding: "2px 8px",
-                                borderRadius: "10px",
-                                color: "#8a8a9a",
-                            }, children: ["Device: ", modelLabel] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: ["Version: ", status?.version ?? "?"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: "Tap (i) on any toggle for details" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#6a6a7a" }, children: ["Last changed: ", timeAgo(s?.last_applied ?? 0), status?.live?.last_enforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(status.live.last_enforced)] })) : ""] }) })] }), !supported && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "6px",
-                            padding: "8px 12px",
-                            background: "rgba(211,36,43,0.08)",
-                            border: "0.5px solid rgba(211,36,43,0.2)",
-                            borderRadius: "8px",
-                            fontSize: "12px",
-                            color: "#ff878c",
-                            width: "100%",
-                            boxSizing: "border-box",
-                        }, children: SP_JSX.jsx("span", { children: "This plugin is designed for Steam Deck only. Unsupported device detected." }) }) }) })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                                borderRadius: theme.radius.pill,
+                                color: theme.text.tertiary,
+                            }, children: ["Device: ", modelLabel] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted }, children: ["Version: ", status?.version ?? "?"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted }, children: "Tap (i) on any toggle for details" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.muted }, children: ["Last changed: ", timeAgo(s?.last_applied ?? 0), status?.live?.last_enforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(status.live.last_enforced)] })) : ""] }) })] }), !supported && (SP_JSX.jsx(Banner, { variant: "error", children: "This plugin is designed for Steam Deck only. Unsupported device detected." })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs(DFL.ButtonItem, { layout: "below", onClick: async () => {
                             setUpdateError(null);
                             setUpdating(true);
                             try {
                                 await applyUpdate();
                             }
                             catch { /* restart killed connection */ }
-                        }, children: ["Update to v", updateInfo.latest_version] }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "12px", color: "#60baff" }, children: "Updating... plugin will restart momentarily." }) }) })), connected && !s?.last_applied && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "6px",
-                            padding: "8px 12px",
-                            background: "rgba(55,138,221,0.08)",
-                            border: "0.5px solid rgba(55,138,221,0.2)",
-                            borderRadius: "8px",
-                            fontSize: "12px",
-                            color: "#60baff",
-                            width: "100%",
-                            boxSizing: "border-box",
-                        }, children: SP_JSX.jsxs("span", { children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] }) }) }) })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "6px",
-                            padding: "8px 12px",
-                            background: "rgba(223,138,0,0.08)",
-                            border: "0.5px solid rgba(223,138,0,0.2)",
-                            borderRadius: "8px",
-                            fontSize: "12px",
-                            color: "#ffc669",
-                            width: "100%",
-                            boxSizing: "border-box",
-                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u26A0" }), SP_JSX.jsxs("span", { children: [driftCount, " setting", driftCount > 1 ? "s" : "", " drifted after wake.", " ", SP_JSX.jsx("span", { style: { textDecoration: "underline", cursor: "pointer" }, onClick: handleOptimize, children: "Fix now" })] })] }) }) })), !connected && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "6px",
-                            padding: "8px 12px",
-                            background: "rgba(211,36,43,0.08)",
-                            border: "0.5px solid rgba(211,36,43,0.2)",
-                            borderRadius: "8px",
-                            fontSize: "12px",
-                            color: "#ff878c",
-                            width: "100%",
-                            boxSizing: "border-box",
-                        }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: "\u2715" }), SP_JSX.jsx("span", { children: "Not connected to WiFi. Connect first, then optimize." })] }) }) })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
+                        }, children: ["Update to v", updateInfo.latest_version] }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: "Updating... plugin will restart momentarily." }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [driftCount, " setting", driftCount > 1 ? "s" : "", " drifted after wake.", " ", SP_JSX.jsx("span", { style: { textDecoration: "underline", cursor: "pointer" }, onClick: handleOptimize, children: "Fix now" })] })), !connected && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "Not connected to WiFi. Connect first, then optimize." })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
                 const r = backendSwitch.result;
                 // Treat reconnect timeout as a warning even when the backend-level
                 // switch succeeded - the system is switched but WiFi didn't come back.
@@ -726,44 +751,10 @@ function Content() {
                         parts.push("WiFi didn't reconnect");
                     text = parts.join(" · ");
                 }
-                return (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
-                                display: "flex",
-                                alignItems: "center",
-                                gap: "6px",
-                                padding: "8px 12px",
-                                background: isWarning
-                                    ? "rgba(223,138,0,0.08)"
-                                    : "rgba(29,158,117,0.08)",
-                                border: `0.5px solid ${isWarning
-                                    ? "rgba(223,138,0,0.2)"
-                                    : "rgba(29,158,117,0.2)"}`,
-                                borderRadius: "8px",
-                                fontSize: "12px",
-                                color: isWarning ? "#ffc669" : "#3fc56e",
-                                width: "100%",
-                                boxSizing: "border-box",
-                            }, children: [SP_JSX.jsx("span", { style: { fontSize: "14px" }, children: isWarning ? "⚠" : "✓" }), SP_JSX.jsx("span", { children: text })] }) }) }));
-            })(), optimizeResult && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "6px",
-                            padding: "8px 12px",
-                            background: optimizeResult.applied === optimizeResult.total
-                                ? "rgba(29,158,117,0.08)"
-                                : "rgba(223,138,0,0.08)",
-                            border: `0.5px solid ${optimizeResult.applied === optimizeResult.total
-                                ? "rgba(29,158,117,0.2)"
-                                : "rgba(223,138,0,0.2)"}`,
-                            borderRadius: "8px",
-                            fontSize: "12px",
-                            color: optimizeResult.applied === optimizeResult.total
-                                ? "#3fc56e"
-                                : "#ffc669",
-                            width: "100%",
-                            boxSizing: "border-box",
-                        }, children: SP_JSX.jsx("span", { children: optimizeResult.applied === optimizeResult.total
-                                ? "All applied"
-                                : `${optimizeResult.applied}/${optimizeResult.total} applied` }) }) }) })), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported || applyingAll || isBusy, onClick: handleOptimize, children: applyingAll
+                return (SP_JSX.jsx(Banner, { variant: isWarning ? "warning" : "success", icon: isWarning ? "⚠" : "✓", children: text }));
+            })(), optimizeResult && (SP_JSX.jsx(Banner, { variant: optimizeResult.applied === optimizeResult.total ? "success" : "warning", children: optimizeResult.applied === optimizeResult.total
+                    ? "All applied"
+                    : `${optimizeResult.applied}/${optimizeResult.total} applied` })), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported || applyingAll || isBusy, onClick: handleOptimize, children: applyingAll
                             ? "Applying..."
                             : allSafeActive
                                 ? "All good"
@@ -813,12 +804,12 @@ function Content() {
                                 if (timedOut)
                                     parts.push("WiFi didn't reconnect");
                                 return (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
-                                            fontSize: "11px",
-                                            color: timedOut ? "#ffc669" : "#3fc56e",
+                                            fontSize: theme.fontSize.small,
+                                            color: timedOut ? theme.warning.text : theme.success.text,
                                             padding: "2px 0",
                                         }, children: [timedOut ? "⚠" : "✓", " ", parts.join(" · ")] }) }));
                             })() }));
-                    })()] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#8a8a9a" }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported || isBusy, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: async () => {
+                    })()] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported || isBusy, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: async () => {
                                 if (busyRef.current)
                                     return;
                                 setBusy(true);
@@ -838,14 +829,14 @@ function Content() {
                                 await setUpdateChannel(option.data);
                                 setUpdateInfo(null);
                                 await refreshStatus();
-                            } }) }), updateError && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", color: "#ffc669" }, children: ["\u26A0 ", updateError] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "12px", color: "#60baff" }, children: "Updating... plugin will restart momentarily." }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", color: "#3fc56e" }, children: ["v", updateInfo.latest_version, " available (you have v", updateInfo.current_version, ")"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                            } }) }), updateError && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text }, children: ["\u26A0 ", updateError] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: "Updating... plugin will restart momentarily." }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.success.text }, children: ["v", updateInfo.latest_version, " available (you have v", updateInfo.current_version, ")"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
                                         setUpdateError(null);
                                         setUpdating(true);
                                         try {
                                             await applyUpdate();
                                         }
                                         catch { /* restart killed connection */ }
-                                    }, children: "Update Now" }) })] })) : (SP_JSX.jsxs(SP_JSX.Fragment, { children: [updateInfo && updateInfo.success === false && updateInfo.message && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "10px", color: "#ff878c" }, children: updateInfo.message }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: checkingUpdate, onClick: async () => {
+                                    }, children: "Update Now" }) })] })) : (SP_JSX.jsxs(SP_JSX.Fragment, { children: [updateInfo && updateInfo.success === false && updateInfo.message && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.error.text }, children: updateInfo.message }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: checkingUpdate, onClick: async () => {
                                         setCheckingUpdate(true);
                                         setUpdateError(null);
                                         lastUpdateCheckAtRef.current = Date.now();
@@ -855,7 +846,7 @@ function Content() {
                                         }
                                         catch { /* ignore */ }
                                         setCheckingUpdate(false);
-                                    }, children: checkingUpdate ? "Checking..." : (updateInfo?.success && !updateInfo?.update_available) ? "Up to date" : "Check for Updates" }) })] }))] }), SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#4a4a5a" }, children: ["v", status?.version ?? "?", " - by jasonridesabike"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#4a4a5a" }, children: ["If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) })] })] }));
+                                    }, children: checkingUpdate ? "Checking..." : (updateInfo?.success && !updateInfo?.update_available) ? "Up to date" : "Check for Updates" }) })] }))] }), SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.dim }, children: ["v", status?.version ?? "?", " - by jasonridesabike"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.dim }, children: ["If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) })] })] }));
 }
 var index = definePlugin(() => {
     return {

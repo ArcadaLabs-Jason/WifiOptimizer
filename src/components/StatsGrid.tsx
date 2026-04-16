@@ -1,14 +1,15 @@
 import { Focusable } from "@decky/ui";
 import type { LiveStatus } from "../types";
+import { theme } from "../theme";
 
 function signalColor(dbm: string | undefined): string {
-  if (!dbm) return "#6a6a7a";
+  if (!dbm) return theme.text.muted;
   const val = parseInt(dbm);
-  if (isNaN(val)) return "#6a6a7a";
-  if (val > -50) return "#3fc56e";
-  if (val > -70) return "#e0e0e0";
-  if (val > -80) return "#ffc669";
-  return "#ff878c";
+  if (isNaN(val)) return theme.text.muted;
+  if (val > -50) return theme.success.text;
+  if (val > -70) return theme.text.primary;
+  if (val > -80) return theme.warning.text;
+  return theme.error.text;
 }
 
 function bandLabel(freqStr: string | undefined): string {
@@ -21,11 +22,11 @@ function bandLabel(freqStr: string | undefined): string {
 }
 
 function bandColor(freqStr: string | undefined): string {
-  if (!freqStr) return "#6a6a7a";
+  if (!freqStr) return theme.text.muted;
   const mhz = parseInt(freqStr);
-  if (isNaN(mhz)) return "#e0e0e0";
-  if (mhz < 3000) return "#ffc669"; // yellow - 2.4 GHz (suboptimal)
-  return "#3fc56e"; // green - 5/6 GHz (good)
+  if (isNaN(mhz)) return theme.text.primary;
+  if (mhz < 3000) return theme.warning.text; // 2.4 GHz (suboptimal)
+  return theme.success.text; // 5/6 GHz (good)
 }
 
 interface StatsGridProps {
@@ -42,20 +43,20 @@ export function StatsGrid({ live, connected }: StatsGridProps) {
   const channel = connected ? live.channel ?? na : na;
 
   const cell: React.CSSProperties = {
-    background: "rgba(255,255,255,0.04)",
-    borderRadius: "4px",
+    background: theme.surface.sm,
+    borderRadius: theme.radius.sm,
     padding: "4px 8px",
   };
   const lbl: React.CSSProperties = {
-    fontSize: "9px",
-    color: "#6a6a7a",
+    fontSize: theme.fontSize.label,
+    color: theme.text.muted,
     textTransform: "uppercase",
     letterSpacing: "0.5px",
   };
   const val = (color: string): React.CSSProperties => ({
-    fontSize: "13px",
+    fontSize: theme.fontSize.heading,
     fontWeight: 500,
-    color: connected ? color : "#6a6a7a",
+    color: connected ? color : theme.text.muted,
   });
 
   return (
@@ -68,16 +69,20 @@ export function StatsGrid({ live, connected }: StatsGridProps) {
       </div>
       <div style={cell}>
         <div style={lbl}>Speed</div>
-        <div style={val("#e0e0e0")}>{speed}</div>
+        <div style={val(theme.text.primary)}>{speed}</div>
       </div>
       <div style={cell}>
         <div style={lbl}>Band</div>
         <div style={val(bandColor(live.frequency))}>{band}</div>
-        {freq && <div style={{ fontSize: "9px", color: "#6a6a7a" }}>{freq} MHz</div>}
+        {freq && (
+          <div style={{ fontSize: theme.fontSize.label, color: theme.text.muted }}>
+            {freq} MHz
+          </div>
+        )}
       </div>
       <div style={cell}>
         <div style={lbl}>Channel</div>
-        <div style={val("#e0e0e0")}>{channel}</div>
+        <div style={val(theme.text.primary)}>{channel}</div>
       </div>
     </Focusable>
   );

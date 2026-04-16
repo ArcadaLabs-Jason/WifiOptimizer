@@ -31,6 +31,8 @@ import type {
 import { ERROR_MESSAGES } from "./types";
 import { InfoRow } from "./components/InfoRow";
 import { StatsGrid } from "./components/StatsGrid";
+import { Banner } from "./components/Banner";
+import { theme } from "./theme";
 
 const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
@@ -97,30 +99,11 @@ class ErrorBoundary extends Component<
   render() {
     if (this.state.err) {
       return (
-        <PanelSection>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                gap: "6px",
-                padding: "8px 12px",
-                background: "rgba(211,36,43,0.08)",
-                border: "0.5px solid rgba(211,36,43,0.2)",
-                borderRadius: "8px",
-                fontSize: "12px",
-                color: "#ff878c",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
-            >
-              <span>
-                WiFi Optimizer hit an unexpected error. Close and reopen the
-                panel to recover. If it keeps happening, please report at
-                github.com/ArcadaLabs-Jason/WifiOptimizer.
-              </span>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
+        <Banner variant="error">
+          WiFi Optimizer hit an unexpected error. Close and reopen the panel to
+          recover. If it keeps happening, please report at
+          github.com/ArcadaLabs-Jason/WifiOptimizer.
+        </Banner>
       );
     }
     return this.props.children;
@@ -480,28 +463,28 @@ function Content() {
         <PanelSectionRow>
           <span
             style={{
-              fontSize: "10px",
-              background: "rgba(255,255,255,0.06)",
+              fontSize: theme.fontSize.tiny,
+              background: theme.surface.md,
               padding: "2px 8px",
-              borderRadius: "10px",
-              color: "#8a8a9a",
+              borderRadius: theme.radius.pill,
+              color: theme.text.tertiary,
             }}
           >
             Device: {modelLabel}
           </span>
         </PanelSectionRow>
         <PanelSectionRow>
-          <div style={{ fontSize: "10px", color: "#6a6a7a" }}>
+          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted }}>
             Version: {status?.version ?? "?"}
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <div style={{ fontSize: "10px", color: "#6a6a7a" }}>
+          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted }}>
             Tap (i) on any toggle for details
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <div style={{ fontSize: "10px", color: "#6a6a7a" }}>
+          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.muted }}>
             Last changed: {timeAgo(s?.last_applied ?? 0)}
             {status?.live?.last_enforced ? (<><br />Auto-applied: {timeAgo(status.live.last_enforced)}</>) : ""}
           </div>
@@ -510,27 +493,9 @@ function Content() {
 
       {/* Unsupported device */}
       {!supported && (
-        <PanelSection>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                padding: "8px 12px",
-                background: "rgba(211,36,43,0.08)",
-                border: "0.5px solid rgba(211,36,43,0.2)",
-                borderRadius: "8px",
-                fontSize: "12px",
-                color: "#ff878c",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
-            >
-              <span>This plugin is designed for Steam Deck only. Unsupported device detected.</span>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
+        <Banner variant="error">
+          This plugin is designed for Steam Deck only. Unsupported device detected.
+        </Banner>
       )}
 
       {/* Update available */}
@@ -555,7 +520,7 @@ function Content() {
       {updating && (
         <PanelSection>
           <PanelSectionRow>
-            <div style={{ fontSize: "12px", color: "#60baff" }}>
+            <div style={{ fontSize: theme.fontSize.body, color: theme.info.text }}>
               Updating... plugin will restart momentarily.
             </div>
           </PanelSectionRow>
@@ -564,87 +529,29 @@ function Content() {
 
       {/* First-run prompt */}
       {connected && !s?.last_applied && (
-        <PanelSection>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                padding: "8px 12px",
-                background: "rgba(55,138,221,0.08)",
-                border: "0.5px solid rgba(55,138,221,0.2)",
-                borderRadius: "8px",
-                fontSize: "12px",
-                color: "#60baff",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
-            >
-              <span>Tap <strong>Optimize Safe</strong> to get started.</span>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
+        <Banner variant="info">
+          Tap <strong>Optimize Safe</strong> to get started.
+        </Banner>
       )}
 
       {/* Drift alert */}
       {connected && !!s?.last_applied && driftCount > 0 && (
-        <PanelSection>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                padding: "8px 12px",
-                background: "rgba(223,138,0,0.08)",
-                border: "0.5px solid rgba(223,138,0,0.2)",
-                borderRadius: "8px",
-                fontSize: "12px",
-                color: "#ffc669",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
-            >
-              <span style={{ fontSize: "14px" }}>&#9888;</span>
-              <span>
-                {driftCount} setting{driftCount > 1 ? "s" : ""} drifted after wake.{" "}
-                <span
-                  style={{ textDecoration: "underline", cursor: "pointer" }}
-                  onClick={handleOptimize}
-                >
-                  Fix now
-                </span>
-              </span>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
+        <Banner variant="warning" icon="⚠">
+          {driftCount} setting{driftCount > 1 ? "s" : ""} drifted after wake.{" "}
+          <span
+            style={{ textDecoration: "underline", cursor: "pointer" }}
+            onClick={handleOptimize}
+          >
+            Fix now
+          </span>
+        </Banner>
       )}
 
       {/* Disconnected banner */}
       {!connected && (
-        <PanelSection>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                padding: "8px 12px",
-                background: "rgba(211,36,43,0.08)",
-                border: "0.5px solid rgba(211,36,43,0.2)",
-                borderRadius: "8px",
-                fontSize: "12px",
-                color: "#ff878c",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
-            >
-              <span style={{ fontSize: "14px" }}>&#10005;</span>
-              <span>Not connected to WiFi. Connect first, then optimize.</span>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
+        <Banner variant="error" icon="✕">
+          Not connected to WiFi. Connect first, then optimize.
+        </Banner>
       )}
 
       {/* Backend switch result banner */}
@@ -665,74 +572,23 @@ function Content() {
           text = parts.join(" · ");
         }
         return (
-          <PanelSection>
-            <PanelSectionRow>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  padding: "8px 12px",
-                  background: isWarning
-                    ? "rgba(223,138,0,0.08)"
-                    : "rgba(29,158,117,0.08)",
-                  border: `0.5px solid ${
-                    isWarning
-                      ? "rgba(223,138,0,0.2)"
-                      : "rgba(29,158,117,0.2)"
-                  }`,
-                  borderRadius: "8px",
-                  fontSize: "12px",
-                  color: isWarning ? "#ffc669" : "#3fc56e",
-                  width: "100%",
-                  boxSizing: "border-box",
-                }}
-              >
-                <span style={{ fontSize: "14px" }}>{isWarning ? "⚠" : "✓"}</span>
-                <span>{text}</span>
-              </div>
-            </PanelSectionRow>
-          </PanelSection>
+          <Banner variant={isWarning ? "warning" : "success"} icon={isWarning ? "⚠" : "✓"}>
+            {text}
+          </Banner>
         );
       })()}
 
       {/* Optimize result banner */}
       {optimizeResult && (
-        <PanelSection>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                padding: "8px 12px",
-                background:
-                  optimizeResult.applied === optimizeResult.total
-                    ? "rgba(29,158,117,0.08)"
-                    : "rgba(223,138,0,0.08)",
-                border: `0.5px solid ${
-                  optimizeResult.applied === optimizeResult.total
-                    ? "rgba(29,158,117,0.2)"
-                    : "rgba(223,138,0,0.2)"
-                }`,
-                borderRadius: "8px",
-                fontSize: "12px",
-                color:
-                  optimizeResult.applied === optimizeResult.total
-                    ? "#3fc56e"
-                    : "#ffc669",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
-            >
-              <span>
-                {optimizeResult.applied === optimizeResult.total
-                  ? "All applied"
-                  : `${optimizeResult.applied}/${optimizeResult.total} applied`}
-              </span>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
+        <Banner
+          variant={
+            optimizeResult.applied === optimizeResult.total ? "success" : "warning"
+          }
+        >
+          {optimizeResult.applied === optimizeResult.total
+            ? "All applied"
+            : `${optimizeResult.applied}/${optimizeResult.total} applied`}
+        </Banner>
       )}
 
       {/* Optimize button */}
@@ -942,8 +798,8 @@ function Content() {
                   <PanelSectionRow>
                     <div
                       style={{
-                        fontSize: "11px",
-                        color: timedOut ? "#ffc669" : "#3fc56e",
+                        fontSize: theme.fontSize.small,
+                        color: timedOut ? theme.warning.text : theme.success.text,
                         padding: "2px 0",
                       }}
                     >
@@ -961,7 +817,7 @@ function Content() {
       <PanelSection title="Live status">
         {connected && status?.live?.ip_address && (
           <PanelSectionRow>
-            <div style={{ fontSize: "10px", color: "#8a8a9a" }}>
+            <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.tertiary }}>
               IP: {status.live.ip_address}
             </div>
           </PanelSectionRow>
@@ -1023,21 +879,21 @@ function Content() {
         </PanelSectionRow>
         {updateError && !updating && (
           <PanelSectionRow>
-            <div style={{ fontSize: "12px", color: "#ffc669" }}>
+            <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>
               &#9888; {updateError}
             </div>
           </PanelSectionRow>
         )}
         {updating ? (
           <PanelSectionRow>
-            <div style={{ fontSize: "12px", color: "#60baff" }}>
+            <div style={{ fontSize: theme.fontSize.body, color: theme.info.text }}>
               Updating... plugin will restart momentarily.
             </div>
           </PanelSectionRow>
         ) : updateInfo?.update_available ? (
           <>
             <PanelSectionRow>
-              <div style={{ fontSize: "12px", color: "#3fc56e" }}>
+              <div style={{ fontSize: theme.fontSize.body, color: theme.success.text }}>
                 v{updateInfo.latest_version} available (you have v{updateInfo.current_version})
               </div>
             </PanelSectionRow>
@@ -1058,7 +914,7 @@ function Content() {
           <>
             {updateInfo && updateInfo.success === false && updateInfo.message && (
               <PanelSectionRow>
-                <div style={{ fontSize: "10px", color: "#ff878c" }}>
+                <div style={{ fontSize: theme.fontSize.tiny, color: theme.error.text }}>
                   {updateInfo.message}
                 </div>
               </PanelSectionRow>
@@ -1088,12 +944,12 @@ function Content() {
       {/* Footer */}
       <PanelSection>
         <PanelSectionRow>
-          <div style={{ fontSize: "10px", color: "#4a4a5a" }}>
+          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.dim }}>
             v{status?.version ?? "?"} - by jasonridesabike
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <div style={{ fontSize: "10px", color: "#4a4a5a" }}>
+          <div style={{ fontSize: theme.fontSize.tiny, color: theme.text.dim }}>
             If WiFi won't reconnect, a reboot usually fixes it.
             <br />
             Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer
