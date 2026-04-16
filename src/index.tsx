@@ -397,8 +397,8 @@ function Content() {
       <PanelSection title="Power & stability">
         <InfoRow
           label="Prevent lag spikes"
-          subtitle="Disables WiFi power save (iw power_save off)"
-          explanation="SteamOS enables WiFi power saving by default, which lets the chip batch network packets and briefly sleep between transmissions. This saves a small amount of battery but causes latency spikes, micro-stutters in online games, and choppy streaming. Disabling it keeps the WiFi chip fully awake at all times. Battery impact is minimal."
+          subtitle="Disables WiFi power save and PCIe power states"
+          explanation="SteamOS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
           {...getBadge(s?.power_save_disabled ?? false, "power_save", status, errors.power_save ?? null)}
           checked={s?.power_save_disabled ?? false}
           error={errors.power_save}

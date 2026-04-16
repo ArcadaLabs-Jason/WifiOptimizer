@@ -30,7 +30,7 @@ Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > 
 
 1. Open WiFi Optimizer from the Decky sidebar
 2. Tap **Optimize Safe** - this applies the four no-brainer optimizations that are always beneficial:
-   - Disables WiFi power save (prevents lag spikes)
+   - Disables WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
    - Locks your BSSID (stops background scanning interruptions)
    - Enables auto-fix on wake (reapplies settings after sleep)
    - Tunes network buffers (handles streaming traffic bursts)
@@ -73,7 +73,7 @@ The plugin has two parts:
 
 1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It detects when settings have drifted after wake and lets you fix them with one tap.
 
-2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, buffers). If you uninstall the plugin, the script removes itself.
+2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers). If you uninstall the plugin, the script removes itself.
 
 No background processes, no polling, no battery impact.
 
