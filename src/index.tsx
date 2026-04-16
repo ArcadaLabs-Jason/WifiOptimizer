@@ -324,97 +324,11 @@ function Content() {
     };
   }, [runUpdateCheck]);
 
-  const handleApplyUpdate = async () => {
-    setUpdateError(null);
-    setUpdating(true);
-    try {
-      await backend.applyUpdate();
-    } catch {
-      // plugin_loader restart killed the connection; expected
-    }
-  };
-
-  const handleCheckForUpdate = async () => {
-    setCheckingUpdate(true);
-    setUpdateError(null);
-    lastUpdateCheckAtRef.current = Date.now();
-    try {
-      const result = await backend.checkForUpdate();
-      setUpdateInfo(result);
-    } catch {
-      // refreshStatus has its own catch; no need to log here
-    }
-    setCheckingUpdate(false);
-  };
-
-  const handleChannelChange = async (nextChannel: string) => {
-    await backend.setUpdateChannel(nextChannel);
-    setUpdateInfo(null);
-    await refreshStatus();
-  };
-
-  const handleResetSettings = async () => {
-    if (busyRef.current) return;
-    setBusy(true);
-    setOptimizeResult(null);
-    setErrors({});
-    try {
-      await backend.resetSettings();
-    } finally {
-      await refreshStatus(true);
-      setBusy(false);
-    }
-  };
-
-  const handleForceReapply = () =>
-    handleToggle("reapply", () => backend.reapplyAll());
-
-  const handleBackendToggle = async (on: boolean) => {
-    // Re-entrancy guard: drop rapid clicks or clicks that land while another
-    // operation is already running. Protects against duplicate backend calls
-    // and the Force-Reapply/backend-switch overlap case.
-    if (busyRef.current) return;
-    const target = on ? "wpa_supplicant" : "iwd";
-    setBusy(true);
-    setErrors((prev) => {
-      const next = { ...prev };
-      delete next.wifi_backend;
-      return next;
-    });
-    setOptimizeResult(null);
-
-    try {
-      const res = await backend.startBackendSwitch(target);
-      if (!res.accepted) {
-        setErrors((prev) => ({
-          ...prev,
-          wifi_backend: res.message ?? "Could not start backend switch",
-        }));
-        // Clear any stale result banner/inline from a prior switch so we don't
-        // render old success + new error side-by-side.
-        setBackendSwitch(null);
-        setBusy(false);
-        return;
-      }
-      setBackendSwitch({
-        success: true,
-        in_progress: true,
-        phase: "switching",
-        target,
-        started_at: Math.floor(Date.now() / 1000),
-        result: null,
-      });
-      beginBackendPoll();
-    } catch (e) {
-      setBusy(false);
-      setErrors((prev) => ({
-        ...prev,
-        wifi_backend: "Failed to start backend switch",
-      }));
-      console.error("startBackendSwitch error", e);
-    }
-  };
-
+  // ---- User action handlers ----
+  //
+  // Generic toggle handler used by every setter toggle (power_save, BSSID,
+  // auto_fix, buffer_tuning, band_preference, DNS, IPv6) and by the Force
+  // Reapply All button. Takes a key for error tracking and a backend fn.
   const handleToggle = async (key: string, fn: () => Promise<MethodResult>) => {
     if (busyRef.current) return;
     setBusy(true);
@@ -477,6 +391,100 @@ function Content() {
       setBusy(false);
       setApplyingAll(false);
     }
+  };
+
+  const handleForceReapply = () =>
+    handleToggle("reapply", () => backend.reapplyAll());
+
+  const handleResetSettings = async () => {
+    if (busyRef.current) return;
+    setBusy(true);
+    setOptimizeResult(null);
+    setErrors({});
+    try {
+      await backend.resetSettings();
+    } finally {
+      await refreshStatus(true);
+      setBusy(false);
+    }
+  };
+
+  const handleBackendToggle = async (on: boolean) => {
+    // Re-entrancy guard: drop rapid clicks or clicks that land while another
+    // operation is already running. Protects against duplicate backend calls
+    // and the Force-Reapply/backend-switch overlap case.
+    if (busyRef.current) return;
+    const target = on ? "wpa_supplicant" : "iwd";
+    setBusy(true);
+    setErrors((prev) => {
+      const next = { ...prev };
+      delete next.wifi_backend;
+      return next;
+    });
+    setOptimizeResult(null);
+
+    try {
+      const res = await backend.startBackendSwitch(target);
+      if (!res.accepted) {
+        setErrors((prev) => ({
+          ...prev,
+          wifi_backend: res.message ?? "Could not start backend switch",
+        }));
+        // Clear any stale result banner/inline from a prior switch so we don't
+        // render old success + new error side-by-side.
+        setBackendSwitch(null);
+        setBusy(false);
+        return;
+      }
+      setBackendSwitch({
+        success: true,
+        in_progress: true,
+        phase: "switching",
+        target,
+        started_at: Math.floor(Date.now() / 1000),
+        result: null,
+      });
+      beginBackendPoll();
+    } catch (e) {
+      setBusy(false);
+      setErrors((prev) => ({
+        ...prev,
+        wifi_backend: "Failed to start backend switch",
+      }));
+      console.error("startBackendSwitch error", e);
+    }
+  };
+
+  // Update-flow handlers, used by the top update banner and the Updates
+  // section. Share the updating/updateError state so either surface can
+  // initiate a check or apply an update.
+  const handleApplyUpdate = async () => {
+    setUpdateError(null);
+    setUpdating(true);
+    try {
+      await backend.applyUpdate();
+    } catch {
+      // plugin_loader restart killed the connection; expected
+    }
+  };
+
+  const handleCheckForUpdate = async () => {
+    setCheckingUpdate(true);
+    setUpdateError(null);
+    lastUpdateCheckAtRef.current = Date.now();
+    try {
+      const result = await backend.checkForUpdate();
+      setUpdateInfo(result);
+    } catch {
+      // refreshStatus has its own catch; no need to log here
+    }
+    setCheckingUpdate(false);
+  };
+
+  const handleChannelChange = async (nextChannel: string) => {
+    await backend.setUpdateChannel(nextChannel);
+    setUpdateInfo(null);
+    await refreshStatus();
   };
 
   // Don't render content until first status arrives (prevents disconnect flash)
