@@ -196,12 +196,12 @@ function Content() {
           setBackendSwitch(s);
           return;
         }
-        // Terminal. Stop polling, then refresh status BEFORE clearing the
-        // in_progress flag - this keeps the optimistic toggle position steady
-        // until live.wifi_backend has caught up, avoiding a toggle/untoggle
-        // flicker at the end of the switch.
+        // Terminal. Stop polling, then refresh status BEFORE flipping backend
+        // state and clearing busy - this keeps the optimistic toggle position
+        // steady until live.wifi_backend has caught up AND keeps other toggles
+        // disabled until the whole UI has consistent state, avoiding any
+        // toggle/untoggle flicker at the end of the switch.
         stopBackendPoll();
-        setBusy(false);
         if (s.result && !s.result.success && s.result.message) {
           const detail = s.result.detail ? ` (${s.result.detail})` : "";
           setErrors((prev) => ({
@@ -211,6 +211,7 @@ function Content() {
         }
         await refreshStatus();
         setBackendSwitch(s);
+        setBusy(false);
       } catch (e) {
         stopBackendPoll();
         setBusy(false);
@@ -958,10 +959,12 @@ function Content() {
             onClick={async () => {
               if (busyRef.current) return;
               setBusy(true);
+              setOptimizeResult(null);
+              setErrors({});
               try {
                 await backend.resetSettings();
-                await refreshStatus();
               } finally {
+                await refreshStatus();
                 setBusy(false);
               }
             }}
