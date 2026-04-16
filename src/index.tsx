@@ -678,6 +678,12 @@ function Content() {
           const currentBackend = status?.live?.wifi_backend || "iwd";
           const isWpa = currentBackend === "wpa_supplicant";
           const switching = backendSwitch?.in_progress ?? false;
+          // Optimistic: during a switch, reflect the target so the toggle matches
+          // the user's click until the operation completes. On failure, it snaps
+          // back to the actual backend.
+          const checkedVal = switching && backendSwitch?.target
+            ? backendSwitch.target === "wpa_supplicant"
+            : isWpa;
           const phaseText = switching
             ? BACKEND_PHASE_TEXT[backendSwitch!.phase] || "Working…"
             : null;
@@ -700,7 +706,7 @@ function Content() {
               explanation="SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface — the plugin automatically recreates it, but a reboot is needed as a last resort."
               badge={backendBadge.badge}
               text={backendBadge.text}
-              checked={isWpa}
+              checked={checkedVal}
               disabled={switching}
               error={errors.wifi_backend}
               onChange={handleBackendToggle}

@@ -577,6 +577,12 @@ function Content() {
                         const currentBackend = status?.live?.wifi_backend || "iwd";
                         const isWpa = currentBackend === "wpa_supplicant";
                         const switching = backendSwitch?.in_progress ?? false;
+                        // Optimistic: during a switch, reflect the target so the toggle matches
+                        // the user's click until the operation completes. On failure, it snaps
+                        // back to the actual backend.
+                        const checkedVal = switching && backendSwitch?.target
+                            ? backendSwitch.target === "wpa_supplicant"
+                            : isWpa;
                         const phaseText = switching
                             ? BACKEND_PHASE_TEXT[backendSwitch.phase] || "Working…"
                             : null;
@@ -589,7 +595,7 @@ function Content() {
                                     : { badge: "off", text: "iwd" };
                         return (SP_JSX.jsx(InfoRow, { label: "Use wpa_supplicant backend", subtitle: phaseText
                                 ? phaseText
-                                : "Alternate WiFi backend — can fix OLED sleep/wake issues", explanation: "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface \u2014 the plugin automatically recreates it, but a reboot is needed as a last resort.", badge: backendBadge.badge, text: backendBadge.text, checked: isWpa, disabled: switching, error: errors.wifi_backend, onChange: handleBackendToggle }));
+                                : "Alternate WiFi backend — can fix OLED sleep/wake issues", explanation: "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. Switching to wpa_supplicant trades slightly slower reconnect (about 5s vs 1-2s) for broader compatibility and better stability on certain routers. The setting survives reboots and SteamOS updates. On OLED, switching to wpa_supplicant may briefly destroy the wlan0 interface \u2014 the plugin automatically recreates it, but a reboot is needed as a last resort.", badge: backendBadge.badge, text: backendBadge.text, checked: checkedVal, disabled: switching, error: errors.wifi_backend, onChange: handleBackendToggle }));
                     })()] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "10px", color: "#8a8a9a" }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || !supported, onClick: () => handleToggle("reapply", () => reapplyAll()), children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
                                 await resetSettings();
                                 await refreshStatus();

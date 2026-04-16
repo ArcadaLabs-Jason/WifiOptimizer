@@ -22,7 +22,9 @@ DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
 BACKEND_TOOL = "/usr/bin/steamos-wifi-set-backend"
-WIFI_BACKEND_CONF = "/etc/NetworkManager/conf.d/wifi_backend.conf"
+BACKEND_HELPER = "/usr/bin/steamos-polkit-helpers/steamos-wifi-set-backend-privileged"
+WIFI_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-valve-wifi-backend.conf"
+NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-steamos-defaults.conf"
 
 # LCD (RTL8822CE) has firmware bugs with deep power save and PCIe ASPM.
 # These sysfs paths let us disable them at runtime (no module reload needed).
@@ -179,42 +181,31 @@ class Plugin:
         return None
 
     def _has_backend_tool(self) -> bool:
-        return os.path.isfile(BACKEND_TOOL) and os.access(BACKEND_TOOL, os.X_OK)
+        # Privileged helper is what we actually invoke — calling the wrapper fails
+        # from a root systemd context because it goes through pkexec.
+        return os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK)
 
     def _get_current_backend(self) -> str | None:
-        """Return 'iwd', 'wpa_supplicant', or None if unknown."""
-        if self._has_backend_tool():
-            result = self._run_cmd([BACKEND_TOOL, "--check"], timeout=3)
-            if result["success"]:
-                out = result["stdout"].strip().lower()
-                if "wpa_supplicant" in out:
-                    return "wpa_supplicant"
-                if "iwd" in out:
-                    return "iwd"
-        # Fallback: read the conf file (absence means the system default, iwd on SteamOS 3.6+)
-        try:
-            with open(WIFI_BACKEND_CONF, "r") as f:
-                content = f.read().lower()
-            if "wpa_supplicant" in content:
-                return "wpa_supplicant"
-            if "iwd" in content:
-                return "iwd"
-            return None
-        except FileNotFoundError:
-            return "iwd"
-        except Exception:
-            return None
+        """Return 'iwd', 'wpa_supplicant', or None if unknown.
 
-    def _get_wifi_phy(self) -> str | None:
-        """Return the first wiphy name (e.g. 'phy0')."""
-        result = self._run_cmd(["/usr/bin/iw", "phy"], timeout=3)
-        if result["success"]:
-            for line in result["stdout"].split("\n"):
-                line = line.strip()
-                if line.startswith("Wiphy "):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return parts[1]
+        Reads user override (99-valve-wifi-backend.conf) first, then the
+        SteamOS default (10-steamos-defaults.conf). Matches the same resolution
+        order that steamos-wifi-set-backend itself uses.
+        """
+        for path in (WIFI_BACKEND_CONF, NM_DEFAULT_CONF):
+            try:
+                with open(path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("wifi.backend"):
+                            _, _, val = line.partition("=")
+                            val = val.strip()
+                            if val in ("iwd", "wpa_supplicant"):
+                                return val
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
         return None
 
     def _ensure_backend_switch_state(self):
@@ -1424,43 +1415,47 @@ systemctl restart plugin_loader 2>/dev/null || true
     async def _backend_switch_worker(self, target: str):
         """Background task that switches the WiFi backend with phase transitions.
 
-        Phases: switching → (recovering_interface)? → reconnecting → done/failed.
-        Uses asyncio.to_thread for blocking subprocess calls so the event loop
-        stays responsive to get_backend_switch_status polling.
+        Invokes the privileged helper directly (at /usr/bin/steamos-polkit-helpers/…)
+        to bypass pkexec, which fails from a rootful systemd context with no polkit
+        agent. The helper handles wlan0 recovery on OLED internally; we parse its
+        output to report whether recovery fired.
         """
         try:
             settings = _load_settings()
             is_oled = settings.get("model") == "oled"
+            other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
 
-            # Phase: switching — run the backend switch command
+            # Phase: switching — write config then restart services
             self._backend_switch["phase"] = "switching"
-            switch_result = await asyncio.to_thread(
-                self._run_cmd, [BACKEND_TOOL, target], 30, False
+            write_result = await asyncio.to_thread(
+                self._run_cmd, [BACKEND_HELPER, "write_config", target], 5, False
             )
-            await asyncio.sleep(2)
+            if not write_result["success"]:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": "Couldn't write WiFi backend config.",
+                    "detail": write_result.get("stderr", "")[:200],
+                }
+                return
 
-            # Phase: recovering_interface — OLED + iwd→wpa_supplicant can destroy wlan0
-            recovery_performed = False
-            needs_reboot = False
+            restart_result = await asyncio.to_thread(
+                self._run_cmd, [BACKEND_HELPER, "restart_units", other], 45, False
+            )
+            rs_stdout = restart_result.get("stdout", "")
+            rs_stderr = restart_result.get("stderr", "")
+            recovery_performed = "missing wlan0" in rs_stdout
+            needs_reboot = "wlan0 could not be created" in rs_stderr
+
+            # Defensive: on OLED, confirm wlan0 actually exists post-restart
+            await asyncio.sleep(1)
             if is_oled and target == "wpa_supplicant":
-                iface = await asyncio.to_thread(self._get_wifi_interface)
-                if not iface or iface != "wlan0":
-                    self._backend_switch["phase"] = "recovering_interface"
-                    phy = await asyncio.to_thread(self._get_wifi_phy) or "phy0"
-                    await asyncio.to_thread(
-                        self._run_cmd,
-                        ["/usr/bin/iw", "phy", phy, "interface", "add",
-                         "wlan0", "type", "station"],
-                        5, False,
-                    )
-                    await asyncio.sleep(2)
-                    iface = await asyncio.to_thread(self._get_wifi_interface)
-                    if iface == "wlan0":
-                        recovery_performed = True
-                    else:
-                        needs_reboot = True
+                iface_check = await asyncio.to_thread(self._get_wifi_interface)
+                if iface_check != "wlan0":
+                    needs_reboot = True
 
-            # Phase: reconnecting — poll for wifi interface + active connection
+            # Phase: reconnecting — wait for NM to reconnect to WiFi
             if not needs_reboot:
                 self._backend_switch["phase"] = "reconnecting"
                 elapsed = 0
@@ -1487,7 +1482,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "needs_reboot": True,
                     "message": "Backend switched but wlan0 didn't come back. Reboot required.",
                 }
-            elif not switch_result["success"] or final_backend != target:
+            elif not restart_result["success"] or final_backend != target:
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
@@ -1496,7 +1491,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "recovery_performed": recovery_performed,
                     "needs_reboot": False,
                     "message": "Backend switch did not take effect.",
-                    "detail": switch_result.get("stderr", "")[:200],
+                    "detail": rs_stderr[:200] or rs_stdout[:200],
                 }
             else:
                 self._backend_switch["phase"] = "done"
