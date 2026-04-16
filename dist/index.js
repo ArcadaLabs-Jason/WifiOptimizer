@@ -133,6 +133,7 @@ function StatusBadge({ badge, text }) {
 }
 
 function InfoRow({ label, subtitle, explanation, badge, text, checked, disabled = false, error, onChange, children, }) {
+    const showBadge = badge !== undefined && text !== undefined;
     const [expanded, setExpanded] = SP_REACT.useState(false);
     return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: SP_JSX.jsxs("span", { style: { display: "flex", alignItems: "center", gap: "4px" }, children: [SP_JSX.jsx("span", { onClick: (e) => {
                                     e.stopPropagation();
@@ -152,11 +153,11 @@ function InfoRow({ label, subtitle, explanation, badge, text, checked, disabled 
                                     fontWeight: 700,
                                     cursor: "pointer",
                                     flexShrink: 0,
-                                }, children: "i" }), SP_JSX.jsx("span", { children: label })] }), description: SP_JSX.jsxs("span", { style: { display: "block" }, children: [SP_JSX.jsx("span", { style: {
+                                }, children: "i" }), SP_JSX.jsx("span", { children: label })] }), description: SP_JSX.jsxs("span", { style: { display: "block" }, children: [showBadge && (SP_JSX.jsx("span", { style: {
                                     display: "flex",
                                     justifyContent: "flex-end",
                                     marginBottom: "4px",
-                                }, children: SP_JSX.jsx(StatusBadge, { badge: badge, text: text }) }), error ? (SP_JSX.jsx("span", { style: { color: "#ff878c" }, children: error })) : (SP_JSX.jsx("span", { style: { color: "#7a7a8a", fontSize: "11px" }, children: subtitle }))] }), checked: checked, disabled: disabled, onChange: onChange }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                                }, children: SP_JSX.jsx(StatusBadge, { badge: badge, text: text }) })), error ? (SP_JSX.jsx("span", { style: { color: "#ff878c" }, children: error })) : (SP_JSX.jsx("span", { style: { color: "#7a7a8a", fontSize: "11px" }, children: subtitle }))] }), checked: checked, disabled: disabled, onChange: onChange }) }), expanded && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                         padding: "8px 12px",
                         background: "rgba(255,255,255,0.02)",
                         borderRadius: "6px",
@@ -252,16 +253,15 @@ function timeAgo(ts) {
         return `${Math.floor(diff / 3600)} hr ago`;
     return `${Math.floor(diff / 86400)}d ago`;
 }
-function getBadge(enabled, driftKey, status, errorKey, activeText = "active") {
+function getBadge(_enabled, driftKey, status, errorKey, _activeText = "active") {
+    // Only surface a badge when it tells the user something the toggle position
+    // doesn't — failure or drift between our setting and the system state.
+    // Binary on/off badges are redundant with the toggle itself and are hidden.
     if (errorKey)
         return { badge: "error", text: "failed" };
-    if (!status?.connected)
-        return { badge: "unknown", text: "?" };
-    if (!enabled)
-        return { badge: "off", text: "off" };
-    if (driftKey && status.drift?.[driftKey])
+    if (driftKey && status?.drift?.[driftKey])
         return { badge: "drifted", text: "drifted" };
-    return { badge: "active", text: activeText };
+    return null;
 }
 const DNS_OPTIONS = [
     { data: "cloudflare", label: "Cloudflare (1.1.1.1)" },

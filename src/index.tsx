@@ -48,17 +48,18 @@ function timeAgo(ts: number): string {
 }
 
 function getBadge(
-  enabled: boolean,
+  _enabled: boolean,
   driftKey: string | undefined,
   status: PluginStatus | null,
   errorKey: string | null,
-  activeText: string = "active"
-): { badge: BadgeStatus; text: string } {
+  _activeText: string = "active"
+): { badge: BadgeStatus; text: string } | null {
+  // Only surface a badge when it tells the user something the toggle position
+  // doesn't — failure or drift between our setting and the system state.
+  // Binary on/off badges are redundant with the toggle itself and are hidden.
   if (errorKey) return { badge: "error", text: "failed" };
-  if (!status?.connected) return { badge: "unknown", text: "?" };
-  if (!enabled) return { badge: "off", text: "off" };
-  if (driftKey && status.drift?.[driftKey]) return { badge: "drifted", text: "drifted" };
-  return { badge: "active", text: activeText };
+  if (driftKey && status?.drift?.[driftKey]) return { badge: "drifted", text: "drifted" };
+  return null;
 }
 
 const DNS_OPTIONS = [

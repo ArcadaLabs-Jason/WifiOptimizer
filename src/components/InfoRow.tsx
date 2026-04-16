@@ -7,8 +7,8 @@ interface InfoRowProps {
   label: string;
   subtitle: string;
   explanation: string;
-  badge: BadgeStatus;
-  text: string;
+  badge?: BadgeStatus;
+  text?: string;
   checked: boolean;
   disabled?: boolean;
   error?: string | null;
@@ -28,6 +28,7 @@ export function InfoRow({
   onChange,
   children,
 }: InfoRowProps) {
+  const showBadge = badge !== undefined && text !== undefined;
   const [expanded, setExpanded] = useState(false);
 
   return (
@@ -65,15 +66,17 @@ export function InfoRow({
           }
           description={
             <span style={{ display: "block" }}>
-              <span
-                style={{
-                  display: "flex",
-                  justifyContent: "flex-end",
-                  marginBottom: "4px",
-                }}
-              >
-                <StatusBadge badge={badge} text={text} />
-              </span>
+              {showBadge && (
+                <span
+                  style={{
+                    display: "flex",
+                    justifyContent: "flex-end",
+                    marginBottom: "4px",
+                  }}
+                >
+                  <StatusBadge badge={badge!} text={text!} />
+                </span>
+              )}
               {error ? (
                 <span style={{ color: "#ff878c" }}>{error}</span>
               ) : (
