@@ -141,7 +141,6 @@ function Content() {
   // State mirror of busyRef so toggles can visually disable during in-flight
   // operations. Ref is used for the sync early-return guard; state drives UI.
   const [isBusy, setIsBusy] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const busyRef = useRef(false);
 
@@ -220,9 +219,38 @@ function Content() {
     }, BACKEND_POLL_INTERVAL);
   }, [refreshStatus]);
 
+  // Main refresh interval, paused when the panel is hidden so we don't burn
+  // CPU/battery on ~12 subprocess calls every 3s in the background. On return
+  // to visible, run one refresh immediately to catch anything that changed
+  // while hidden, then resume the interval.
   useEffect(() => {
-    refreshStatus();
-    intervalRef.current = setInterval(refreshStatus, REFRESH_INTERVAL);
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (id) return;
+      refreshStatus();
+      id = setInterval(refreshStatus, REFRESH_INTERVAL);
+    };
+    const stop = () => {
+      if (id) {
+        clearInterval(id);
+        id = null;
+      }
+    };
+    const onVis = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      stop();
+    };
+  }, [refreshStatus]);
+
+  // One-time init: initial update check and resume backend polling if a switch
+  // was already in flight when the panel opened.
+  useEffect(() => {
     // Initial update check. If it fails (e.g., no network yet), the effect
     // below retries on connectivity recovery. QAM tends to cache the panel
     // across close/open, so we can't rely on remount to retry.
@@ -239,10 +267,9 @@ function Content() {
       })
       .catch(() => {});
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
       if (backendPollRef.current) clearInterval(backendPollRef.current);
     };
-  }, [refreshStatus, beginBackendPoll, runUpdateCheck]);
+  }, [beginBackendPoll, runUpdateCheck]);
 
   // Retry update check when connectivity recovers - the initial one-shot check
   // in the mount effect misses the case where the panel was already open when
