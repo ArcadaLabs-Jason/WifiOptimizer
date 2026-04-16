@@ -48,11 +48,9 @@ function timeAgo(ts: number): string {
 }
 
 function getBadge(
-  _enabled: boolean,
   driftKey: string | undefined,
   status: PluginStatus | null,
   errorKey: string | null,
-  _activeText: string = "active"
 ): { badge: BadgeStatus; text: string } | null {
   // Only surface a badge when it tells the user something the toggle position
   // doesn't - failure or drift between our setting and the system state.
@@ -632,7 +630,7 @@ function Content() {
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
           explanation="SteamOS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
-          {...getBadge(s?.power_save_disabled ?? false, "power_save", status, errors.power_save ?? null)}
+          {...getBadge("power_save", status, errors.power_save ?? null)}
           checked={s?.power_save_disabled ?? false}
           error={errors.power_save}
           onChange={(val: boolean) =>
@@ -643,7 +641,7 @@ function Content() {
           label="Stop background scanning"
           subtitle="Locks to current AP - disable to switch networks or roam"
           explanation="Your Steam Deck scans for other WiFi networks every 2 minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
-          {...getBadge(s?.bssid_lock_enabled ?? false, "bssid_lock", status, errors.bssid_lock ?? null, "locked")}
+          {...getBadge("bssid_lock", status, errors.bssid_lock ?? null)}
           checked={s?.bssid_lock_enabled ?? false}
           disabled={!connected && !s?.bssid_lock_enabled}
           error={errors.bssid_lock}
@@ -655,7 +653,7 @@ function Content() {
           label="Auto-fix on wake"
           subtitle="Reapplies settings after sleep (NM dispatcher)"
           explanation="SteamOS often resets WiFi settings when the Deck wakes from sleep. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
-          {...getBadge(s?.auto_fix_on_wake ?? false, undefined, status, errors.auto_fix ?? null)}
+          {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
           error={errors.auto_fix}
           onChange={(val: boolean) =>
@@ -666,7 +664,7 @@ function Content() {
           label="Network buffer tuning"
           subtitle="Optimize UDP buffers and TX queue for streaming"
           explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
-          {...getBadge(s?.buffer_tuning_enabled ?? false, "buffer_tuning", status, errors.buffer_tuning ?? null)}
+          {...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null)}
           checked={s?.buffer_tuning_enabled ?? false}
           error={errors.buffer_tuning}
           onChange={(val: boolean) =>
@@ -685,13 +683,7 @@ function Content() {
           }. Using 5 GHz${
             isOled ? " or 6 GHz" : ""
           } for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`}
-          {...getBadge(
-            s?.band_preference_enabled ?? false,
-            undefined,
-            status,
-            errors.band_preference ?? null,
-            "5 GHz"
-          )}
+          {...getBadge(undefined, status, errors.band_preference ?? null)}
           checked={s?.band_preference_enabled ?? false}
           disabled={!connected && !s?.band_preference_enabled}
           error={errors.band_preference}
@@ -705,7 +697,7 @@ function Content() {
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
           explanation="Your internet provider's DNS servers translate domain names (like store.steampowered.com) into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
-          {...getBadge(s?.dns_enabled ?? false, undefined, status, errors.dns ?? null, "set")}
+          {...getBadge(undefined, status, errors.dns ?? null)}
           checked={s?.dns_enabled ?? false}
           disabled={!connected && !s?.dns_enabled}
           error={errors.dns}
@@ -755,7 +747,7 @@ function Content() {
           label="Disable IPv6"
           subtitle="Use IPv4 only on this network"
           explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine."
-          {...getBadge(s?.ipv6_disabled ?? false, undefined, status, errors.ipv6 ?? null)}
+          {...getBadge(undefined, status, errors.ipv6 ?? null)}
           checked={s?.ipv6_disabled ?? false}
           disabled={!connected && !s?.ipv6_disabled}
           error={errors.ipv6}
@@ -763,7 +755,7 @@ function Content() {
             handleToggle("ipv6", () => backend.setIpv6(val))
           }
         />
-        {status?.live?.backend_tool_available && (() => {
+        {supported && status?.live?.backend_tool_available && (() => {
           const currentBackend = status?.live?.wifi_backend || "iwd";
           const isWpa = currentBackend === "wpa_supplicant";
           const switching = backendSwitch?.in_progress ?? false;
