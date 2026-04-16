@@ -76,7 +76,14 @@ export function InfoRow({
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <div style={{ padding: "0 0 4px 0", marginTop: "-6px" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            padding: "0 0 4px 0",
+            marginTop: "-6px",
+          }}
+        >
           <StatusBadge badge={badge} text={text} />
         </div>
       </PanelSectionRow>
