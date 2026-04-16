@@ -1262,6 +1262,15 @@ class Plugin:
             except FileNotFoundError:
                 pass
 
+            # Repopulate model/driver so the plugin doesn't show as "UNKNOWN /
+            # Unsupported device" until the next plugin reload. Mirrors the
+            # hardware detection _main does on startup.
+            info = await self.get_device_info()
+            fresh = dict(DEFAULT_SETTINGS)
+            fresh["model"] = info.get("model", "unknown")
+            fresh["driver"] = info.get("driver", "unknown")
+            _save_settings(fresh)
+
             decky.logger.info("Settings reset to defaults")
             return {"success": True, "message": "Settings reset to defaults"}
         except Exception as e:

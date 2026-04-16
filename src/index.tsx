@@ -138,9 +138,17 @@ function Content() {
   const [updating, setUpdating] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [backendSwitch, setBackendSwitch] = useState<BackendSwitchStatus | null>(null);
+  // State mirror of busyRef so toggles can visually disable during in-flight
+  // operations. Ref is used for the sync early-return guard; state drives UI.
+  const [isBusy, setIsBusy] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const busyRef = useRef(false);
+
+  const setBusy = (val: boolean) => {
+    busyRef.current = val;
+    setIsBusy(val);
+  };
   const prevConnectedRef = useRef<boolean | null>(null);
   const lastUpdateCheckAtRef = useRef<number>(0);
 
@@ -193,7 +201,7 @@ function Content() {
         // until live.wifi_backend has caught up, avoiding a toggle/untoggle
         // flicker at the end of the switch.
         stopBackendPoll();
-        busyRef.current = false;
+        setBusy(false);
         if (s.result && !s.result.success && s.result.message) {
           const detail = s.result.detail ? ` (${s.result.detail})` : "";
           setErrors((prev) => ({
@@ -205,7 +213,7 @@ function Content() {
         setBackendSwitch(s);
       } catch (e) {
         stopBackendPoll();
-        busyRef.current = false;
+        setBusy(false);
         console.error("backend switch poll error", e);
       }
     }, BACKEND_POLL_INTERVAL);
@@ -224,7 +232,7 @@ function Content() {
       .then((s) => {
         if (s.in_progress) {
           setBackendSwitch(s);
-          busyRef.current = true;
+          setBusy(true);
           beginBackendPoll();
         }
       })
@@ -304,7 +312,7 @@ function Content() {
     // and the Force-Reapply/backend-switch overlap case.
     if (busyRef.current) return;
     const target = on ? "wpa_supplicant" : "iwd";
-    busyRef.current = true;
+    setBusy(true);
     setErrors((prev) => {
       const next = { ...prev };
       delete next.wifi_backend;
@@ -322,7 +330,7 @@ function Content() {
         // Clear any stale result banner/inline from a prior switch so we don't
         // render old success + new error side-by-side.
         setBackendSwitch(null);
-        busyRef.current = false;
+        setBusy(false);
         return;
       }
       setBackendSwitch({
@@ -335,7 +343,7 @@ function Content() {
       });
       beginBackendPoll();
     } catch (e) {
-      busyRef.current = false;
+      setBusy(false);
       setErrors((prev) => ({
         ...prev,
         wifi_backend: "Failed to start backend switch",
@@ -346,7 +354,7 @@ function Content() {
 
   const handleToggle = async (key: string, fn: () => Promise<MethodResult>) => {
     if (busyRef.current) return;
-    busyRef.current = true;
+    setBusy(true);
     setErrors((prev) => {
       const next = { ...prev };
       delete next[key];
@@ -366,14 +374,17 @@ function Content() {
         await new Promise((r) => setTimeout(r, RECONNECT_DELAY));
       }
     } finally {
-      busyRef.current = false;
+      // Refresh before clearing busy so toggles/badges don't briefly flip to
+      // stale pre-operation values in the interim render. Refresh runs even on
+      // unexpected errors to keep UI consistent with backend state.
+      await refreshStatus();
+      setBusy(false);
     }
-    await refreshStatus();
   };
 
   const handleOptimize = async () => {
     if (busyRef.current) return;
-    busyRef.current = true;
+    setBusy(true);
     setApplyingAll(true);
     setErrors({});
     setOptimizeResult(null);
@@ -397,10 +408,12 @@ function Content() {
     } catch (e) {
       console.error("optimize error", e);
     } finally {
-      busyRef.current = false;
+      // Refresh before clearing applyingAll so button doesn't briefly flip to
+      // "All good" from stale status. Refresh runs on errors too.
+      await refreshStatus();
+      setBusy(false);
       setApplyingAll(false);
     }
-    await refreshStatus();
   };
 
   // Don't render content until first status arrives (prevents disconnect flash)
@@ -696,7 +709,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected || !supported || applyingAll}
+            disabled={!connected || !supported || applyingAll || isBusy}
             onClick={handleOptimize}
           >
             {applyingAll
@@ -716,6 +729,7 @@ function Content() {
           explanation="SteamOS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
           {...getBadge("power_save", status, errors.power_save ?? null)}
           checked={s?.power_save_disabled ?? false}
+          disabled={isBusy}
           error={errors.power_save}
           onChange={(val: boolean) =>
             handleToggle("power_save", () => backend.setPowerSave(val))
@@ -727,7 +741,7 @@ function Content() {
           explanation="Your Steam Deck scans for other WiFi networks every 2 minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
           {...getBadge("bssid_lock", status, errors.bssid_lock ?? null)}
           checked={s?.bssid_lock_enabled ?? false}
-          disabled={!connected && !s?.bssid_lock_enabled}
+          disabled={isBusy || (!connected && !s?.bssid_lock_enabled)}
           error={errors.bssid_lock}
           onChange={(val: boolean) =>
             handleToggle("bssid_lock", () => backend.setBssidLock(val))
@@ -739,6 +753,7 @@ function Content() {
           explanation="SteamOS often resets WiFi settings when the Deck wakes from sleep. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
           {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
+          disabled={isBusy}
           error={errors.auto_fix}
           onChange={(val: boolean) =>
             handleToggle("auto_fix", () => backend.setAutoFix(val))
@@ -750,6 +765,7 @@ function Content() {
           explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
           {...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null)}
           checked={s?.buffer_tuning_enabled ?? false}
+          disabled={isBusy}
           error={errors.buffer_tuning}
           onChange={(val: boolean) =>
             handleToggle("buffer_tuning", () => backend.setBufferTuning(val))
@@ -769,7 +785,7 @@ function Content() {
           } for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`}
           {...getBadge(undefined, status, errors.band_preference ?? null)}
           checked={s?.band_preference_enabled ?? false}
-          disabled={!connected && !s?.band_preference_enabled}
+          disabled={isBusy || (!connected && !s?.band_preference_enabled)}
           error={errors.band_preference}
           onChange={(val: boolean) =>
             handleToggle("band_preference", () =>
@@ -783,7 +799,7 @@ function Content() {
           explanation="Your internet provider's DNS servers translate domain names (like store.steampowered.com) into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
           {...getBadge(undefined, status, errors.dns ?? null)}
           checked={s?.dns_enabled ?? false}
-          disabled={!connected && !s?.dns_enabled}
+          disabled={isBusy || (!connected && !s?.dns_enabled)}
           error={errors.dns}
           onChange={(val: boolean) =>
             handleToggle("dns", () =>
@@ -833,7 +849,7 @@ function Content() {
           explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine."
           {...getBadge(undefined, status, errors.ipv6 ?? null)}
           checked={s?.ipv6_disabled ?? false}
-          disabled={!connected && !s?.ipv6_disabled}
+          disabled={isBusy || (!connected && !s?.ipv6_disabled)}
           error={errors.ipv6}
           onChange={(val: boolean) =>
             handleToggle("ipv6", () => backend.setIpv6(val))
@@ -882,7 +898,7 @@ function Content() {
               badge={backendBadge.badge}
               text={backendBadge.text}
               checked={checkedVal}
-              disabled={switching}
+              disabled={switching || isBusy}
               error={errors.wifi_backend}
               onChange={handleBackendToggle}
             >
@@ -929,7 +945,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected || !supported}
+            disabled={!connected || !supported || isBusy}
             onClick={() => handleToggle("reapply", () => backend.reapplyAll())}
           >
             Force Reapply All
@@ -938,9 +954,16 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
+            disabled={isBusy}
             onClick={async () => {
-              await backend.resetSettings();
-              await refreshStatus();
+              if (busyRef.current) return;
+              setBusy(true);
+              try {
+                await backend.resetSettings();
+                await refreshStatus();
+              } finally {
+                setBusy(false);
+              }
             }}
           >
             Reset Settings
