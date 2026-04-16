@@ -218,6 +218,23 @@ class Plugin:
                 "result": None,
             }
 
+    def _friendly_backend_error(self, detail: str) -> str:
+        """Rewrite raw stderr into user-friendly guidance for common failures.
+        Returns a one-line explanation; callers pass the raw detail separately
+        so the technical text is still available to the UI/logs."""
+        d = (detail or "").lower()
+        if "symbol lookup error" in d or "undefined symbol" in d:
+            return "A system-library conflict occurred. Please reboot your Deck and try again."
+        if "permission denied" in d:
+            return "The system denied permission. Try rebooting your Deck."
+        if "command not found" in d or "no such file" in d:
+            return "A required system tool is missing. This SteamOS version may not be supported."
+        if "timed out" in d or "timeout" in d:
+            return "The system didn't respond in time. Try again in a moment."
+        if "network is unreachable" in d or "connection refused" in d:
+            return "Network problem during the switch. Check WiFi and try again."
+        return "The WiFi backend switch didn't take effect."
+
     def _require_wifi(self) -> tuple:
         iface = self._get_wifi_interface()
         if not iface:
@@ -354,6 +371,24 @@ class Plugin:
 
             if settings.get("model") in ("lcd", "oled") and settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
+
+            # Sanity check: does the conf-declared backend match what's actually
+            # running? Divergence would indicate a previous switch got interrupted
+            # (plugin_loader crash, external tool, etc.). Log only; user can
+            # re-toggle to resolve.
+            if self._has_backend_tool():
+                conf_backend = self._get_current_backend()
+                if conf_backend:
+                    active = self._run_cmd(
+                        ["/usr/bin/systemctl", "is-active", conf_backend], timeout=3
+                    )
+                    state = (active.get("stdout") or "").strip()
+                    if state and state != "active":
+                        decky.logger.error(
+                            f"Backend inconsistency: conf says '{conf_backend}' "
+                            f"but systemd reports '{state}'. Likely an interrupted "
+                            f"backend switch — user can retry via the UI."
+                        )
 
             decky.logger.info(
                 f"WiFi Optimizer ready: model={info.get('model')}, driver={info.get('driver')}"
@@ -1453,7 +1488,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
-                    "message": f"Couldn't write WiFi backend config (rc={write_result.get('returncode')}).",
+                    "message": self._friendly_backend_error(detail),
                     "detail": detail,
                 }
                 decky.logger.error(
@@ -1509,6 +1544,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "message": "Backend switched but wlan0 didn't come back. Reboot required.",
                 }
             elif not restart_result["success"] or final_backend != target:
+                detail = rs_stderr[:200] or rs_stdout[:200]
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
@@ -1517,8 +1553,8 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "recovery_performed": recovery_performed,
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
-                    "message": "Backend switch did not take effect.",
-                    "detail": rs_stderr[:200] or rs_stdout[:200],
+                    "message": self._friendly_backend_error(detail),
+                    "detail": detail,
                 }
             else:
                 self._backend_switch["phase"] = "done"
