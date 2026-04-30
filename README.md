@@ -73,6 +73,14 @@ Want to go further? The remaining optimizations are available as individual togg
 
 The plugin detects your WiFi hardware at startup and applies the right optimizations for your chip. Devices with unrecognized hardware still get universal optimizations (power save, buffer tuning, BSSID lock, etc.).
 
+### Legion Go / ROG Ally / other handhelds (beta)
+
+Multi-device support is in beta testing. The beta branch adds detection and driver-specific optimizations for Legion Go (all models), ROG Ally (all models), and other PC handhelds with Decky Loader.
+
+To try it: open WiFi Optimizer, scroll to the Updates section, switch the channel from **Stable** to **Beta**, then tap the update button. To go back, switch the channel to Stable and update again.
+
+If you test on a non-Steam Deck device, use the **Copy Diagnostics** button at the bottom of the plugin panel and include the output in any bug reports.
+
 ## How it works
 
 The plugin has two parts:
