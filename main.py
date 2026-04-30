@@ -570,13 +570,21 @@ class Plugin:
         return (product, "unknown", "Unknown Device")
 
     def _detect_wifi_driver(self) -> str:
-        """Detect the kernel driver of the active WiFi interface via sysfs."""
+        """Detect the kernel driver of the active WiFi interface via sysfs.
+        Normalizes sub-module names (e.g. rtw88_pci) to the canonical
+        DRIVER_PROFILES key (rtw88)."""
         iface = self._get_wifi_interface()
         if not iface:
             return "unknown"
         try:
             driver_path = os.path.realpath(f"/sys/class/net/{iface}/device/driver/module")
-            return os.path.basename(driver_path)
+            module = os.path.basename(driver_path)
+            if module in DRIVER_PROFILES:
+                return module
+            for key in DRIVER_PROFILES:
+                if module.startswith(key):
+                    return key
+            return module
         except Exception:
             return "unknown"
 
