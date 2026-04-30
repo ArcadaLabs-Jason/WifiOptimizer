@@ -1392,9 +1392,6 @@ class Plugin:
     async def apply_update(self) -> dict:
         """Download and install update from the selected channel, then restart Decky."""
         try:
-            if not self._is_supported_device():
-                return {"success": False, "error": "unexpected", "message": "Unsupported device."}
-
             info = await self.check_for_update()
             if not info.get("update_available"):
                 return {"success": False, "message": "No update available."}
