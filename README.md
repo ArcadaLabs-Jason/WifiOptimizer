@@ -68,6 +68,14 @@ Works on both Steam Deck models. OLED owners tend to see the biggest improvement
 | Driver | rtw88 | ath11k_pci |
 | Backend switch quirk | None | Switching from iwd to wpa_supplicant briefly drops wlan0; the plugin recreates it automatically |
 
+### Legion Go / ROG Ally / other handhelds (beta)
+
+Multi-device support is in beta testing. The beta branch adds detection and driver-specific optimizations for Legion Go (all models), ROG Ally (all models), and other PC handhelds with Decky Loader.
+
+To try it: open WiFi Optimizer, scroll to the Updates section, switch the channel from **Stable** to **Beta**, then tap the update button. To go back, switch the channel to Stable and update again.
+
+If you test on a non-Steam Deck device, use the **Copy Diagnostics** button at the bottom of the plugin panel and include the output in any bug reports.
+
 ## How it works
 
 The plugin has two parts:
