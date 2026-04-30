@@ -101,6 +101,7 @@ const applyUpdate = callable("apply_update");
 const startBackendSwitch = callable("start_backend_switch");
 const getBackendSwitchStatus = callable("get_backend_switch_status");
 const getDiagnosticInfo = callable("get_diagnostic_info");
+const saveDiagnosticInfo = callable("save_diagnostic_info");
 
 const ERROR_MESSAGES = {
     no_wifi: "Not connected to WiFi. Connect first, then optimize.",
@@ -434,22 +435,31 @@ function PanelFooter({ version }) {
         try {
             const info = await getDiagnosticInfo();
             const text = JSON.stringify(info, null, 2);
-            await navigator.clipboard.writeText(text);
-            setDiagState("done");
-            setTimeout(() => setDiagState("idle"), 3000);
+            try {
+                await navigator.clipboard.writeText(text);
+                setDiagState("done");
+            }
+            catch {
+                await saveDiagnosticInfo();
+                setDiagState("saved");
+            }
+            setTimeout(() => setDiagState("idle"), 5000);
         }
         catch {
             setDiagState("error");
             setTimeout(() => setDiagState("idle"), 3000);
         }
     };
-    return (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["v", version, " - by jasonridesabike"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: diagState === "copying", onClick: handleCopyDiagnostics, children: diagState === "done"
-                        ? "Copied to clipboard"
-                        : diagState === "error"
-                            ? "Copy failed"
-                            : diagState === "copying"
-                                ? "Collecting..."
-                                : "Copy diagnostics" }) })] }));
+    const label = diagState === "done"
+        ? "Copied to clipboard"
+        : diagState === "saved"
+            ? "Saved to plugin settings folder"
+            : diagState === "error"
+                ? "Failed to collect diagnostics"
+                : diagState === "copying"
+                    ? "Collecting..."
+                    : "Copy diagnostics";
+    return (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["v", version, " - by jasonridesabike"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: diagState === "copying", onClick: handleCopyDiagnostics, children: label }) })] }));
 }
 
 function ActionsSection({ connected, isBusy, onForceReapply, onReset, }) {

@@ -8,7 +8,9 @@ interface PanelFooterProps {
 }
 
 export function PanelFooter({ version }: PanelFooterProps) {
-  const [diagState, setDiagState] = useState<"idle" | "copying" | "done" | "error">("idle");
+  const [diagState, setDiagState] = useState<
+    "idle" | "copying" | "done" | "saved" | "error"
+  >("idle");
   const rowStyle: React.CSSProperties = {
     fontSize: theme.fontSize.tiny,
     color: theme.text.dim,
@@ -19,14 +21,30 @@ export function PanelFooter({ version }: PanelFooterProps) {
     try {
       const info = await backend.getDiagnosticInfo();
       const text = JSON.stringify(info, null, 2);
-      await navigator.clipboard.writeText(text);
-      setDiagState("done");
-      setTimeout(() => setDiagState("idle"), 3000);
+      try {
+        await navigator.clipboard.writeText(text);
+        setDiagState("done");
+      } catch {
+        await backend.saveDiagnosticInfo();
+        setDiagState("saved");
+      }
+      setTimeout(() => setDiagState("idle"), 5000);
     } catch {
       setDiagState("error");
       setTimeout(() => setDiagState("idle"), 3000);
     }
   };
+
+  const label =
+    diagState === "done"
+      ? "Copied to clipboard"
+      : diagState === "saved"
+        ? "Saved to plugin settings folder"
+        : diagState === "error"
+          ? "Failed to collect diagnostics"
+          : diagState === "copying"
+            ? "Collecting..."
+            : "Copy diagnostics";
 
   return (
     <PanelSection>
@@ -46,13 +64,7 @@ export function PanelFooter({ version }: PanelFooterProps) {
           disabled={diagState === "copying"}
           onClick={handleCopyDiagnostics}
         >
-          {diagState === "done"
-            ? "Copied to clipboard"
-            : diagState === "error"
-              ? "Copy failed"
-              : diagState === "copying"
-                ? "Collecting..."
-                : "Copy diagnostics"}
+          {label}
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>

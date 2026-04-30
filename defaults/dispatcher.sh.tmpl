@@ -47,6 +47,14 @@ else
     logger -t "$LOG_TAG" "Settings missing, safe defaults only"
 fi
 
+# Guard: if python3 failed or produced no output, fall back to safe defaults
+if [ -z "$POWER_SAVE" ]; then
+    POWER_SAVE="True"
+    BUFFER_TUNING="False"
+    DRIVER="unknown"
+    logger -t "$LOG_TAG" "Settings parse failed, safe defaults only"
+fi
+
 # Apply power save
 if [ "$POWER_SAVE" = "True" ]; then
     /usr/bin/iw dev "$IFACE" set power_save off 2>/dev/null

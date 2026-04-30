@@ -708,6 +708,21 @@ class Plugin:
             decky.logger.error(f"get_diagnostic_info error: {e}")
             return {"success": False, "error": str(e)}
 
+    async def save_diagnostic_info(self) -> dict:
+        """Write diagnostics to a file in the settings directory as a
+        fallback when clipboard is unavailable."""
+        try:
+            info = await self.get_diagnostic_info()
+            diag_path = os.path.join(
+                os.path.dirname(SETTINGS_FILE), "diagnostics.json"
+            )
+            with open(diag_path, "w") as f:
+                json.dump(info, f, indent=2)
+            return {"success": True, "path": diag_path}
+        except Exception as e:
+            decky.logger.error(f"save_diagnostic_info error: {e}")
+            return {"success": False, "error": str(e)}
+
     # ---- Status ----
 
     async def get_status(self) -> dict:
