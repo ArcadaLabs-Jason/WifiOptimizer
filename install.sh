@@ -14,10 +14,10 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Resolve the real user's home directory (same method as Decky's own installer)
-DECK_USER="${SUDO_USER:-deck}"
+DECK_USER="${SUDO_USER:-$(logname 2>/dev/null || echo deck)}"
 USER_HOME="$(getent passwd "$DECK_USER" | cut -d: -f6)"
 if [ -z "$USER_HOME" ]; then
-    USER_HOME="/home/deck"
+    USER_HOME="/home/$DECK_USER"
 fi
 
 PLUGIN_BASE="$USER_HOME/homebrew/plugins"

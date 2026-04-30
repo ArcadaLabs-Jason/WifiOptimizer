@@ -24,3 +24,4 @@ export const checkForUpdate = callable<[], UpdateCheckResult>("check_for_update"
 export const applyUpdate = callable<[], MethodResult>("apply_update");
 export const startBackendSwitch = callable<[backend: string], BackendSwitchStartResult>("start_backend_switch");
 export const getBackendSwitchStatus = callable<[], BackendSwitchStatus>("get_backend_switch_status");
+export const getDiagnosticInfo = callable<[], Record<string, unknown>>("get_diagnostic_info");

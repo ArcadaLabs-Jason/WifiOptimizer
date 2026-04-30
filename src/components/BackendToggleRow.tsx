@@ -17,16 +17,16 @@ const PHASE_TEXT: Record<BackendSwitchPhase, string> = {
 };
 
 const EXPLANATION =
-  "SteamOS 3.6+ defaults to iwd for WiFi. Some OLED owners see disconnects " +
-  "after sleep, 5 GHz dropouts, or 'invalid password' errors with iwd. " +
-  "Switching to wpa_supplicant trades slightly slower reconnect (about 5s " +
-  "vs 1-2s) for broader compatibility and better stability on certain " +
-  "routers. The setting survives reboots and SteamOS updates. On OLED, " +
-  "switching to wpa_supplicant may briefly destroy the wlan0 interface - " +
-  "the plugin automatically recreates it, but a reboot is needed as a last " +
-  "resort. Note: some networks (WPA3-only, certain enterprise setups) " +
-  "behave differently between backends - if your WiFi stops connecting " +
-  "after a switch, try switching back.";
+  "Your system defaults to iwd for WiFi management. Some devices see " +
+  "disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors " +
+  "with iwd. Switching to wpa_supplicant trades slightly slower reconnect " +
+  "(about 5s vs 1-2s) for broader compatibility and better stability on " +
+  "certain routers. The setting survives reboots and OS updates. On some " +
+  "devices, the switch may briefly disrupt the WiFi interface - the plugin " +
+  "handles recovery automatically, but a reboot is needed as a last resort. " +
+  "Note: some networks (WPA3-only, certain enterprise setups) behave " +
+  "differently between backends - if your WiFi stops connecting after a " +
+  "switch, try switching back.";
 
 interface BackendToggleRowProps {
   status: PluginStatus;
@@ -77,7 +77,7 @@ export function BackendToggleRow({
   return (
     <InfoRow
       label="Use wpa_supplicant backend"
-      subtitle={phaseText ?? "Alternate WiFi backend - can fix OLED sleep/wake issues"}
+      subtitle={phaseText ?? "Alternate WiFi backend - can fix sleep/wake and stability issues"}
       explanation={EXPLANATION}
       badge={badge.badge}
       text={badge.text}

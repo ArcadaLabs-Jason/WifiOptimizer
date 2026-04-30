@@ -105,7 +105,7 @@ class ErrorBoundary extends Component<
 //   3. Lifecycle effects (main refresh, init, connectivity retry, update timeout,
 //      update heartbeat)
 //   4. User action handlers (toggles, optimize, reset, backend switch, updates)
-//   5. Derived render state (connected, supported, allSafeActive, etc.)
+//   5. Derived render state (connected, supportTier, allSafeActive, etc.)
 //   6. JSX for the panel sections in top-to-bottom screen order
 function Content() {
   // --- General status and toggle state ---
@@ -140,7 +140,7 @@ function Content() {
 
   // Runs checkForUpdate with dedupe - skips if a check was issued within the
   // dedupe window. Lowers GitHub API pressure in CGNAT/dorm scenarios where
-  // many Decks share an IP. Manual button bypasses this (force=true).
+  // many devices share an IP. Manual button bypasses this (force=true).
   const runUpdateCheck = useCallback((force: boolean = false) => {
     const now = Date.now();
     if (!force && now - lastUpdateCheckAtRef.current < UPDATE_CHECK_DEDUPE_MS) {
@@ -494,9 +494,10 @@ function Content() {
 
   const s = status?.settings;
   const connected = status?.connected ?? false;
-  const supported = status?.supported ?? true;
+  const supportTier = status?.support_tier ?? 1;
   const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
-  const isOled = s?.model === "oled";
+  const supports6GHz = s?.supports_6ghz ?? false;
+  const isDeckLcd = s?.device_family === "deck_lcd";
 
   // Check if all safe optimizations are already active
   const allSafeActive =
@@ -512,17 +513,21 @@ function Content() {
   return (
     <>
       <PanelHeader
-        model={s?.model ?? "unknown"}
         driver={s?.driver ?? ""}
         version={status?.version ?? "?"}
         lastApplied={s?.last_applied ?? 0}
         lastEnforced={status?.live?.last_enforced}
+        deviceLabel={s?.device_label !== "Unknown Device"
+          ? `${s?.device_label} - ${s?.chip_label}`
+          : s?.chip_label && s.chip_label !== "unknown"
+            ? s.chip_label
+            : undefined}
       />
 
-      {/* Unsupported device */}
-      {!supported && (
-        <Banner variant="error">
-          This plugin is designed for Steam Deck only. Unsupported device detected.
+      {/* Unknown hardware info */}
+      {supportTier === 3 && (
+        <Banner variant="info">
+          Unknown WiFi hardware detected. Some optimizations may not apply.
         </Banner>
       )}
 
@@ -617,7 +622,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected || !supported || applyingAll || isBusy}
+            disabled={!connected || applyingAll || isBusy}
             onClick={handleOptimize}
           >
             {applyingAll
@@ -634,7 +639,7 @@ function Content() {
         <InfoRow
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
-          explanation="SteamOS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
+          explanation="The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
           {...getBadge("power_save", status, errors.power_save ?? null)}
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy}
@@ -646,7 +651,7 @@ function Content() {
         <InfoRow
           label="Stop background scanning"
           subtitle="Locks to current AP - disable to switch networks or roam"
-          explanation="Your Steam Deck scans for other WiFi networks every 2 minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
+          explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
           {...getBadge("bssid_lock", status, errors.bssid_lock ?? null)}
           checked={s?.bssid_lock_enabled ?? false}
           disabled={isBusy || (!connected && !s?.bssid_lock_enabled)}
@@ -658,7 +663,7 @@ function Content() {
         <InfoRow
           label="Auto-fix on wake"
           subtitle="Reapplies settings after sleep (NM dispatcher)"
-          explanation="SteamOS often resets WiFi settings when the Deck wakes from sleep. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
+          explanation="The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
           {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
           disabled={isBusy}
@@ -684,12 +689,12 @@ function Content() {
       {/* Advanced */}
       <PanelSection title="Advanced">
         <InfoRow
-          label={isOled ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band"}
+          label={supports6GHz ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band"}
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
-            !isOled ? ", and on the LCD model the antennas are shared" : ""
+            isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
           }. Using 5 GHz${
-            isOled ? " or 6 GHz" : ""
+            supports6GHz ? " or 6 GHz" : ""
           } for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`}
           {...getBadge(undefined, status, errors.band_preference ?? null)}
           checked={s?.band_preference_enabled ?? false}
@@ -704,7 +709,7 @@ function Content() {
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
-          explanation="Your internet provider's DNS servers translate domain names (like store.steampowered.com) into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
+          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
           {...getBadge(undefined, status, errors.dns ?? null)}
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || (!connected && !s?.dns_enabled)}
@@ -763,7 +768,7 @@ function Content() {
             handleToggle("ipv6", () => backend.setIpv6(val))
           }
         />
-        {supported && status?.live?.backend_tool_available && (
+        {status?.live?.backend_tool_available && (
           <BackendToggleRow
             status={status}
             backendSwitch={backendSwitch}
@@ -790,7 +795,6 @@ function Content() {
 
       <ActionsSection
         connected={connected}
-        supported={supported}
         isBusy={isBusy}
         onForceReapply={handleForceReapply}
         onReset={handleResetSettings}

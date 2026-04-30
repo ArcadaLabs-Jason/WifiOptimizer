@@ -33,23 +33,31 @@ try:
     d=json.load(open('$SETTINGS_FILE'))
     print(f'POWER_SAVE={\"True\" if d.get(\"power_save_disabled\",True) else \"False\"}')
     print(f'BUFFER_TUNING={\"True\" if d.get(\"buffer_tuning_enabled\",False) else \"False\"}')
+    v=d.get('driver','unknown')
+    print(f'DRIVER={v if v.isalnum() or v.replace(\"_\",\"\").isalnum() else \"unknown\"}')
 except:
     print('POWER_SAVE=True')
     print('BUFFER_TUNING=False')
+    print('DRIVER=unknown')
 " 2>/dev/null)
 else
     POWER_SAVE="True"
     BUFFER_TUNING="False"
+    DRIVER="unknown"
     logger -t "$LOG_TAG" "Settings missing, safe defaults only"
 fi
 
 # Apply power save
 if [ "$POWER_SAVE" = "True" ]; then
     /usr/bin/iw dev "$IFACE" set power_save off 2>/dev/null
-    # LCD (RTL8822CE): disable deep LPS and driver ASPM (silently no-ops on OLED)
-    echo Y > /sys/module/rtw88_core/parameters/disable_lps_deep 2>/dev/null
-    echo Y > /sys/module/rtw88_pci/parameters/disable_aspm 2>/dev/null
-    # Both: disable PCIe ASPM for WiFi device (prevents streaming throughput degradation)
+    # Driver-specific sysfs fixes
+    if [ "$DRIVER" = "rtw88" ]; then
+        echo Y > /sys/module/rtw88_core/parameters/disable_lps_deep 2>/dev/null
+        echo Y > /sys/module/rtw88_pci/parameters/disable_aspm 2>/dev/null
+    elif [ "$DRIVER" = "mt7921e" ]; then
+        echo Y > /sys/module/mt7921e/parameters/disable_aspm 2>/dev/null
+    fi
+    # Disable PCIe ASPM for WiFi device (all drivers)
     WIFI_PCI=$(readlink -f /sys/class/net/"$IFACE"/device 2>/dev/null)
     if [ -d "$WIFI_PCI/link" ]; then
         for f in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
@@ -57,7 +65,7 @@ if [ "$POWER_SAVE" = "True" ]; then
         done
         echo on > "$WIFI_PCI/power/control" 2>/dev/null
     fi
-    logger -t "$LOG_TAG" "power_save off applied to $IFACE"
+    logger -t "$LOG_TAG" "power_save off applied to $IFACE (driver=$DRIVER)"
 fi
 
 # Apply buffer tuning

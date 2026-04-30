@@ -1,6 +1,10 @@
 export interface PluginSettings {
   model: string;
   driver: string;
+  device_family: string;
+  device_label: string;
+  chip_label: string;
+  supports_6ghz: boolean;
   power_save_disabled: boolean;
   auto_fix_on_wake: boolean;
   bssid_lock_enabled: boolean;
@@ -41,7 +45,7 @@ export interface LiveStatus {
 export interface PluginStatus {
   success: boolean;
   connected: boolean;
-  supported: boolean;
+  support_tier: number;
   version?: string;
   settings: PluginSettings;
   live: LiveStatus;
@@ -56,6 +60,7 @@ export interface MethodResult {
   error?: string;
   message?: string;
   detail?: string;
+  reconnected?: boolean;
   [key: string]: unknown;
 }
 
