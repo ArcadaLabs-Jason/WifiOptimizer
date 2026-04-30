@@ -1414,30 +1414,26 @@ class Plugin:
             decky.logger.info(f"Update check: current={current}, channel={channel}")
 
             if channel == "beta":
-                # Use the GitHub contents API instead of raw.githubusercontent.com
-                # to bypass raw's CDN cache (typical 5-15 min TTL), which made
-                # beta updates appear unavailable immediately after a push.
-                # The `Accept: ...raw` header tells the API to return the file
-                # content directly instead of base64-wrapped JSON.
-                result = self._run_cmd(
+                result = await asyncio.to_thread(
+                    self._run_cmd,
                     [
-                        "/usr/bin/curl", "-sL", "--max-time", "10",
+                        "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.raw+json",
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/contents/package.json?ref=beta",
                     ],
-                    timeout=15,
-                    clean_env=True,
+                    15,
+                    True,
                 )
             else:
-                # Fetch latest release
-                result = self._run_cmd(
+                result = await asyncio.to_thread(
+                    self._run_cmd,
                     [
-                        "/usr/bin/curl", "-sL", "--max-time", "10",
+                        "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.v3+json",
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest",
                     ],
-                    timeout=15,
-                    clean_env=True,
+                    15,
+                    True,
                 )
 
             if not result["success"] or not result["stdout"]:
