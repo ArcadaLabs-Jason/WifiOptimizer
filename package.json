@@ -1,6 +1,6 @@
 {
   "name": "wifi-optimizer",
-  "version": "0.9.3-beta",
+  "version": "0.10.0-beta",
   "description": "WiFi optimizer for game streaming on Steam Deck and PC handhelds",
   "type": "module",
   "scripts": {
