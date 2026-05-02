@@ -17,6 +17,7 @@ export const setDns = callable<[enabled: boolean, provider: string, customServer
 export const setIpv6 = callable<[disabled: boolean], MethodResult>("set_ipv6");
 export const setBufferTuning = callable<[enabled: boolean], MethodResult>("set_buffer_tuning");
 export const setCake = callable<[enabled: boolean], MethodResult>("set_cake");
+export const setIrqAffinity = callable<[enabled: boolean], MethodResult>("set_irq_affinity");
 export const optimizeSafe = callable<[], OptimizeSafeResult>("optimize_safe");
 export const reapplyAll = callable<[], OptimizeSafeResult>("reapply_all");
 export const resetSettings = callable<[], MethodResult>("reset_settings");

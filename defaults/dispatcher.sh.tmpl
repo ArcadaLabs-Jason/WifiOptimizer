@@ -36,17 +36,20 @@ try:
     v=d.get('driver','unknown')
     print(f'DRIVER={v if v.isalnum() or v.replace(\"_\",\"\").isalnum() else \"unknown\"}')
     print(f'CAKE={\"True\" if d.get(\"cake_enabled\",False) else \"False\"}')
+    print(f'IRQ_AFFINITY={\"True\" if d.get(\"irq_affinity_enabled\",False) else \"False\"}')
 except:
     print('POWER_SAVE=True')
     print('BUFFER_TUNING=False')
     print('DRIVER=unknown')
     print('CAKE=False')
+    print('IRQ_AFFINITY=False')
 " 2>/dev/null)
 else
     POWER_SAVE="True"
     BUFFER_TUNING="False"
     DRIVER="unknown"
     CAKE="False"
+    IRQ_AFFINITY="False"
     logger -t "$LOG_TAG" "Settings missing, safe defaults only"
 fi
 
@@ -56,6 +59,7 @@ if [ -z "$POWER_SAVE" ]; then
     BUFFER_TUNING="False"
     DRIVER="unknown"
     CAKE="False"
+    IRQ_AFFINITY="False"
     logger -t "$LOG_TAG" "Settings parse failed, safe defaults only"
 fi
 
@@ -106,6 +110,14 @@ if [ "$CAKE" = "True" ]; then
     fi
     tc qdisc replace dev "$IFACE" root cake bandwidth ${BW}mbit diffserv4 nat wash ack-filter 2>/dev/null
     logger -t "$LOG_TAG" "CAKE QoS applied: ${BW}mbit on $IFACE"
+fi
+
+# Apply IRQ affinity pinning
+if [ "$IRQ_AFFINITY" = "True" ]; then
+    for irq in $(grep -E "ath11k|MHI|mt7921|mt76|rtw88|rtl_pci|iwlwifi|$IFACE" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '); do
+        echo 2 > /proc/irq/$irq/smp_affinity 2>/dev/null
+    done
+    logger -t "$LOG_TAG" "IRQ affinity pinned to CPU 1 for $IFACE"
 fi
 
 # Record enforcement timestamp
