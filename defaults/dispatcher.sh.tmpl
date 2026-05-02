@@ -21,6 +21,7 @@ if [ ! -d "$PLUGIN_DIR" ]; then
     logger -t "$LOG_TAG" "Plugin directory gone, removing dispatcher"
     rm -f "$0"
     rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
+    rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf
     rm -f /etc/modprobe.d/99-wifi-optimizer.conf
     exit 0
 fi

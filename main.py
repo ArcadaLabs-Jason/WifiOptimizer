@@ -579,6 +579,8 @@ class Plugin:
             iface = self._get_wifi_interface()
             if iface:
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+                settings = _load_settings()
+                self._revert_irq_affinity(iface, settings.get("driver", "unknown"))
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF]:
                 try:
                     os.remove(path)
@@ -1332,7 +1334,8 @@ class Plugin:
                 return {"success": True, "cake": False}
 
             if enabled:
-                self._run_cmd(["/usr/sbin/modprobe", "sch_cake"], timeout=5)
+                modprobe = "/usr/bin/modprobe" if os.path.isfile("/usr/bin/modprobe") else "/usr/sbin/modprobe"
+                self._run_cmd([modprobe, "sch_cake"], timeout=5)
                 phy_rate = self._get_phy_rate_mbit(iface)
                 if phy_rate > 20:
                     bw = max(int(phy_rate * 0.85), 20)
@@ -1340,7 +1343,7 @@ class Plugin:
                     bw = 100
                 result = self._run_cmd([
                     "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
-                    "cake", f"bandwidth", f"{bw}mbit",
+                    "cake", "bandwidth", f"{bw}mbit",
                     "diffserv4", "nat", "wash", "ack-filter",
                 ])
                 if not result["success"]:
