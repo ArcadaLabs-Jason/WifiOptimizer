@@ -159,6 +159,7 @@ DEFAULT_SETTINGS = {
     "dns_enabled": False,
     "ipv6_disabled": False,
     "buffer_tuning_enabled": False,
+    "cake_enabled": False,
     "last_connection_uuid": "",
     "priority_set": False,
     "distro_id": "unknown",
@@ -567,6 +568,9 @@ class Plugin:
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
             self._remove_dispatcher()
+            iface = self._get_wifi_interface()
+            if iface:
+                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF]:
                 try:
                     os.remove(path)
@@ -965,6 +969,12 @@ class Plugin:
             if settings.get("buffer_tuning_enabled") and current_rmem != "16777216":
                 status["drift"]["buffer_tuning"] = True
 
+            # CAKE QoS
+            cake_active = self._get_cake_status(iface)
+            status["live"]["cake_applied"] = cake_active
+            if settings.get("cake_enabled") and not cake_active:
+                status["drift"]["cake"] = True
+
             # Dispatcher
             status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
 
@@ -1275,18 +1285,81 @@ class Plugin:
             decky.logger.error(f"set_buffer_tuning error: {e}")
             return self._unexpected_response(e)
 
+    def _get_phy_rate_mbit(self, iface: str) -> int:
+        """Read current TX PHY rate in Mbit/s from iw link output."""
+        result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"], timeout=3)
+        for line in result.get("stdout", "").split("\n"):
+            if "tx bitrate:" in line:
+                # e.g. "tx bitrate: 866.7 MBit/s ..."
+                parts = line.split("tx bitrate:", 1)[1].strip().split()
+                if parts:
+                    try:
+                        return int(float(parts[0]))
+                    except (ValueError, IndexError):
+                        pass
+        return 0
+
+    def _get_cake_status(self, iface: str) -> bool:
+        """Check if CAKE qdisc is active on the interface."""
+        result = self._run_cmd(["/usr/bin/tc", "qdisc", "show", "dev", iface])
+        return "cake" in result.get("stdout", "")
+
+    async def set_cake(self, enabled: bool) -> dict:
+        """Enable or disable CAKE QoS traffic shaping."""
+        try:
+            iface = self._get_wifi_interface()
+            if not iface:
+                if enabled:
+                    return {"success": False, "error": "no_wifi", "message": "Not connected to WiFi."}
+                settings = _load_settings()
+                settings["cake_enabled"] = False
+                _save_settings_with_timestamp(settings)
+                return {"success": True, "cake": False}
+
+            if enabled:
+                self._run_cmd(["/usr/sbin/modprobe", "sch_cake"], timeout=5)
+                phy_rate = self._get_phy_rate_mbit(iface)
+                if phy_rate > 20:
+                    bw = max(int(phy_rate * 0.85), 20)
+                else:
+                    bw = 100
+                result = self._run_cmd([
+                    "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
+                    "cake", f"bandwidth", f"{bw}mbit",
+                    "diffserv4", "nat", "wash", "ack-filter",
+                ])
+                if not result["success"]:
+                    return {
+                        "success": False,
+                        "error": "unexpected",
+                        "message": "Failed to apply CAKE qdisc.",
+                        "detail": result.get("stderr", ""),
+                    }
+                decky.logger.info(f"CAKE enabled: {bw}mbit on {iface} (phy={phy_rate})")
+            else:
+                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+                decky.logger.info(f"CAKE disabled on {iface}")
+
+            settings = _load_settings()
+            settings["cake_enabled"] = enabled
+            _save_settings_with_timestamp(settings)
+            return {"success": True, "cake": enabled}
+        except Exception as e:
+            decky.logger.error(f"set_cake error: {e}")
+            return self._unexpected_response(e)
+
     async def optimize_safe(self) -> dict:
-        """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning."""
+        """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning, CAKE."""
         try:
 
             results = {}
             applied = 0
-            total = 4
+            total = 5
 
             # Order matters: BSSID lock reconnects WiFi which resets power_save.
-            # Apply auto-fix and buffer tuning first (no reconnect), then BSSID
-            # lock (reconnects - dispatcher reapplies settings), then power_save
-            # last to ensure it sticks.
+            # Apply auto-fix, buffer tuning, and CAKE first (no reconnect), then
+            # BSSID lock (reconnects - dispatcher reapplies settings), then
+            # power_save last to ensure it sticks.
             r = await self.set_auto_fix(True)
             results["auto_fix"] = r
             if r.get("success"):
@@ -1294,6 +1367,11 @@ class Plugin:
 
             r = await self.set_buffer_tuning(True)
             results["buffer_tuning"] = r
+            if r.get("success"):
+                applied += 1
+
+            r = await self.set_cake(True)
+            results["cake"] = r
             if r.get("success"):
                 applied += 1
 
@@ -1344,6 +1422,13 @@ class Plugin:
                 total += 1
                 r = await self.set_buffer_tuning(True)
                 results["buffer_tuning"] = r
+                if r.get("success"):
+                    applied += 1
+
+            if settings.get("cake_enabled"):
+                total += 1
+                r = await self.set_cake(True)
+                results["cake"] = r
                 if r.get("success"):
                     applied += 1
 
@@ -1422,6 +1507,9 @@ class Plugin:
             # Revert runtime state
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
+            iface = self._get_wifi_interface()
+            if iface:
+                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
             try:
                 os.remove(NM_CONF_PATH)
             except FileNotFoundError:

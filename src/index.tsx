@@ -684,6 +684,18 @@ function Content() {
             handleToggle("buffer_tuning", () => backend.setBufferTuning(val))
           }
         />
+        <InfoRow
+          label="Traffic shaping (CAKE)"
+          subtitle="Reduces bufferbloat and jitter under load"
+          explanation="CAKE manages outgoing network queues to prevent bufferbloat - the latency spikes that happen when your device sends bursts of data alongside game traffic. It prioritizes latency-sensitive packets over bulk transfers. Most useful when other devices share your WiFi or background downloads are running."
+          {...getBadge("cake", status, errors.cake ?? null)}
+          checked={s?.cake_enabled ?? false}
+          disabled={isBusy}
+          error={errors.cake}
+          onChange={(val: boolean) =>
+            handleToggle("cake", () => backend.setCake(val))
+          }
+        />
       </PanelSection>
 
       {/* Advanced */}

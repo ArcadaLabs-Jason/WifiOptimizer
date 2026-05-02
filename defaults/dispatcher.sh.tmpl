@@ -35,15 +35,18 @@ try:
     print(f'BUFFER_TUNING={\"True\" if d.get(\"buffer_tuning_enabled\",False) else \"False\"}')
     v=d.get('driver','unknown')
     print(f'DRIVER={v if v.isalnum() or v.replace(\"_\",\"\").isalnum() else \"unknown\"}')
+    print(f'CAKE={\"True\" if d.get(\"cake_enabled\",False) else \"False\"}')
 except:
     print('POWER_SAVE=True')
     print('BUFFER_TUNING=False')
     print('DRIVER=unknown')
+    print('CAKE=False')
 " 2>/dev/null)
 else
     POWER_SAVE="True"
     BUFFER_TUNING="False"
     DRIVER="unknown"
+    CAKE="False"
     logger -t "$LOG_TAG" "Settings missing, safe defaults only"
 fi
 
@@ -52,6 +55,7 @@ if [ -z "$POWER_SAVE" ]; then
     POWER_SAVE="True"
     BUFFER_TUNING="False"
     DRIVER="unknown"
+    CAKE="False"
     logger -t "$LOG_TAG" "Settings parse failed, safe defaults only"
 fi
 
@@ -88,6 +92,20 @@ if [ "$BUFFER_TUNING" = "True" ]; then
     /usr/bin/sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
     /usr/bin/ip link set "$IFACE" txqueuelen 2000 2>/dev/null
     logger -t "$LOG_TAG" "buffer tuning applied"
+fi
+
+# Apply CAKE QoS
+if [ "$CAKE" = "True" ]; then
+    modprobe sch_cake 2>/dev/null
+    PHYRATE=$(/usr/bin/iw dev "$IFACE" link 2>/dev/null | grep "tx bitrate" | awk '{print $3}' | cut -d. -f1)
+    if [ -n "$PHYRATE" ] && [ "$PHYRATE" -gt 20 ]; then
+        BW=$(( PHYRATE * 85 / 100 ))
+        [ "$BW" -lt 20 ] && BW=20
+    else
+        BW=100
+    fi
+    tc qdisc replace dev "$IFACE" root cake bandwidth ${BW}mbit diffserv4 nat wash ack-filter 2>/dev/null
+    logger -t "$LOG_TAG" "CAKE QoS applied: ${BW}mbit on $IFACE"
 fi
 
 # Record enforcement timestamp

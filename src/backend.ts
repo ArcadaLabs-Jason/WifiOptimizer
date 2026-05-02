@@ -16,6 +16,7 @@ export const setBandPreference = callable<[enabled: boolean, band: string], Meth
 export const setDns = callable<[enabled: boolean, provider: string, customServers: string], MethodResult>("set_dns");
 export const setIpv6 = callable<[disabled: boolean], MethodResult>("set_ipv6");
 export const setBufferTuning = callable<[enabled: boolean], MethodResult>("set_buffer_tuning");
+export const setCake = callable<[enabled: boolean], MethodResult>("set_cake");
 export const optimizeSafe = callable<[], OptimizeSafeResult>("optimize_safe");
 export const reapplyAll = callable<[], OptimizeSafeResult>("reapply_all");
 export const resetSettings = callable<[], MethodResult>("reset_settings");

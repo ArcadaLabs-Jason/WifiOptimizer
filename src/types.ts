@@ -17,6 +17,7 @@ export interface PluginSettings {
   dns_enabled: boolean;
   ipv6_disabled: boolean;
   buffer_tuning_enabled: boolean;
+  cake_enabled: boolean;
   distro_id: string;
   distro_name: string;
   last_connection_uuid: string;
@@ -38,6 +39,7 @@ export interface LiveStatus {
   ipv6_method?: string;
   band?: string;
   buffer_tuning_applied?: boolean;
+  cake_applied?: boolean;
   dispatcher_installed?: boolean;
   last_enforced?: number;
   wifi_backend?: string;
