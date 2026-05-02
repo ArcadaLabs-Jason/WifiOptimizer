@@ -1423,21 +1423,23 @@ class Plugin:
         irqs = self._find_wifi_irqs(iface, driver)
         pinned = 0
         for irq in irqs:
-            path = f"/proc/irq/{irq}/smp_affinity"
-            try:
-                with open(path, "w") as f:
-                    f.write("2")
-                pinned += 1
-            except OSError as e:
-                decky.logger.error(f"IRQ pin failed for {irq}: {e}")
-                # Fallback: try via shell (handles kernel restrictions on direct write)
+            # Try smp_affinity_list first (CPU number), then smp_affinity (hex mask).
+            # Some MSI interrupts reject hex mask writes with EIO but accept list writes.
+            # Use shell with clean_env to avoid Decky's LD_LIBRARY_PATH conflict.
+            for path, val in [
+                (f"/proc/irq/{irq}/smp_affinity_list", "1"),
+                (f"/proc/irq/{irq}/smp_affinity", "2"),
+            ]:
                 result = self._run_cmd(
-                    ["/bin/bash", "-c", f"echo 2 > {path}"], timeout=3
+                    ["/bin/bash", "-c", f"echo {val} > {path}"],
+                    timeout=3,
+                    clean_env=True,
                 )
                 if result["success"]:
                     pinned += 1
-                else:
-                    decky.logger.error(f"IRQ pin shell fallback failed for {irq}: {result['stderr']}")
+                    break
+            else:
+                decky.logger.error(f"IRQ pin failed for {irq}: {result.get('stderr', '')}")
         return pinned
 
     def _revert_irq_affinity(self, iface: str, driver: str) -> int:
@@ -1445,23 +1447,31 @@ class Plugin:
         irqs = self._find_wifi_irqs(iface, driver)
         reverted = 0
         for irq in irqs:
-            path = f"/proc/irq/{irq}/smp_affinity"
-            try:
-                with open(path, "w") as f:
-                    f.write("ff")
-                reverted += 1
-            except OSError:
+            for path, val in [
+                (f"/proc/irq/{irq}/smp_affinity_list", "0-7"),
+                (f"/proc/irq/{irq}/smp_affinity", "ff"),
+            ]:
                 result = self._run_cmd(
-                    ["/bin/bash", "-c", f"echo ff > {path}"], timeout=3
+                    ["/bin/bash", "-c", f"echo {val} > {path}"],
+                    timeout=3,
+                    clean_env=True,
                 )
                 if result["success"]:
                     reverted += 1
+                    break
         return reverted
 
     def _get_irq_pinned(self, iface: str, driver: str) -> bool:
         """Check if any WiFi IRQ is pinned to CPU 1."""
         irqs = self._find_wifi_irqs(iface, driver)
         for irq in irqs:
+            try:
+                with open(f"/proc/irq/{irq}/smp_affinity_list") as f:
+                    val = f.read().strip()
+                    if val == "1":
+                        return True
+            except OSError:
+                pass
             try:
                 with open(f"/proc/irq/{irq}/smp_affinity") as f:
                     val = f.read().strip()
