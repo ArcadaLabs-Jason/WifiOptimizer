@@ -307,6 +307,8 @@ class Plugin:
                 with open(path, "r") as f:
                     for line in f:
                         line = line.strip()
+                        if not line or line.startswith("#") or line.startswith(";"):
+                            continue
                         if line.startswith("wifi.backend"):
                             _, _, val = line.partition("=")
                             val = val.strip()
@@ -534,7 +536,7 @@ class Plugin:
             settings["distro_name"] = distro["name"]
             _save_settings(settings)
 
-            if settings.get("driver") in DRIVER_PROFILES and settings.get("auto_fix_on_wake", True):
+            if settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
 
             # Sanity check: does the conf-declared backend match what's actually
@@ -576,8 +578,13 @@ class Plugin:
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
             self._remove_dispatcher()
+            self._apply_driver_fixes(False)
+            self._apply_pcie_aspm_fix(False)
+            for key, value in SYSCTL_DEFAULTS.items():
+                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
             iface = self._get_wifi_interface()
             if iface:
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
                 settings = _load_settings()
                 self._revert_irq_affinity(iface, settings.get("driver", "unknown"))
@@ -1615,8 +1622,11 @@ class Plugin:
             # Revert runtime state
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
+            for key, value in SYSCTL_DEFAULTS.items():
+                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
             iface = self._get_wifi_interface()
             if iface:
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
                 driver = _load_settings().get("driver", "unknown")
                 self._revert_irq_affinity(iface, driver)
@@ -1988,15 +1998,13 @@ systemctl restart plugin_loader 2>/dev/null || true
             self._backend_switch["phase"] = "switching"
             decky.logger.info(f"generic backend switch: {other} -> {target}")
 
+            os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
             if target == "iwd":
-                os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
                 with open(GENERIC_BACKEND_CONF, "w") as f:
                     f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
             else:
-                try:
-                    os.remove(GENERIC_BACKEND_CONF)
-                except FileNotFoundError:
-                    pass
+                with open(GENERIC_BACKEND_CONF, "w") as f:
+                    f.write("[device]\nwifi.backend=wpa_supplicant\n")
 
             # Stop old, enable + start new, restart NM
             for cmd in [

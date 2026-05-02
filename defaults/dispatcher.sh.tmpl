@@ -101,7 +101,7 @@ fi
 
 # Apply CAKE QoS
 if [ "$CAKE" = "True" ]; then
-    modprobe sch_cake 2>/dev/null
+    /usr/bin/modprobe sch_cake 2>/dev/null || /usr/sbin/modprobe sch_cake 2>/dev/null
     PHYRATE=$(/usr/bin/iw dev "$IFACE" link 2>/dev/null | grep "tx bitrate" | awk '{print $3}' | cut -d. -f1)
     if [ -n "$PHYRATE" ] && [ "$PHYRATE" -gt 20 ]; then
         BW=$(( PHYRATE * 85 / 100 ))
@@ -109,7 +109,7 @@ if [ "$CAKE" = "True" ]; then
     else
         BW=100
     fi
-    tc qdisc replace dev "$IFACE" root cake bandwidth ${BW}mbit diffserv4 nat wash ack-filter 2>/dev/null
+    /usr/bin/tc qdisc replace dev "$IFACE" root cake bandwidth ${BW}mbit diffserv4 nat wash ack-filter 2>/dev/null
     logger -t "$LOG_TAG" "CAKE QoS applied: ${BW}mbit on $IFACE"
 fi
 
