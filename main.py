@@ -82,7 +82,7 @@ DRIVER_PROFILES = {
 DRIVER_IRQ_TERMS = {
     "ath11k_pci": ["ath11k", "mhi"],
     "mt7921e": ["mt7921", "mt76"],
-    "rtw88": ["rtw88", "rtl_pci"],
+    "rtw88": ["rtw88", "rtl_pci", "rtw_pci"],
     "iwlwifi": ["iwlwifi"],
 }
 
@@ -280,8 +280,12 @@ class Plugin:
     def _get_backend_method(self) -> str:
         """Return 'steamos', 'generic', or 'none'.
         SteamOS has a privileged helper. Generic uses NM conf + systemctl
-        directly and requires iwd to be installed."""
-        if os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK):
+        directly and requires iwd to be installed. Non-SteamOS distros
+        always use generic even if the SteamOS helper exists (it may
+        behave differently on Bazzite/CachyOS)."""
+        settings = _load_settings()
+        distro = settings.get("distro_id", "unknown")
+        if distro == "steamos" and os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK):
             return "steamos"
         if os.path.isfile("/usr/lib/systemd/system/iwd.service"):
             return "generic"
@@ -423,7 +427,9 @@ class Plugin:
         Works on all PCIe-attached WiFi adapters."""
         try:
             # Discover WiFi PCI device path dynamically
-            iface = self._get_wifi_interface() or "wlan0"
+            iface = self._get_wifi_interface()
+            if not iface:
+                return
             device_link = os.path.realpath(f"/sys/class/net/{iface}/device")
             if not os.path.isdir(device_link):
                 return
@@ -538,6 +544,24 @@ class Plugin:
 
             if settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
+
+            # Apply volatile settings that may have been lost on reboot.
+            # The dispatcher handles reconnects, but on a fresh boot WiFi
+            # connects before the plugin starts, so we apply here too.
+            iface = self._get_wifi_interface()
+            if iface:
+                if settings.get("cake_enabled"):
+                    try:
+                        await self.set_cake(True)
+                    except Exception as e:
+                        decky.logger.error(f"Startup CAKE apply failed: {e}")
+                if settings.get("irq_affinity_enabled"):
+                    try:
+                        driver = settings.get("driver", "unknown")
+                        count = self._apply_irq_affinity(iface, driver)
+                        decky.logger.info(f"Startup IRQ affinity: pinned {count} IRQs")
+                    except Exception as e:
+                        decky.logger.error(f"Startup IRQ affinity failed: {e}")
 
             # Sanity check: does the conf-declared backend match what's actually
             # running? Divergence would indicate a previous switch got interrupted

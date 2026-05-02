@@ -109,16 +109,28 @@ if [ "$CAKE" = "True" ]; then
     else
         BW=100
     fi
-    /usr/bin/tc qdisc replace dev "$IFACE" root cake bandwidth ${BW}mbit diffserv4 nat wash ack-filter 2>/dev/null
-    logger -t "$LOG_TAG" "CAKE QoS applied: ${BW}mbit on $IFACE"
+    if /usr/bin/tc qdisc replace dev "$IFACE" root cake bandwidth ${BW}mbit diffserv4 nat wash ack-filter 2>/dev/null; then
+        logger -t "$LOG_TAG" "CAKE QoS applied: ${BW}mbit on $IFACE"
+    else
+        logger -t "$LOG_TAG" "CAKE QoS failed on $IFACE (sch_cake may not be available)"
+    fi
 fi
 
-# Apply IRQ affinity pinning
+# Apply IRQ affinity pinning (driver-aware to avoid pinning unrelated IRQs)
 if [ "$IRQ_AFFINITY" = "True" ]; then
-    for irq in $(grep -iE "ath11k|mhi|mt7921|mt76|rtw88|rtl_pci|iwlwifi|$IFACE" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '); do
-        echo 2 > /proc/irq/$irq/smp_affinity 2>/dev/null
+    IRQ_PATTERN="$IFACE"
+    case "$DRIVER" in
+        ath11k_pci) IRQ_PATTERN="ath11k|mhi|$IFACE" ;;
+        mt7921e)    IRQ_PATTERN="mt7921|mt76|$IFACE" ;;
+        rtw88)      IRQ_PATTERN="rtw88|rtl_pci|rtw_pci|$IFACE" ;;
+        iwlwifi)    IRQ_PATTERN="iwlwifi|$IFACE" ;;
+    esac
+    PINNED=0
+    for irq in $(grep -iE "$IRQ_PATTERN" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '); do
+        [ "$irq" -eq "$irq" ] 2>/dev/null || continue
+        echo 2 > /proc/irq/$irq/smp_affinity 2>/dev/null && PINNED=$((PINNED+1))
     done
-    logger -t "$LOG_TAG" "IRQ affinity pinned to CPU 1 for $IFACE"
+    [ "$PINNED" -gt 0 ] && logger -t "$LOG_TAG" "IRQ affinity: pinned $PINNED IRQs to CPU 1 for $IFACE"
 fi
 
 # Record enforcement timestamp
