@@ -17,6 +17,8 @@ export interface PluginSettings {
   dns_enabled: boolean;
   ipv6_disabled: boolean;
   buffer_tuning_enabled: boolean;
+  distro_id: string;
+  distro_name: string;
   last_connection_uuid: string;
   priority_set: boolean;
   update_channel: string;

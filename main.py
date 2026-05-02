@@ -36,6 +36,8 @@ MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
 BACKEND_HELPER = "/usr/bin/steamos-polkit-helpers/steamos-wifi-set-backend-privileged"
 WIFI_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-valve-wifi-backend.conf"
 NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-steamos-defaults.conf"
+GENERIC_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf"
+BAZZITE_IWD_CONF = "/etc/NetworkManager/conf.d/iwd.conf"
 
 DRIVER_PROFILES = {
     "rtw88": {
@@ -159,6 +161,8 @@ DEFAULT_SETTINGS = {
     "buffer_tuning_enabled": False,
     "last_connection_uuid": "",
     "priority_set": False,
+    "distro_id": "unknown",
+    "distro_name": "Unknown",
     "update_channel": "stable",
     "last_applied": 0,
 }
@@ -264,19 +268,32 @@ class Plugin:
                 return parts[0]
         return None
 
+    def _get_backend_method(self) -> str:
+        """Return 'steamos', 'generic', or 'none'.
+        SteamOS has a privileged helper. Generic uses NM conf + systemctl
+        directly and requires iwd to be installed."""
+        if os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK):
+            return "steamos"
+        if os.path.isfile("/usr/lib/systemd/system/iwd.service"):
+            return "generic"
+        return "none"
+
     def _has_backend_tool(self) -> bool:
-        # Privileged helper is what we actually invoke - calling the wrapper fails
-        # from a root systemd context because it goes through pkexec.
-        return os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK)
+        return self._get_backend_method() != "none"
 
     def _get_current_backend(self) -> str | None:
         """Return 'iwd', 'wpa_supplicant', or None if unknown.
 
-        Reads user override (99-valve-wifi-backend.conf) first, then the
-        SteamOS default (10-steamos-defaults.conf). Matches the same resolution
-        order that steamos-wifi-set-backend itself uses.
+        Checks config files in priority order: our own generic conf, Bazzite's
+        iwd conf, SteamOS override, SteamOS defaults. Falls back to checking
+        which systemd service is active.
         """
-        for path in (WIFI_BACKEND_CONF, NM_DEFAULT_CONF):
+        for path in (
+            GENERIC_BACKEND_CONF,
+            BAZZITE_IWD_CONF,
+            WIFI_BACKEND_CONF,
+            NM_DEFAULT_CONF,
+        ):
             try:
                 with open(path, "r") as f:
                     for line in f:
@@ -290,6 +307,15 @@ class Plugin:
                 continue
             except Exception:
                 continue
+        # No config found — check which service is running
+        result = self._run_cmd(["/usr/bin/systemctl", "is-active", "iwd"], timeout=3)
+        if result.get("stdout", "").strip() == "active":
+            return "iwd"
+        result = self._run_cmd(
+            ["/usr/bin/systemctl", "is-active", "wpa_supplicant"], timeout=3
+        )
+        if result.get("stdout", "").strip() == "active":
+            return "wpa_supplicant"
         return None
 
     def _ensure_backend_switch_state(self):
@@ -494,6 +520,9 @@ class Plugin:
             settings["device_label"] = info.get("device_label", "Unknown Device")
             settings["chip_label"] = info.get("chip_label", "unknown")
             settings["supports_6ghz"] = info.get("supports_6ghz", False)
+            distro = self._detect_distro()
+            settings["distro_id"] = distro["id"]
+            settings["distro_name"] = distro["name"]
             _save_settings(settings)
 
             if settings.get("driver") in DRIVER_PROFILES and settings.get("auto_fix_on_wake", True):
@@ -503,7 +532,7 @@ class Plugin:
             # running? Divergence would indicate a previous switch got interrupted
             # (plugin_loader crash, external tool, etc.). Log only; user can
             # re-toggle to resolve.
-            if self._has_backend_tool():
+            if self._get_backend_method() != "none":
                 conf_backend = self._get_current_backend()
                 if conf_backend:
                     active = self._run_cmd(
@@ -520,7 +549,7 @@ class Plugin:
             decky.logger.info(
                 f"WiFi Optimizer ready: device={info.get('device_label')}, "
                 f"family={info.get('device_family')}, driver={info.get('driver')}, "
-                f"chip={info.get('chip_label')}"
+                f"chip={info.get('chip_label')}, distro={distro['id']}"
             )
         except Exception as e:
             decky.logger.error(f"WiFi Optimizer _main error: {e}")
@@ -538,7 +567,7 @@ class Plugin:
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
             self._remove_dispatcher()
-            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH]:
+            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF]:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -587,6 +616,20 @@ class Plugin:
             return module
         except Exception:
             return "unknown"
+
+    def _detect_distro(self) -> dict:
+        """Detect OS from /etc/os-release. Returns {id, name}."""
+        info = {"id": "unknown", "name": "Unknown"}
+        try:
+            with open("/etc/os-release", "r") as f:
+                for line in f:
+                    if line.startswith("ID="):
+                        info["id"] = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("PRETTY_NAME="):
+                        info["name"] = line.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return info
 
     async def get_device_info(self) -> dict:
         try:
@@ -694,6 +737,7 @@ class Plugin:
                     os_release = f.read()
             except Exception:
                 pass
+            distro = self._detect_distro()
             return {
                 "success": True,
                 "device_info": info,
@@ -702,6 +746,8 @@ class Plugin:
                 "iw_reg": iw_reg.get("stdout", ""),
                 "kernel": uname.get("stdout", "").strip(),
                 "os_release": os_release,
+                "distro_id": distro["id"],
+                "distro_name": distro["name"],
                 "support_tier": self._get_support_tier(),
             }
         except Exception as e:
@@ -1392,6 +1438,10 @@ class Plugin:
                 os.remove(ENFORCED_FILE)
             except FileNotFoundError:
                 pass
+            try:
+                os.remove(GENERIC_BACKEND_CONF)
+            except FileNotFoundError:
+                pass
 
             # Repopulate model/driver so the plugin doesn't show as "UNKNOWN /
             # Unsupported device" until the next plugin reload. Mirrors the
@@ -1404,6 +1454,9 @@ class Plugin:
             fresh["device_label"] = info.get("device_label", "Unknown Device")
             fresh["chip_label"] = info.get("chip_label", "unknown")
             fresh["supports_6ghz"] = info.get("supports_6ghz", False)
+            distro = self._detect_distro()
+            fresh["distro_id"] = distro["id"]
+            fresh["distro_name"] = distro["name"]
             _save_settings(fresh)
 
             decky.logger.info("Settings reset to defaults")
@@ -1728,6 +1781,110 @@ systemctl restart plugin_loader 2>/dev/null || true
         finally:
             self._backend_switch["in_progress"] = False
 
+    async def _generic_backend_switch_worker(self, target: str):
+        """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
+        Writes NM config directly and manages systemd services."""
+        try:
+            other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
+
+            self._backend_switch["phase"] = "switching"
+            decky.logger.info(f"generic backend switch: {other} -> {target}")
+
+            if target == "iwd":
+                os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
+                with open(GENERIC_BACKEND_CONF, "w") as f:
+                    f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
+            else:
+                try:
+                    os.remove(GENERIC_BACKEND_CONF)
+                except FileNotFoundError:
+                    pass
+
+            # Stop old, enable + start new, restart NM
+            for cmd in [
+                ["/usr/bin/systemctl", "stop", other],
+                ["/usr/bin/systemctl", "disable", other],
+                ["/usr/bin/systemctl", "enable", target],
+                ["/usr/bin/systemctl", "start", target],
+            ]:
+                await asyncio.to_thread(self._run_cmd, cmd, 10, True)
+
+            restart = await asyncio.to_thread(
+                self._run_cmd,
+                ["/usr/bin/systemctl", "restart", "NetworkManager"],
+                15,
+                True,
+            )
+            if not restart["success"]:
+                detail = restart.get("stderr", "")[:200]
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": self._friendly_backend_error(detail),
+                    "detail": detail,
+                }
+                return
+
+            # Phase: reconnecting
+            self._backend_switch["phase"] = "reconnecting"
+            reconnect_timed_out = True
+            for _ in range(15):
+                await asyncio.sleep(1)
+                iface = await asyncio.to_thread(self._get_wifi_interface)
+                if iface:
+                    uuid = await asyncio.to_thread(self._get_active_connection_uuid)
+                    if uuid:
+                        reconnect_timed_out = False
+                        break
+
+            final_backend = await asyncio.to_thread(self._get_current_backend)
+
+            if final_backend == target:
+                self._backend_switch["phase"] = "done"
+                self._backend_switch["result"] = {
+                    "success": True,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": False,
+                    "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
+                }
+            else:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": False,
+                    "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
+                    "message": f"Expected {target} but got {final_backend}. A reboot may help.",
+                }
+
+            decky.logger.info(
+                f"generic backend switch: target={target}, final={final_backend}, "
+                f"reconnect_timed_out={reconnect_timed_out}"
+            )
+        except asyncio.CancelledError:
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": "Backend switch cancelled",
+            }
+            raise
+        except Exception as e:
+            decky.logger.error(f"_generic_backend_switch_worker error: {e}")
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": str(e),
+            }
+        finally:
+            self._backend_switch["in_progress"] = False
+
     async def start_backend_switch(self, backend: str) -> dict:
         """Kick off a backend switch. Returns immediately; poll get_backend_switch_status for progress."""
         try:
@@ -1766,10 +1923,13 @@ systemctl restart plugin_loader 2>/dev/null || true
                 "started_at": int(time.time()),
                 "result": None,
             })
-            # Keep a reference so the task isn't garbage-collected mid-run
-            self._backend_switch_task = asyncio.create_task(
-                self._backend_switch_worker(backend)
-            )
+            # Route to the appropriate worker based on backend method
+            method = self._get_backend_method()
+            if method == "steamos":
+                worker = self._backend_switch_worker(backend)
+            else:
+                worker = self._generic_backend_switch_worker(backend)
+            self._backend_switch_task = asyncio.create_task(worker)
             decky.logger.info(f"backend switch started: {current} -> {backend}")
             return {
                 "accepted": True,
