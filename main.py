@@ -1496,8 +1496,21 @@ class Plugin:
                 return {"success": True, "irq_affinity": False}
 
             if enabled:
+                irqs = self._find_wifi_irqs(iface, driver)
+                if not irqs:
+                    return {
+                        "success": False,
+                        "error": "unexpected",
+                        "message": "No WiFi interrupts found for this driver.",
+                    }
                 count = self._apply_irq_affinity(iface, driver)
-                decky.logger.info(f"IRQ affinity: pinned {count} IRQs to CPU 1 for {iface}")
+                decky.logger.info(f"IRQ affinity: pinned {count}/{len(irqs)} IRQs to CPU 1 for {iface}")
+                if count == 0:
+                    return {
+                        "success": False,
+                        "error": "unexpected",
+                        "message": "Your WiFi chip's interrupts are managed by the kernel and can't be pinned.",
+                    }
             else:
                 count = self._revert_irq_affinity(iface, driver)
                 decky.logger.info(f"IRQ affinity: reverted {count} IRQs for {iface}")
