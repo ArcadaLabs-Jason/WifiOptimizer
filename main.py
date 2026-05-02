@@ -1309,27 +1309,13 @@ class Plugin:
             decky.logger.error(f"set_buffer_tuning error: {e}")
             return self._unexpected_response(e)
 
-    def _get_phy_rate_mbit(self, iface: str) -> int:
-        """Read current TX PHY rate in Mbit/s from iw link output."""
-        result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"], timeout=3)
-        for line in result.get("stdout", "").split("\n"):
-            if "tx bitrate:" in line:
-                # e.g. "tx bitrate: 866.7 MBit/s ..."
-                parts = line.split("tx bitrate:", 1)[1].strip().split()
-                if parts:
-                    try:
-                        return int(float(parts[0]))
-                    except (ValueError, IndexError):
-                        pass
-        return 0
-
     def _get_cake_status(self, iface: str) -> bool:
         """Check if CAKE qdisc is active on the interface."""
         result = self._run_cmd(["/usr/bin/tc", "qdisc", "show", "dev", iface])
         return "cake" in result.get("stdout", "")
 
     async def set_cake(self, enabled: bool) -> dict:
-        """Enable or disable CAKE QoS traffic shaping."""
+        """Enable or disable CAKE QoS (unlimited mode: FQ + AQM + ack-filter, no bandwidth shaper)."""
         try:
             iface = self._get_wifi_interface()
             if not iface:
@@ -1343,15 +1329,9 @@ class Plugin:
             if enabled:
                 modprobe = "/usr/bin/modprobe" if os.path.isfile("/usr/bin/modprobe") else "/usr/sbin/modprobe"
                 self._run_cmd([modprobe, "sch_cake"], timeout=5)
-                phy_rate = self._get_phy_rate_mbit(iface)
-                if phy_rate > 20:
-                    bw = max(int(phy_rate * 0.85), 20)
-                else:
-                    bw = 100
                 result = self._run_cmd([
                     "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
-                    "cake", "bandwidth", f"{bw}mbit",
-                    "diffserv4", "nat", "wash", "ack-filter",
+                    "cake", "unlimited", "diffserv4", "nat", "ack-filter",
                 ])
                 if not result["success"]:
                     return {
@@ -1360,9 +1340,15 @@ class Plugin:
                         "message": "Failed to apply CAKE qdisc.",
                         "detail": result.get("stderr", ""),
                     }
-                decky.logger.info(f"CAKE enabled: {bw}mbit on {iface} (phy={phy_rate})")
+                # Lower txqueuelen to complement CAKE's queue management
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"])
+                decky.logger.info(f"CAKE enabled (unlimited) on {iface}")
             else:
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+                # Restore txqueuelen based on whether buffer tuning is active
+                settings = _load_settings()
+                txq = "2000" if settings.get("buffer_tuning_enabled") else "1000"
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
                 decky.logger.info(f"CAKE disabled on {iface}")
 
             settings = _load_settings()
@@ -1374,17 +1360,17 @@ class Plugin:
             return self._unexpected_response(e)
 
     async def optimize_safe(self) -> dict:
-        """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning, CAKE."""
+        """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning."""
         try:
 
             results = {}
             applied = 0
-            total = 5
+            total = 4
 
             # Order matters: BSSID lock reconnects WiFi which resets power_save.
-            # Apply auto-fix, buffer tuning, and CAKE first (no reconnect), then
-            # BSSID lock (reconnects - dispatcher reapplies settings), then
-            # power_save last to ensure it sticks.
+            # Apply auto-fix and buffer tuning first (no reconnect), then BSSID
+            # lock (reconnects - dispatcher reapplies settings), then power_save
+            # last to ensure it sticks.
             r = await self.set_auto_fix(True)
             results["auto_fix"] = r
             if r.get("success"):
@@ -1392,11 +1378,6 @@ class Plugin:
 
             r = await self.set_buffer_tuning(True)
             results["buffer_tuning"] = r
-            if r.get("success"):
-                applied += 1
-
-            r = await self.set_cake(True)
-            results["cake"] = r
             if r.get("success"):
                 applied += 1
 

@@ -1,4 +1,4 @@
-# WiFi Optimizer v0.11.0-beta
+# WiFi Optimizer v0.11.1-beta
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
@@ -31,15 +31,14 @@ Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > 
 ## Getting started
 
 1. Open WiFi Optimizer from the Decky sidebar
-2. Tap **Optimize Safe** - this applies five no-brainer optimizations that are always beneficial:
+2. Tap **Optimize Safe** - this applies four no-brainer optimizations that are always beneficial:
    - Disables WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
    - Locks your BSSID (stops background scanning interruptions)
    - Enables auto-fix on wake (reapplies settings after sleep)
    - Tunes network buffers (handles streaming traffic bursts)
-   - Enables CAKE traffic shaping (reduces bufferbloat and jitter)
 3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
 
-Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5/6 GHz, custom DNS, disabling IPv6, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
+Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5/6 GHz, custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
 
 ## All optimizations
 
@@ -51,13 +50,13 @@ Want to go further? The remaining optimizations are available as individual togg
 | Stop background scanning | Locks to your current access point so your device stops scanning for other networks every few minutes. Disable before switching networks or if you use a mesh/multi-AP setup and need to roam. |
 | Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects - works even if Decky isn't running |
 | Network buffer tuning | Increases kernel buffer sizes and TX queue length to handle bursty streaming traffic without dropping packets |
-| Traffic shaping (CAKE) | Manages outgoing network queues to prevent bufferbloat, automatically sized to 85% of your link speed |
 
 **Manual opt-in (require configuration or have tradeoffs)**
 
 | Optimization | What it does | Why it's manual |
 |---|---|---|
 | Force 5 GHz / 6 GHz | Locks WiFi to the higher-frequency band to avoid Bluetooth interference | Won't connect if your network is 2.4 GHz only |
+| Traffic shaping (CAKE) | Replaces the default network queue with CAKE for fair queuing, bufferbloat prevention, and ACK filtering. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
 | WiFi backend (iwd / wpa_supplicant) | Switches between the default `iwd` and the older `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. | Only available when both backends are installed on the system; some networks (certain WPA3, enterprise setups) behave differently between the two |

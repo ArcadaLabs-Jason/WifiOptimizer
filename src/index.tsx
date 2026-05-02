@@ -508,9 +508,7 @@ function Content() {
     !status?.drift?.bssid_lock &&
     status?.live?.dispatcher_installed &&
     status?.live?.buffer_tuning_applied &&
-    !status?.drift?.buffer_tuning &&
-    status?.live?.cake_applied &&
-    !status?.drift?.cake;
+    !status?.drift?.buffer_tuning;
 
   return (
     <>
@@ -686,18 +684,6 @@ function Content() {
             handleToggle("buffer_tuning", () => backend.setBufferTuning(val))
           }
         />
-        <InfoRow
-          label="Traffic shaping (CAKE)"
-          subtitle="Reduces bufferbloat and jitter under load"
-          explanation="CAKE manages outgoing network queues to prevent bufferbloat - the latency spikes that happen when your device sends bursts of data alongside game traffic. It automatically sizes itself to 85% of your current link speed and prioritizes latency-sensitive packets over bulk transfers. Most useful when other devices share your WiFi or background downloads are running."
-          {...getBadge("cake", status, errors.cake ?? null)}
-          checked={s?.cake_enabled ?? false}
-          disabled={isBusy || (!connected && !s?.cake_enabled)}
-          error={errors.cake}
-          onChange={(val: boolean) =>
-            handleToggle("cake", () => backend.setCake(val))
-          }
-        />
       </PanelSection>
 
       {/* Advanced */}
@@ -780,6 +766,18 @@ function Content() {
           error={errors.ipv6}
           onChange={(val: boolean) =>
             handleToggle("ipv6", () => backend.setIpv6(val))
+          }
+        />
+        <InfoRow
+          label="Traffic shaping (CAKE)"
+          subtitle="Fair queuing and bufferbloat prevention"
+          explanation="Replaces the default network queue with CAKE, which isolates traffic flows so a background download or another device can't starve your game stream. Also filters redundant TCP acknowledgments and prioritizes latency-sensitive packets. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
+          {...getBadge("cake", status, errors.cake ?? null)}
+          checked={s?.cake_enabled ?? false}
+          disabled={isBusy || (!connected && !s?.cake_enabled)}
+          error={errors.cake}
+          onChange={(val: boolean) =>
+            handleToggle("cake", () => backend.setCake(val))
           }
         />
         {status?.live?.backend_tool_available && (
