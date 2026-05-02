@@ -115,7 +115,7 @@ fi
 
 # Apply IRQ affinity pinning
 if [ "$IRQ_AFFINITY" = "True" ]; then
-    for irq in $(grep -E "ath11k|MHI|mt7921|mt76|rtw88|rtl_pci|iwlwifi|$IFACE" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '); do
+    for irq in $(grep -iE "ath11k|mhi|mt7921|mt76|rtw88|rtl_pci|iwlwifi|$IFACE" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '); do
         echo 2 > /proc/irq/$irq/smp_affinity 2>/dev/null
     done
     logger -t "$LOG_TAG" "IRQ affinity pinned to CPU 1 for $IFACE"

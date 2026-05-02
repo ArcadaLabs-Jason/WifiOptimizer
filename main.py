@@ -80,7 +80,7 @@ DRIVER_PROFILES = {
 }
 
 DRIVER_IRQ_TERMS = {
-    "ath11k_pci": ["ath11k", "MHI"],
+    "ath11k_pci": ["ath11k", "mhi"],
     "mt7921e": ["mt7921", "mt76"],
     "rtw88": ["rtw88", "rtl_pci"],
     "iwlwifi": ["iwlwifi"],
@@ -1381,7 +1381,8 @@ class Plugin:
         try:
             with open("/proc/interrupts") as f:
                 for line in f:
-                    if any(term in line for term in search_terms):
+                    lower = line.lower()
+                    if any(term in lower for term in search_terms):
                         irq = line.strip().split(":")[0].strip()
                         if irq.isdigit():
                             irqs.append(irq)
