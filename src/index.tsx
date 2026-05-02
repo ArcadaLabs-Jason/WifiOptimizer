@@ -508,7 +508,9 @@ function Content() {
     !status?.drift?.bssid_lock &&
     status?.live?.dispatcher_installed &&
     status?.live?.buffer_tuning_applied &&
-    !status?.drift?.buffer_tuning;
+    !status?.drift?.buffer_tuning &&
+    status?.live?.cake_applied &&
+    !status?.drift?.cake;
 
   return (
     <>
@@ -687,10 +689,10 @@ function Content() {
         <InfoRow
           label="Traffic shaping (CAKE)"
           subtitle="Reduces bufferbloat and jitter under load"
-          explanation="CAKE manages outgoing network queues to prevent bufferbloat - the latency spikes that happen when your device sends bursts of data alongside game traffic. It prioritizes latency-sensitive packets over bulk transfers. Most useful when other devices share your WiFi or background downloads are running."
+          explanation="CAKE manages outgoing network queues to prevent bufferbloat - the latency spikes that happen when your device sends bursts of data alongside game traffic. It automatically sizes itself to 85% of your current link speed and prioritizes latency-sensitive packets over bulk transfers. Most useful when other devices share your WiFi or background downloads are running."
           {...getBadge("cake", status, errors.cake ?? null)}
           checked={s?.cake_enabled ?? false}
-          disabled={isBusy}
+          disabled={isBusy || (!connected && !s?.cake_enabled)}
           error={errors.cake}
           onChange={(val: boolean) =>
             handleToggle("cake", () => backend.setCake(val))
@@ -783,10 +785,10 @@ function Content() {
         <InfoRow
           label="Pin WiFi to dedicated CPU"
           subtitle="Reduces network jitter by dedicating a CPU core"
-          explanation="By default, WiFi interrupt processing bounces between CPU cores, which causes cache misses and micro-latency. Pinning WiFi interrupts to a dedicated core keeps the processing cache-warm and avoids contention with the game and display compositor on other cores."
+          explanation="By default, WiFi interrupt processing bounces between CPU cores, which causes cache misses and micro-latency. Pinning WiFi interrupts to a dedicated core (CPU 1) keeps the processing cache-warm and avoids contention with the game and display compositor on other cores. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
           {...getBadge("irq_affinity", status, errors.irq_affinity ?? null)}
           checked={s?.irq_affinity_enabled ?? false}
-          disabled={isBusy}
+          disabled={isBusy || (!connected && !s?.irq_affinity_enabled)}
           error={errors.irq_affinity}
           onChange={(val: boolean) =>
             handleToggle("irq_affinity", () => backend.setIrqAffinity(val))

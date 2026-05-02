@@ -4,8 +4,8 @@ Runs as root inside the plugin_loader process. All public async methods on
 the Plugin class are callable from the React frontend via Decky's IPC. State
 is persisted to settings.json under DECKY_PLUGIN_SETTINGS_DIR and shared with
 the NetworkManager dispatcher script at defaults/dispatcher.sh.tmpl, which
-reapplies volatile optimizations (power save, PCIe ASPM, buffer tuning) on
-every WiFi reconnect independently of Decky.
+reapplies volatile optimizations (power save, PCIe ASPM, buffer tuning, CAKE
+QoS, IRQ affinity) on every WiFi reconnect independently of Decky.
 """
 
 import os
