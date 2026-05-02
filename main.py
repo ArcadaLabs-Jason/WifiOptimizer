@@ -5,7 +5,7 @@ the Plugin class are callable from the React frontend via Decky's IPC. State
 is persisted to settings.json under DECKY_PLUGIN_SETTINGS_DIR and shared with
 the NetworkManager dispatcher script at defaults/dispatcher.sh.tmpl, which
 reapplies volatile optimizations (power save, PCIe ASPM, buffer tuning, CAKE
-QoS, IRQ affinity) on every WiFi reconnect independently of Decky.
+QoS) on every WiFi reconnect independently of Decky.
 """
 
 import os
@@ -77,13 +77,6 @@ DRIVER_PROFILES = {
             "options iwlmvm power_scheme=1",
         ],
     },
-}
-
-DRIVER_IRQ_TERMS = {
-    "ath11k_pci": ["ath11k", "mhi"],
-    "mt7921e": ["mt7921", "mt76"],
-    "rtw88": ["rtw88", "rtl_pci", "rtw_pci"],
-    "iwlwifi": ["iwlwifi"],
 }
 
 DMI_DEVICES = {
@@ -167,7 +160,6 @@ DEFAULT_SETTINGS = {
     "ipv6_disabled": False,
     "buffer_tuning_enabled": False,
     "cake_enabled": False,
-    "irq_affinity_enabled": False,
     "last_connection_uuid": "",
     "priority_set": False,
     "distro_id": "unknown",
@@ -555,13 +547,6 @@ class Plugin:
                         await self.set_cake(True)
                     except Exception as e:
                         decky.logger.error(f"Startup CAKE apply failed: {e}")
-                if settings.get("irq_affinity_enabled"):
-                    try:
-                        driver = settings.get("driver", "unknown")
-                        count = self._apply_irq_affinity(iface, driver)
-                        decky.logger.info(f"Startup IRQ affinity: pinned {count} IRQs")
-                    except Exception as e:
-                        decky.logger.error(f"Startup IRQ affinity failed: {e}")
 
             # Sanity check: does the conf-declared backend match what's actually
             # running? Divergence would indicate a previous switch got interrupted
@@ -610,8 +595,6 @@ class Plugin:
             if iface:
                 self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
-                settings = _load_settings()
-                self._revert_irq_affinity(iface, settings.get("driver", "unknown"))
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF]:
                 try:
                     os.remove(path)
@@ -1016,13 +999,6 @@ class Plugin:
             if settings.get("cake_enabled") and not cake_active:
                 status["drift"]["cake"] = True
 
-            # IRQ affinity
-            driver = settings.get("driver", "unknown")
-            irq_pinned = self._get_irq_pinned(iface, driver)
-            status["live"]["irq_pinned"] = irq_pinned
-            if settings.get("irq_affinity_enabled") and not irq_pinned:
-                status["drift"]["irq_affinity"] = True
-
             # Dispatcher
             status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
 
@@ -1397,131 +1373,6 @@ class Plugin:
             decky.logger.error(f"set_cake error: {e}")
             return self._unexpected_response(e)
 
-    def _find_wifi_irqs(self, iface: str, driver: str) -> list[str]:
-        """Find IRQ numbers for the WiFi driver in /proc/interrupts."""
-        search_terms = list(DRIVER_IRQ_TERMS.get(driver, [driver]))
-        search_terms.append(iface)
-        irqs = []
-        try:
-            with open("/proc/interrupts") as f:
-                for line in f:
-                    lower = line.lower()
-                    if any(term in lower for term in search_terms):
-                        irq = line.strip().split(":")[0].strip()
-                        if irq.isdigit():
-                            irqs.append(irq)
-        except Exception as e:
-            decky.logger.error(f"_find_wifi_irqs error: {e}")
-        decky.logger.info(
-            f"_find_wifi_irqs: driver={driver} iface={iface} "
-            f"terms={search_terms} found={irqs}"
-        )
-        return irqs
-
-    def _apply_irq_affinity(self, iface: str, driver: str) -> int:
-        """Pin WiFi IRQs to CPU 1. Returns count of IRQs pinned."""
-        irqs = self._find_wifi_irqs(iface, driver)
-        pinned = 0
-        for irq in irqs:
-            # Try smp_affinity_list first (CPU number), then smp_affinity (hex mask).
-            # Some MSI interrupts reject hex mask writes with EIO but accept list writes.
-            # Use shell with clean_env to avoid Decky's LD_LIBRARY_PATH conflict.
-            for path, val in [
-                (f"/proc/irq/{irq}/smp_affinity_list", "1"),
-                (f"/proc/irq/{irq}/smp_affinity", "2"),
-            ]:
-                result = self._run_cmd(
-                    ["/bin/bash", "-c", f"echo {val} > {path}"],
-                    timeout=3,
-                    clean_env=True,
-                )
-                if result["success"]:
-                    pinned += 1
-                    break
-            else:
-                decky.logger.error(f"IRQ pin failed for {irq}: {result.get('stderr', '')}")
-        return pinned
-
-    def _revert_irq_affinity(self, iface: str, driver: str) -> int:
-        """Reset WiFi IRQs to all CPUs. Returns count of IRQs reverted."""
-        irqs = self._find_wifi_irqs(iface, driver)
-        reverted = 0
-        for irq in irqs:
-            for path, val in [
-                (f"/proc/irq/{irq}/smp_affinity_list", "0-7"),
-                (f"/proc/irq/{irq}/smp_affinity", "ff"),
-            ]:
-                result = self._run_cmd(
-                    ["/bin/bash", "-c", f"echo {val} > {path}"],
-                    timeout=3,
-                    clean_env=True,
-                )
-                if result["success"]:
-                    reverted += 1
-                    break
-        return reverted
-
-    def _get_irq_pinned(self, iface: str, driver: str) -> bool:
-        """Check if any WiFi IRQ is pinned to CPU 1."""
-        irqs = self._find_wifi_irqs(iface, driver)
-        for irq in irqs:
-            try:
-                with open(f"/proc/irq/{irq}/smp_affinity_list") as f:
-                    val = f.read().strip()
-                    if val == "1":
-                        return True
-            except OSError:
-                pass
-            try:
-                with open(f"/proc/irq/{irq}/smp_affinity") as f:
-                    val = f.read().strip()
-                    if val in ("2", "02", "00000002"):
-                        return True
-            except OSError:
-                pass
-        return False
-
-    async def set_irq_affinity(self, enabled: bool) -> dict:
-        """Enable or disable WiFi IRQ affinity pinning to CPU 1."""
-        try:
-            iface = self._get_wifi_interface()
-            settings = _load_settings()
-            driver = settings.get("driver", "unknown")
-
-            if not iface:
-                if enabled:
-                    return {"success": False, "error": "no_wifi", "message": "Not connected to WiFi."}
-                settings["irq_affinity_enabled"] = False
-                _save_settings_with_timestamp(settings)
-                return {"success": True, "irq_affinity": False}
-
-            if enabled:
-                irqs = self._find_wifi_irqs(iface, driver)
-                if not irqs:
-                    return {
-                        "success": False,
-                        "error": "unexpected",
-                        "message": "No WiFi interrupts found for this driver.",
-                    }
-                count = self._apply_irq_affinity(iface, driver)
-                decky.logger.info(f"IRQ affinity: pinned {count}/{len(irqs)} IRQs to CPU 1 for {iface}")
-                if count == 0:
-                    return {
-                        "success": False,
-                        "error": "unexpected",
-                        "message": "Your WiFi chip's interrupts are managed by the kernel and can't be pinned.",
-                    }
-            else:
-                count = self._revert_irq_affinity(iface, driver)
-                decky.logger.info(f"IRQ affinity: reverted {count} IRQs for {iface}")
-
-            settings["irq_affinity_enabled"] = enabled
-            _save_settings_with_timestamp(settings)
-            return {"success": True, "irq_affinity": enabled}
-        except Exception as e:
-            decky.logger.error(f"set_irq_affinity error: {e}")
-            return self._unexpected_response(e)
-
     async def optimize_safe(self) -> dict:
         """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning, CAKE."""
         try:
@@ -1606,13 +1457,6 @@ class Plugin:
                 if r.get("success"):
                     applied += 1
 
-            if settings.get("irq_affinity_enabled"):
-                total += 1
-                r = await self.set_irq_affinity(True)
-                results["irq_affinity"] = r
-                if r.get("success"):
-                    applied += 1
-
             # Reconnecting (each does hard_reconnect)
             if settings.get("bssid_lock_enabled"):
                 total += 1
@@ -1694,8 +1538,6 @@ class Plugin:
             if iface:
                 self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
-                driver = _load_settings().get("driver", "unknown")
-                self._revert_irq_affinity(iface, driver)
             try:
                 os.remove(NM_CONF_PATH)
             except FileNotFoundError:

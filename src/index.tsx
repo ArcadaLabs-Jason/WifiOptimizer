@@ -782,18 +782,6 @@ function Content() {
             handleToggle("ipv6", () => backend.setIpv6(val))
           }
         />
-        <InfoRow
-          label="Pin WiFi to dedicated CPU"
-          subtitle="Reduces network jitter by dedicating a CPU core"
-          explanation="By default, WiFi interrupt processing bounces between CPU cores, which causes cache misses and micro-latency. Pinning WiFi interrupts to a dedicated core (CPU 1) keeps the processing cache-warm and avoids contention with the game and display compositor on other cores. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
-          {...getBadge("irq_affinity", status, errors.irq_affinity ?? null)}
-          checked={s?.irq_affinity_enabled ?? false}
-          disabled={isBusy || (!connected && !s?.irq_affinity_enabled)}
-          error={errors.irq_affinity}
-          onChange={(val: boolean) =>
-            handleToggle("irq_affinity", () => backend.setIrqAffinity(val))
-          }
-        />
         {status?.live?.backend_tool_available && (
           <BackendToggleRow
             status={status}
