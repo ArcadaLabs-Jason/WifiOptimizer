@@ -1423,12 +1423,21 @@ class Plugin:
         irqs = self._find_wifi_irqs(iface, driver)
         pinned = 0
         for irq in irqs:
+            path = f"/proc/irq/{irq}/smp_affinity"
             try:
-                with open(f"/proc/irq/{irq}/smp_affinity", "w") as f:
+                with open(path, "w") as f:
                     f.write("2")
                 pinned += 1
-            except OSError:
-                pass
+            except OSError as e:
+                decky.logger.error(f"IRQ pin failed for {irq}: {e}")
+                # Fallback: try via shell (handles kernel restrictions on direct write)
+                result = self._run_cmd(
+                    ["/bin/bash", "-c", f"echo 2 > {path}"], timeout=3
+                )
+                if result["success"]:
+                    pinned += 1
+                else:
+                    decky.logger.error(f"IRQ pin shell fallback failed for {irq}: {result['stderr']}")
         return pinned
 
     def _revert_irq_affinity(self, iface: str, driver: str) -> int:
@@ -1436,12 +1445,17 @@ class Plugin:
         irqs = self._find_wifi_irqs(iface, driver)
         reverted = 0
         for irq in irqs:
+            path = f"/proc/irq/{irq}/smp_affinity"
             try:
-                with open(f"/proc/irq/{irq}/smp_affinity", "w") as f:
+                with open(path, "w") as f:
                     f.write("ff")
                 reverted += 1
             except OSError:
-                pass
+                result = self._run_cmd(
+                    ["/bin/bash", "-c", f"echo ff > {path}"], timeout=3
+                )
+                if result["success"]:
+                    reverted += 1
         return reverted
 
     def _get_irq_pinned(self, iface: str, driver: str) -> bool:
