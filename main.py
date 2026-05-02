@@ -1410,8 +1410,12 @@ class Plugin:
                         irq = line.strip().split(":")[0].strip()
                         if irq.isdigit():
                             irqs.append(irq)
-        except Exception:
-            pass
+        except Exception as e:
+            decky.logger.error(f"_find_wifi_irqs error: {e}")
+        decky.logger.info(
+            f"_find_wifi_irqs: driver={driver} iface={iface} "
+            f"terms={search_terms} found={irqs}"
+        )
         return irqs
 
     def _apply_irq_affinity(self, iface: str, driver: str) -> int:
