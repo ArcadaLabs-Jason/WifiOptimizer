@@ -975,9 +975,11 @@ class Plugin:
                 timeout=T,
             )
             ipv6_out = ipv6_result.get("stdout", "")
-            status["live"]["ipv6_method"] = (
-                ipv6_out.split(":", 1)[1].strip() if ":" in ipv6_out else ""
-            )
+            live_ipv6 = ipv6_out.split(":", 1)[1].strip() if ":" in ipv6_out else ""
+            status["live"]["ipv6_method"] = live_ipv6
+            if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
+                status["drift"]["ipv6"] = True
+                self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=T)
 
             # Band preference
             band_result = self._run_cmd(
@@ -994,9 +996,12 @@ class Plugin:
                 timeout=T,
             )
             band_out = band_result.get("stdout", "")
-            status["live"]["band"] = (
-                band_out.split(":", 1)[1].strip() if ":" in band_out else ""
-            )
+            live_band = band_out.split(":", 1)[1].strip() if ":" in band_out else ""
+            status["live"]["band"] = live_band
+            expected_band = settings.get("band_preference", "a")
+            if settings.get("band_preference_enabled") and live_band != expected_band:
+                status["drift"]["band_preference"] = True
+                self._nmcli_modify(uuid, "802-11-wireless.band", expected_band, timeout=T)
 
             # Buffer tuning
             sysctl_result = self._run_cmd(

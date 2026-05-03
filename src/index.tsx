@@ -696,7 +696,7 @@ function Content() {
           }. Using 5 GHz${
             supports6GHz ? " or 6 GHz" : ""
           } for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`}
-          {...getBadge(undefined, status, errors.band_preference ?? null)}
+          {...getBadge("band_preference", status, errors.band_preference ?? null)}
           checked={s?.band_preference_enabled ?? false}
           disabled={isBusy || (!connected && !s?.band_preference_enabled)}
           error={errors.band_preference}
@@ -760,7 +760,7 @@ function Content() {
           label="Disable IPv6"
           subtitle="Use IPv4 only on this network"
           explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine."
-          {...getBadge(undefined, status, errors.ipv6 ?? null)}
+          {...getBadge("ipv6", status, errors.ipv6 ?? null)}
           checked={s?.ipv6_disabled ?? false}
           disabled={isBusy || (!connected && !s?.ipv6_disabled)}
           error={errors.ipv6}
