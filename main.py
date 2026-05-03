@@ -608,7 +608,8 @@ class Plugin:
             if iface:
                 self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
-            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF]:
+            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
+                         SETTINGS_FILE, ENFORCED_FILE]:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
