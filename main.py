@@ -1198,12 +1198,37 @@ class Plugin:
                     "detail": result["stderr"],
                 }
 
+            # Temporarily clear BSSID lock so NM can find an AP on the
+            # requested band. Re-lock to the new BSSID after reconnect.
             settings = _load_settings()
+            had_bssid_lock = settings.get("bssid_lock_enabled", False)
+            if enabled and had_bssid_lock:
+                self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+
             settings["band_preference_enabled"] = enabled
             settings["band_preference"] = band
             _save_settings_with_timestamp(settings)
 
             self._hard_reconnect(uuid)
+
+            # Re-lock BSSID to whatever AP NM picked on the new band
+            if enabled and had_bssid_lock:
+                time.sleep(3)
+                iface = self._get_wifi_interface()
+                if iface:
+                    link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+                    for line in link_result.get("stdout", "").split("\n"):
+                        if "Connected to" in line:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                new_bssid = parts[2]
+                                self._nmcli_modify(uuid, "802-11-wireless.bssid", new_bssid)
+                                settings = _load_settings()
+                                settings["bssid_lock_value"] = new_bssid
+                                _save_settings(settings)
+                                decky.logger.info(f"Re-locked BSSID to {new_bssid} after band change")
+                            break
+
             return {"success": True, "band": value, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_band_preference error: {e}")
