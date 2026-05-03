@@ -540,13 +540,26 @@ class Plugin:
             # Apply volatile settings that may have been lost on reboot.
             # The dispatcher handles reconnects, but on a fresh boot WiFi
             # connects before the plugin starts, so we apply here too.
+            # Order: buffer tuning first (sets txqueuelen), then CAKE
+            # (overrides txqueuelen to 256), then power_save last (sticks
+            # after any reconnects the dispatcher might trigger).
             iface = self._get_wifi_interface()
             if iface:
+                if settings.get("buffer_tuning_enabled"):
+                    try:
+                        await self.set_buffer_tuning(True)
+                    except Exception as e:
+                        decky.logger.error(f"Startup buffer tuning failed: {e}")
                 if settings.get("cake_enabled"):
                     try:
                         await self.set_cake(True)
                     except Exception as e:
                         decky.logger.error(f"Startup CAKE apply failed: {e}")
+                if settings.get("power_save_disabled"):
+                    try:
+                        await self.set_power_save(True)
+                    except Exception as e:
+                        decky.logger.error(f"Startup power save failed: {e}")
 
             # Sanity check: does the conf-declared backend match what's actually
             # running? Divergence would indicate a previous switch got interrupted
@@ -1293,15 +1306,18 @@ class Plugin:
                 if not result["success"]:
                     decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
 
-            # TX queue length
+            # TX queue length (CAKE needs 256; defer to it if active)
             iface = self._get_wifi_interface()
+            settings = _load_settings()
             if iface:
-                txq = "2000" if enabled else "1000"
+                if settings.get("cake_enabled"):
+                    txq = "256"
+                else:
+                    txq = "2000" if enabled else "1000"
                 self._run_cmd(
                     ["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq]
                 )
 
-            settings = _load_settings()
             settings["buffer_tuning_enabled"] = enabled
             _save_settings_with_timestamp(settings)
             return {"success": True, "buffer_tuning": enabled}
