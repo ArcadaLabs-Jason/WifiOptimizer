@@ -73,20 +73,6 @@ Want to go further? The remaining optimizations are available as individual togg
 
 The plugin detects your WiFi hardware at startup and applies the right optimizations for your chip. Devices with unrecognized hardware still get universal optimizations (power save, buffer tuning, BSSID lock, etc.).
 
-### Legion Go / ROG Ally / other handhelds (beta)
-
-Multi-device support is in beta testing. The beta branch adds detection and driver-specific optimizations for Legion Go (all models), ROG Ally (all models), and other PC handhelds with Decky Loader.
-
-**Non-Steam Deck users:** The stable version (v0.8.1) doesn't recognize your device yet, so the in-app updater won't work. Install the beta directly from Desktop Mode or a terminal:
-
-```bash
-curl -sL "https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/heads/beta.tar.gz" -o /tmp/wo-beta.tar.gz && sudo bash -c 'D=$(mktemp -d); tar xzf /tmp/wo-beta.tar.gz -C "$D"; P="$(getent passwd "${SUDO_USER:-$(logname 2>/dev/null || echo deck)}" | cut -d: -f6)/homebrew/plugins/WiFi Optimizer"; rm -rf "$P"; mkdir -p "$P/dist" "$P/defaults" "$P/py_modules"; cp "$D"/WifiOptimizer-beta/{plugin.json,package.json,main.py,decky.pyi} "$P/"; cp "$D"/WifiOptimizer-beta/dist/* "$P/dist/"; cp "$D"/WifiOptimizer-beta/defaults/* "$P/defaults/"; touch "$P/py_modules/.keep"; rm -rf "$D" /tmp/wo-beta.tar.gz; systemctl restart plugin_loader'
-```
-
-**Steam Deck users** who want to try beta: open WiFi Optimizer, scroll to Updates, switch the channel to **Beta**, then tap the update button.
-
-If you test on a non-Steam Deck device, use the **Copy Diagnostics** button at the bottom of the plugin panel and include the output in any bug reports.
-
 ## How it works
 
 The plugin has two parts:
