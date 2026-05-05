@@ -1,6 +1,10 @@
 export interface PluginSettings {
   model: string;
   driver: string;
+  device_family: string;
+  device_label: string;
+  chip_label: string;
+  supports_6ghz: boolean;
   power_save_disabled: boolean;
   auto_fix_on_wake: boolean;
   bssid_lock_enabled: boolean;
@@ -13,6 +17,9 @@ export interface PluginSettings {
   dns_enabled: boolean;
   ipv6_disabled: boolean;
   buffer_tuning_enabled: boolean;
+  cake_enabled: boolean;
+  distro_id: string;
+  distro_name: string;
   last_connection_uuid: string;
   priority_set: boolean;
   update_channel: string;
@@ -32,6 +39,7 @@ export interface LiveStatus {
   ipv6_method?: string;
   band?: string;
   buffer_tuning_applied?: boolean;
+  cake_applied?: boolean;
   dispatcher_installed?: boolean;
   last_enforced?: number;
   wifi_backend?: string;
@@ -41,7 +49,7 @@ export interface LiveStatus {
 export interface PluginStatus {
   success: boolean;
   connected: boolean;
-  supported: boolean;
+  support_tier: number;
   version?: string;
   settings: PluginSettings;
   live: LiveStatus;
@@ -56,6 +64,7 @@ export interface MethodResult {
   error?: string;
   message?: string;
   detail?: string;
+  reconnected?: boolean;
   [key: string]: unknown;
 }
 

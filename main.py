@@ -4,8 +4,8 @@ Runs as root inside the plugin_loader process. All public async methods on
 the Plugin class are callable from the React frontend via Decky's IPC. State
 is persisted to settings.json under DECKY_PLUGIN_SETTINGS_DIR and shared with
 the NetworkManager dispatcher script at defaults/dispatcher.sh.tmpl, which
-reapplies volatile optimizations (power save, PCIe ASPM, buffer tuning) on
-every WiFi reconnect independently of Decky.
+reapplies volatile optimizations (power save, PCIe ASPM, buffer tuning, CAKE
+QoS) on every WiFi reconnect independently of Decky.
 """
 
 import os
@@ -36,12 +36,66 @@ MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
 BACKEND_HELPER = "/usr/bin/steamos-polkit-helpers/steamos-wifi-set-backend-privileged"
 WIFI_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-valve-wifi-backend.conf"
 NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-steamos-defaults.conf"
+GENERIC_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf"
+BAZZITE_IWD_CONF = "/etc/NetworkManager/conf.d/iwd.conf"
 
-# LCD (RTL8822CE) has firmware bugs with deep power save and PCIe ASPM.
-# These sysfs paths let us disable them at runtime (no module reload needed).
-RTW88_SYSFS_PARAMS = [
-    "/sys/module/rtw88_core/parameters/disable_lps_deep",
-    "/sys/module/rtw88_pci/parameters/disable_aspm",
+DRIVER_PROFILES = {
+    "rtw88": {
+        "chip_label": "WiFi 5 (RTL8822CE)",
+        "supports_6ghz": False,
+        "sysfs_power_fixes": [
+            "/sys/module/rtw88_core/parameters/disable_lps_deep",
+            "/sys/module/rtw88_pci/parameters/disable_aspm",
+        ],
+        "modprobe_options": [
+            "options rtw88_core disable_lps_deep=Y",
+            "options rtw88_pci disable_aspm=Y",
+        ],
+    },
+    "ath11k_pci": {
+        "chip_label": "WiFi 6E (QCA206X)",
+        "supports_6ghz": True,
+        "sysfs_power_fixes": [],
+        "modprobe_options": [],
+    },
+    "mt7921e": {
+        "chip_label": "WiFi 6E (MT7922)",
+        "supports_6ghz": True,
+        "sysfs_power_fixes": [
+            "/sys/module/mt7921e/parameters/disable_aspm",
+        ],
+        "modprobe_options": [
+            "options mt7921e disable_aspm=Y",
+        ],
+    },
+    "iwlwifi": {
+        "chip_label": "Intel WiFi",
+        "supports_6ghz": True,
+        "sysfs_power_fixes": [],
+        "modprobe_options": [
+            "options iwlwifi power_save=0 uapsd_disable=3",
+            "options iwlmvm power_scheme=1",
+        ],
+    },
+}
+
+DMI_DEVICES = {
+    "Jupiter": {"family": "deck_lcd", "label": "Steam Deck LCD"},
+    "Galileo": {"family": "deck_oled", "label": "Steam Deck OLED"},
+    "83E1": {"family": "legion_go", "label": "Legion Go"},
+    "83L3": {"family": "legion_go_s", "label": "Legion Go S"},
+    "83N6": {"family": "legion_go_s", "label": "Legion Go S"},
+    "83Q2": {"family": "legion_go_s", "label": "Legion Go S"},
+    "83Q3": {"family": "legion_go_s", "label": "Legion Go S"},
+    "83N0": {"family": "legion_go_2", "label": "Legion Go 2"},
+    "83N1": {"family": "legion_go_2", "label": "Legion Go 2"},
+}
+
+DMI_SUBSTRING_DEVICES = [
+    ("ROG Xbox Ally X RC73X", {"family": "rog_xbox_ally_x", "label": "ROG Xbox Ally X"}),
+    ("ROG Xbox Ally RC73Y", {"family": "rog_xbox_ally", "label": "ROG Xbox Ally"}),
+    ("ROG Ally X RC72LA", {"family": "rog_ally_x", "label": "ROG Ally X"}),
+    ("ROG Ally RC71L", {"family": "rog_ally", "label": "ROG Ally"}),
 ]
 
 try:
@@ -89,6 +143,10 @@ SYSCTL_DEFAULTS = {
 DEFAULT_SETTINGS = {
     "model": "unknown",
     "driver": "unknown",
+    "device_family": "unknown",
+    "device_label": "Unknown Device",
+    "chip_label": "unknown",
+    "supports_6ghz": False,
     "power_save_disabled": True,
     "auto_fix_on_wake": True,
     "bssid_lock_enabled": False,
@@ -101,8 +159,11 @@ DEFAULT_SETTINGS = {
     "dns_enabled": False,
     "ipv6_disabled": False,
     "buffer_tuning_enabled": False,
+    "cake_enabled": False,
     "last_connection_uuid": "",
     "priority_set": False,
+    "distro_id": "unknown",
+    "distro_name": "Unknown",
     "update_channel": "stable",
     "last_applied": 0,
 }
@@ -208,23 +269,42 @@ class Plugin:
                 return parts[0]
         return None
 
+    def _get_backend_method(self) -> str:
+        """Return 'steamos', 'generic', or 'none'.
+        SteamOS has a privileged helper. Generic uses NM conf + systemctl
+        directly and requires iwd to be installed. Non-SteamOS distros
+        always use generic even if the SteamOS helper exists (it may
+        behave differently on Bazzite/CachyOS)."""
+        settings = _load_settings()
+        distro = settings.get("distro_id", "unknown")
+        if distro == "steamos" and os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK):
+            return "steamos"
+        if os.path.isfile("/usr/lib/systemd/system/iwd.service"):
+            return "generic"
+        return "none"
+
     def _has_backend_tool(self) -> bool:
-        # Privileged helper is what we actually invoke - calling the wrapper fails
-        # from a root systemd context because it goes through pkexec.
-        return os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK)
+        return self._get_backend_method() != "none"
 
     def _get_current_backend(self) -> str | None:
         """Return 'iwd', 'wpa_supplicant', or None if unknown.
 
-        Reads user override (99-valve-wifi-backend.conf) first, then the
-        SteamOS default (10-steamos-defaults.conf). Matches the same resolution
-        order that steamos-wifi-set-backend itself uses.
+        Checks config files in priority order: our own generic conf, Bazzite's
+        iwd conf, SteamOS override, SteamOS defaults. Falls back to checking
+        which systemd service is active.
         """
-        for path in (WIFI_BACKEND_CONF, NM_DEFAULT_CONF):
+        for path in (
+            GENERIC_BACKEND_CONF,
+            BAZZITE_IWD_CONF,
+            WIFI_BACKEND_CONF,
+            NM_DEFAULT_CONF,
+        ):
             try:
                 with open(path, "r") as f:
                     for line in f:
                         line = line.strip()
+                        if not line or line.startswith("#") or line.startswith(";"):
+                            continue
                         if line.startswith("wifi.backend"):
                             _, _, val = line.partition("=")
                             val = val.strip()
@@ -234,6 +314,15 @@ class Plugin:
                 continue
             except Exception:
                 continue
+        # No config found — check which service is running
+        result = self._run_cmd(["/usr/bin/systemctl", "is-active", "iwd"], timeout=3)
+        if result.get("stdout", "").strip() == "active":
+            return "iwd"
+        result = self._run_cmd(
+            ["/usr/bin/systemctl", "is-active", "wpa_supplicant"], timeout=3
+        )
+        if result.get("stdout", "").strip() == "active":
+            return "wpa_supplicant"
         return None
 
     def _ensure_backend_switch_state(self):
@@ -252,11 +341,11 @@ class Plugin:
         so the technical text is still available to the UI/logs."""
         d = (detail or "").lower()
         if "symbol lookup error" in d or "undefined symbol" in d:
-            return "A system-library conflict occurred. Please reboot your Deck and try again."
+            return "A system-library conflict occurred. Please reboot and try again."
         if "permission denied" in d:
-            return "The system denied permission. Try rebooting your Deck."
+            return "The system denied permission. Try rebooting."
         if "command not found" in d or "no such file" in d:
-            return "A required system tool is missing. This SteamOS version may not be supported."
+            return "A required system tool is missing. Your OS version may not be supported."
         if "timed out" in d or "timeout" in d:
             return "The system didn't respond in time. Try again in a moment."
         if "network is unreachable" in d or "connection refused" in d:
@@ -292,30 +381,33 @@ class Plugin:
         if uuid:
             self._run_cmd(["/usr/bin/nmcli", "con", "up", "uuid", uuid], timeout=10)
 
-    def _apply_rtw88_fixes(self, enable: bool):
-        """Apply or revert LCD-specific RTL8822CE driver power save fixes.
-        Silently no-ops on OLED (sysfs paths don't exist)."""
+    def _apply_driver_fixes(self, enable: bool):
+        """Apply or revert driver-specific power save fixes from DRIVER_PROFILES.
+        Silently no-ops for drivers with no sysfs paths or modprobe options."""
+        settings = _load_settings()
+        profile = DRIVER_PROFILES.get(settings.get("driver"), {})
+
         val = "Y" if enable else "N"
-        for path in RTW88_SYSFS_PARAMS:
+        for path in profile.get("sysfs_power_fixes", []):
             try:
                 with open(path, "w") as f:
                     f.write(val)
-            except (FileNotFoundError, PermissionError):
+            except FileNotFoundError:
                 pass
+            except PermissionError:
+                decky.logger.info(f"sysfs path not writable: {path}")
 
-        # Persist via modprobe.d for next boot
-        if enable:
+        options = profile.get("modprobe_options", [])
+        if enable and options:
             try:
                 os.makedirs(os.path.dirname(MODPROBE_CONF_PATH), exist_ok=True)
                 with open(MODPROBE_CONF_PATH, "w") as f:
-                    f.write(
-                        "# WiFi Optimizer - LCD RTL8822CE deep power save fixes\n"
-                        "options rtw88_core disable_lps_deep=Y\n"
-                        "options rtw88_pci disable_aspm=Y\n"
-                    )
+                    f.write("# WiFi Optimizer - driver power save fixes\n")
+                    for opt in options:
+                        f.write(opt + "\n")
             except Exception as e:
                 decky.logger.error(f"Failed to write modprobe config: {e}")
-        else:
+        elif not enable:
             try:
                 os.remove(MODPROBE_CONF_PATH)
             except FileNotFoundError:
@@ -323,11 +415,13 @@ class Plugin:
 
     def _apply_pcie_aspm_fix(self, enable: bool):
         """Disable or restore PCIe ASPM for the WiFi device.
-        Prevents throughput degradation during sustained streaming (OLED ath11k).
-        Also prevents LCD rtw88 PCIe stalls. Works on both models."""
+        Prevents throughput degradation during sustained streaming.
+        Works on all PCIe-attached WiFi adapters."""
         try:
             # Discover WiFi PCI device path dynamically
-            iface = self._get_wifi_interface() or "wlan0"
+            iface = self._get_wifi_interface()
+            if not iface:
+                return
             device_link = os.path.realpath(f"/sys/class/net/{iface}/device")
             if not os.path.isdir(device_link):
                 return
@@ -431,16 +525,47 @@ class Plugin:
             settings = _load_settings()
             settings["model"] = info.get("model", "unknown")
             settings["driver"] = info.get("driver", "unknown")
+            settings["device_family"] = info.get("device_family", "unknown")
+            settings["device_label"] = info.get("device_label", "Unknown Device")
+            settings["chip_label"] = info.get("chip_label", "unknown")
+            settings["supports_6ghz"] = info.get("supports_6ghz", False)
+            distro = self._detect_distro()
+            settings["distro_id"] = distro["id"]
+            settings["distro_name"] = distro["name"]
             _save_settings(settings)
 
-            if settings.get("model") in ("lcd", "oled") and settings.get("auto_fix_on_wake", True):
+            if settings.get("auto_fix_on_wake", True):
                 self._install_dispatcher()
+
+            # Apply volatile settings that may have been lost on reboot.
+            # The dispatcher handles reconnects, but on a fresh boot WiFi
+            # connects before the plugin starts, so we apply here too.
+            # Order: buffer tuning first (sets txqueuelen), then CAKE
+            # (overrides txqueuelen to 256), then power_save last (sticks
+            # after any reconnects the dispatcher might trigger).
+            iface = self._get_wifi_interface()
+            if iface:
+                if settings.get("buffer_tuning_enabled"):
+                    try:
+                        await self.set_buffer_tuning(True)
+                    except Exception as e:
+                        decky.logger.error(f"Startup buffer tuning failed: {e}")
+                if settings.get("cake_enabled"):
+                    try:
+                        await self.set_cake(True)
+                    except Exception as e:
+                        decky.logger.error(f"Startup CAKE apply failed: {e}")
+                if settings.get("power_save_disabled"):
+                    try:
+                        await self.set_power_save(True)
+                    except Exception as e:
+                        decky.logger.error(f"Startup power save failed: {e}")
 
             # Sanity check: does the conf-declared backend match what's actually
             # running? Divergence would indicate a previous switch got interrupted
             # (plugin_loader crash, external tool, etc.). Log only; user can
             # re-toggle to resolve.
-            if self._has_backend_tool():
+            if self._get_backend_method() != "none":
                 conf_backend = self._get_current_backend()
                 if conf_backend:
                     active = self._run_cmd(
@@ -455,7 +580,9 @@ class Plugin:
                         )
 
             decky.logger.info(
-                f"WiFi Optimizer ready: model={info.get('model')}, driver={info.get('driver')}"
+                f"WiFi Optimizer ready: device={info.get('device_label')}, "
+                f"family={info.get('device_family')}, driver={info.get('driver')}, "
+                f"chip={info.get('chip_label')}, distro={distro['id']}"
             )
         except Exception as e:
             decky.logger.error(f"WiFi Optimizer _main error: {e}")
@@ -473,7 +600,16 @@ class Plugin:
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
             self._remove_dispatcher()
-            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH]:
+            self._apply_driver_fixes(False)
+            self._apply_pcie_aspm_fix(False)
+            for key, value in SYSCTL_DEFAULTS.items():
+                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
+            iface = self._get_wifi_interface()
+            if iface:
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
+                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
+                         SETTINGS_FILE, ENFORCED_FILE]:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -486,39 +622,80 @@ class Plugin:
 
     # ---- Hardware detection ----
 
+    def _detect_device_family(self) -> tuple[str, str, str]:
+        """Read DMI product_name and return (raw_product, family_id, display_label)."""
+        try:
+            with open("/sys/devices/virtual/dmi/id/product_name", "r") as f:
+                product = f.read().strip()
+        except Exception:
+            return ("unknown", "unknown", "Unknown Device")
+
+        if product in DMI_DEVICES:
+            info = DMI_DEVICES[product]
+            return (product, info["family"], info["label"])
+
+        for prefix, info in DMI_SUBSTRING_DEVICES:
+            if product.startswith(prefix):
+                return (product, info["family"], info["label"])
+
+        return (product, "unknown", "Unknown Device")
+
+    def _detect_wifi_driver(self) -> str:
+        """Detect the kernel driver of the active WiFi interface via sysfs.
+        Normalizes sub-module names (e.g. rtw88_pci) to the canonical
+        DRIVER_PROFILES key (rtw88)."""
+        iface = self._get_wifi_interface()
+        if not iface:
+            return "unknown"
+        try:
+            driver_path = os.path.realpath(f"/sys/class/net/{iface}/device/driver/module")
+            module = os.path.basename(driver_path)
+            if module in DRIVER_PROFILES:
+                return module
+            for key in DRIVER_PROFILES:
+                if module.startswith(key):
+                    return key
+            return module
+        except Exception:
+            return "unknown"
+
+    def _detect_distro(self) -> dict:
+        """Detect OS from /etc/os-release. Returns {id, name}."""
+        info = {"id": "unknown", "name": "Unknown"}
+        try:
+            with open("/etc/os-release", "r") as f:
+                for line in f:
+                    if line.startswith("ID="):
+                        info["id"] = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("PRETTY_NAME="):
+                        info["name"] = line.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return info
+
     async def get_device_info(self) -> dict:
         try:
+            product, device_family, device_label = self._detect_device_family()
+            driver = self._detect_wifi_driver()
+            profile = DRIVER_PROFILES.get(driver, {})
+
+            chip_label = profile.get("chip_label", "unknown")
+            supports_6ghz = profile.get("supports_6ghz", False)
+
             model = "unknown"
-            driver = "unknown"
-            wifi_chip = "unknown"
-            bands = ["2.4 GHz", "5 GHz"]
-
-            try:
-                with open("/sys/devices/virtual/dmi/id/product_name", "r") as f:
-                    product = f.read().strip()
-                if product == "Jupiter":
-                    model = "lcd"
-                    wifi_chip = "WiFi 5 (RTL8822CE)"
-                elif product == "Galileo":
-                    model = "oled"
-                    wifi_chip = "WiFi 6E (QCA206X)"
-                    bands.append("6 GHz")
-            except Exception:
-                pass
-
-            result = self._run_cmd(["/usr/bin/lsmod"])
-            if result["success"]:
-                if "ath11k_pci" in result["stdout"]:
-                    driver = "ath11k_pci"
-                elif "rtw88" in result["stdout"]:
-                    driver = "rtw88"
+            if device_family == "deck_lcd":
+                model = "lcd"
+            elif device_family == "deck_oled":
+                model = "oled"
 
             return {
                 "success": True,
                 "model": model,
                 "driver": driver,
-                "wifi_chip": wifi_chip,
-                "bands": bands,
+                "device_family": device_family,
+                "device_label": device_label,
+                "chip_label": chip_label,
+                "supports_6ghz": supports_6ghz,
             }
         except Exception as e:
             decky.logger.error(f"get_device_info error: {e}")
@@ -526,23 +703,25 @@ class Plugin:
                 "success": True,
                 "model": "unknown",
                 "driver": "unknown",
-                "wifi_chip": "unknown",
-                "bands": ["2.4 GHz", "5 GHz"],
+                "device_family": "unknown",
+                "device_label": "Unknown Device",
+                "chip_label": "unknown",
+                "supports_6ghz": False,
             }
 
-    def _is_supported_device(self) -> bool:
-        """Check if this is a Steam Deck (Jupiter or Galileo)."""
+    def _get_support_tier(self) -> int:
+        """Return 1 (full), 2 (partial), or 3 (generic) based on detection.
+        Tier 1: recognized device + recognized driver.
+        Tier 2: unknown device + recognized driver.
+        Tier 3: unknown device + unknown driver."""
         settings = _load_settings()
-        return settings.get("model") in ("lcd", "oled")
-
-    def _unsupported_response(self) -> dict:
-        """Standard error dict returned by every setter when running on a
-        non-Steam-Deck device."""
-        return {
-            "success": False,
-            "error": "unexpected",
-            "message": "Unsupported device. This plugin is designed for Steam Deck only.",
-        }
+        driver = settings.get("driver", "unknown")
+        device_family = settings.get("device_family", "unknown")
+        if driver in DRIVER_PROFILES and device_family != "unknown":
+            return 1
+        if driver in DRIVER_PROFILES:
+            return 2
+        return 3
 
     def _unexpected_response(self, e: Exception) -> dict:
         """Standard error dict for the catch-all exception handler in every
@@ -584,6 +763,54 @@ class Plugin:
             }
         return uuid, None
 
+    # ---- Diagnostics ----
+
+    async def get_diagnostic_info(self) -> dict:
+        """Collect system info for remote debugging. Sanitized (no passwords)."""
+        try:
+            info = await self.get_device_info()
+            iface = self._get_wifi_interface() or "none"
+            iw_dev = self._run_cmd(["/usr/bin/iw", "dev"], timeout=3)
+            iw_reg = self._run_cmd(["/usr/bin/iw", "reg", "get"], timeout=3)
+            uname = self._run_cmd(["/usr/bin/uname", "-r"], timeout=3)
+            os_release = ""
+            try:
+                with open("/etc/os-release", "r") as f:
+                    os_release = f.read()
+            except Exception:
+                pass
+            distro = self._detect_distro()
+            return {
+                "success": True,
+                "device_info": info,
+                "wifi_interface": iface,
+                "iw_dev": iw_dev.get("stdout", ""),
+                "iw_reg": iw_reg.get("stdout", ""),
+                "kernel": uname.get("stdout", "").strip(),
+                "os_release": os_release,
+                "distro_id": distro["id"],
+                "distro_name": distro["name"],
+                "support_tier": self._get_support_tier(),
+            }
+        except Exception as e:
+            decky.logger.error(f"get_diagnostic_info error: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def save_diagnostic_info(self) -> dict:
+        """Write diagnostics to a file in the settings directory as a
+        fallback when clipboard is unavailable."""
+        try:
+            info = await self.get_diagnostic_info()
+            diag_path = os.path.join(
+                os.path.dirname(SETTINGS_FILE), "diagnostics.json"
+            )
+            with open(diag_path, "w") as f:
+                json.dump(info, f, indent=2)
+            return {"success": True, "path": diag_path}
+        except Exception as e:
+            decky.logger.error(f"save_diagnostic_info error: {e}")
+            return {"success": False, "error": str(e)}
+
     # ---- Status ----
 
     async def get_status(self) -> dict:
@@ -596,12 +823,12 @@ class Plugin:
             iface = self._get_wifi_interface()
             uuid = self._get_active_connection_uuid()
             connected = iface is not None and uuid is not None
-            supported = settings.get("model") in ("lcd", "oled")
+            support_tier = self._get_support_tier()
 
             status = {
                 "success": True,
                 "connected": connected,
-                "supported": supported,
+                "support_tier": support_tier,
                 "version": decky.DECKY_PLUGIN_VERSION,
                 "settings": settings,
                 "live": {},
@@ -748,9 +975,11 @@ class Plugin:
                 timeout=T,
             )
             ipv6_out = ipv6_result.get("stdout", "")
-            status["live"]["ipv6_method"] = (
-                ipv6_out.split(":", 1)[1].strip() if ":" in ipv6_out else ""
-            )
+            live_ipv6 = ipv6_out.split(":", 1)[1].strip() if ":" in ipv6_out else ""
+            status["live"]["ipv6_method"] = live_ipv6
+            if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
+                status["drift"]["ipv6"] = True
+                self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=T)
 
             # Band preference
             band_result = self._run_cmd(
@@ -767,9 +996,12 @@ class Plugin:
                 timeout=T,
             )
             band_out = band_result.get("stdout", "")
-            status["live"]["band"] = (
-                band_out.split(":", 1)[1].strip() if ":" in band_out else ""
-            )
+            live_band = band_out.split(":", 1)[1].strip() if ":" in band_out else ""
+            status["live"]["band"] = live_band
+            expected_band = settings.get("band_preference", "a")
+            if settings.get("band_preference_enabled") and live_band != expected_band:
+                status["drift"]["band_preference"] = True
+                self._nmcli_modify(uuid, "802-11-wireless.band", expected_band, timeout=T)
 
             # Buffer tuning
             sysctl_result = self._run_cmd(
@@ -779,6 +1011,12 @@ class Plugin:
             status["live"]["buffer_tuning_applied"] = current_rmem == "16777216"
             if settings.get("buffer_tuning_enabled") and current_rmem != "16777216":
                 status["drift"]["buffer_tuning"] = True
+
+            # CAKE QoS
+            cake_active = self._get_cake_status(iface)
+            status["live"]["cake_applied"] = cake_active
+            if settings.get("cake_enabled") and not cake_active:
+                status["drift"]["cake"] = True
 
             # Dispatcher
             status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
@@ -799,8 +1037,7 @@ class Plugin:
 
     async def set_power_save(self, disabled: bool) -> dict:
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             iface = self._get_wifi_interface()
 
             # Apply immediately if connected - verify before saving
@@ -828,9 +1065,7 @@ class Plugin:
                 except FileNotFoundError:
                     pass
 
-            # LCD: disable deep LPS and rtw88 ASPM (no-op on OLED)
-            self._apply_rtw88_fixes(disabled)
-            # Both: disable PCIe ASPM for WiFi device (prevents throughput degradation)
+            self._apply_driver_fixes(disabled)
             self._apply_pcie_aspm_fix(disabled)
 
             # Save settings only after success
@@ -845,8 +1080,7 @@ class Plugin:
 
     async def set_auto_fix(self, enabled: bool) -> dict:
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             settings = _load_settings()
             settings["auto_fix_on_wake"] = enabled
 
@@ -866,8 +1100,7 @@ class Plugin:
 
     async def set_bssid_lock(self, enabled: bool) -> dict:
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             if enabled:
                 # Enabling requires active WiFi to read current BSSID
                 iface, uuid, err = self._require_wifi()
@@ -941,8 +1174,7 @@ class Plugin:
 
     async def set_band_preference(self, enabled: bool, band: str = "a") -> dict:
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             if enabled and band not in ("a", "bg"):
                 return {
                     "success": False,
@@ -966,12 +1198,37 @@ class Plugin:
                     "detail": result["stderr"],
                 }
 
+            # Temporarily clear BSSID lock so NM can find an AP on the
+            # requested band. Re-lock to the new BSSID after reconnect.
             settings = _load_settings()
+            had_bssid_lock = settings.get("bssid_lock_enabled", False)
+            if enabled and had_bssid_lock:
+                self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+
             settings["band_preference_enabled"] = enabled
             settings["band_preference"] = band
             _save_settings_with_timestamp(settings)
 
             self._hard_reconnect(uuid)
+
+            # Re-lock BSSID to whatever AP NM picked on the new band
+            if enabled and had_bssid_lock:
+                time.sleep(3)
+                iface = self._get_wifi_interface()
+                if iface:
+                    link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+                    for line in link_result.get("stdout", "").split("\n"):
+                        if "Connected to" in line:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                new_bssid = parts[2]
+                                self._nmcli_modify(uuid, "802-11-wireless.bssid", new_bssid)
+                                settings = _load_settings()
+                                settings["bssid_lock_value"] = new_bssid
+                                _save_settings(settings)
+                                decky.logger.info(f"Re-locked BSSID to {new_bssid} after band change")
+                            break
+
             return {"success": True, "band": value, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_band_preference error: {e}")
@@ -981,8 +1238,7 @@ class Plugin:
         self, enabled: bool, provider: str = "cloudflare", custom_servers: str = ""
     ) -> dict:
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             uuid, err = self._resolve_uuid(
                 "Connect to WiFi first to set DNS" if enabled else None
             )
@@ -1043,8 +1299,7 @@ class Plugin:
 
     async def set_ipv6(self, disabled: bool) -> dict:
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             uuid, err = self._resolve_uuid(
                 "Connect to WiFi first to disable IPv6" if disabled else None
             )
@@ -1073,8 +1328,7 @@ class Plugin:
 
     async def set_buffer_tuning(self, enabled: bool) -> dict:
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             params = SYSCTL_PARAMS if enabled else SYSCTL_DEFAULTS
             for key, value in params.items():
                 result = self._run_cmd(
@@ -1083,15 +1337,18 @@ class Plugin:
                 if not result["success"]:
                     decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
 
-            # TX queue length
+            # TX queue length (CAKE needs 256; defer to it if active)
             iface = self._get_wifi_interface()
+            settings = _load_settings()
             if iface:
-                txq = "2000" if enabled else "1000"
+                if settings.get("cake_enabled"):
+                    txq = "256"
+                else:
+                    txq = "2000" if enabled else "1000"
                 self._run_cmd(
                     ["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq]
                 )
 
-            settings = _load_settings()
             settings["buffer_tuning_enabled"] = enabled
             _save_settings_with_timestamp(settings)
             return {"success": True, "buffer_tuning": enabled}
@@ -1099,11 +1356,60 @@ class Plugin:
             decky.logger.error(f"set_buffer_tuning error: {e}")
             return self._unexpected_response(e)
 
+    def _get_cake_status(self, iface: str) -> bool:
+        """Check if CAKE qdisc is active on the interface."""
+        result = self._run_cmd(["/usr/bin/tc", "qdisc", "show", "dev", iface])
+        return "cake" in result.get("stdout", "")
+
+    async def set_cake(self, enabled: bool) -> dict:
+        """Enable or disable CAKE QoS (unlimited mode: FQ + AQM + ack-filter, no bandwidth shaper)."""
+        try:
+            iface = self._get_wifi_interface()
+            if not iface:
+                if enabled:
+                    return {"success": False, "error": "no_wifi", "message": "Not connected to WiFi."}
+                settings = _load_settings()
+                settings["cake_enabled"] = False
+                _save_settings_with_timestamp(settings)
+                return {"success": True, "cake": False}
+
+            if enabled:
+                modprobe = "/usr/bin/modprobe" if os.path.isfile("/usr/bin/modprobe") else "/usr/sbin/modprobe"
+                self._run_cmd([modprobe, "sch_cake"], timeout=5)
+                result = self._run_cmd([
+                    "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
+                    "cake", "unlimited", "diffserv4", "nat", "ack-filter",
+                ])
+                if not result["success"]:
+                    return {
+                        "success": False,
+                        "error": "unexpected",
+                        "message": "Failed to apply CAKE qdisc.",
+                        "detail": result.get("stderr", ""),
+                    }
+                # Lower txqueuelen to complement CAKE's queue management
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"])
+                decky.logger.info(f"CAKE enabled (unlimited) on {iface}")
+            else:
+                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+                # Restore txqueuelen based on whether buffer tuning is active
+                settings = _load_settings()
+                txq = "2000" if settings.get("buffer_tuning_enabled") else "1000"
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
+                decky.logger.info(f"CAKE disabled on {iface}")
+
+            settings = _load_settings()
+            settings["cake_enabled"] = enabled
+            _save_settings_with_timestamp(settings)
+            return {"success": True, "cake": enabled}
+        except Exception as e:
+            decky.logger.error(f"set_cake error: {e}")
+            return self._unexpected_response(e)
+
     async def optimize_safe(self) -> dict:
         """Apply universally-safe optimizations: power save, BSSID lock, auto-fix, buffer tuning."""
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             results = {}
             applied = 0
             total = 4
@@ -1150,8 +1456,7 @@ class Plugin:
     async def reapply_all(self) -> dict:
         """Force reapply all enabled optimizations."""
         try:
-            if not self._is_supported_device():
-                return self._unsupported_response()
+
             settings = _load_settings()
             results = {}
             applied = 0
@@ -1170,6 +1475,13 @@ class Plugin:
                 total += 1
                 r = await self.set_buffer_tuning(True)
                 results["buffer_tuning"] = r
+                if r.get("success"):
+                    applied += 1
+
+            if settings.get("cake_enabled"):
+                total += 1
+                r = await self.set_cake(True)
+                results["cake"] = r
                 if r.get("success"):
                     applied += 1
 
@@ -1246,8 +1558,14 @@ class Plugin:
         """Delete settings and revert to defaults."""
         try:
             # Revert runtime state
-            self._apply_rtw88_fixes(False)
+            self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
+            for key, value in SYSCTL_DEFAULTS.items():
+                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
+            iface = self._get_wifi_interface()
+            if iface:
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
+                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
             try:
                 os.remove(NM_CONF_PATH)
             except FileNotFoundError:
@@ -1264,6 +1582,10 @@ class Plugin:
                 os.remove(ENFORCED_FILE)
             except FileNotFoundError:
                 pass
+            try:
+                os.remove(GENERIC_BACKEND_CONF)
+            except FileNotFoundError:
+                pass
 
             # Repopulate model/driver so the plugin doesn't show as "UNKNOWN /
             # Unsupported device" until the next plugin reload. Mirrors the
@@ -1272,6 +1594,13 @@ class Plugin:
             fresh = dict(DEFAULT_SETTINGS)
             fresh["model"] = info.get("model", "unknown")
             fresh["driver"] = info.get("driver", "unknown")
+            fresh["device_family"] = info.get("device_family", "unknown")
+            fresh["device_label"] = info.get("device_label", "Unknown Device")
+            fresh["chip_label"] = info.get("chip_label", "unknown")
+            fresh["supports_6ghz"] = info.get("supports_6ghz", False)
+            distro = self._detect_distro()
+            fresh["distro_id"] = distro["id"]
+            fresh["distro_name"] = distro["name"]
             _save_settings(fresh)
 
             decky.logger.info("Settings reset to defaults")
@@ -1305,30 +1634,26 @@ class Plugin:
             decky.logger.info(f"Update check: current={current}, channel={channel}")
 
             if channel == "beta":
-                # Use the GitHub contents API instead of raw.githubusercontent.com
-                # to bypass raw's CDN cache (typical 5-15 min TTL), which made
-                # beta updates appear unavailable immediately after a push.
-                # The `Accept: ...raw` header tells the API to return the file
-                # content directly instead of base64-wrapped JSON.
-                result = self._run_cmd(
+                result = await asyncio.to_thread(
+                    self._run_cmd,
                     [
-                        "/usr/bin/curl", "-sL", "--max-time", "10",
+                        "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.raw+json",
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/contents/package.json?ref=beta",
                     ],
-                    timeout=15,
-                    clean_env=True,
+                    15,
+                    True,
                 )
             else:
-                # Fetch latest release
-                result = self._run_cmd(
+                result = await asyncio.to_thread(
+                    self._run_cmd,
                     [
-                        "/usr/bin/curl", "-sL", "--max-time", "10",
+                        "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.v3+json",
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest",
                     ],
-                    timeout=15,
-                    clean_env=True,
+                    15,
+                    True,
                 )
 
             if not result["success"] or not result["stdout"]:
@@ -1465,12 +1790,12 @@ systemctl restart plugin_loader 2>/dev/null || true
 
         Invokes the privileged helper directly (at /usr/bin/steamos-polkit-helpers/…)
         to bypass pkexec, which fails from a rootful systemd context with no polkit
-        agent. The helper handles wlan0 recovery on OLED internally; we parse its
+        agent. The helper handles wlan0 recovery on ath11k devices internally; we parse its
         output to report whether recovery fired.
         """
         try:
             settings = _load_settings()
-            is_oled = settings.get("model") == "oled"
+            has_wlan0_quirk = settings.get("driver") == "ath11k_pci"
             other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
 
             # Phase: switching - write config then restart services.
@@ -1513,9 +1838,8 @@ systemctl restart plugin_loader 2>/dev/null || true
             recovery_performed = "missing wlan0" in rs_stdout
             needs_reboot = "wlan0 could not be created" in rs_stderr
 
-            # Defensive: on OLED, confirm wlan0 actually exists post-restart
             await asyncio.sleep(1)
-            if is_oled and target == "wpa_supplicant":
+            if has_wlan0_quirk and target == "wpa_supplicant":
                 iface_check = await asyncio.to_thread(self._get_wifi_interface)
                 if iface_check != "wlan0":
                     needs_reboot = True
@@ -1601,16 +1925,112 @@ systemctl restart plugin_loader 2>/dev/null || true
         finally:
             self._backend_switch["in_progress"] = False
 
+    async def _generic_backend_switch_worker(self, target: str):
+        """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
+        Writes NM config directly and manages systemd services."""
+        try:
+            other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
+
+            self._backend_switch["phase"] = "switching"
+            decky.logger.info(f"generic backend switch: {other} -> {target}")
+
+            os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
+            if target == "iwd":
+                with open(GENERIC_BACKEND_CONF, "w") as f:
+                    f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
+            else:
+                with open(GENERIC_BACKEND_CONF, "w") as f:
+                    f.write("[device]\nwifi.backend=wpa_supplicant\n")
+
+            # Stop old, enable + start new, restart NM
+            for cmd in [
+                ["/usr/bin/systemctl", "stop", other],
+                ["/usr/bin/systemctl", "disable", other],
+                ["/usr/bin/systemctl", "enable", target],
+                ["/usr/bin/systemctl", "start", target],
+            ]:
+                await asyncio.to_thread(self._run_cmd, cmd, 10, True)
+
+            restart = await asyncio.to_thread(
+                self._run_cmd,
+                ["/usr/bin/systemctl", "restart", "NetworkManager"],
+                15,
+                True,
+            )
+            if not restart["success"]:
+                detail = restart.get("stderr", "")[:200]
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": self._friendly_backend_error(detail),
+                    "detail": detail,
+                }
+                return
+
+            # Phase: reconnecting
+            self._backend_switch["phase"] = "reconnecting"
+            reconnect_timed_out = True
+            for _ in range(15):
+                await asyncio.sleep(1)
+                iface = await asyncio.to_thread(self._get_wifi_interface)
+                if iface:
+                    uuid = await asyncio.to_thread(self._get_active_connection_uuid)
+                    if uuid:
+                        reconnect_timed_out = False
+                        break
+
+            final_backend = await asyncio.to_thread(self._get_current_backend)
+
+            if final_backend == target:
+                self._backend_switch["phase"] = "done"
+                self._backend_switch["result"] = {
+                    "success": True,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": False,
+                    "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
+                }
+            else:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": False,
+                    "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
+                    "message": f"Expected {target} but got {final_backend}. A reboot may help.",
+                }
+
+            decky.logger.info(
+                f"generic backend switch: target={target}, final={final_backend}, "
+                f"reconnect_timed_out={reconnect_timed_out}"
+            )
+        except asyncio.CancelledError:
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": "Backend switch cancelled",
+            }
+            raise
+        except Exception as e:
+            decky.logger.error(f"_generic_backend_switch_worker error: {e}")
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": str(e),
+            }
+        finally:
+            self._backend_switch["in_progress"] = False
+
     async def start_backend_switch(self, backend: str) -> dict:
         """Kick off a backend switch. Returns immediately; poll get_backend_switch_status for progress."""
         try:
             self._ensure_backend_switch_state()
-            if not self._is_supported_device():
-                return {
-                    "accepted": False,
-                    "reason": "unsupported_device",
-                    "message": "Unsupported device. This plugin is designed for Steam Deck only.",
-                }
             if backend not in ("iwd", "wpa_supplicant"):
                 return {
                     "accepted": False,
@@ -1621,7 +2041,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                 return {
                     "accepted": False,
                     "reason": "tool_missing",
-                    "message": "steamos-wifi-set-backend not found. Requires SteamOS 3.6 or later.",
+                    "message": "WiFi backend switch tool not found on this system.",
                 }
             if self._backend_switch.get("in_progress"):
                 return {
@@ -1645,10 +2065,13 @@ systemctl restart plugin_loader 2>/dev/null || true
                 "started_at": int(time.time()),
                 "result": None,
             })
-            # Keep a reference so the task isn't garbage-collected mid-run
-            self._backend_switch_task = asyncio.create_task(
-                self._backend_switch_worker(backend)
-            )
+            # Route to the appropriate worker based on backend method
+            method = self._get_backend_method()
+            if method == "steamos":
+                worker = self._backend_switch_worker(backend)
+            else:
+                worker = self._generic_backend_switch_worker(backend)
+            self._backend_switch_task = asyncio.create_task(worker)
             decky.logger.info(f"backend switch started: {current} -> {backend}")
             return {
                 "accepted": True,

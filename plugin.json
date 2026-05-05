@@ -4,8 +4,8 @@
   "flags": ["root"],
   "api_version": 1,
   "publish": {
-    "tags": ["wifi", "network", "optimization", "streaming", "moonlight"],
-    "description": "Automatically apply and maintain WiFi optimizations that survive sleep and updates.",
+    "tags": ["wifi", "network", "optimization", "streaming", "moonlight", "handheld"],
+    "description": "WiFi optimizations for game streaming. Survives sleep and updates.",
     "image": ""
   }
 }

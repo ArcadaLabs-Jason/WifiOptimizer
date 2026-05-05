@@ -11,7 +11,7 @@ interface BannerProps {
 }
 
 // Shared banner styling for the panel's many inline notifications
-// (unsupported device, drift alert, optimize result, backend switch
+// (unknown hardware, drift alert, optimize result, backend switch
 // result, update errors, etc.). Each banner sits in its own
 // PanelSection so Decky's QAM can focus it with gamepad navigation.
 export function Banner({ variant, icon, children }: BannerProps) {

@@ -1,12 +1,14 @@
-# WiFi Optimizer v0.8.1
+# WiFi Optimizer v0.11.4
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
-A [Decky Loader](https://decky.xyz/) plugin for Steam Deck that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. Benefits any streaming over WiFi - Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki, and more. Works on both Steam Deck LCD and OLED.
+A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. Benefits any streaming over WiFi - Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki, and more.
+
+**Supported devices:** Steam Deck (LCD and OLED), Legion Go, ROG Ally, and other PC handhelds. Works on SteamOS, Bazzite, and CachyOS.
 
 ## The problem
 
-SteamOS resets WiFi settings after every system update and sleep/wake cycle. Power management gets re-enabled and network buffers reset to defaults. The result: latency spikes, connection drops, and degraded streaming quality - and the only fix is a trip to Desktop Mode.
+The OS resets WiFi settings after every system update and sleep/wake cycle. Power management gets re-enabled and network buffers reset to defaults. The result: latency spikes, connection drops, and degraded streaming quality - and the only fix is a trip to Desktop Mode.
 
 WiFi Optimizer fixes this from Game Mode. One tap, and it stays fixed.
 
@@ -29,14 +31,14 @@ Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > 
 ## Getting started
 
 1. Open WiFi Optimizer from the Decky sidebar
-2. Tap **Optimize Safe** - this applies the four no-brainer optimizations that are always beneficial:
+2. Tap **Optimize Safe** - this applies four no-brainer optimizations that are always beneficial:
    - Disables WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
    - Locks your BSSID (stops background scanning interruptions)
    - Enables auto-fix on wake (reapplies settings after sleep)
    - Tunes network buffers (handles streaming traffic bursts)
-3. That's it. The plugin maintains these settings automatically, even after sleep/wake and SteamOS updates.
+3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
 
-Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5/6 GHz, custom DNS, disabling IPv6, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
+Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5/6 GHz, custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
 
 ## All optimizations
 
@@ -45,7 +47,7 @@ Want to go further? The remaining optimizations are available as individual togg
 | Optimization | What it does |
 |---|---|
 | Prevent lag spikes | Disables WiFi power management and PCIe power states that cause packet batching, latency spikes, and throughput degradation during sustained streaming. |
-| Stop background scanning | Locks to your current access point so the Deck stops scanning for other networks every 2 minutes. Disable before switching networks or if you use a mesh/multi-AP setup and need to roam. |
+| Stop background scanning | Locks to your current access point so your device stops scanning for other networks every few minutes. Disable before switching networks or if you use a mesh/multi-AP setup and need to roam. |
 | Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects - works even if Decky isn't running |
 | Network buffer tuning | Increases kernel buffer sizes and TX queue length to handle bursty streaming traffic without dropping packets |
 
@@ -54,19 +56,22 @@ Want to go further? The remaining optimizations are available as individual togg
 | Optimization | What it does | Why it's manual |
 |---|---|---|
 | Force 5 GHz / 6 GHz | Locks WiFi to the higher-frequency band to avoid Bluetooth interference | Won't connect if your network is 2.4 GHz only |
+| Traffic shaping (CAKE) | Replaces the default network queue with CAKE for fair queuing, bufferbloat prevention, and ACK filtering. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
-| WiFi backend (iwd / wpa_supplicant) | Switches between SteamOS's default `iwd` and the older `wpa_supplicant`. Some OLED owners find wpa_supplicant more stable across sleep/wake and 5 GHz. | Requires SteamOS 3.6+; some networks (certain WPA3, enterprise setups) behave differently between the two |
+| WiFi backend (iwd / wpa_supplicant) | Switches between the default `iwd` and the older `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. | Only available when both backends are installed on the system; some networks (certain WPA3, enterprise setups) behave differently between the two |
 
 ## Hardware support
 
-Works on both Steam Deck models. OLED owners tend to see the biggest improvement since its ath11k driver is more sensitive to sleep/wake cycles.
+| Device | WiFi Chip | Driver | Notes |
+|---|---|---|---|
+| Steam Deck LCD | WiFi 5 (RTL8822CE) | rtw88 | Full support |
+| Steam Deck OLED | WiFi 6E (QCA206X) | ath11k_pci | Full support |
+| Legion Go (all models) | WiFi 6E (MT7922) | mt7921e | Full support |
+| ROG Ally (all models) | WiFi 6E (MT7922) | mt7921e | Full support |
+| Other PC handhelds | Varies | iwlwifi, etc. | Detected automatically; driver-specific fixes applied when available |
 
-| | LCD | OLED |
-|---|---|---|
-| WiFi | WiFi 5 (RTL8822CE) | WiFi 6E (QCA206X) |
-| Driver | rtw88 | ath11k_pci |
-| Backend switch quirk | None | Switching from iwd to wpa_supplicant briefly drops wlan0; the plugin recreates it automatically |
+The plugin detects your WiFi hardware at startup and applies the right optimizations for your chip. Devices with unrecognized hardware still get universal optimizations (power save, buffer tuning, BSSID lock, etc.).
 
 ### Legion Go / ROG Ally / other handhelds (beta)
 
@@ -88,13 +93,13 @@ The plugin has two parts:
 
 1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It detects when settings have drifted after wake and lets you fix them with one tap.
 
-2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers). If you uninstall the plugin, the script removes itself.
+2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers, CAKE). If you uninstall the plugin, the script removes itself.
 
 No background processes, no polling, no battery impact.
 
 ## Uninstall
 
-**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This reverts the runtime optimizations (power save, buffer tuning, PCIe ASPM) and deletes the plugin's own config files. Per-connection NetworkManager profile changes (BSSID lock, band preference, custom DNS, IPv6) stay on your saved WiFi network - to remove those, forget and rejoin the network from Steam's WiFi settings. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide SteamOS setting and isn't touched by the plugin on uninstall.
+**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This reverts the runtime optimizations (power save, buffer tuning, PCIe ASPM, CAKE) and deletes the plugin's own config files. Per-connection NetworkManager profile changes (BSSID lock, band preference, custom DNS, IPv6) stay on your saved WiFi network - to remove those, forget and rejoin the network from Steam's WiFi settings. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
 
 Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
 
@@ -102,6 +107,7 @@ Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Un
 rm -rf ~/homebrew/plugins/WiFi\ Optimizer
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-wifi-optimizer
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
+sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf
 sudo rm -f /etc/modprobe.d/99-wifi-optimizer.conf
 sudo systemctl restart plugin_loader
 ```

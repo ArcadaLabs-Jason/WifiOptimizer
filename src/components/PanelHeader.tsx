@@ -3,24 +3,25 @@ import { theme } from "../theme";
 import { timeAgo } from "../utils";
 
 interface PanelHeaderProps {
-  model: string;
   driver: string;
   version: string;
   lastApplied: number;
   lastEnforced?: number;
+  deviceLabel?: string;
 }
 
-// Top-of-panel identification: device chip, plugin version, hint, and the
-// two timestamps that tell the user when their settings were last touched
-// (either by them via a toggle or by the dispatcher on a WiFi reconnect).
 export function PanelHeader({
-  model,
   driver,
   version,
   lastApplied,
   lastEnforced,
+  deviceLabel,
 }: PanelHeaderProps) {
-  const modelLabel = `${(model || "unknown").toUpperCase()} - ${driver || "?"}`;
+  const modelLabel = deviceLabel && deviceLabel !== "unknown"
+    ? deviceLabel
+    : driver && driver !== "unknown"
+      ? driver
+      : "Unrecognized hardware";
   const rowStyle: React.CSSProperties = {
     fontSize: theme.fontSize.tiny,
     color: theme.text.muted,
