@@ -1453,6 +1453,39 @@ class Plugin:
             decky.logger.error(f"optimize_safe error: {e}")
             return self._unexpected_response(e)
 
+    async def reapply_volatile(self) -> dict:
+        """Reapply volatile (non-reconnecting) settings. Safe to call mid-stream."""
+        try:
+            settings = _load_settings()
+            applied = 0
+            total = 0
+
+            if settings.get("power_save_disabled"):
+                total += 1
+                r = await self.set_power_save(True)
+                if r.get("success"):
+                    applied += 1
+
+            if settings.get("buffer_tuning_enabled"):
+                total += 1
+                r = await self.set_buffer_tuning(True)
+                if r.get("success"):
+                    applied += 1
+
+            if settings.get("cake_enabled"):
+                total += 1
+                r = await self.set_cake(True)
+                if r.get("success"):
+                    applied += 1
+
+            if total > 0:
+                decky.logger.info(f"reapply_volatile: {applied}/{total} applied")
+
+            return {"success": True, "applied": applied, "total": total}
+        except Exception as e:
+            decky.logger.error(f"reapply_volatile error: {e}")
+            return self._unexpected_response(e)
+
     async def reapply_all(self) -> dict:
         """Force reapply all enabled optimizations."""
         try:

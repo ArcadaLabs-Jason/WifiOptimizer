@@ -829,6 +829,22 @@ function Content() {
 }
 
 export default definePlugin(() => {
+  let gameLifetimeUnsub: { unregister(): void } | null = null;
+
+  try {
+    gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications(
+      (notification: { bRunning: boolean }) => {
+        if (notification.bRunning) {
+          setTimeout(() => {
+            backend.reapplyVolatile().catch(() => {});
+          }, 3000);
+        }
+      },
+    );
+  } catch (e) {
+    console.error("WiFi Optimizer: failed to register game launch listener", e);
+  }
+
   return {
     name: "WiFi Optimizer",
     titleView: <div className={staticClasses.Title}>WiFi Optimizer</div>,
@@ -838,6 +854,8 @@ export default definePlugin(() => {
       </ErrorBoundary>
     ),
     icon: <FaWifi />,
-    onDismount() {},
+    onDismount() {
+      gameLifetimeUnsub?.unregister();
+    },
   };
 });
