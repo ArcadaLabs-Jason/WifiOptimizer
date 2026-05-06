@@ -1694,7 +1694,9 @@ class Plugin:
                 latest_clean = latest.split("-")[0]
                 current_tuple = tuple(int(x) for x in current_clean.split("."))
                 latest_tuple = tuple(int(x) for x in latest_clean.split("."))
-                update_available = latest_tuple > current_tuple or "-beta" in current
+                update_available = latest_tuple > current_tuple or (
+                    "-beta" in current and latest_tuple >= current_tuple
+                )
 
             decky.logger.info(f"Update check: current={current}, latest={latest}, channel={channel}, update={update_available}")
 
