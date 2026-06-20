@@ -268,6 +268,13 @@ class Plugin:
             }
 
     def _get_wifi_interface(self) -> str | None:
+        try:
+            for iface in os.listdir("/sys/class/net"):
+                if os.path.exists(f"/sys/class/net/{iface}/phy80211") or os.path.exists(f"/sys/class/net/{iface}/wireless"):
+                    return iface
+        except Exception:
+            pass
+
         result = self._run_cmd(
             ["/usr/bin/nmcli", "-t", "-f", "DEVICE,TYPE", "dev", "status"]
         )
