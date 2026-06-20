@@ -114,6 +114,10 @@ DMI_SUBSTRING_DEVICES = [
     ("ROG Xbox Ally RC73Y", {"family": "rog_xbox_ally", "label": "ROG Xbox Ally"}),
     ("ROG Ally X RC72LA", {"family": "rog_ally_x", "label": "ROG Ally X"}),
     ("ROG Ally RC71L", {"family": "rog_ally", "label": "ROG Ally"}),
+    ("Claw", {"family": "msi_claw", "label": "MSI Claw"}),
+    ("AYANEO", {"family": "ayaneo", "label": "AYANEO Device"}),
+    ("GPD", {"family": "gpd", "label": "GPD Device"}),
+    ("G1618", {"family": "gpd_win", "label": "GPD WIN Device"}),
 ]
 
 try:
