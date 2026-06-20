@@ -58,6 +58,24 @@ DRIVER_PROFILES = {
         "sysfs_power_fixes": [],
         "modprobe_options": [],
     },
+    "rtw89": {
+        "chip_label": "WiFi 6 (RTL8852)",
+        "supports_6ghz": True,
+        "sysfs_power_fixes": [
+            "/sys/module/rtw89_pci/parameters/disable_aspm_l1",
+            "/sys/module/rtw89_pci/parameters/disable_aspm_l1ss",
+        ],
+        "modprobe_options": [
+            "options rtw89_pci disable_aspm_l1=Y",
+            "options rtw89_pci disable_aspm_l1ss=Y",
+        ],
+    },
+    "ath12k": {
+        "chip_label": "WiFi 7 (WCN7850)",
+        "supports_6ghz": True,
+        "sysfs_power_fixes": [],
+        "modprobe_options": [],
+    },
     "mt7921e": {
         "chip_label": "WiFi 6E (MT7922)",
         "supports_6ghz": True,
@@ -96,6 +114,10 @@ DMI_SUBSTRING_DEVICES = [
     ("ROG Xbox Ally RC73Y", {"family": "rog_xbox_ally", "label": "ROG Xbox Ally"}),
     ("ROG Ally X RC72LA", {"family": "rog_ally_x", "label": "ROG Ally X"}),
     ("ROG Ally RC71L", {"family": "rog_ally", "label": "ROG Ally"}),
+    ("Claw", {"family": "msi_claw", "label": "MSI Claw"}),
+    ("AYANEO", {"family": "ayaneo", "label": "AYANEO Device"}),
+    ("GPD", {"family": "gpd", "label": "GPD Device"}),
+    ("G1618", {"family": "gpd_win", "label": "GPD WIN Device"}),
 ]
 
 try:
@@ -246,6 +268,13 @@ class Plugin:
             }
 
     def _get_wifi_interface(self) -> str | None:
+        try:
+            for iface in os.listdir("/sys/class/net"):
+                if os.path.exists(f"/sys/class/net/{iface}/phy80211") or os.path.exists(f"/sys/class/net/{iface}/wireless"):
+                    return iface
+        except Exception:
+            pass
+
         result = self._run_cmd(
             ["/usr/bin/nmcli", "-t", "-f", "DEVICE,TYPE", "dev", "status"]
         )
