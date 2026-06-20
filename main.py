@@ -58,6 +58,24 @@ DRIVER_PROFILES = {
         "sysfs_power_fixes": [],
         "modprobe_options": [],
     },
+    "rtw89": {
+        "chip_label": "WiFi 6 (RTL8852)",
+        "supports_6ghz": True,
+        "sysfs_power_fixes": [
+            "/sys/module/rtw89_pci/parameters/disable_aspm_l1",
+            "/sys/module/rtw89_pci/parameters/disable_aspm_l1ss",
+        ],
+        "modprobe_options": [
+            "options rtw89_pci disable_aspm_l1=Y",
+            "options rtw89_pci disable_aspm_l1ss=Y",
+        ],
+    },
+    "ath12k": {
+        "chip_label": "WiFi 7 (WCN7850)",
+        "supports_6ghz": True,
+        "sysfs_power_fixes": [],
+        "modprobe_options": [],
+    },
     "mt7921e": {
         "chip_label": "WiFi 6E (MT7922)",
         "supports_6ghz": True,
