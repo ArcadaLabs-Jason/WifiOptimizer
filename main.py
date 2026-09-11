@@ -1337,17 +1337,18 @@ class Plugin:
         # Setting the band does not move an existing association, so the very
         # next poll sees the band as correct, proposes nothing for it, and
         # would otherwise pin the old band's access point anyway.
-        def band_conflict() -> bool:
-            live = status.get("live", {})
+        def band_conflict(action: dict) -> bool:
             return self._band_conflicts(
-                settings, live.get("frequency", ""), live.get("active_ssid")
+                settings,
+                status.get("live", {}).get("frequency", ""),
+                action.get("active_ssid"),
             )
 
         for action in actions:
             kind = action["kind"]
             uuid = action["uuid"]
 
-            if kind == "bssid_repoint" and band_conflict():
+            if kind == "bssid_repoint" and band_conflict(action):
                 continue
 
             if kind == "priority":
@@ -1737,6 +1738,10 @@ class Plugin:
                 # Bump priority to favor this profile over duplicates on boot.
                 actions.append({"kind": "priority", "uuid": uuid})
 
+            # Resolved lazily by the blocks below that need it; declared here
+            # so every path has it, and None keeps meaning "not established".
+            active_ssid: str | None = None
+
             # Power save
             ps_result = self._run_cmd(
                 ["/usr/bin/iw", "dev", iface, "get", "power_save"], timeout=T
@@ -1829,13 +1834,18 @@ class Plugin:
                 # this, leaving home with the lock still enabled would pin the
                 # user to the first AP of whatever network they joined next,
                 # which they never asked for and which blocks roaming on it.
+                # Resolved once, here, because two things need it: deciding
+                # whether this is the locked network, and telling the applier
+                # which network the pin would land on so it can honour the
+                # band preference's scope. None means "could not tell", and
+                # every consumer treats that as a reason to hold off.
+                active_ssid = self._get_profile_ssid(uuid, timeout=T)
                 locked_uuid = settings.get("bssid_lock_connection_uuid", "")
                 same_network = False
                 if locked_uuid == uuid:
                     same_network = True
                 elif locked_uuid:
                     locked_ssid = self._get_profile_ssid(locked_uuid, timeout=T)
-                    active_ssid = self._get_profile_ssid(uuid, timeout=T)
                     same_network = bool(
                         locked_ssid and active_ssid and locked_ssid == active_ssid
                     )
@@ -1846,6 +1856,10 @@ class Plugin:
                         actions.append({
                             "kind": "bssid_repoint", "uuid": uuid,
                             "value": live_bssid,
+                            # Carried on the action rather than published in
+                            # `live`: the applier is its only consumer and the
+                            # panel has no use for it.
+                            "active_ssid": active_ssid,
                         })
                     # Genuinely drifted: this IS the locked network and the
                     # lock is missing from the profile in use.
@@ -1923,8 +1937,10 @@ class Plugin:
             band_ssid = settings.get("band_preference_ssid", "")
             band_scope_ok = True
             if settings.get("band_preference_enabled") and band_ssid:
-                active_ssid = self._get_profile_ssid(uuid, timeout=T)
-                status["live"]["active_ssid"] = active_ssid or ""
+                # active_ssid was resolved with the BSSID lock above. Reading
+                # it again would be a second subprocess for the same answer.
+                if active_ssid is None:
+                    active_ssid = self._get_profile_ssid(uuid, timeout=T)
                 band_scope_ok = active_ssid == band_ssid
             if (
                 settings.get("band_preference_enabled")
