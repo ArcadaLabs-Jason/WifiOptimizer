@@ -314,7 +314,7 @@ class Plugin:
                 continue
             except Exception:
                 continue
-        # No config found — check which service is running
+        # No config found, check which service is running
         result = self._run_cmd(["/usr/bin/systemctl", "is-active", "iwd"], timeout=3)
         if result.get("stdout", "").strip() == "active":
             return "iwd"
