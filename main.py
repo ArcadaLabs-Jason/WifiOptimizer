@@ -9,6 +9,7 @@ QoS) on every WiFi reconnect independently of Decky.
 """
 
 import os
+import pwd
 import json
 import time
 import asyncio
@@ -34,6 +35,7 @@ DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
 BACKEND_HELPER = "/usr/bin/steamos-polkit-helpers/steamos-wifi-set-backend-privileged"
+STEAMOSCTL = "/usr/bin/steamosctl"
 WIFI_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-valve-wifi-backend.conf"
 NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-steamos-defaults.conf"
 GENERIC_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf"
@@ -269,14 +271,69 @@ class Plugin:
                 return parts[0]
         return None
 
+    def _session_bus_cmd(self, args: list[str]) -> list[str] | None:
+        """Wrap a command so it runs against the desktop user's session bus.
+
+        steamosctl talks to steamos-manager on the session bus, but the plugin
+        runs as root inside plugin_loader and root has no session of its own -
+        invoking it directly fails with ENOENT, and connecting to the user's
+        bus as root is refused during authentication. Dropping to the user with
+        the bus address supplied explicitly is what actually works.
+        """
+        user = getattr(decky, "DECKY_USER", None) or "deck"
+        try:
+            uid = pwd.getpwnam(user).pw_uid
+        except Exception:
+            return None
+        bus = f"/run/user/{uid}/bus"
+        if not os.path.exists(bus):
+            return None
+        return [
+            "/usr/bin/runuser", "-u", user, "--",
+            "env",
+            f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}",
+        ] + args
+
+    def _steamosctl_backend(self) -> str | None:
+        """Read the backend through steamos-manager. None if unavailable."""
+        if not os.path.isfile(STEAMOSCTL):
+            return None
+        cmd = self._session_bus_cmd([STEAMOSCTL, "get-wifi-backend"])
+        if not cmd:
+            return None
+        result = self._run_cmd(cmd, timeout=5, clean_env=True)
+        if not result["success"]:
+            return None
+        # "Wi-Fi backend: wpa_supplicant"
+        _, _, value = result.get("stdout", "").partition(":")
+        value = value.strip()
+        return value if value in ("iwd", "wpa_supplicant") else None
+
+    def _has_steamos_manager(self) -> bool:
+        """Probe once and remember. This is reached from the status poll, and
+        whether steamos-manager is present cannot change while we are loaded."""
+        cached = getattr(self, "_steamos_manager_available", None)
+        if cached is None:
+            cached = self._steamosctl_backend() is not None
+            self._steamos_manager_available = cached
+            decky.logger.info(f"steamos-manager backend control available: {cached}")
+        return cached
+
     def _get_backend_method(self) -> str:
-        """Return 'steamos', 'generic', or 'none'.
-        SteamOS has a privileged helper. Generic uses NM conf + systemctl
-        directly and requires iwd to be installed. Non-SteamOS distros
-        always use generic even if the SteamOS helper exists (it may
-        behave differently on Bazzite/CachyOS)."""
+        """Return 'steamos_manager', 'steamos', 'generic', or 'none'.
+
+        Preference order matters. SteamOS 3.8 switches the backend through
+        steamos-manager, and that is what the OS settings UI drives; the older
+        polkit helper is still installed but no longer maintained, and its
+        interface recovery hardcodes phy0, which does not exist on every
+        device. Probe for the manager by capability rather than by OS version
+        so this degrades cleanly on 3.7 and on non-SteamOS systems.
+        """
         settings = _load_settings()
         distro = settings.get("distro_id", "unknown")
+        if distro == "steamos" and self._has_steamos_manager():
+            return "steamos_manager"
         if distro == "steamos" and os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK):
             return "steamos"
         if os.path.isfile("/usr/lib/systemd/system/iwd.service"):
@@ -1945,6 +2002,15 @@ systemctl restart plugin_loader 2>/dev/null || true
                 if iface_check != "wlan0":
                     needs_reboot = True
 
+            # The helper's own recovery only knows about phy0. Try again with
+            # the real phy before making the user reboot.
+            if needs_reboot:
+                if await asyncio.to_thread(self._recover_wlan0):
+                    await asyncio.sleep(2)
+                    if await asyncio.to_thread(self._get_wifi_interface):
+                        needs_reboot = False
+                        recovery_performed = True
+
             # Phase: reconnecting. Poll nmcli at 1-second cadence for up to 15s
             # to confirm WiFi actually comes back. 15s is generous for typical
             # NM reconnect (about 5s on wpa_supplicant, 1-2s on iwd) but not
@@ -2017,6 +2083,140 @@ systemctl restart plugin_loader 2>/dev/null || true
             raise
         except Exception as e:
             decky.logger.error(f"_backend_switch_worker error: {e}")
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": str(e),
+            }
+        finally:
+            self._backend_switch["in_progress"] = False
+
+    def _recover_wlan0(self) -> bool:
+        """Recreate a wlan0 that the backend switch destroyed.
+
+        Valve's polkit helper tries this itself but calls `iw phy phy0`, with
+        the phy index hardcoded. Devices whose wiphy is not phy0 - the Steam
+        Deck OLED among them - fail there, and because the helper runs under
+        `set -e` it aborts before restarting NetworkManager, leaving no
+        interface at all. Retry with the phy this machine actually has.
+
+        The wiphy outlives the netdev, so /sys/class/ieee80211 still lists it
+        even though wlan0 is gone.
+        """
+        try:
+            phys = sorted(os.listdir("/sys/class/ieee80211"))
+        except Exception:
+            return False
+        if not phys:
+            return False
+
+        for phy in phys:
+            result = self._run_cmd(
+                ["/usr/bin/iw", "phy", phy, "interface", "add", "wlan0",
+                 "type", "station"],
+                timeout=10,
+            )
+            if result["success"]:
+                decky.logger.info(f"Recreated wlan0 on {phy}")
+                self._run_cmd(
+                    ["/usr/bin/systemctl", "restart", "NetworkManager"],
+                    timeout=30, clean_env=True,
+                )
+                return True
+            decky.logger.error(
+                f"wlan0 recovery on {phy} failed: {result.get('stderr', '')[:120]}"
+            )
+        return False
+
+    async def _steamos_manager_backend_switch_worker(self, target: str):
+        """Backend switch through steamos-manager (SteamOS 3.8+).
+
+        This is the path the OS settings UI uses. It is preferred over the
+        polkit helper for two concrete reasons: the helper recreates a missing
+        wlan0 with a hardcoded `iw phy phy0`, which fails outright on devices
+        whose wiphy is not phy0 and leaves NetworkManager stopped with no
+        interface; and the helper rewrites the Valve config file with only the
+        backend stanza, discarding the Wi-Fi power management setting the OS
+        stores alongside it.
+        """
+        try:
+            self._backend_switch["phase"] = "switching"
+            decky.logger.info(f"steamos-manager backend switch -> {target}")
+
+            cmd = self._session_bus_cmd([STEAMOSCTL, "set-wifi-backend", target])
+            if not cmd:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": "Couldn't reach the SteamOS settings service.",
+                }
+                return
+
+            result = await asyncio.to_thread(self._run_cmd, cmd, 45, True)
+            if not result["success"]:
+                detail = (result.get("stderr") or result.get("stdout") or "")[:200]
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": self._friendly_backend_error(detail),
+                    "detail": detail,
+                }
+                decky.logger.error(f"steamos-manager switch failed: {detail!r}")
+                return
+
+            # Phase: reconnecting. Same cadence as the other workers.
+            self._backend_switch["phase"] = "reconnecting"
+            reconnect_timed_out = True
+            for _ in range(15):
+                await asyncio.sleep(1)
+                iface = await asyncio.to_thread(self._get_wifi_interface)
+                if iface:
+                    uuid = await asyncio.to_thread(self._get_active_connection_uuid)
+                    if uuid:
+                        reconnect_timed_out = False
+                        break
+
+            final_backend = await asyncio.to_thread(self._get_current_backend)
+
+            if final_backend == target:
+                self._backend_switch["phase"] = "done"
+                self._backend_switch["result"] = {
+                    "success": True,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": False,
+                    "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
+                }
+            else:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": False,
+                    "needs_reboot": False,
+                    "reconnect_timed_out": reconnect_timed_out,
+                    "message": f"Expected {target} but got {final_backend}. A reboot may help.",
+                }
+
+            decky.logger.info(
+                f"steamos-manager backend switch: target={target}, "
+                f"final={final_backend}, reconnect_timed_out={reconnect_timed_out}"
+            )
+        except asyncio.CancelledError:
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "target": target,
+                "message": "Backend switch cancelled",
+            }
+            raise
+        except Exception as e:
+            decky.logger.error(f"_steamos_manager_backend_switch_worker error: {e}")
             self._backend_switch["phase"] = "failed"
             self._backend_switch["result"] = {
                 "success": False,
@@ -2168,7 +2368,9 @@ systemctl restart plugin_loader 2>/dev/null || true
             })
             # Route to the appropriate worker based on backend method
             method = self._get_backend_method()
-            if method == "steamos":
+            if method == "steamos_manager":
+                worker = self._steamos_manager_backend_switch_worker(backend)
+            elif method == "steamos":
                 worker = self._backend_switch_worker(backend)
             else:
                 worker = self._generic_backend_switch_worker(backend)
