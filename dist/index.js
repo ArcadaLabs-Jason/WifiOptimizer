@@ -335,7 +335,10 @@ const EXPLANATION = "Your system defaults to iwd for WiFi management. Some devic
     "differently between backends - if your WiFi stops connecting after a " +
     "switch, try switching back.";
 function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
-    const currentBackend = status.live?.wifi_backend || "iwd";
+    // The backend is genuinely unknown when no config declares one and neither
+    // service reports active. Defaulting the label to iwd states something we
+    // have not established, on a machine that may well be on wpa_supplicant.
+    const currentBackend = status.live?.wifi_backend || "";
     const isWpa = currentBackend === "wpa_supplicant";
     const switching = backendSwitch?.in_progress ?? false;
     // Optimistic: during a switch, reflect the target so the toggle matches
@@ -353,7 +356,9 @@ function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
             ? { badge: "unknown", text: "…" }
             : isWpa
                 ? { badge: "active", text: "wpa_supplicant" }
-                : { badge: "off", text: "iwd" };
+                : currentBackend === "iwd"
+                    ? { badge: "off", text: "iwd" }
+                    : { badge: "unknown", text: "unknown" };
     // Inline result shown right under the toggle so it's visible where the
     // user clicked - the top-of-panel banner is often off-screen when the
     // user is scrolled down to the Advanced section.
@@ -362,7 +367,11 @@ function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
         : null;
     return (SP_JSX.jsx(InfoRow, { label: "Use wpa_supplicant backend", subtitle: phaseText ?? "Alternate WiFi backend - can fix sleep/wake and stability issues", explanation: EXPLANATION, badge: badge.badge, text: badge.text, checked: checked, disabled: switching || isBusy, error: error, onChange: onToggle, children: lastResult?.success && (() => {
             const timedOut = lastResult.reconnect_timed_out;
-            const parts = [`Switched to ${lastResult.backend}`];
+            const parts = [
+                lastResult.backend
+                    ? `Switched to ${lastResult.backend}`
+                    : `Switched to ${lastResult.target}`,
+            ];
             if (lastResult.recovery_performed)
                 parts.push("wlan0 interface recreated");
             if (timedOut)
@@ -544,6 +553,7 @@ function Content() {
     const backendPollRef = SP_REACT.useRef(null);
     const prevConnectedRef = SP_REACT.useRef(null);
     const lastUpdateCheckAtRef = SP_REACT.useRef(0);
+    const statusSeqRef = SP_REACT.useRef(0);
     const setBusy = SP_REACT.useCallback((val) => {
         busyRef.current = val;
         setIsBusy(val);
@@ -565,8 +575,16 @@ function Content() {
         // catches up immediately instead of waiting for the next interval tick.
         if (!force && busyRef.current)
             return;
+        // Status collection runs off the event loop on the backend, so a slow
+        // call can still be in flight when the next tick fires. Without a
+        // sequence check the older reply lands last and overwrites the newer
+        // one, which shows up as toggles and stats flicking back to stale
+        // values a second after they settled.
+        const seq = ++statusSeqRef.current;
         try {
             const s = await getStatus();
+            if (seq !== statusSeqRef.current)
+                return;
             setStatus(s);
             if (s.settings) {
                 if (s.settings.dns_provider === "custom") {

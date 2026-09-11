@@ -132,6 +132,7 @@ function Content() {
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
   const lastUpdateCheckAtRef = useRef<number>(0);
+  const statusSeqRef = useRef(0);
 
   const setBusy = useCallback((val: boolean) => {
     busyRef.current = val;
@@ -155,8 +156,15 @@ function Content() {
     // handler-driven refreshes (at the end of an op) force through so the UI
     // catches up immediately instead of waiting for the next interval tick.
     if (!force && busyRef.current) return;
+    // Status collection runs off the event loop on the backend, so a slow
+    // call can still be in flight when the next tick fires. Without a
+    // sequence check the older reply lands last and overwrites the newer
+    // one, which shows up as toggles and stats flicking back to stale
+    // values a second after they settled.
+    const seq = ++statusSeqRef.current;
     try {
       const s = await backend.getStatus();
+      if (seq !== statusSeqRef.current) return;
       setStatus(s);
       if (s.settings) {
         if (s.settings.dns_provider === "custom") {
