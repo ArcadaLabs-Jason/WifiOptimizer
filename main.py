@@ -10,6 +10,7 @@ QoS) on every WiFi reconnect independently of Decky.
 
 import os
 import re
+import copy
 import pwd
 import shlex
 import json
@@ -122,6 +123,9 @@ VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}(-[A-Za-z0-9.]+)?\Z")
 # separator, but the value is checked rather than assumed.
 IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z")
 
+# NetworkManager connection uuids, as stored in our own settings.
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}\Z")
+
 # DNS servers are free text from the panel. They are passed to nmcli as a
 # single argument, so there is no shell involved, but the value is stored and
 # replayed later and should be addresses and nothing else.
@@ -180,6 +184,10 @@ DEFAULT_SETTINGS = {
     # single slot loses the earlier ones and leaves them pinned to an access
     # point with nothing able to clear it.
     "bssid_lock_uuids": [],
+    # Same reasoning for the band: a profile left demanding a band its
+    # network does not offer will not associate, and only the one profile
+    # that happened to be active was ever cleared.
+    "band_preference_uuids": [],
     "band_preference": "a",
     "band_preference_enabled": False,
     "dns_provider": "cloudflare",
@@ -255,6 +263,14 @@ def _load_settings() -> dict:
         # a band with no control able to clear it.
         if merged.get("band_preference") not in ("a", "bg"):
             merged["band_preference"] = "a"
+        # These lists are handed to nmcli as root. argv rather than a shell,
+        # so junk is not dangerous, but a list of it turns a reset into a
+        # long series of doomed calls on the event loop.
+        for key in ("bssid_lock_uuids", "band_preference_uuids"):
+            merged[key] = [
+                u for u in merged.get(key, [])
+                if isinstance(u, str) and UUID_RE.match(u)
+            ]
         return merged
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -492,6 +508,17 @@ class Plugin:
     def _has_backend_tool(self) -> bool:
         return self._get_backend_method() != "none"
 
+    def _get_backend_method_cached(self) -> bool:
+        """Whether a backend switch is possible, without probing.
+
+        Called from the status collector, which runs in a worker thread and
+        must not mutate. Anything not already known is answered from files.
+        """
+        settings = _load_settings()
+        if settings.get("distro_id") == "steamos" and os.path.isfile(BACKEND_HELPER):
+            return True
+        return os.path.isfile("/usr/lib/systemd/system/iwd.service")
+
     def _get_current_backend(self) -> str | None:
         """Return 'iwd', 'wpa_supplicant', or None if unknown.
 
@@ -594,7 +621,7 @@ class Plugin:
         _, sep, value = result.get("stdout", "").partition(":")
         return value.strip() if sep else None
 
-    def _clear_all_bssid_locks(self):
+    def _clear_profile_pins(self):
         """Remove the pins this plugin added from every profile it touched.
 
         The lock follows whichever profile NetworkManager uses, so discarding
@@ -620,8 +647,9 @@ class Plugin:
             )
         if clear_band:
             last = settings.get("last_connection_uuid", "")
-            for uuid in {u for u in uuids + [last] if u}:
-                self._nmcli_modify(uuid, "802-11-wireless.band", "")
+            band_uuids = settings.get("band_preference_uuids", [])
+            for uuid in {u for u in list(band_uuids) + uuids + [last] if u}:
+                self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
 
     def _hard_reconnect(self, uuid: str | None = None):
         """Reconnect by cycling WiFi radio to fully reset NM connection state."""
@@ -773,14 +801,16 @@ class Plugin:
             decky.logger.error(f"Failed to install dispatcher: {e}")
             return False
 
-    def _remove_dispatcher(self):
+    def _remove_dispatcher(self) -> bool:
         try:
             os.remove(DISPATCHER_PATH)
             decky.logger.info("Dispatcher script removed")
+            return True
         except FileNotFoundError:
-            pass
+            return True
         except Exception as e:
             decky.logger.error(f"Failed to remove dispatcher: {e}")
+            return False
 
     def _rotate_logs(self, keep: int = 10):
         """Prune old log files on plugin startup. Decky does not rotate plugin
@@ -878,7 +908,10 @@ class Plugin:
             # running? Divergence would indicate a previous switch got interrupted
             # (plugin_loader crash, external tool, etc.). Log only; user can
             # re-toggle to resolve.
-            if await asyncio.to_thread(self._get_backend_method) != "none":
+            # Warm the steamos-manager probe here, off the polling path, so
+            # the collector never has to fork or memoise from its thread.
+            backend_method = await asyncio.to_thread(self._get_backend_method)
+            if backend_method != "none":
                 conf_backend = self._get_current_backend()
                 if conf_backend:
                     active = self._run_cmd(
@@ -912,7 +945,7 @@ class Plugin:
     async def _uninstall(self):
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
-            self._clear_all_bssid_locks()
+            self._clear_profile_pins()
             self._remove_dispatcher()
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
@@ -1155,9 +1188,9 @@ class Plugin:
         # this one is still out, and on an unresponsive NetworkManager a dozen
         # of them pile up, each spawning its own subprocesses.
         #
-        # A counter rather than a flag: with a flag, callers arriving before
-        # the first result exists all fall through and start their own, and the
-        # first one to finish clears it for everyone.
+        # A counter rather than a flag, because with a flag the first caller
+        # to finish clears it for everyone still running. Callers arriving
+        # before any result exists are handled separately, below.
         #
         # The reply is the live values from the last completed pass, which may
         # be as old as that pass took - but its settings are re-read, because
@@ -1166,12 +1199,29 @@ class Plugin:
         if getattr(self, "_collect_depth", 0) > 0:
             last = getattr(self, "_last_status", None)
             if last is not None:
-                cached = dict(last)
+                # deepcopy, not dict(): a shallow copy shares live and drift
+                # with the cached object, so anything that later mutates them
+                # after this early return would corrupt every future reply.
+                cached = copy.deepcopy(last)
                 try:
                     cached["settings"] = _load_settings()
                 except Exception:
                     pass
                 return cached
+            # No previous result to hand back. Falling through here is what
+            # the guard exists to prevent: the first collection of a cold boot
+            # routinely outlives the poll interval, so every caller would
+            # start its own. Report not-ready instead; the panel renders a
+            # disconnected state correctly.
+            return {
+                "success": True,
+                "connected": False,
+                "support_tier": self._get_support_tier(),
+                "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
+                "settings": _load_settings(),
+                "live": {},
+                "drift": {},
+            }
 
         self._collect_depth = getattr(self, "_collect_depth", 0) + 1
         try:
@@ -1209,10 +1259,13 @@ class Plugin:
         that, a poll begun before the user touched a toggle would undo the
         change they just made.
 
-        This deliberately runs ON the event loop rather than in a thread. The
-        setters are await-free coroutines, so the loop is what serializes them
-        against this; moving it to a thread would make it concurrent with them
-        again and reinstate the race the split exists to prevent. The cost is
+        This deliberately runs ON the event loop rather than in a thread.
+        Every setter but one is an await-free coroutine, so the loop is what
+        serializes them against this. The exception is set_band_preference,
+        which sleeps mid-way and is covered separately by the band-change
+        gate. Moving this to a thread would make it concurrent with all of
+        them, which a lock could still handle - but that is an eight-setter
+        refactor, not a property of the current arrangement. The cost is
         that it holds the loop, so every call here is given a short timeout
         and nothing runs in steady state - actions exist only while something
         has actually drifted.
@@ -1230,20 +1283,9 @@ class Plugin:
         # next poll sees the band as correct, proposes nothing for it, and
         # would otherwise pin the old band's access point anyway.
         def band_conflict() -> bool:
-            if not settings.get("band_preference_enabled"):
-                return False
-            want = settings.get("band_preference")
-            # Take the leading number whatever follows it. iw has reported
-            # this as "5180", "5180 MHz" and "5180.0" across versions, and a
-            # form we cannot read would otherwise refuse to pin forever.
-            found = re.match(
-                r"\s*(\d+)", str(status.get("live", {}).get("frequency", ""))
+            return self._band_conflicts(
+                settings, status.get("live", {}).get("frequency", "")
             )
-            if not found:
-                return True          # cannot tell; do not pin
-            freq = int(found.group(1))
-            on_5ghz = freq >= 5000
-            return on_5ghz != (want == "a")
 
         for action in actions:
             kind = action["kind"]
@@ -1301,6 +1343,13 @@ class Plugin:
                     uuid, "802-11-wireless.band", action["value"], timeout=2
                 )
                 self._record_reassert("band", healed["success"])
+                if healed["success"]:
+                    known = list(settings.get("band_preference_uuids", []))
+                    if uuid not in known:
+                        known.append(uuid)
+                        pending["band_preference_uuids"] = known[
+                            -self._MAX_TRACKED_LOCK_UUIDS:
+                        ]
                 self._log_throttled(
                     "band",
                     f"Band drifted to {action['observed']!r} on {uuid}, "
@@ -1380,9 +1429,10 @@ class Plugin:
                     ]
                     status["live"]["bssid_lock"] = action["value"]
                     status["drift"].pop("bssid_lock", None)
-                    decky.logger.info(
+                    self._log_throttled(
+                        "bssid_repoint_ok",
                         f"BSSID lock re-pointed to active profile {uuid} "
-                        f"at {action['value']}"
+                        f"at {action['value']}",
                     )
                 else:
                     self._log_throttled(
@@ -1445,6 +1495,28 @@ class Plugin:
             count, _ = state.get(key, (0, 0.0))
             state[key] = (count + 1, time.monotonic())
 
+    def _band_conflicts(self, settings: dict, frequency: str) -> bool:
+        """Whether pinning an address now would contradict the band setting.
+
+        Writing both a band and an address from the other band leaves a
+        profile no access point satisfies, so it never associates again.
+        Setting a band does not move an existing association, so this must be
+        judged from the band the radio is actually on.
+        """
+        if not settings.get("band_preference_enabled"):
+            return False
+        # Take the leading number whatever follows it. iw has reported this as
+        # "5180", "5180 MHz" and "5180.0" across versions, and a form we
+        # cannot read must refuse rather than guess.
+        found = re.match(r"\s*(\d+)", str(frequency or ""))
+        if not found:
+            return True
+        # NetworkManager's band property has no 6 GHz value; a 6 GHz
+        # association is satisfied by "a", so anything at or above 5 GHz
+        # counts as the 5 GHz band here.
+        on_5ghz = int(found.group(1)) >= 5000
+        return on_5ghz != (settings.get("band_preference") == "a")
+
     def _band_change_in_flight(self) -> bool:
         # The count is released in a finally, including on cancellation, and a
         # process that dies mid-change takes the whole instance with it - so
@@ -1485,7 +1557,13 @@ class Plugin:
             }
 
             # Backend info is system-wide; populate regardless of connection state
-            backend_available = self._has_backend_tool()
+            # Uses the memoised probe result only. Probing here would both
+            # fork from the worker thread and write to the instance, which
+            # this function promises not to do; _main warms it instead.
+            backend_available = (
+                getattr(self, "_steamos_manager_available", False)
+                or self._get_backend_method_cached()
+            )
             status["live"]["backend_tool_available"] = backend_available
             if backend_available:
                 status["live"]["wifi_backend"] = self._get_current_backend() or ""
@@ -1807,16 +1885,26 @@ class Plugin:
             settings = _load_settings()
 
             installed = True
+            removed = True
             if enabled:
                 installed = self._install_dispatcher()
             else:
-                self._remove_dispatcher()
+                removed = self._remove_dispatcher()
 
             # Only record the setting as on once the script is actually in
             # place. Saving first left the toggle showing on, and the header
             # claiming a recent change, while nothing had been installed.
             settings["auto_fix_on_wake"] = enabled and installed
             _save_settings_with_timestamp(settings)
+            if not enabled and not removed:
+                # The toggle would otherwise read off while the script stays
+                # on disk, still run by NetworkManager as root on every
+                # connect - the opposite of what the user asked for.
+                return {
+                    "success": False,
+                    "error": "write_failed",
+                    "message": "Couldn't remove the auto-fix script.",
+                }
             if enabled and not installed:
                 # os.path.isfile is not proof of success here: a failed write
                 # leaves the PREVIOUS script in place, so the check passes
@@ -1832,7 +1920,11 @@ class Plugin:
             }
         except Exception as e:
             decky.logger.error(f"set_auto_fix error: {e}")
-            return {"success": False, "error": "write_failed", "message": str(e)}
+            return {
+                "success": False,
+                "error": "write_failed",
+                "message": "Couldn't change the auto-fix script.",
+            }
 
     async def set_bssid_lock(self, enabled: bool) -> dict:
         try:
@@ -1858,6 +1950,29 @@ class Plugin:
                         "success": False,
                         "error": "no_wifi",
                         "message": "Could not determine current BSSID",
+                    }
+
+                # Refuse rather than write a profile that cannot associate.
+                # This is reachable from the drift banner's Fix now, which
+                # runs Optimize Safe, and it reconnects immediately after -
+                # so getting it wrong strands the user then and there rather
+                # than at their next wake.
+                frequency = ""
+                for line in link_out.split("\n"):
+                    line = line.strip()
+                    if line.startswith("freq:"):
+                        frequency = line.split(":", 1)[1].strip()
+                        break
+                if self._band_conflicts(_load_settings(), frequency):
+                    want = _load_settings().get("band_preference")
+                    other = "5 GHz" if want == "a" else "2.4 GHz"
+                    return {
+                        "success": False,
+                        "error": "no_wifi",
+                        "message": (
+                            f"Connected on the wrong band while {other} is "
+                            f"enforced. Reconnect first, then lock."
+                        ),
                     }
 
                 result = self._nmcli_modify(uuid, "802-11-wireless.bssid", bssid)
@@ -1915,25 +2030,32 @@ class Plugin:
                 previous_uuid = settings.get("bssid_lock_connection_uuid", "")
                 if previous_uuid and previous_uuid != uuid and previous_uuid not in stale_uuids:
                     stale_uuids.append(previous_uuid)
+                unresolved = []
                 for stale_uuid in stale_uuids:
                     stale = self._nmcli_modify(
-                        stale_uuid, "802-11-wireless.bssid", ""
+                        stale_uuid, "802-11-wireless.bssid", "", timeout=2
                     )
                     if stale["success"]:
                         decky.logger.info(
                             f"Cleared stale BSSID lock from profile {stale_uuid}"
                         )
-                    else:
-                        decky.logger.info(
-                            f"Could not clear stale BSSID lock from profile "
-                            f"{stale_uuid} (it may no longer exist): "
-                            f"{stale.get('stderr', '')[:120]}"
-                        )
+                        continue
+                    detail = stale.get("stderr", "")
+                    decky.logger.info(
+                        f"Could not clear stale BSSID lock from profile "
+                        f"{stale_uuid}: {detail[:120]}"
+                    )
+                    # A profile that is merely gone needs no further thought.
+                    # Anything else is still pinned, so keep the record of it
+                    # rather than forgetting the only reference to a profile
+                    # that will now fail to associate.
+                    if "unknown connection" not in detail.lower():
+                        unresolved.append(stale_uuid)
 
                 settings["bssid_lock_enabled"] = False
                 settings["bssid_lock_value"] = ""
                 settings["bssid_lock_connection_uuid"] = ""
-                settings["bssid_lock_uuids"] = []
+                settings["bssid_lock_uuids"] = unresolved
                 _save_settings_with_timestamp(settings)
                 self._hard_reconnect(uuid)
 
@@ -1950,13 +2072,11 @@ class Plugin:
             # window so reconciliation does not write the old BSSID back and
             # leave the profile demanding a band and an AP that contradict.
             #
-            # The counter is the real gate and `finally` is what releases it;
-            # the deadline behind it is only a failsafe for a process that
-            # dies mid-change. Sized the other way round, a slow
-            # NetworkManager could outlive the deadline - the worst case here
-            # is close to a minute - and it would fail open in exactly the
-            # circumstance where reassociation is slowest and the race most
-            # likely.
+            # The counter is the whole gate and `finally` is what releases
+            # it, including on cancellation. An earlier version put a deadline
+            # behind it as a failsafe; a slow NetworkManager could outlive
+            # that deadline and it failed open in exactly the circumstance
+            # where reassociation is slowest and the race most likely.
             self._band_change_depth = getattr(self, "_band_change_depth", 0) + 1
 
             if band not in ("a", "bg"):
@@ -1973,6 +2093,17 @@ class Plugin:
                 return err
 
             value = band if enabled else ""
+            if not enabled:
+                # Clear every profile the preference was written to, not just
+                # whichever happens to be active. One left demanding a band
+                # its network does not offer stops associating, and nothing
+                # else would ever revisit it.
+                settings_now = _load_settings()
+                for other in settings_now.get("band_preference_uuids", []):
+                    if other != uuid:
+                        self._nmcli_modify(
+                            other, "802-11-wireless.band", "", timeout=2
+                        )
             result = self._nmcli_modify(uuid, "802-11-wireless.band", value)
             if not result["success"]:
                 return {
@@ -1991,6 +2122,15 @@ class Plugin:
 
             settings["band_preference_enabled"] = enabled
             settings["band_preference"] = band
+            if not enabled:
+                settings["band_preference_uuids"] = []
+            if enabled:
+                known = list(settings.get("band_preference_uuids", []))
+                if uuid not in known:
+                    known.append(uuid)
+                settings["band_preference_uuids"] = known[
+                    -self._MAX_TRACKED_LOCK_UUIDS:
+                ]
             _save_settings_with_timestamp(settings)
 
             self._hard_reconnect(uuid)
@@ -2081,8 +2221,27 @@ class Plugin:
                         "detail": result2["stderr"],
                     }
             else:
-                self._nmcli_modify(uuid, "ipv4.dns", "")
-                self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
+                # Order matters and both results matter. Clearing the servers
+                # first and then failing to re-enable the automatic ones
+                # leaves a profile that ignores DHCP DNS and has none of its
+                # own, so it reconnects with no resolvers at all - and there
+                # is no drift key for DNS, so nothing would report it.
+                restored = self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
+                if not restored["success"]:
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't restore automatic DNS",
+                        "detail": restored["stderr"],
+                    }
+                cleared = self._nmcli_modify(uuid, "ipv4.dns", "")
+                if not cleared["success"]:
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't clear the custom DNS servers",
+                        "detail": cleared["stderr"],
+                    }
                 servers = ""
 
             settings = _load_settings()
@@ -2139,10 +2298,14 @@ class Plugin:
                     failed += 1
                     decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
 
-            if failed == len(params):
+            if enabled and failed == len(params):
                 # Reporting success here recorded the setting as on, which then
                 # showed as drift on every poll with no control able to clear
                 # it: Optimize Safe just calls back into here and fails again.
+                # Only on the enable path. Refusing to disable would leave
+                # the setting recorded as on with a toggle that will not move,
+                # which is worse than recording the user's intent and logging
+                # that the restore did not take.
                 return {
                     "success": False,
                     "error": "unexpected",
@@ -2203,7 +2366,15 @@ class Plugin:
                 self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"])
                 decky.logger.info(f"CAKE enabled (unlimited) on {iface}")
             else:
-                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+                removal = self._run_cmd(
+                    ["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"]
+                )
+                if not removal["success"]:
+                    # Not fatal - tc reports an error when there is no qdisc
+                    # to remove - but worth a line when it is something else.
+                    decky.logger.info(
+                        f"tc qdisc del on {iface}: {removal.get('stderr', '')[:120]}"
+                    )
                 # Restore txqueuelen based on whether buffer tuning is active
                 settings = _load_settings()
                 txq = "2000" if settings.get("buffer_tuning_enabled") else "1000"
@@ -2403,7 +2574,7 @@ class Plugin:
         """Delete settings and revert to defaults."""
         try:
             # Before the settings naming them are discarded.
-            self._clear_all_bssid_locks()
+            self._clear_profile_pins()
             # Revert runtime state
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
@@ -2588,7 +2759,7 @@ class Plugin:
                 "success": False,
                 "current_version": decky.DECKY_PLUGIN_VERSION,
                 "update_available": False,
-                "message": str(e),
+                "message": "Couldn't check for updates.",
             }
 
     async def apply_update(self) -> dict:
@@ -3018,8 +3189,8 @@ systemctl restart plugin_loader 2>/dev/null || true
             # Ask steamos-manager rather than reading the config file it
             # writes. This is the one place the answer decides whether the
             # user is told the switch worked, so it should come from the
-            # service that performed it; the per-poll reader stays on the
-            # file because it must not fork a process every few seconds.
+            # service that performed it. The per-poll reader keeps its own
+            # path, which is cheap when a conf file declares the backend.
             final_backend = await asyncio.to_thread(self._steamosctl_backend)
             if final_backend is None:
                 final_backend = await asyncio.to_thread(self._get_current_backend)

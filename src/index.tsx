@@ -167,8 +167,14 @@ function Content() {
       if (seq !== statusSeqRef.current) return;
       setStatus(s);
       if (s.settings) {
-        if (s.settings.dns_provider === "custom") {
-          setCustomDnsInput(s.settings.dns_servers || "");
+        // Only adopt a stored value that exists. Turning DNS off clears
+        // dns_servers while leaving the provider on "custom", and copying
+        // that empty string back over the field every few seconds made the
+        // setting impossible to re-enable: the servers field is only
+        // rendered while DNS is on, and turning it on with an empty custom
+        // list is rejected. Reset Settings was the only way out.
+        if (s.settings.dns_provider === "custom" && s.settings.dns_servers) {
+          setCustomDnsInput(s.settings.dns_servers);
         }
       }
     } catch (e) {

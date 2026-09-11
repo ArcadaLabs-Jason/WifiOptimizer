@@ -141,7 +141,10 @@ ENFORCED_FILE="$SETTINGS_DIR/last_enforced"
 ENFORCED_TMP=$(mktemp "$SETTINGS_DIR/.last_enforced.XXXXXX" 2>/dev/null)
 if [ -n "$ENFORCED_TMP" ]; then
     if date +%s 2>/dev/null > "$ENFORCED_TMP"; then
-        mv -f "$ENFORCED_TMP" "$ENFORCED_FILE" 2>/dev/null || rm -f "$ENFORCED_TMP"
+        # -T so a directory planted at the destination is not moved INTO;
+        # that would silently stop the timestamp updating and leave a temp
+        # file behind on every connect.
+        mv -fT "$ENFORCED_TMP" "$ENFORCED_FILE" 2>/dev/null || rm -f "$ENFORCED_TMP"
     else
         rm -f "$ENFORCED_TMP"
     fi
