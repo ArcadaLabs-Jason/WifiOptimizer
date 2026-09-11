@@ -965,6 +965,17 @@ class Plugin:
                 # has no useful response to an RPC error here and would just
                 # keep showing stale values with no signal.
                 decky.logger.error(f"status reconciliation error: {e}")
+
+        # The settings in `status` are the worker thread's snapshot, taken
+        # before any of this ran, and the frontend renders every toggle
+        # straight off them. A poll that started before the user touched a
+        # toggle would otherwise report the pre-touch value and the toggle
+        # would appear to spring back. Hand back what is on disk now.
+        if status.get("success"):
+            try:
+                status["settings"] = _load_settings()
+            except Exception as e:
+                decky.logger.error(f"settings refresh error: {e}")
         return status
 
     def _apply_status_actions(self, status: dict, pending: dict, actions: list):
@@ -1031,6 +1042,10 @@ class Plugin:
                 # cleared, leaving the profile pinned with the toggle showing
                 # off and nothing left to clear it.
                 if not settings.get("bssid_lock_enabled"):
+                    # The user turned the lock off while this poll was in
+                    # flight. Nothing has drifted; leaving the flag set shows
+                    # a drift warning for a setting that is no longer on.
+                    status["drift"].pop("bssid_lock", None)
                     continue
                 # A band change clears the BSSID on purpose so NM can find an
                 # AP on the other band, and only re-locks once it associates.
