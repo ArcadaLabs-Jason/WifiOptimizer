@@ -180,6 +180,31 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _write_no_follow(path: str, data: str) -> bool:
+    """Write a file without following a symlink at the final component.
+
+    The settings directory belongs to the desktop user, so anything we write
+    there can be replaced with a link to a file we should not be touching.
+    Plain open(path, "w") follows that link and truncates the target as root.
+    O_NOFOLLOW refuses instead, and O_EXCL means we only ever create.
+    """
+    try:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
 def _first_existing(paths: list[str]) -> str | None:
     """First path in the list that exists, or None."""
     for path in paths:
@@ -952,8 +977,12 @@ class Plugin:
             diag_path = os.path.join(
                 os.path.dirname(SETTINGS_FILE), "diagnostics.json"
             )
-            with open(diag_path, "w") as f:
-                json.dump(info, f, indent=2)
+            if not _write_no_follow(diag_path, json.dumps(info, indent=2)):
+                return {
+                    "success": False,
+                    "error": "write_failed",
+                    "message": "Couldn't write the diagnostics file.",
+                }
             return {"success": True, "path": diag_path}
         except Exception as e:
             decky.logger.error(f"save_diagnostic_info error: {e}")

@@ -126,7 +126,17 @@ if [ "$CAKE" = "True" ]; then
     fi
 fi
 
-# Record enforcement timestamp
-date +%s 2>/dev/null > "$SETTINGS_DIR/last_enforced"
+# Record enforcement timestamp.
+#
+# This script runs as root and the settings directory belongs to the desktop
+# user, so this filename can be replaced with a link to a root-owned file that
+# `>` would happily truncate. Remove anything that is not a regular file first,
+# and never write through a link.
+ENFORCED_FILE="$SETTINGS_DIR/last_enforced"
+if [ -L "$ENFORCED_FILE" ] || { [ -e "$ENFORCED_FILE" ] && [ ! -f "$ENFORCED_FILE" ]; }; then
+    logger -t "$LOG_TAG" "refusing to write through non-regular $ENFORCED_FILE"
+    rm -f "$ENFORCED_FILE"
+fi
+date +%s 2>/dev/null > "$ENFORCED_FILE"
 
 exit 0
