@@ -188,6 +188,10 @@ DEFAULT_SETTINGS = {
     # network does not offer will not associate, and only the one profile
     # that happened to be active was ever cleared.
     "band_preference_uuids": [],
+    # The network the band preference was set on. Without it the preference
+    # is enforced on every network you join, including ones that have no
+    # 5 GHz at all, and the list above then grows once per network visited.
+    "band_preference_ssid": "",
     "band_preference": "a",
     "band_preference_enabled": False,
     "dns_provider": "cloudflare",
@@ -466,7 +470,8 @@ class Plugin:
         miss would route every backend switch for the rest of the session to
         the legacy helper, which is the failure this path exists to avoid.
 
-        Retries are rate limited because this is reached from the status poll.
+        Retries are rate limited: this is no longer on the polling path, but
+        start_backend_switch can reach it repeatedly.
         """
         if getattr(self, "_steamos_manager_available", False):
             return True
@@ -1215,6 +1220,11 @@ class Plugin:
             # disconnected state correctly.
             return {
                 "success": True,
+                # Not the same as knowing it is disconnected. The panel holds
+                # its banners and live rows while this is set, because saying
+                # "not connected" at the one moment the plugin knows least is
+                # the disconnect flash it already guards against elsewhere.
+                "initializing": True,
                 "connected": False,
                 "support_tier": self._get_support_tier(),
                 "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
@@ -1393,6 +1403,26 @@ class Plugin:
                     f"CAKE drifted on {iface}, reasserting: "
                     f"{'ok' if applied['success'] else 'failed'}",
                 )
+
+            elif kind == "pin_cleanup":
+                if settings.get("bssid_lock_enabled"):
+                    continue
+                if self._reassert_exhausted("pin_cleanup"):
+                    continue
+                done = self._nmcli_modify(
+                    uuid, "802-11-wireless.bssid", "", timeout=2
+                )
+                self._record_reassert("pin_cleanup", done["success"])
+                detail = done.get("stderr", "")
+                if done["success"] or "unknown connection" in detail.lower():
+                    remaining = [
+                        u for u in settings.get("bssid_lock_uuids", []) if u != uuid
+                    ]
+                    pending["bssid_lock_uuids"] = remaining
+                    self._log_throttled(
+                        "pin_cleanup",
+                        f"Cleared a leftover access point pin from {uuid}",
+                    )
 
             elif kind == "bssid_repoint":
                 # The lock may have been switched off while this poll was in
@@ -1765,7 +1795,19 @@ class Plugin:
             live_band = band_out.split(":", 1)[1].strip() if ":" in band_out else ""
             status["live"]["band"] = live_band
             expected_band = settings.get("band_preference", "a")
-            if settings.get("band_preference_enabled") and live_band != expected_band:
+            # Only on the network the preference was set on. Enforcing it
+            # everywhere writes a band into profiles for networks that may not
+            # offer it, which then stop connecting - and the panel gives no
+            # sign it is happening. The lock above is scoped the same way.
+            band_ssid = settings.get("band_preference_ssid", "")
+            band_scope_ok = True
+            if settings.get("band_preference_enabled") and band_ssid:
+                band_scope_ok = self._get_profile_ssid(uuid, timeout=T) == band_ssid
+            if (
+                settings.get("band_preference_enabled")
+                and band_scope_ok
+                and live_band != expected_band
+            ):
                 status["drift"]["band_preference"] = True
                 actions.append({
                     "kind": "band", "uuid": uuid, "value": expected_band,
@@ -1792,6 +1834,13 @@ class Plugin:
                 # already reapplies CAKE on every reconnect, so doing it here
                 # matches behaviour the user has already opted into.
                 actions.append({"kind": "cake", "uuid": uuid, "iface": iface})
+
+            # Profiles still carrying a pin we failed to clear. Retaining them
+            # is only worth anything if something retries, and with the lock
+            # already off nothing else proposes any work for them.
+            if not settings.get("bssid_lock_enabled"):
+                for stale_uuid in settings.get("bssid_lock_uuids", [])[:1]:
+                    actions.append({"kind": "pin_cleanup", "uuid": stale_uuid})
 
             # Dispatcher
             status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
@@ -1963,17 +2012,52 @@ class Plugin:
                     if line.startswith("freq:"):
                         frequency = line.split(":", 1)[1].strip()
                         break
-                if self._band_conflicts(_load_settings(), frequency):
-                    want = _load_settings().get("band_preference")
-                    other = "5 GHz" if want == "a" else "2.4 GHz"
-                    return {
-                        "success": False,
-                        "error": "no_wifi",
-                        "message": (
-                            f"Connected on the wrong band while {other} is "
-                            f"enforced. Reconnect first, then lock."
-                        ),
-                    }
+                current = _load_settings()
+                if self._band_conflicts(current, frequency):
+                    # Refusing alone would be a dead end: this is exactly the
+                    # state the drift banner reports, its Fix now lands here,
+                    # and nothing the panel offers moves the association. Do
+                    # the reconnect ourselves, then look again.
+                    decky.logger.info(
+                        "Band conflict before locking; reconnecting to let NM "
+                        "pick an access point on the preferred band"
+                    )
+                    self._hard_reconnect(uuid)
+                    # A BLOCKING sleep, on purpose, and it must stay one.
+                    # This setter's whole body is await-free, which is what
+                    # lets the event loop serialize it against status
+                    # reconciliation. Turning this into asyncio.sleep would
+                    # add a suspension point and let a poll write to the
+                    # profile mid-change - the race the reader/applier split
+                    # exists to prevent. _hard_reconnect immediately above
+                    # already blocks for longer.
+                    time.sleep(3)
+                    iface = self._get_wifi_interface() or iface
+                    link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+                    link_out = link_result.get("stdout", "")
+                    frequency = ""
+                    bssid = ""
+                    for line in link_out.split("\n"):
+                        line = line.strip()
+                        if line.startswith("freq:"):
+                            frequency = line.split(":", 1)[1].strip()
+                        elif "Connected to" in line:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                bssid = parts[2]
+
+                    if not bssid or self._band_conflicts(current, frequency):
+                        want = current.get("band_preference")
+                        other = "5 GHz" if want == "a" else "2.4 GHz"
+                        return {
+                            "success": False,
+                            "error": "nmcli_failed",
+                            "message": (
+                                f"Couldn't reach an access point on {other}, "
+                                f"which this network is set to require. Turn "
+                                f"the band preference off to lock anyway."
+                            ),
+                        }
 
                 result = self._nmcli_modify(uuid, "802-11-wireless.bssid", bssid)
                 if not result["success"]:
@@ -2093,6 +2177,7 @@ class Plugin:
                 return err
 
             value = band if enabled else ""
+            unresolved_bands: list[str] = []
             if not enabled:
                 # Clear every profile the preference was written to, not just
                 # whichever happens to be active. One left demanding a band
@@ -2100,10 +2185,20 @@ class Plugin:
                 # else would ever revisit it.
                 settings_now = _load_settings()
                 for other in settings_now.get("band_preference_uuids", []):
-                    if other != uuid:
-                        self._nmcli_modify(
-                            other, "802-11-wireless.band", "", timeout=2
-                        )
+                    if other == uuid:
+                        continue
+                    done = self._nmcli_modify(
+                        other, "802-11-wireless.band", "", timeout=2
+                    )
+                    if done["success"]:
+                        continue
+                    detail = done.get("stderr", "")
+                    decky.logger.info(
+                        f"Could not clear band from profile {other}: {detail[:120]}"
+                    )
+                    # Still set. Keep the record, or nothing knows about it.
+                    if "unknown connection" not in detail.lower():
+                        unresolved_bands.append(other)
             result = self._nmcli_modify(uuid, "802-11-wireless.band", value)
             if not result["success"]:
                 return {
@@ -2124,11 +2219,17 @@ class Plugin:
                     # other band beside it gives a profile no access point
                     # satisfies, and the reconnect below would activate it.
                     # Put the band back and report, rather than strand it.
-                    self._nmcli_modify(
+                    rollback = self._nmcli_modify(
                         uuid, "802-11-wireless.band",
                         settings.get("band_preference", "") if
                         settings.get("band_preference_enabled") else "",
                     )
+                    if not rollback["success"]:
+                        decky.logger.error(
+                            "Could not undo the band write after the lock "
+                            "release failed; this profile may not associate: "
+                            f"{rollback.get('stderr', '')[:120]}"
+                        )
                     return {
                         "success": False,
                         "error": "nmcli_failed",
@@ -2139,7 +2240,8 @@ class Plugin:
             settings["band_preference_enabled"] = enabled
             settings["band_preference"] = band
             if not enabled:
-                settings["band_preference_uuids"] = []
+                settings["band_preference_uuids"] = unresolved_bands
+                settings["band_preference_ssid"] = ""
             if enabled:
                 known = list(settings.get("band_preference_uuids", []))
                 if uuid not in known:
@@ -2147,6 +2249,9 @@ class Plugin:
                 settings["band_preference_uuids"] = known[
                     -self._MAX_TRACKED_LOCK_UUIDS:
                 ]
+                settings["band_preference_ssid"] = (
+                    self._get_profile_ssid(uuid) or ""
+                )
             _save_settings_with_timestamp(settings)
 
             self._hard_reconnect(uuid)
@@ -2326,6 +2431,11 @@ class Plugin:
                     failed += 1
                     decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
 
+            if failed == len(params) and not enabled:
+                decky.logger.error(
+                    "Could not restore any kernel buffer defaults; recording "
+                    "the setting as off anyway so the toggle is not stuck"
+                )
             if enabled and failed == len(params):
                 # Reporting success here recorded the setting as on, which then
                 # showed as drift on every poll with no control able to clear

@@ -50,6 +50,8 @@ export interface LiveStatus {
 export interface PluginStatus {
   success: boolean;
   connected: boolean;
+  /** First collection has not finished; connected is not yet meaningful. */
+  initializing?: boolean;
   support_tier: number;
   version?: string;
   settings: PluginSettings;

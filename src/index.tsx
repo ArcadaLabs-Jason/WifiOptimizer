@@ -501,8 +501,10 @@ function Content() {
     await refreshStatus();
   };
 
-  // Don't render content until first status arrives (prevents disconnect flash)
-  if (!status) {
+  // Don't render content until first status arrives (prevents disconnect flash).
+  // A status marked initializing is the backend saying a collection is still
+  // running and it has nothing to report yet, which is the same situation.
+  if (!status || status.initializing) {
     return <PanelSection title="WiFi Optimizer" />;
   }
 
