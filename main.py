@@ -1239,9 +1239,9 @@ class Plugin:
             # subprocess.run waits again after killing a timed-out child, so
             # a process stuck against a wedged driver can do exactly that.
             started = getattr(self, "_collect_started_at", 0.0)
-            if started and (time.monotonic() - started) > 30:
+            if started and (time.monotonic() - started) > 90:
                 decky.logger.error(
-                    "Status collection has not returned in 30s; reporting a "
+                    "Status collection has not returned in 90s; reporting a "
                     "read failure rather than leaving the panel empty"
                 )
                 return {
@@ -1338,8 +1338,9 @@ class Plugin:
         # next poll sees the band as correct, proposes nothing for it, and
         # would otherwise pin the old band's access point anyway.
         def band_conflict() -> bool:
+            live = status.get("live", {})
             return self._band_conflicts(
-                settings, status.get("live", {}).get("frequency", "")
+                settings, live.get("frequency", ""), live.get("active_ssid")
             )
 
         for action in actions:
@@ -1615,7 +1616,10 @@ class Plugin:
             return False
         for line in scan.get("stdout", "").split("\n"):
             name, _, freq = line.rpartition(":")
-            if name.replace("\\", "") != ssid:
+            # Unescape BOTH sides. _get_profile_ssid returns nmcli's terse
+            # value with its escapes intact, so comparing it against an
+            # unescaped scan result fails for any SSID containing : or \.
+            if name.replace("\\", "") != ssid.replace("\\", ""):
                 continue
             found = re.match(r"\s*(\d+)", freq.strip())
             if not found:
@@ -1624,15 +1628,26 @@ class Plugin:
                 return True
         return False
 
-    def _band_conflicts(self, settings: dict, frequency: str) -> bool:
+    def _band_conflicts(
+        self, settings: dict, frequency: str, ssid: str | None = None
+    ) -> bool:
         """Whether pinning an address now would contradict the band setting.
 
         Writing both a band and an address from the other band leaves a
         profile no access point satisfies, so it never associates again.
         Setting a band does not move an existing association, so this must be
         judged from the band the radio is actually on.
+
+        It must also respect the network the preference is scoped to. Without
+        that, a preference set at home suppresses the address pin on every
+        other network forever - the drift flag never clears, the lock never
+        applies, and the refusal tells the user a network requires a band it
+        was never asked to.
         """
         if not settings.get("band_preference_enabled"):
+            return False
+        scoped_to = settings.get("band_preference_ssid", "")
+        if scoped_to and ssid is not None and ssid != scoped_to:
             return False
         # Take the leading number whatever follows it. iw has reported this as
         # "5180", "5180 MHz" and "5180.0" across versions, and a form we
@@ -1908,7 +1923,9 @@ class Plugin:
             band_ssid = settings.get("band_preference_ssid", "")
             band_scope_ok = True
             if settings.get("band_preference_enabled") and band_ssid:
-                band_scope_ok = self._get_profile_ssid(uuid, timeout=T) == band_ssid
+                active_ssid = self._get_profile_ssid(uuid, timeout=T)
+                status["live"]["active_ssid"] = active_ssid or ""
+                band_scope_ok = active_ssid == band_ssid
             if (
                 settings.get("band_preference_enabled")
                 and band_scope_ok
@@ -2112,7 +2129,8 @@ class Plugin:
                         frequency = line.split(":", 1)[1].strip()
                         break
                 current = _load_settings()
-                if self._band_conflicts(current, frequency):
+                active_ssid = self._get_profile_ssid(uuid)
+                if self._band_conflicts(current, frequency, active_ssid):
                     # Refusing alone would be a dead end: this is exactly the
                     # state the drift banner reports, its Fix now lands here,
                     # and nothing the panel offers moves the association.
@@ -2161,7 +2179,9 @@ class Plugin:
                             if len(parts) >= 3:
                                 bssid = parts[2]
 
-                    if not bssid or self._band_conflicts(current, frequency):
+                    if not bssid or self._band_conflicts(
+                        current, frequency, active_ssid
+                    ):
                         want = current.get("band_preference")
                         other = "5 GHz" if want == "a" else "2.4 GHz"
                         return {
