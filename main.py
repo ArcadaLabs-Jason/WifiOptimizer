@@ -414,6 +414,11 @@ class Plugin:
                 return candidate
         return None
 
+    # How many profiles the BSSID lock will remember having pinned. It only
+    # grows when NetworkManager picks a different profile for the same SSID,
+    # so this is generous; the cap exists so it cannot accumulate forever.
+    _MAX_TRACKED_LOCK_UUIDS = 16
+
     _PROBE_RETRY_SECONDS = 30
 
     def _has_steamos_manager(self) -> bool:
@@ -1300,7 +1305,9 @@ class Plugin:
                     known = list(settings.get("bssid_lock_uuids", []))
                     if uuid not in known:
                         known.append(uuid)
-                    pending["bssid_lock_uuids"] = known
+                    pending["bssid_lock_uuids"] = known[
+                        -self._MAX_TRACKED_LOCK_UUIDS:
+                    ]
                     status["live"]["bssid_lock"] = action["value"]
                     status["drift"].pop("bssid_lock", None)
                     decky.logger.info(
@@ -1769,7 +1776,9 @@ class Plugin:
                 known = list(settings.get("bssid_lock_uuids", []))
                 if uuid not in known:
                     known.append(uuid)
-                settings["bssid_lock_uuids"] = known
+                settings["bssid_lock_uuids"] = known[
+                    -self._MAX_TRACKED_LOCK_UUIDS:
+                ]
                 _save_settings_with_timestamp(settings)
                 self._hard_reconnect(uuid)
             else:
