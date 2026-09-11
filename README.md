@@ -87,7 +87,7 @@ volatile settings shortly after a game launches.
 
 ## Uninstall
 
-**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This reverts the runtime optimizations (power save, buffer tuning, PCIe ASPM, CAKE) and deletes the plugin's own config files. The BSSID lock is removed from every network it was applied to, because a network still pinned to an access point stops connecting once you are out of range of it. The other per-connection changes (band preference, custom DNS, IPv6) stay on your saved WiFi network and degrade harmlessly - to remove those, forget and rejoin the network from Steam's WiFi settings. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
+**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This reverts the runtime optimizations (power save, buffer tuning, PCIe ASPM, CAKE) and deletes the plugin's own config files. The BSSID lock and the band preference are removed from every network they were applied to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. Custom DNS and the IPv6 setting stay on your saved WiFi network - to remove those, forget and rejoin the network from Steam's WiFi settings. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
 
 Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
 

@@ -250,6 +250,11 @@ def _load_settings() -> dict:
         for key, default in DEFAULT_SETTINGS.items():
             if not isinstance(merged.get(key), type(default)):
                 merged[key] = default
+        # An out-of-range band would be rejected by the setter, including on
+        # the path that turns the preference OFF - leaving a profile pinned to
+        # a band with no control able to clear it.
+        if merged.get("band_preference") not in ("a", "bg"):
+            merged["band_preference"] = "a"
         return merged
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -419,6 +424,14 @@ class Plugin:
     # so this is generous; the cap exists so it cannot accumulate forever.
     _MAX_TRACKED_LOCK_UUIDS = 16
 
+    # How many times a reassertion may fail before it stops being attempted.
+    # Reconciliation runs on the event loop, so an action that can never
+    # succeed - a profile NetworkManager will not let us modify, a kernel with
+    # no sch_cake - would otherwise block it for seconds at a time on every
+    # poll, forever. Giving up leaves the drift flag standing, which is the
+    # honest report anyway.
+    _MAX_REASSERT_FAILURES = 3
+
     _PROBE_RETRY_SECONDS = 30
 
     def _has_steamos_manager(self) -> bool:
@@ -577,24 +590,33 @@ class Plugin:
         return value.strip() if sep else None
 
     def _clear_all_bssid_locks(self):
-        """Remove the BSSID from every profile the lock has been written to.
+        """Remove the pins this plugin added from every profile it touched.
 
         The lock follows whichever profile NetworkManager uses, so discarding
         the settings without clearing them would leave profiles pinned to an
         access point with nothing left that knows about them - and a pinned
         profile fails to associate once that access point is out of range.
+
+        The band preference is cleared alongside it, for the same reason: a
+        profile left demanding a band its network does not offer will not
+        connect, and after teardown there is nothing left to undo it.
         """
         settings = _load_settings()
         uuids = list(settings.get("bssid_lock_uuids", []))
         current = settings.get("bssid_lock_connection_uuid", "")
         if current and current not in uuids:
             uuids.append(current)
+        clear_band = settings.get("band_preference_enabled", False)
         for uuid in uuids:
             result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
             decky.logger.info(
                 f"Clearing BSSID lock from {uuid}: "
                 f"{'ok' if result['success'] else 'not found'}"
             )
+        if clear_band:
+            last = settings.get("last_connection_uuid", "")
+            for uuid in {u for u in uuids + [last] if u}:
+                self._nmcli_modify(uuid, "802-11-wireless.band", "")
 
     def _hard_reconnect(self, uuid: str | None = None):
         """Reconnect by cycling WiFi radio to fully reset NM connection state."""
@@ -808,17 +830,20 @@ class Plugin:
             distro = self._detect_distro()
             settings["distro_id"] = distro["id"]
             settings["distro_name"] = distro["name"]
-            _save_settings(settings)
-
             if settings.get("auto_fix_on_wake", True):
                 if not self._install_dispatcher():
                     # Don't leave the toggle reading on with nothing installed.
                     # There is no drift indicator for auto-fix, so a silent
                     # failure here is invisible until WiFi stops being fixed.
+                    # Decided before the save below on purpose: correcting it
+                    # afterwards is discarded, and the volatile-apply block
+                    # then re-reads the stale value and writes it back.
                     settings["auto_fix_on_wake"] = False
                     decky.logger.error(
                         "Auto-fix disabled: the dispatcher could not be installed"
                     )
+
+            _save_settings(settings)
 
             # Apply volatile settings that may have been lost on reboot.
             # The dispatcher handles reconnects, but on a fresh boot WiFi
@@ -1123,18 +1148,31 @@ class Plugin:
         # Collection used to be serialized by the blocked event loop. Now that
         # it runs in a worker thread nothing stops the next poll starting while
         # this one is still out, and on an unresponsive NetworkManager a dozen
-        # of them pile up, each spawning its own subprocesses. Hand back the
-        # last result instead; it is at most one interval old.
-        if getattr(self, "_collect_in_flight", False):
+        # of them pile up, each spawning its own subprocesses.
+        #
+        # A counter rather than a flag: with a flag, callers arriving before
+        # the first result exists all fall through and start their own, and the
+        # first one to finish clears it for everyone.
+        #
+        # The reply is the live values from the last completed pass, which may
+        # be as old as that pass took - but its settings are re-read, because
+        # the panel renders every toggle from them and handing back a snapshot
+        # taken before the user's change makes the toggle spring back.
+        if getattr(self, "_collect_depth", 0) > 0:
             last = getattr(self, "_last_status", None)
             if last is not None:
-                return last
+                cached = dict(last)
+                try:
+                    cached["settings"] = _load_settings()
+                except Exception:
+                    pass
+                return cached
 
-        self._collect_in_flight = True
+        self._collect_depth = getattr(self, "_collect_depth", 0) + 1
         try:
             status, pending, actions = await asyncio.to_thread(self._collect_status)
         finally:
-            self._collect_in_flight = False
+            self._collect_depth = max(0, getattr(self, "_collect_depth", 1) - 1)
         if pending or actions:
             try:
                 self._apply_status_actions(status, pending, actions)
@@ -1176,26 +1214,46 @@ class Plugin:
         """
         settings = _load_settings()
 
-        # A band reassertion and a BSSID re-point in the same pass would write
-        # a profile demanding one band and an access point that may only exist
-        # on the other, which nothing can satisfy and which the plugin would
-        # then keep reasserting. The band is the user's explicit choice, so it
-        # wins; the address is re-read next poll, once association settled.
-        band_uuids = {a["uuid"] for a in actions if a["kind"] == "band"}
+        # Never pin an address while the radio is on a band the profile does
+        # not want. Writing both leaves a profile demanding one band and an
+        # access point that only exists on the other, which nothing can
+        # satisfy and which the plugin would then keep reasserting.
+        #
+        # This is judged from the band the device is CURRENTLY on, not from
+        # whether a band reassertion happens to be proposed in the same pass.
+        # Setting the band does not move an existing association, so the very
+        # next poll sees the band as correct, proposes nothing for it, and
+        # would otherwise pin the old band's access point anyway.
+        def band_conflict() -> bool:
+            if not settings.get("band_preference_enabled"):
+                return False
+            want = settings.get("band_preference")
+            raw = str(status.get("live", {}).get("frequency", "")).split()[:1]
+            if not raw:
+                return True          # cannot tell; do not pin
+            try:
+                freq = int(raw[0])
+            except ValueError:
+                return True
+            on_5ghz = freq >= 5000
+            return on_5ghz != (want == "a")
 
         for action in actions:
             kind = action["kind"]
             uuid = action["uuid"]
 
-            if kind == "bssid_repoint" and uuid in band_uuids:
+            if kind == "bssid_repoint" and band_conflict():
                 continue
 
             if kind == "priority":
                 if settings.get("priority_set"):
                     continue
+                if self._reassert_exhausted("priority"):
+                    continue
                 bumped = self._nmcli_modify(
                     uuid, "connection.autoconnect-priority", "100", timeout=2
                 )
+                self._record_reassert("priority", bumped["success"])
                 if bumped["success"]:
                     pending["priority_set"] = True
                 else:
@@ -1212,7 +1270,10 @@ class Plugin:
                 if not settings.get("ipv6_disabled"):
                     status["drift"].pop("ipv6", None)
                     continue
+                if self._reassert_exhausted("ipv6"):
+                    continue
                 healed = self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=2)
+                self._record_reassert("ipv6", healed["success"])
                 self._log_throttled(
                     "ipv6",
                     f"IPv6 drifted to {action['observed']!r} on {uuid}, "
@@ -1227,9 +1288,12 @@ class Plugin:
                 if settings.get("band_preference") != action["value"]:
                     status["drift"].pop("band_preference", None)
                     continue
+                if self._reassert_exhausted("band"):
+                    continue
                 healed = self._nmcli_modify(
                     uuid, "802-11-wireless.band", action["value"], timeout=2
                 )
+                self._record_reassert("band", healed["success"])
                 self._log_throttled(
                     "band",
                     f"Band drifted to {action['observed']!r} on {uuid}, "
@@ -1246,7 +1310,7 @@ class Plugin:
                 # forever, blocking every other call for as long as it takes.
                 # Give up after a few consecutive failures and leave the drift
                 # flag standing, which is the honest report anyway.
-                if getattr(self, "_cake_reassert_failures", 0) >= 3:
+                if self._reassert_exhausted("cake"):
                     continue
                 iface = action["iface"]
                 if not getattr(self, "_cake_module_loaded", False):
@@ -1260,18 +1324,14 @@ class Plugin:
                     "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
                     "cake", "unlimited", "diffserv4", "nat", "ack-filter",
                 ], timeout=2)
+                self._record_reassert("cake", applied["success"])
                 if applied["success"]:
-                    self._cake_reassert_failures = 0
                     self._run_cmd(
                         ["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"],
                         timeout=2,
                     )
                     status["live"]["cake_applied"] = True
                     status["drift"].pop("cake", None)
-                else:
-                    self._cake_reassert_failures = (
-                        getattr(self, "_cake_reassert_failures", 0) + 1
-                    )
                 self._log_throttled(
                     "cake",
                     f"CAKE drifted on {iface}, reasserting: "
@@ -1296,9 +1356,12 @@ class Plugin:
                 # which stops it associating at all.
                 if self._band_change_in_flight():
                     continue
+                if self._reassert_exhausted("bssid_repoint"):
+                    continue
                 retarget = self._nmcli_modify(
                     uuid, "802-11-wireless.bssid", action["value"], timeout=2
                 )
+                self._record_reassert("bssid_repoint", retarget["success"])
                 if retarget["success"]:
                     pending["bssid_lock_value"] = action["value"]
                     pending["bssid_lock_connection_uuid"] = uuid
@@ -1347,6 +1410,17 @@ class Plugin:
             return
         seen[key] = (message, now)
         decky.logger.info(message)
+
+    def _reassert_exhausted(self, key: str) -> bool:
+        counts = getattr(self, "_reassert_failures", None)
+        return bool(counts) and counts.get(key, 0) >= self._MAX_REASSERT_FAILURES
+
+    def _record_reassert(self, key: str, succeeded: bool):
+        counts = getattr(self, "_reassert_failures", None)
+        if counts is None:
+            counts = {}
+            self._reassert_failures = counts
+        counts[key] = 0 if succeeded else counts.get(key, 0) + 1
 
     def _band_change_in_flight(self) -> bool:
         # The count is released in a finally, including on cancellation, and a
@@ -1646,7 +1720,10 @@ class Plugin:
                     "error": "unexpected",
                     "message": "Couldn't read WiFi status.",
                     "connected": False,
-                    "support_tier": 3,
+                    # Reads settings only, so it is still meaningful here -
+                    # hardcoding 3 made the panel announce unrecognised
+                    # hardware because an unrelated read failed.
+                    "support_tier": self._get_support_tier(),
                     "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
                     "settings": settings,
                     "live": {},
@@ -2792,14 +2869,18 @@ systemctl restart plugin_loader 2>/dev/null || true
             # Steam Deck LCD - and the preference silently degraded to
             # alphabetical order.
             for probe in ("device/driver/module", "device/driver"):
+                path = f"/sys/class/ieee80211/{phy}/{probe}"
+                # realpath does not raise on a missing path, it just returns
+                # the normalised name - which would hand back the literal
+                # "module" and then match nothing.
+                if not os.path.exists(path):
+                    continue
                 try:
-                    name = os.path.basename(
-                        os.path.realpath(f"/sys/class/ieee80211/{phy}/{probe}")
-                    )
-                    if name:
-                        return name
+                    name = os.path.basename(os.path.realpath(path))
                 except Exception:
                     continue
+                if name and name != os.path.basename(probe):
+                    return name
             return ""
 
         phys = [phy for phy in phys if not already_has_netdev(phy)]
