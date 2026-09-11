@@ -81,9 +81,9 @@ The plugin has two parts:
 
 2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers, CAKE). If you uninstall the plugin, the script removes itself.
 
-Nothing runs in the background while the panel is closed. The panel polls for
-live status only while it is open, and the dispatcher script runs only when
-WiFi reconnects.
+The panel polls for live status only while it is open. Two things run without
+it: the dispatcher script, whenever WiFi reconnects, and a reapply of the
+volatile settings shortly after a game launches.
 
 ## Uninstall
 

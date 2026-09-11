@@ -1321,11 +1321,10 @@ class Plugin:
         decky.logger.info(message)
 
     def _band_change_in_flight(self) -> bool:
-        if getattr(self, "_band_change_depth", 0) > 0:
-            return True
-        # Failsafe for a change that never released its count. In the normal
-        # case the deadline is already cleared and this returns False.
-        return time.monotonic() < getattr(self, "_band_change_until", 0.0)
+        # The count is released in a finally, including on cancellation, and a
+        # process that dies mid-change takes the whole instance with it - so
+        # there is nothing a deadline here could catch that this does not.
+        return getattr(self, "_band_change_depth", 0) > 0
 
     def _collect_status(self) -> tuple[dict, dict, list]:
         # Short timeout for the queries that take one. Note this does not
@@ -1829,7 +1828,6 @@ class Plugin:
             # circumstance where reassociation is slowest and the race most
             # likely.
             self._band_change_depth = getattr(self, "_band_change_depth", 0) + 1
-            self._band_change_until = time.monotonic() + 300
 
             if band not in ("a", "bg"):
                 return {
@@ -1896,8 +1894,6 @@ class Plugin:
             self._band_change_depth = max(
                 0, getattr(self, "_band_change_depth", 1) - 1
             )
-            if self._band_change_depth == 0:
-                self._band_change_until = 0.0
 
     async def set_dns(
         self, enabled: bool, provider: str = "cloudflare", custom_servers: str = ""
@@ -2856,6 +2852,10 @@ systemctl restart plugin_loader 2>/dev/null || true
             # not exist yet, then reporting "WiFi didn't reconnect" about a
             # switch that recovered and works.
             self._backend_switch["phase"] = "reconnecting"
+            # Let the restart settle before deciding the interface is missing.
+            # Checking immediately can catch the moment it is down and add a
+            # second station netdev to a phy that was about to get its own.
+            await asyncio.sleep(2)
             iface = await asyncio.to_thread(self._get_wifi_interface)
             recovery_performed = False
             if not iface:
