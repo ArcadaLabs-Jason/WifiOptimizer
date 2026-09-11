@@ -65,18 +65,18 @@ if [ "$POWER_SAVE" = "True" ]; then
     /usr/bin/iw dev "$IFACE" set power_save off 2>/dev/null
     # Driver-specific sysfs fixes
     if [ "$DRIVER" = "rtw88" ]; then
-        echo Y > /sys/module/rtw88_core/parameters/disable_lps_deep 2>/dev/null
-        echo Y > /sys/module/rtw88_pci/parameters/disable_aspm 2>/dev/null
+        echo Y 2>/dev/null > /sys/module/rtw88_core/parameters/disable_lps_deep
+        echo Y 2>/dev/null > /sys/module/rtw88_pci/parameters/disable_aspm
     elif [ "$DRIVER" = "mt7921e" ]; then
-        echo Y > /sys/module/mt7921e/parameters/disable_aspm 2>/dev/null
+        echo Y 2>/dev/null > /sys/module/mt7921e/parameters/disable_aspm
     fi
     # Disable PCIe ASPM for WiFi device (all drivers)
     WIFI_PCI=$(readlink -f /sys/class/net/"$IFACE"/device 2>/dev/null)
     if [ -d "$WIFI_PCI/link" ]; then
         for f in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
-            echo 0 > "$WIFI_PCI/link/$f" 2>/dev/null
+            echo 0 2>/dev/null > "$WIFI_PCI/link/$f"
         done
-        echo on > "$WIFI_PCI/power/control" 2>/dev/null
+        echo on 2>/dev/null > "$WIFI_PCI/power/control"
     fi
     logger -t "$LOG_TAG" "power_save off applied to $IFACE (driver=$DRIVER)"
 fi
@@ -107,6 +107,6 @@ if [ "$CAKE" = "True" ]; then
 fi
 
 # Record enforcement timestamp
-date +%s > "$SETTINGS_DIR/last_enforced" 2>/dev/null
+date +%s 2>/dev/null > "$SETTINGS_DIR/last_enforced"
 
 exit 0
