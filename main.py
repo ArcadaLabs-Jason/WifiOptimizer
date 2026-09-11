@@ -2118,7 +2118,23 @@ class Plugin:
             settings = _load_settings()
             had_bssid_lock = settings.get("bssid_lock_enabled", False)
             if enabled and had_bssid_lock:
-                self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+                unlocked = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+                if not unlocked["success"]:
+                    # The band is already written. Leaving an address from the
+                    # other band beside it gives a profile no access point
+                    # satisfies, and the reconnect below would activate it.
+                    # Put the band back and report, rather than strand it.
+                    self._nmcli_modify(
+                        uuid, "802-11-wireless.band",
+                        settings.get("band_preference", "") if
+                        settings.get("band_preference_enabled") else "",
+                    )
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't release the access point lock for the band change",
+                        "detail": unlocked["stderr"],
+                    }
 
             settings["band_preference_enabled"] = enabled
             settings["band_preference"] = band
@@ -2149,11 +2165,23 @@ class Plugin:
                             parts = line.split()
                             if len(parts) >= 3:
                                 new_bssid = parts[2]
-                                self._nmcli_modify(uuid, "802-11-wireless.bssid", new_bssid)
-                                settings = _load_settings()
-                                settings["bssid_lock_value"] = new_bssid
-                                _save_settings(settings)
-                                decky.logger.info(f"Re-locked BSSID to {new_bssid} after band change")
+                                relocked = self._nmcli_modify(
+                                    uuid, "802-11-wireless.bssid", new_bssid
+                                )
+                                if relocked["success"]:
+                                    settings = _load_settings()
+                                    settings["bssid_lock_value"] = new_bssid
+                                    _save_settings(settings)
+                                    decky.logger.info(
+                                        f"Re-locked BSSID to {new_bssid} after band change"
+                                    )
+                                else:
+                                    # Recording a lock that was not applied
+                                    # would report it as present forever.
+                                    decky.logger.error(
+                                        f"Could not re-lock BSSID after band change: "
+                                        f"{relocked.get('stderr', '')[:120]}"
+                                    )
                             break
 
             return {"success": True, "band": value, "reconnected": True}
