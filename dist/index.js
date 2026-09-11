@@ -593,7 +593,8 @@ function Content() {
                 // that empty string back over the field every few seconds made the
                 // setting impossible to re-enable: the servers field is only
                 // rendered while DNS is on, and turning it on with an empty custom
-                // list is rejected. Reset Settings was the only way out.
+                // list is rejected. The backend also resets the provider when it
+                // clears the servers, so the pair cannot get stuck together.
                 if (s.settings.dns_provider === "custom" && s.settings.dns_servers) {
                     setCustomDnsInput(s.settings.dns_servers);
                 }

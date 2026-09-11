@@ -270,6 +270,10 @@ def _load_settings() -> dict:
         # These lists are handed to nmcli as root. argv rather than a shell,
         # so junk is not dangerous, but a list of it turns a reset into a
         # long series of doomed calls on the event loop.
+        for key in ("last_connection_uuid", "bssid_lock_connection_uuid"):
+            value = merged.get(key, "")
+            if value and not UUID_RE.match(value):
+                merged[key] = ""
         for key in ("bssid_lock_uuids", "band_preference_uuids"):
             merged[key] = [
                 u for u in merged.get(key, [])
@@ -439,9 +443,9 @@ class Plugin:
                 return candidate
         return None
 
-    # How many profiles the BSSID lock will remember having pinned. It only
-    # grows when NetworkManager picks a different profile for the same SSID,
-    # so this is generous; the cap exists so it cannot accumulate forever.
+    # How many profiles each pin list will remember. The cap matters less for
+    # memory than for teardown: clearing them is a synchronous nmcli call per
+    # entry on the event loop, so an unbounded list is an unbounded stall.
     _MAX_TRACKED_LOCK_UUIDS = 16
 
     # How many times a reassertion may fail before it stops being attempted.
@@ -514,10 +518,14 @@ class Plugin:
         return self._get_backend_method() != "none"
 
     def _get_backend_method_cached(self) -> bool:
-        """Whether a backend switch is possible, without probing.
+        """Whether a backend switch looks possible, without probing.
 
         Called from the status collector, which runs in a worker thread and
-        must not mutate. Anything not already known is answered from files.
+        must not mutate, so this answers from files alone. It is deliberately
+        more permissive than _get_backend_method - it does not check the
+        helper is executable - so the panel can offer the control while the
+        switch itself still declines. Erring the other way would hide a
+        working control.
         """
         settings = _load_settings()
         if settings.get("distro_id") == "steamos" and os.path.isfile(BACKEND_HELPER):
@@ -656,12 +664,27 @@ class Plugin:
         for uuid in {u for u in list(band_uuids) + uuids + [last] if u}:
             self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
 
-    def _hard_reconnect(self, uuid: str | None = None):
-        """Reconnect by cycling WiFi radio to fully reset NM connection state."""
+    def _hard_reconnect(self, uuid: str | None = None) -> bool:
+        """Reconnect by cycling WiFi radio to fully reset NM connection state.
+
+        Returns whether the radio came back on. Callers previously reported
+        success regardless, so a failed `radio on` left the user with the
+        radio off and a setter claiming it had reconnected - and there is no
+        drift indicator for radio state to reveal it.
+        """
         self._run_cmd(["/usr/bin/nmcli", "radio", "wifi", "off"])
-        self._run_cmd(["/usr/bin/nmcli", "radio", "wifi", "on"])
+        back = self._run_cmd(["/usr/bin/nmcli", "radio", "wifi", "on"])
+        if not back["success"]:
+            decky.logger.error(
+                f"Could not turn the WiFi radio back on: "
+                f"{back.get('stderr', '')[:120]}"
+            )
+            retry = self._run_cmd(["/usr/bin/nmcli", "radio", "wifi", "on"])
+            if not retry["success"]:
+                return False
         if uuid:
             self._run_cmd(["/usr/bin/nmcli", "con", "up", "uuid", uuid], timeout=10)
+        return True
 
     # A driver profile is privileged configuration, not data. Everything in it
     # is consumed as root: the sysfs paths get opened for write, and the
@@ -821,8 +844,8 @@ class Plugin:
         """Prune old log files on plugin startup. Decky does not rotate plugin
         logs automatically; each plugin load creates a new timestamped file in
         DECKY_PLUGIN_LOG_DIR, so without pruning they accumulate forever.
-        Keep the newest `keep` files (typical size ~2-3 KB each, so bounded at
-        roughly 30 KB total).
+        Keep the newest `keep` files. This runs at plugin start only, and says
+        nothing about the growth of the log currently being written.
         """
         try:
             log_dir = getattr(decky, "DECKY_PLUGIN_LOG_DIR", None)
@@ -1462,9 +1485,13 @@ class Plugin:
                 if self._reassert_exhausted(f"pin_cleanup:{list_key}"):
                     continue
                 done = self._nmcli_modify(uuid, prop, "", timeout=2)
-                self._record_reassert(f"pin_cleanup:{list_key}", done["success"])
                 detail = done.get("stderr", "")
-                if done["success"] or "unknown connection" in detail.lower():
+                # A profile that no longer exists is resolved, not failed.
+                # Counting it as a failure pushed cleanup into its cooldown
+                # while it was in fact draining the list.
+                resolved = done["success"] or "unknown connection" in detail.lower()
+                self._record_reassert(f"pin_cleanup:{list_key}", resolved)
+                if resolved:
                     pending[list_key] = [
                         u for u in settings.get(list_key, []) if u != uuid
                     ]
@@ -1580,7 +1607,7 @@ class Plugin:
     )
 
     def _propose_pin_cleanup(self, settings: dict) -> list[dict]:
-        """One cleanup per poll for anything we pinned and could not unpin.
+        """One cleanup per property per poll for anything we could not unpin.
 
         Both properties need this, not just the address: a profile left
         demanding a band its network does not offer fails to associate the
@@ -1647,8 +1674,14 @@ class Plugin:
         """
         if not settings.get("band_preference_enabled"):
             return False
+        # An unrecorded scope means we do not know which network this belongs
+        # to. Enforcing it everywhere is what stranded profiles in the first
+        # place, and the cost of not enforcing is only that the preference
+        # does not apply until a successful read claims a network.
         scoped_to = settings.get("band_preference_ssid", "")
-        if scoped_to and ssid is not None and ssid != scoped_to:
+        if not scoped_to:
+            return False
+        if ssid is not None and ssid != scoped_to:
             return False
         # Take the leading number whatever follows it. iw has reported this as
         # "5180", "5180 MHz" and "5180.0" across versions, and a form we
@@ -1935,7 +1968,9 @@ class Plugin:
             # offer it, which then stop connecting - and the panel gives no
             # sign it is happening. The lock above is scoped the same way.
             band_ssid = settings.get("band_preference_ssid", "")
-            band_scope_ok = True
+            # Same rule as the conflict test: without a recorded network the
+            # preference is not enforced anywhere.
+            band_scope_ok = bool(band_ssid)
             if settings.get("band_preference_enabled") and band_ssid:
                 # active_ssid was resolved with the BSSID lock above. Reading
                 # it again would be a second subprocess for the same answer.
@@ -2419,9 +2454,27 @@ class Plugin:
                 # method, and a blocking sleep stalls the whole event loop.
                 await asyncio.sleep(3)
                 iface = self._get_wifi_interface()
-                if iface:
+                # The reconnect may have landed on a different profile - a
+                # duplicate for the same network, which is the situation this
+                # plugin exists to handle. Pinning what we see onto the profile
+                # we meant to change would write a foreign address, possibly on
+                # the other band, into a profile that now demands this one.
+                landed_on = self._get_active_connection_uuid()
+                if iface and landed_on == uuid:
                     link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
-                    for line in link_result.get("stdout", "").split("\n"):
+                    link_text = link_result.get("stdout", "")
+                    seen_freq = ""
+                    for line in link_text.split("\n"):
+                        st = line.strip()
+                        if st.startswith("freq:"):
+                            seen_freq = st.split(":", 1)[1].strip()
+                    if self._band_conflicts(_load_settings(), seen_freq, None):
+                        decky.logger.info(
+                            "Not re-locking after the band change: the radio is "
+                            "not on the band this network now requires"
+                        )
+                        link_text = ""
+                    for line in link_text.split("\n"):
                         if "Connected to" in line:
                             parts = line.split()
                             if len(parts) >= 3:
@@ -2510,6 +2563,13 @@ class Plugin:
                         "detail": result2["stderr"],
                     }
             else:
+                # The provider is reset alongside the servers. Leaving it on
+                # custom with nothing stored is a dead end: the panel only
+                # renders the provider dropdown and the servers field while
+                # DNS is on, and turning it on with an empty custom list is
+                # refused - so after a reload there is no way back except
+                # resetting every setting.
+                provider = "cloudflare"
                 # Order matters and both results matter. Clearing the servers
                 # first and then failing to re-enable the automatic ones
                 # leaves a profile that ignores DHCP DNS and has none of its
@@ -2805,14 +2865,29 @@ class Plugin:
                 did_reconnect = True
 
             if settings.get("band_preference_enabled"):
-                total += 1
-                r = await self.set_band_preference(
-                    True, settings.get("band_preference", "a")
+                # Only on the network the preference belongs to. Reapplying it
+                # anywhere else writes a band into that network's profile and
+                # reconnects into it, which strands a network that has no
+                # access point on that band. A deliberate toggle still
+                # re-scopes; this path is programmatic.
+                scoped_to = settings.get("band_preference_ssid", "")
+                here = self._get_profile_ssid(
+                    self._get_active_connection_uuid() or ""
                 )
-                results["band_preference"] = r
-                if r.get("success"):
-                    applied += 1
-                did_reconnect = True
+                if scoped_to and here != scoped_to:
+                    decky.logger.info(
+                        f"Skipping band preference: it belongs to {scoped_to!r}, "
+                        f"this is {here!r}"
+                    )
+                else:
+                    total += 1
+                    r = await self.set_band_preference(
+                        True, settings.get("band_preference", "a")
+                    )
+                    results["band_preference"] = r
+                    if r.get("success"):
+                        applied += 1
+                    did_reconnect = True
 
             if settings.get("dns_enabled"):
                 total += 1
