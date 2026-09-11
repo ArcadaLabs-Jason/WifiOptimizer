@@ -984,10 +984,20 @@ class Plugin:
             if kind == "priority":
                 if settings.get("priority_set"):
                     continue
-                self._nmcli_modify(
+                bumped = self._nmcli_modify(
                     uuid, "connection.autoconnect-priority", "100", timeout=2
                 )
-                pending["priority_set"] = True
+                if bumped["success"]:
+                    pending["priority_set"] = True
+                else:
+                    # Don't record it as done when it wasn't, or the profile
+                    # never gets the priority that stops NM preferring a
+                    # duplicate on boot.
+                    self._log_throttled(
+                        "priority",
+                        f"Couldn't set autoconnect priority on {uuid}: "
+                        f"{bumped.get('stderr', '')[:120]}",
+                    )
 
             elif kind == "ipv6":
                 if not settings.get("ipv6_disabled"):
@@ -1040,6 +1050,12 @@ class Plugin:
                     decky.logger.info(
                         f"BSSID lock re-pointed to active profile {uuid} "
                         f"at {action['value']}"
+                    )
+                else:
+                    self._log_throttled(
+                        "bssid_repoint",
+                        f"Couldn't re-point BSSID lock to {uuid}: "
+                        f"{retarget.get('stderr', '')[:120]}",
                     )
 
         if pending:
