@@ -930,8 +930,19 @@ class Plugin:
 
     def _unexpected_response(self, e: Exception) -> dict:
         """Standard error dict for the catch-all exception handler in every
-        setter. Callers log the error separately with the setter name."""
-        return {"success": False, "error": "unexpected", "message": str(e)}
+        setter. Callers log the error separately with the setter name.
+
+        The exception text goes to `detail`, not `message`. The panel prints
+        `message` beneath the control the user just touched, and a raw Python
+        traceback string there is noise to them while the real text stays in
+        the log either way.
+        """
+        return {
+            "success": False,
+            "error": "unexpected",
+            "message": "Something went wrong. Check the Decky log for details.",
+            "detail": str(e)[:200],
+        }
 
     def _nmcli_modify(self, uuid: str, key: str, value: str, timeout: int = 5) -> dict:
         """Run `nmcli con mod uuid <uuid> <key> <value>`. Returns the
@@ -1437,7 +1448,30 @@ class Plugin:
             return status, pending, actions
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
-            return self._unexpected_response(e), {}, []
+            # Hand back a COMPLETE status shape. The panel reads settings,
+            # live, drift, connected and version unconditionally, so a bare
+            # error dict renders as "not connected" with every toggle off -
+            # telling the user their optimizations are gone rather than that
+            # the status read failed.
+            try:
+                settings = _load_settings()
+            except Exception:
+                settings = dict(DEFAULT_SETTINGS)
+            return (
+                {
+                    "success": False,
+                    "error": "unexpected",
+                    "message": "Couldn't read WiFi status.",
+                    "connected": False,
+                    "support_tier": 1,
+                    "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
+                    "settings": settings,
+                    "live": {},
+                    "drift": {},
+                },
+                {},
+                [],
+            )
 
     # ---- Optimization setters ----
 
@@ -1488,7 +1522,6 @@ class Plugin:
         try:
 
             settings = _load_settings()
-            settings["auto_fix_on_wake"] = enabled
 
             installed = True
             if enabled:
@@ -1496,6 +1529,10 @@ class Plugin:
             else:
                 self._remove_dispatcher()
 
+            # Only record the setting as on once the script is actually in
+            # place. Saving first left the toggle showing on, and the header
+            # claiming a recent change, while nothing had been installed.
+            settings["auto_fix_on_wake"] = enabled and installed
             _save_settings_with_timestamp(settings)
             if enabled and not installed:
                 # os.path.isfile is not proof of success here: a failed write
@@ -2600,25 +2637,12 @@ systemctl restart plugin_loader 2>/dev/null || true
                 decky.logger.error(f"steamos-manager switch failed: {detail!r}")
                 return
 
-            # Phase: reconnecting. Same cadence as the other workers.
+            # Recover the interface BEFORE waiting for a reconnection. iwd
+            # destroys the netdev when it stops on ath11k, and waiting first
+            # means spending the whole timeout against an interface that does
+            # not exist yet, then reporting "WiFi didn't reconnect" about a
+            # switch that recovered and works.
             self._backend_switch["phase"] = "reconnecting"
-            reconnect_timed_out = True
-            for _ in range(15):
-                await asyncio.sleep(1)
-                iface = await asyncio.to_thread(self._get_wifi_interface)
-                if iface:
-                    uuid = await asyncio.to_thread(self._get_active_connection_uuid)
-                    if uuid:
-                        reconnect_timed_out = False
-                        break
-
-            final_backend = await asyncio.to_thread(self._get_current_backend)
-
-            # The backend is read from config, which steamos-manager writes as
-            # part of the switch. That makes it match the target even if the
-            # interface is gone, so it cannot stand alone as proof of success.
-            # iwd destroys the netdev when it stops on ath11k, so confirm an
-            # interface exists and try to bring one back before reporting.
             iface = await asyncio.to_thread(self._get_wifi_interface)
             recovery_performed = False
             if not iface:
@@ -2627,6 +2651,22 @@ systemctl restart plugin_loader 2>/dev/null || true
                     iface = await asyncio.to_thread(self._get_wifi_interface)
                     recovery_performed = bool(iface)
             needs_reboot = not iface
+
+            # Only now is it meaningful to wait for an association.
+            reconnect_timed_out = True
+            if not needs_reboot:
+                for _ in range(15):
+                    iface = await asyncio.to_thread(self._get_wifi_interface)
+                    if iface:
+                        uuid = await asyncio.to_thread(
+                            self._get_active_connection_uuid
+                        )
+                        if uuid:
+                            reconnect_timed_out = False
+                            break
+                    await asyncio.sleep(1)
+
+            final_backend = await asyncio.to_thread(self._get_current_backend)
 
             if needs_reboot:
                 self._backend_switch["phase"] = "failed"
@@ -2658,7 +2698,10 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "recovery_performed": recovery_performed,
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
-                    "message": f"Expected {target} but got {final_backend}. A reboot may help.",
+                    "message": (
+                        f"Expected {target} but the system reports "
+                        f"{final_backend or 'no backend'}. A reboot may help."
+                    ),
                 }
 
             decky.logger.info(
@@ -2762,7 +2805,10 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "recovery_performed": False,
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
-                    "message": f"Expected {target} but got {final_backend}. A reboot may help.",
+                    "message": (
+                        f"Expected {target} but the system reports "
+                        f"{final_backend or 'no backend'}. A reboot may help."
+                    ),
                 }
 
             decky.logger.info(
