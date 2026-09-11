@@ -175,6 +175,11 @@ DEFAULT_SETTINGS = {
     "bssid_lock_enabled": False,
     "bssid_lock_value": "",
     "bssid_lock_connection_uuid": "",
+    # Every profile we have written a BSSID to. NetworkManager keeps more than
+    # one profile per SSID and the lock follows whichever is in use, so a
+    # single slot loses the earlier ones and leaves them pinned to an access
+    # point with nothing able to clear it.
+    "bssid_lock_uuids": [],
     "band_preference": "a",
     "band_preference_enabled": False,
     "dns_provider": "cloudflare",
@@ -1114,9 +1119,19 @@ class Plugin:
         """
         settings = _load_settings()
 
+        # A band reassertion and a BSSID re-point in the same pass would write
+        # a profile demanding one band and an access point that may only exist
+        # on the other, which nothing can satisfy and which the plugin would
+        # then keep reasserting. The band is the user's explicit choice, so it
+        # wins; the address is re-read next poll, once association settled.
+        band_uuids = {a["uuid"] for a in actions if a["kind"] == "band"}
+
         for action in actions:
             kind = action["kind"]
             uuid = action["uuid"]
+
+            if kind == "bssid_repoint" and uuid in band_uuids:
+                continue
 
             if kind == "priority":
                 if settings.get("priority_set"):
@@ -1227,6 +1242,10 @@ class Plugin:
                 if retarget["success"]:
                     pending["bssid_lock_value"] = action["value"]
                     pending["bssid_lock_connection_uuid"] = uuid
+                    known = list(settings.get("bssid_lock_uuids", []))
+                    if uuid not in known:
+                        known.append(uuid)
+                    pending["bssid_lock_uuids"] = known
                     status["live"]["bssid_lock"] = action["value"]
                     status["drift"].pop("bssid_lock", None)
                     decky.logger.info(
@@ -1689,6 +1708,10 @@ class Plugin:
                 settings["bssid_lock_enabled"] = True
                 settings["bssid_lock_value"] = bssid
                 settings["bssid_lock_connection_uuid"] = uuid
+                known = list(settings.get("bssid_lock_uuids", []))
+                if uuid not in known:
+                    known.append(uuid)
+                settings["bssid_lock_uuids"] = known
                 _save_settings_with_timestamp(settings)
                 self._hard_reconnect(uuid)
             else:
@@ -1714,29 +1737,36 @@ class Plugin:
 
                 settings = _load_settings()
 
-                # The lock may have been written to a different profile for the
-                # same SSID before it was re-pointed at the active one. Clear
-                # that profile too, or it keeps a BSSID we are no longer
-                # honouring and NM fails to associate if it ever picks it again.
+                # The lock follows whichever profile NM actually uses, so over
+                # time it may have been written to several profiles for the
+                # same SSID. Clear all of them: one left pinned to an access
+                # point we are no longer honouring will fail to associate if
+                # NM ever picks it again, and no control would clear it.
+                stale_uuids = [
+                    u for u in settings.get("bssid_lock_uuids", []) if u != uuid
+                ]
                 previous_uuid = settings.get("bssid_lock_connection_uuid", "")
-                if previous_uuid and previous_uuid != uuid:
+                if previous_uuid and previous_uuid != uuid and previous_uuid not in stale_uuids:
+                    stale_uuids.append(previous_uuid)
+                for stale_uuid in stale_uuids:
                     stale = self._nmcli_modify(
-                        previous_uuid, "802-11-wireless.bssid", ""
+                        stale_uuid, "802-11-wireless.bssid", ""
                     )
                     if stale["success"]:
                         decky.logger.info(
-                            f"Cleared stale BSSID lock from profile {previous_uuid}"
+                            f"Cleared stale BSSID lock from profile {stale_uuid}"
                         )
                     else:
                         decky.logger.info(
                             f"Could not clear stale BSSID lock from profile "
-                            f"{previous_uuid} (it may no longer exist): "
+                            f"{stale_uuid} (it may no longer exist): "
                             f"{stale.get('stderr', '')[:120]}"
                         )
 
                 settings["bssid_lock_enabled"] = False
                 settings["bssid_lock_value"] = ""
                 settings["bssid_lock_connection_uuid"] = ""
+                settings["bssid_lock_uuids"] = []
                 _save_settings_with_timestamp(settings)
                 self._hard_reconnect(uuid)
 
