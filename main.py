@@ -432,6 +432,11 @@ class Plugin:
     # honest report anyway.
     _MAX_REASSERT_FAILURES = 3
 
+    # How long to leave it alone after giving up, before allowing one more
+    # attempt. Long enough that a permanently failing reassertion costs
+    # almost nothing, short enough that a recovered one heals by itself.
+    _REASSERT_COOLDOWN_SECONDS = 300
+
     _PROBE_RETRY_SECONDS = 30
 
     def _has_steamos_manager(self) -> bool:
@@ -1228,13 +1233,15 @@ class Plugin:
             if not settings.get("band_preference_enabled"):
                 return False
             want = settings.get("band_preference")
-            raw = str(status.get("live", {}).get("frequency", "")).split()[:1]
-            if not raw:
+            # Take the leading number whatever follows it. iw has reported
+            # this as "5180", "5180 MHz" and "5180.0" across versions, and a
+            # form we cannot read would otherwise refuse to pin forever.
+            found = re.match(
+                r"\s*(\d+)", str(status.get("live", {}).get("frequency", ""))
+            )
+            if not found:
                 return True          # cannot tell; do not pin
-            try:
-                freq = int(raw[0])
-            except ValueError:
-                return True
+            freq = int(found.group(1))
             on_5ghz = freq >= 5000
             return on_5ghz != (want == "a")
 
@@ -1412,15 +1419,31 @@ class Plugin:
         decky.logger.info(message)
 
     def _reassert_exhausted(self, key: str) -> bool:
-        counts = getattr(self, "_reassert_failures", None)
-        return bool(counts) and counts.get(key, 0) >= self._MAX_REASSERT_FAILURES
+        """Whether this reassertion has given up for now.
+
+        Giving up permanently would be wrong: whatever made the profile
+        unmodifiable - NetworkManager restarting, a network change, a module
+        finally loading - can go away, and nothing else would ever retry. So
+        the limit expires, and one attempt is allowed through afterwards.
+        """
+        state = getattr(self, "_reassert_failures", None)
+        if not state:
+            return False
+        count, last_at = state.get(key, (0, 0.0))
+        if count < self._MAX_REASSERT_FAILURES:
+            return False
+        return (time.monotonic() - last_at) < self._REASSERT_COOLDOWN_SECONDS
 
     def _record_reassert(self, key: str, succeeded: bool):
-        counts = getattr(self, "_reassert_failures", None)
-        if counts is None:
-            counts = {}
-            self._reassert_failures = counts
-        counts[key] = 0 if succeeded else counts.get(key, 0) + 1
+        state = getattr(self, "_reassert_failures", None)
+        if state is None:
+            state = {}
+            self._reassert_failures = state
+        if succeeded:
+            state[key] = (0, 0.0)
+        else:
+            count, _ = state.get(key, (0, 0.0))
+            state[key] = (count + 1, time.monotonic())
 
     def _band_change_in_flight(self) -> bool:
         # The count is released in a finally, including on cancellation, and a
