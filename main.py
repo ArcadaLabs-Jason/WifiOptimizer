@@ -77,6 +77,9 @@ DRIVER_PROFILES = {
         "chip_label": "Intel WiFi",
         "supports_6ghz": True,
         "sysfs_power_fixes": [],
+        # iwlmvm is a separate module from iwlwifi, so the modules it may
+        # configure are listed rather than inferred from the driver name.
+        "modules": ["iwlwifi", "iwlmvm"],
         "modprobe_options": [
             "options iwlwifi power_save=0 uapsd_disable=3",
             "options iwlmvm power_scheme=1",
@@ -113,16 +116,16 @@ except Exception:
 # A version string from the network ends up in a filename, a URL and a root
 # shell script, so it is validated the moment it is parsed rather than at each
 # use. Digits and dots, with an optional alphanumeric prerelease suffix.
-VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}(-[A-Za-z0-9.]+)?$")
+VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}(-[A-Za-z0-9.]+)?\Z")
 
 # Interface names are used to build sysfs paths. Kernel names cannot contain a
 # separator, but the value is checked rather than assumed.
-IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z")
 
 # DNS servers are free text from the panel. They are passed to nmcli as a
 # single argument, so there is no shell involved, but the value is stored and
 # replayed later and should be addresses and nothing else.
-DNS_SERVER_RE = re.compile(r"^[0-9A-Fa-f:.]{2,45}$")
+DNS_SERVER_RE = re.compile(r"^[0-9A-Fa-f:.]{2,45}\Z")
 
 
 DNS_PROVIDERS = {
@@ -224,8 +227,15 @@ def _first_existing(paths: list[str]) -> str | None:
 
 def _load_settings() -> dict:
     try:
-        with open(SETTINGS_FILE, "r") as f:
-            data = json.load(f)
+        # Bounded read. This file belongs to the desktop user and root parses
+        # it on every status poll, so an oversized one is a way to make the
+        # plugin allocate arbitrarily much, repeatedly. The dispatcher applies
+        # the same cap.
+        with open(SETTINGS_FILE, "rb") as f:
+            raw = f.read(65536)
+            if f.read(1):
+                raise ValueError("settings file too large")
+        data = json.loads(raw)
         # Merge with defaults (adds new keys), then strip stale keys
         merged = {**DEFAULT_SETTINGS, **data}
         merged = {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
@@ -570,9 +580,9 @@ class Plugin:
     # here rather than trusted, because a new adapter profile is the most
     # ordinary-looking change anyone could send and reviewing it by eye is not
     # a control.
-    _SYSFS_FIX_RE = re.compile(r"^/sys/module/[A-Za-z0-9_]+/parameters/[A-Za-z0-9_]+$")
+    _SYSFS_FIX_RE = re.compile(r"^/sys/module/[A-Za-z0-9_]+/parameters/[A-Za-z0-9_]+\Z")
     _MODPROBE_OPT_RE = re.compile(
-        r"^options [a-z0-9_]+(?: [a-z0-9_]+=[A-Za-z0-9,._-]+)+$"
+        r"^options [a-z0-9_]+(?: [a-z0-9_]+=[A-Za-z0-9,._-]+)+\Z"
     )
 
     def _safe_sysfs_fixes(self, profile: dict) -> list[str]:
@@ -584,15 +594,30 @@ class Plugin:
                 decky.logger.error(f"Refusing sysfs path outside /sys/module: {path!r}")
         return out
 
-    def _safe_modprobe_options(self, profile: dict) -> list[str]:
+    def _safe_modprobe_options(self, driver: str, profile: dict) -> list[str]:
+        # The grammar check alone would let a profile set a parameter on any
+        # module in the kernel, from a diff that reads like a WiFi adapter
+        # entry. Restrict it to modules belonging to this driver: an explicit
+        # list where the names differ, otherwise anything sharing its prefix.
+        allowed = profile.get("modules")
         out = []
         for opt in profile.get("modprobe_options", []):
             # `install`, `alias`, `softdep` and `remove` all let modprobe run a
             # shell command as root. Only parameter assignments are accepted.
-            if isinstance(opt, str) and self._MODPROBE_OPT_RE.match(opt):
-                out.append(opt)
-            else:
+            if not isinstance(opt, str) or not self._MODPROBE_OPT_RE.match(opt):
                 decky.logger.error(f"Refusing modprobe directive: {opt!r}")
+                continue
+            module = opt.split()[1]
+            permitted = (
+                module in allowed if allowed else module.startswith(driver)
+            )
+            if not permitted:
+                decky.logger.error(
+                    f"Refusing modprobe option for {module!r}, which does not "
+                    f"belong to the {driver!r} profile"
+                )
+                continue
+            out.append(opt)
         return out
 
     def _apply_driver_fixes(self, enable: bool):
@@ -611,7 +636,7 @@ class Plugin:
             except PermissionError:
                 decky.logger.info(f"sysfs path not writable: {path}")
 
-        options = self._safe_modprobe_options(profile)
+        options = self._safe_modprobe_options(settings.get("driver", ""), profile)
         if enable and options:
             try:
                 os.makedirs(os.path.dirname(MODPROBE_CONF_PATH), exist_ok=True)
@@ -1537,7 +1562,7 @@ class Plugin:
                     "error": "unexpected",
                     "message": "Couldn't read WiFi status.",
                     "connected": False,
-                    "support_tier": 1,
+                    "support_tier": 3,
                     "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
                     "settings": settings,
                     "live": {},
@@ -2288,7 +2313,7 @@ class Plugin:
                 tag = data.get("tag_name", "")
                 latest = tag.lstrip("v")
 
-            if latest and not VERSION_RE.match(latest):
+            if latest and (len(latest) > 64 or not VERSION_RE.match(latest)):
                 # Refuse rather than sanitise. This value reaches a download
                 # URL and a root shell script, and a version that does not
                 # look like a version means something is wrong upstream.
@@ -2396,7 +2421,7 @@ LABEL="$5"
 
 sleep 2
 
-TMP=$(mktemp -d)
+TMP=$(mktemp -d) || exit 1
 cleanup() { rm -rf "$TMP"; rm -rf "$SELF_DIR"; }
 trap cleanup EXIT
 

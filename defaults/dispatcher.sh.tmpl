@@ -129,14 +129,22 @@ fi
 # Record enforcement timestamp.
 #
 # This script runs as root and the settings directory belongs to the desktop
-# user, so this filename can be replaced with a link to a root-owned file that
-# `>` would happily truncate. Remove anything that is not a regular file first,
-# and never write through a link.
+# user, so this name can be replaced with a link to a root-owned file that `>`
+# would truncate. Checking the file first and then writing is three separate
+# operations, and the user owning the directory can keep replacing it until a
+# write lands between them.
+#
+# Write somewhere fresh and rename over the target instead. rename replaces
+# whatever is at the destination rather than following it, so a link planted
+# at any moment is simply overwritten, and the same holds for a hard link.
 ENFORCED_FILE="$SETTINGS_DIR/last_enforced"
-if [ -L "$ENFORCED_FILE" ] || { [ -e "$ENFORCED_FILE" ] && [ ! -f "$ENFORCED_FILE" ]; }; then
-    logger -t "$LOG_TAG" "refusing to write through non-regular $ENFORCED_FILE"
-    rm -f "$ENFORCED_FILE"
+ENFORCED_TMP=$(mktemp "$SETTINGS_DIR/.last_enforced.XXXXXX" 2>/dev/null)
+if [ -n "$ENFORCED_TMP" ]; then
+    if date +%s 2>/dev/null > "$ENFORCED_TMP"; then
+        mv -f "$ENFORCED_TMP" "$ENFORCED_FILE" 2>/dev/null || rm -f "$ENFORCED_TMP"
+    else
+        rm -f "$ENFORCED_TMP"
+    fi
 fi
-date +%s 2>/dev/null > "$ENFORCED_FILE"
 
 exit 0
