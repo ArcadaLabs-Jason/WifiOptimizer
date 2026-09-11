@@ -962,6 +962,17 @@ class Plugin:
                     decky.logger.info(
                         f"Band preference scoped to {adopted!r} on upgrade"
                     )
+                else:
+                    # Leaving it enabled with no network attached is the state
+                    # that lets it be applied to the wrong one. Turn it off so
+                    # the toggle tells the truth; one tap re-enables it against
+                    # whatever network the user is actually on.
+                    settings["band_preference_enabled"] = False
+                    _save_settings(settings)
+                    decky.logger.info(
+                        "Band preference disabled: could not establish which "
+                        "network it belongs to"
+                    )
 
             # Warm the steamos-manager probe here, off the polling path, so
             # the collector never has to fork or memoise from its thread.
@@ -2378,6 +2389,21 @@ class Plugin:
             if err:
                 return err
 
+            # Establish which network this belongs to BEFORE writing anything.
+            # Recording the preference as on with no network attached leaves it
+            # enforced nowhere while the toggle reads on, and lets Force Reapply
+            # write the band into an unrelated network. Doing it here means a
+            # failure needs no rollback.
+            scope_ssid = ""
+            if enabled:
+                scope_ssid = self._get_profile_ssid(uuid) or ""
+                if not scope_ssid:
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't identify this network. Try again in a moment.",
+                    }
+
             value = band if enabled else ""
             unresolved_bands: list[str] = []
             if not enabled:
@@ -2456,9 +2482,7 @@ class Plugin:
                 # preference set at home onto whatever network Force Reapply
                 # happened to be pressed on.
                 if not settings.get("band_preference_ssid"):
-                    settings["band_preference_ssid"] = (
-                        self._get_profile_ssid(uuid) or ""
-                    )
+                    settings["band_preference_ssid"] = scope_ssid
             _save_settings_with_timestamp(settings)
 
             if not self._hard_reconnect(uuid):
@@ -2893,7 +2917,11 @@ class Plugin:
                 here = self._get_profile_ssid(
                     self._get_active_connection_uuid() or ""
                 )
-                if scoped_to and here != scoped_to:
+                # An unknown scope is not permission. Everything else treats
+                # it as "do not enforce"; treating it as "go ahead" here would
+                # write the band into whatever network is active and reconnect
+                # into it, which is the stranding this scoping exists to stop.
+                if not scoped_to or here != scoped_to:
                     decky.logger.info(
                         f"Skipping band preference: it belongs to {scoped_to!r}, "
                         f"this is {here!r}"
