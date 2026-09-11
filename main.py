@@ -786,7 +786,14 @@ class Plugin:
             _save_settings(settings)
 
             if settings.get("auto_fix_on_wake", True):
-                self._install_dispatcher()
+                if not self._install_dispatcher():
+                    # Don't leave the toggle reading on with nothing installed.
+                    # There is no drift indicator for auto-fix, so a silent
+                    # failure here is invisible until WiFi stops being fixed.
+                    settings["auto_fix_on_wake"] = False
+                    decky.logger.error(
+                        "Auto-fix disabled: the dispatcher could not be installed"
+                    )
 
             # Apply volatile settings that may have been lost on reboot.
             # The dispatcher handles reconnects, but on a fresh boot WiFi
@@ -896,7 +903,7 @@ class Plugin:
         Normalizes sub-module names (e.g. rtw88_pci) to the canonical
         DRIVER_PROFILES key (rtw88)."""
         iface = self._get_wifi_interface()
-        if not iface:
+        if not iface or not IFACE_RE.match(iface):
             return "unknown"
         try:
             driver_path = os.path.realpath(f"/sys/class/net/{iface}/device/driver/module")
@@ -1087,7 +1094,21 @@ class Plugin:
         event loop for as long as NM took to answer. One thread hop covers the
         whole collection rather than wrapping each call individually.
         """
-        status, pending, actions = await asyncio.to_thread(self._collect_status)
+        # Collection used to be serialized by the blocked event loop. Now that
+        # it runs in a worker thread nothing stops the next poll starting while
+        # this one is still out, and on an unresponsive NetworkManager a dozen
+        # of them pile up, each spawning its own subprocesses. Hand back the
+        # last result instead; it is at most one interval old.
+        if getattr(self, "_collect_in_flight", False):
+            last = getattr(self, "_last_status", None)
+            if last is not None:
+                return last
+
+        self._collect_in_flight = True
+        try:
+            status, pending, actions = await asyncio.to_thread(self._collect_status)
+        finally:
+            self._collect_in_flight = False
         if pending or actions:
             try:
                 self._apply_status_actions(status, pending, actions)
@@ -1107,6 +1128,8 @@ class Plugin:
                 status["settings"] = _load_settings()
             except Exception as e:
                 decky.logger.error(f"settings refresh error: {e}")
+
+        self._last_status = status
         return status
 
     def _apply_status_actions(self, status: dict, pending: dict, actions: list):
@@ -1116,6 +1139,14 @@ class Plugin:
         the worker thread's snapshot, which may be up to ~20s old. Without
         that, a poll begun before the user touched a toggle would undo the
         change they just made.
+
+        This deliberately runs ON the event loop rather than in a thread. The
+        setters are await-free coroutines, so the loop is what serializes them
+        against this; moving it to a thread would make it concurrent with them
+        again and reinstate the race the split exists to prevent. The cost is
+        that it holds the loop, so every call here is given a short timeout
+        and nothing runs in steady state - actions exist only while something
+        has actually drifted.
         """
         settings = _load_settings()
 
@@ -1153,6 +1184,7 @@ class Plugin:
 
             elif kind == "ipv6":
                 if not settings.get("ipv6_disabled"):
+                    status["drift"].pop("ipv6", None)
                     continue
                 healed = self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=2)
                 self._log_throttled(
@@ -1164,8 +1196,10 @@ class Plugin:
 
             elif kind == "band":
                 if not settings.get("band_preference_enabled"):
+                    status["drift"].pop("band_preference", None)
                     continue
                 if settings.get("band_preference") != action["value"]:
+                    status["drift"].pop("band_preference", None)
                     continue
                 healed = self._nmcli_modify(
                     uuid, "802-11-wireless.band", action["value"], timeout=2
@@ -1194,17 +1228,17 @@ class Plugin:
                         ["/usr/bin/modprobe", "/usr/sbin/modprobe"]
                     )
                     if modprobe:
-                        self._run_cmd([modprobe, "sch_cake"], timeout=5)
+                        self._run_cmd([modprobe, "sch_cake"], timeout=2)
                     self._cake_module_loaded = True
                 applied = self._run_cmd([
                     "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
                     "cake", "unlimited", "diffserv4", "nat", "ack-filter",
-                ], timeout=5)
+                ], timeout=2)
                 if applied["success"]:
                     self._cake_reassert_failures = 0
                     self._run_cmd(
                         ["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"],
-                        timeout=5,
+                        timeout=2,
                     )
                     status["live"]["cake_applied"] = True
                     status["drift"].pop("cake", None)
@@ -1294,8 +1328,12 @@ class Plugin:
         return time.monotonic() < getattr(self, "_band_change_until", 0.0)
 
     def _collect_status(self) -> tuple[dict, dict, list]:
-        # Short timeout per read-only query so an unresponsive NM bounds the
-        # worst case (~12 commands x 2s) instead of hanging the poll.
+        # Short timeout for the queries that take one. Note this does not
+        # bound the whole collection: the interface and connection lookups,
+        # the backend probe and the qdisc check use their own longer defaults,
+        # so a wedged NetworkManager can stretch a single pass to the better
+        # part of a minute. That is survivable because collection runs in a
+        # worker thread and the caller drops overlapping polls.
         T = 2
 
         try:
@@ -1793,7 +1831,7 @@ class Plugin:
             self._band_change_depth = getattr(self, "_band_change_depth", 0) + 1
             self._band_change_until = time.monotonic() + 300
 
-            if enabled and band not in ("a", "bg"):
+            if band not in ("a", "bg"):
                 return {
                     "success": False,
                     "error": "nmcli_failed",
@@ -1966,12 +2004,24 @@ class Plugin:
         try:
 
             params = SYSCTL_PARAMS if enabled else SYSCTL_DEFAULTS
+            failed = 0
             for key, value in params.items():
                 result = self._run_cmd(
                     ["/usr/bin/sysctl", "-w", f"{key}={value}"]
                 )
                 if not result["success"]:
+                    failed += 1
                     decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
+
+            if failed == len(params):
+                # Reporting success here recorded the setting as on, which then
+                # showed as drift on every poll with no control able to clear
+                # it: Optimize Safe just calls back into here and fails again.
+                return {
+                    "success": False,
+                    "error": "unexpected",
+                    "message": "Couldn't apply network buffer settings.",
+                }
 
             # TX queue length (CAKE needs 256; defer to it if active)
             iface = self._get_wifi_interface()
@@ -2582,6 +2632,12 @@ systemctl restart plugin_loader 2>/dev/null || true
                 if not iface_check:
                     needs_reboot = True
 
+            # The helper reports "wlan0 could not be created" by name, but an
+            # interface that came back as wlpXsY is working. Check before
+            # acting on that claim, the same way the quirk branch above does.
+            if needs_reboot and await asyncio.to_thread(self._get_wifi_interface):
+                needs_reboot = False
+
             # The helper's own recovery only knows about phy0. Try again with
             # the real phy before making the user reboot.
             if needs_reboot:
@@ -2621,7 +2677,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "success": False,
                     "backend": final_backend,
                     "target": target,
-                    "recovery_performed": False,
+                    "recovery_performed": recovery_performed,
                     "needs_reboot": True,
                     "message": "Backend switched but wlan0 didn't come back. Reboot required.",
                 }
@@ -2701,12 +2757,22 @@ systemctl restart plugin_loader 2>/dev/null || true
                 return False
 
         def driver_of(phy: str) -> str:
-            try:
-                return os.path.basename(
-                    os.path.realpath(f"/sys/class/ieee80211/{phy}/device/driver")
-                )
-            except Exception:
-                return ""
+            # Read the module name, not the driver directory. The stored
+            # driver is normalized to the DRIVER_PROFILES key (rtw88_pci and
+            # rtw88_8822ce both become rtw88) while the driver directory is
+            # the raw name, so comparing the two never matched on rtw88 - the
+            # Steam Deck LCD - and the preference silently degraded to
+            # alphabetical order.
+            for probe in ("device/driver/module", "device/driver"):
+                try:
+                    name = os.path.basename(
+                        os.path.realpath(f"/sys/class/ieee80211/{phy}/{probe}")
+                    )
+                    if name:
+                        return name
+                except Exception:
+                    continue
+            return ""
 
         phys = [phy for phy in phys if not already_has_netdev(phy)]
         if not phys:
@@ -2717,7 +2783,16 @@ systemctl restart plugin_loader 2>/dev/null || true
         # one brings WiFi back on the wrong hardware while the internal radio
         # stays dead - reported as a successful recovery.
         wanted = _load_settings().get("driver", "")
-        phys.sort(key=lambda phy: (driver_of(phy) != wanted, phy))
+
+        def mismatch(phy: str) -> bool:
+            name = driver_of(phy)
+            if not name or not wanted:
+                return True
+            # Either direction: the stored value may be the normalized family
+            # name while the module is a variant of it, or the reverse.
+            return not (name.startswith(wanted) or wanted.startswith(name))
+
+        phys.sort(key=lambda phy: (mismatch(phy), phy))
 
         for phy in phys:
             result = self._run_cmd(
