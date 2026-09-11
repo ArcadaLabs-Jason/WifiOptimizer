@@ -643,18 +643,18 @@ class Plugin:
         current = settings.get("bssid_lock_connection_uuid", "")
         if current and current not in uuids:
             uuids.append(current)
-        clear_band = settings.get("band_preference_enabled", False)
+        # Unconditional. Gating on the toggle skipped exactly the profiles
+        # left behind by turning it OFF, which is when they are stranded.
         for uuid in uuids:
             result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
             decky.logger.info(
                 f"Clearing BSSID lock from {uuid}: "
                 f"{'ok' if result['success'] else 'not found'}"
             )
-        if clear_band:
-            last = settings.get("last_connection_uuid", "")
-            band_uuids = settings.get("band_preference_uuids", [])
-            for uuid in {u for u in list(band_uuids) + uuids + [last] if u}:
-                self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
+        last = settings.get("last_connection_uuid", "")
+        band_uuids = settings.get("band_preference_uuids", [])
+        for uuid in {u for u in list(band_uuids) + uuids + [last] if u}:
+            self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
 
     def _hard_reconnect(self, uuid: str | None = None):
         """Reconnect by cycling WiFi radio to fully reset NM connection state."""
@@ -1234,6 +1234,28 @@ class Plugin:
                 except Exception:
                     pass
                 return cached
+            # A collection that never returns would otherwise hold this
+            # branch forever and leave the panel blank with nothing to say.
+            # subprocess.run waits again after killing a timed-out child, so
+            # a process stuck against a wedged driver can do exactly that.
+            started = getattr(self, "_collect_started_at", 0.0)
+            if started and (time.monotonic() - started) > 30:
+                decky.logger.error(
+                    "Status collection has not returned in 30s; reporting a "
+                    "read failure rather than leaving the panel empty"
+                )
+                return {
+                    "success": False,
+                    "error": "unexpected",
+                    "message": "Couldn't read WiFi status.",
+                    "connected": False,
+                    "support_tier": self._get_support_tier(),
+                    "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
+                    "settings": _load_settings(),
+                    "live": {},
+                    "drift": {},
+                }
+
             # No previous result to hand back. Falling through here is what
             # the guard exists to prevent: the first collection of a cold boot
             # routinely outlives the poll interval, so every caller would
@@ -1255,6 +1277,8 @@ class Plugin:
             }
 
         self._collect_depth = getattr(self, "_collect_depth", 0) + 1
+        if self._collect_depth == 1:
+            self._collect_started_at = time.monotonic()
         try:
             status, pending, actions = await asyncio.to_thread(self._collect_status)
         finally:
@@ -1426,23 +1450,25 @@ class Plugin:
                 )
 
             elif kind == "pin_cleanup":
-                if settings.get("bssid_lock_enabled"):
-                    continue
-                if self._reassert_exhausted("pin_cleanup"):
-                    continue
-                done = self._nmcli_modify(
-                    uuid, "802-11-wireless.bssid", "", timeout=2
+                list_key = action["list_key"]
+                prop = action["property"]
+                enabled_key = next(
+                    e for e, l, _ in self._PIN_PROPERTIES if l == list_key
                 )
-                self._record_reassert("pin_cleanup", done["success"])
+                if settings.get(enabled_key):
+                    continue
+                if self._reassert_exhausted(f"pin_cleanup:{list_key}"):
+                    continue
+                done = self._nmcli_modify(uuid, prop, "", timeout=2)
+                self._record_reassert(f"pin_cleanup:{list_key}", done["success"])
                 detail = done.get("stderr", "")
                 if done["success"] or "unknown connection" in detail.lower():
-                    remaining = [
-                        u for u in settings.get("bssid_lock_uuids", []) if u != uuid
+                    pending[list_key] = [
+                        u for u in settings.get(list_key, []) if u != uuid
                     ]
-                    pending["bssid_lock_uuids"] = remaining
                     self._log_throttled(
-                        "pin_cleanup",
-                        f"Cleared a leftover access point pin from {uuid}",
+                        f"pin_cleanup:{list_key}",
+                        f"Cleared a leftover {prop} from {uuid}",
                     )
 
             elif kind == "bssid_repoint":
@@ -1546,6 +1572,58 @@ class Plugin:
             count, _ = state.get(key, (0, 0.0))
             state[key] = (count + 1, time.monotonic())
 
+    _PIN_PROPERTIES = (
+        ("bssid_lock_enabled", "bssid_lock_uuids", "802-11-wireless.bssid"),
+        ("band_preference_enabled", "band_preference_uuids", "802-11-wireless.band"),
+    )
+
+    def _propose_pin_cleanup(self, settings: dict) -> list[dict]:
+        """One cleanup per poll for anything we pinned and could not unpin.
+
+        Both properties need this, not just the address: a profile left
+        demanding a band its network does not offer fails to associate the
+        same way, and once the preference is off nothing else would look at
+        it again.
+        """
+        out = []
+        for enabled_key, list_key, prop in self._PIN_PROPERTIES:
+            if settings.get(enabled_key):
+                continue
+            for stale_uuid in settings.get(list_key, [])[:1]:
+                out.append({
+                    "kind": "pin_cleanup", "uuid": stale_uuid,
+                    "property": prop, "list_key": list_key,
+                })
+        return out
+
+    def _band_is_reachable(self, iface: str, uuid: str, want: str) -> bool:
+        """Whether this network has a visible AP on the wanted band.
+
+        Checked before cycling the radio, because a cycle that cannot get
+        back leaves the user disconnected - worse than the state the cycle
+        was meant to improve.
+        """
+        ssid = self._get_profile_ssid(uuid)
+        if not ssid:
+            return False
+        scan = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "SSID,FREQ", "dev", "wifi", "list",
+             "ifname", iface],
+            timeout=5,
+        )
+        if not scan["success"]:
+            return False
+        for line in scan.get("stdout", "").split("\n"):
+            name, _, freq = line.rpartition(":")
+            if name.replace("\\", "") != ssid:
+                continue
+            found = re.match(r"\s*(\d+)", freq.strip())
+            if not found:
+                continue
+            if (int(found.group(1)) >= 5000) == (want == "a"):
+                return True
+        return False
+
     def _band_conflicts(self, settings: dict, frequency: str) -> bool:
         """Whether pinning an address now would contradict the band setting.
 
@@ -1618,6 +1696,13 @@ class Plugin:
             status["live"]["backend_tool_available"] = backend_available
             if backend_available:
                 status["live"]["wifi_backend"] = self._get_current_backend() or ""
+
+            # Leftover pins, proposed BEFORE the not-connected return. A pin
+            # we failed to clear is what stops a profile associating, so the
+            # user is most likely to be DISCONNECTED when it needs clearing -
+            # and this needs neither an interface nor an active connection,
+            # only a saved profile.
+            actions.extend(self._propose_pin_cleanup(settings))
 
             if not connected:
                 status["live"]["dispatcher_installed"] = os.path.isfile(
@@ -1856,13 +1941,6 @@ class Plugin:
                 # matches behaviour the user has already opted into.
                 actions.append({"kind": "cake", "uuid": uuid, "iface": iface})
 
-            # Profiles still carrying a pin we failed to clear. Retaining them
-            # is only worth anything if something retries, and with the lock
-            # already off nothing else proposes any work for them.
-            if not settings.get("bssid_lock_enabled"):
-                for stale_uuid in settings.get("bssid_lock_uuids", [])[:1]:
-                    actions.append({"kind": "pin_cleanup", "uuid": stale_uuid})
-
             # Dispatcher
             status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
 
@@ -2037,8 +2115,24 @@ class Plugin:
                 if self._band_conflicts(current, frequency):
                     # Refusing alone would be a dead end: this is exactly the
                     # state the drift banner reports, its Fix now lands here,
-                    # and nothing the panel offers moves the association. Do
-                    # the reconnect ourselves, then look again.
+                    # and nothing the panel offers moves the association.
+                    #
+                    # But cycling the radio can also fail to get back, and a
+                    # remedy must not be able to leave the user worse off than
+                    # it found them. Only reconnect if an access point on the
+                    # wanted band is actually visible for this network.
+                    want = current.get("band_preference")
+                    if not self._band_is_reachable(iface, uuid, want):
+                        other = "5 GHz" if want == "a" else "2.4 GHz"
+                        return {
+                            "success": False,
+                            "error": "nmcli_failed",
+                            "message": (
+                                f"No {other} access point is in range for this "
+                                f"network, which it is set to require. Turn the "
+                                f"band preference off to lock anyway."
+                            ),
+                        }
                     decky.logger.info(
                         "Band conflict before locking; reconnecting to let NM "
                         "pick an access point on the preferred band"
@@ -2270,9 +2364,14 @@ class Plugin:
                 settings["band_preference_uuids"] = known[
                     -self._MAX_TRACKED_LOCK_UUIDS:
                 ]
-                settings["band_preference_ssid"] = (
-                    self._get_profile_ssid(uuid) or ""
-                )
+                # Only claim the network on a fresh enable. reapply_all calls
+                # this setter too, so rewriting it every time would move a
+                # preference set at home onto whatever network Force Reapply
+                # happened to be pressed on.
+                if not settings.get("band_preference_ssid"):
+                    settings["band_preference_ssid"] = (
+                        self._get_profile_ssid(uuid) or ""
+                    )
             _save_settings_with_timestamp(settings)
 
             self._hard_reconnect(uuid)
