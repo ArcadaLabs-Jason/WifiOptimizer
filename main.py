@@ -664,6 +664,12 @@ class Plugin:
         for uuid in {u for u in list(band_uuids) + uuids + [last] if u}:
             self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
 
+    _RADIO_OFF_RESULT = {
+        "success": False,
+        "error": "iw_failed",
+        "message": "The WiFi radio didn't come back on. Try toggling WiFi in Steam settings.",
+    }
+
     def _hard_reconnect(self, uuid: str | None = None) -> bool:
         """Reconnect by cycling WiFi radio to fully reset NM connection state.
 
@@ -1499,6 +1505,13 @@ class Plugin:
                         f"pin_cleanup:{list_key}",
                         f"Cleared a leftover {prop} from {uuid}",
                     )
+                else:
+                    # Move it to the back. Only the head is attempted each
+                    # poll, so one profile that cannot be cleared would
+                    # otherwise keep every other entry from ever being tried.
+                    rest = [u for u in settings.get(list_key, []) if u != uuid]
+                    if rest:
+                        pending[list_key] = rest + [uuid]
 
             elif kind == "bssid_repoint":
                 # The lock may have been switched off while this poll was in
@@ -2206,7 +2219,8 @@ class Plugin:
                         "Band conflict before locking; reconnecting to let NM "
                         "pick an access point on the preferred band"
                     )
-                    self._hard_reconnect(uuid)
+                    if not self._hard_reconnect(uuid):
+                        return dict(self._RADIO_OFF_RESULT)
                     # A BLOCKING sleep, on purpose, and it must stay one.
                     # This setter's whole body is await-free, which is what
                     # lets the event loop serialize it against status
@@ -2265,7 +2279,8 @@ class Plugin:
                     -self._MAX_TRACKED_LOCK_UUIDS:
                 ]
                 _save_settings_with_timestamp(settings)
-                self._hard_reconnect(uuid)
+                if not self._hard_reconnect(uuid):
+                    return dict(self._RADIO_OFF_RESULT)
             else:
                 # Disabling works on saved profiles - no active WiFi needed
                 iface, uuid, _ = self._require_wifi()
@@ -2327,7 +2342,8 @@ class Plugin:
                 settings["bssid_lock_connection_uuid"] = ""
                 settings["bssid_lock_uuids"] = unresolved
                 _save_settings_with_timestamp(settings)
-                self._hard_reconnect(uuid)
+                if not self._hard_reconnect(uuid):
+                    return dict(self._RADIO_OFF_RESULT)
 
             return {"success": True, "bssid_locked": enabled, "reconnected": True}
         except Exception as e:
@@ -2445,7 +2461,8 @@ class Plugin:
                     )
             _save_settings_with_timestamp(settings)
 
-            self._hard_reconnect(uuid)
+            if not self._hard_reconnect(uuid):
+                return dict(self._RADIO_OFF_RESULT)
 
             # Re-lock BSSID to whatever AP NM picked on the new band
             if enabled and had_bssid_lock:
@@ -2599,7 +2616,8 @@ class Plugin:
             settings["dns_servers"] = servers
             _save_settings_with_timestamp(settings)
 
-            self._hard_reconnect(uuid)
+            if not self._hard_reconnect(uuid):
+                return dict(self._RADIO_OFF_RESULT)
             return {"success": True, "dns_set": enabled, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_dns error: {e}")
@@ -2628,7 +2646,8 @@ class Plugin:
             settings["ipv6_disabled"] = disabled
             _save_settings_with_timestamp(settings)
 
-            self._hard_reconnect(uuid)
+            if not self._hard_reconnect(uuid):
+                return dict(self._RADIO_OFF_RESULT)
             return {"success": True, "ipv6_disabled": disabled, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_ipv6 error: {e}")
