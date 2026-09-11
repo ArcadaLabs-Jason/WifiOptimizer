@@ -431,6 +431,20 @@ class Plugin:
         settings = _load_settings()
         return settings.get("last_connection_uuid") or settings.get("bssid_lock_connection_uuid") or None
 
+    def _get_profile_ssid(self, uuid: str, timeout: int = 5) -> str | None:
+        """SSID of a saved connection profile, or None if it cannot be read."""
+        if not uuid:
+            return None
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "802-11-wireless.ssid",
+             "con", "show", "uuid", uuid],
+            timeout=timeout,
+        )
+        if not result["success"]:
+            return None
+        _, sep, value = result.get("stdout", "").partition(":")
+        return value.strip() if sep else None
+
     def _hard_reconnect(self, uuid: str | None = None):
         """Reconnect by cycling WiFi radio to fully reset NM connection state."""
         self._run_cmd(["/usr/bin/nmcli", "radio", "wifi", "off"])
@@ -878,15 +892,28 @@ class Plugin:
         event loop for as long as NM took to answer. One thread hop covers the
         whole collection rather than wrapping each call individually.
         """
-        return await asyncio.to_thread(self._collect_status)
+        status, pending = await asyncio.to_thread(self._collect_status)
+        if pending:
+            # Apply on the event loop, re-reading first and merging only the
+            # keys collection asked to change. Collection runs in a worker
+            # thread, so writing the whole settings dict from there could
+            # clobber a concurrent setter: the thread's snapshot predates the
+            # setter's change and would silently revert it.
+            settings = _load_settings()
+            settings.update(pending)
+            _save_settings(settings)
+        return status
 
-    def _collect_status(self) -> dict:
+    def _collect_status(self) -> tuple[dict, dict]:
         # Short timeout per read-only query so an unresponsive NM bounds the
         # worst case (~12 commands x 2s) instead of hanging the poll.
         T = 2
 
         try:
             settings = _load_settings()
+            # Settings changes this collection wants made. Returned to the
+            # caller rather than written here; see get_status.
+            pending: dict = {}
             iface = self._get_wifi_interface()
             uuid = self._get_active_connection_uuid()
             connected = iface is not None and uuid is not None
@@ -912,14 +939,15 @@ class Plugin:
                 status["live"]["dispatcher_installed"] = os.path.isfile(
                     DISPATCHER_PATH
                 )
-                return status
+                return status, pending
 
             # Remember UUID and ensure high autoconnect-priority so NM
             # prefers this profile over duplicates on boot (fixes 2.4GHz issue)
             if uuid and uuid != settings.get("last_connection_uuid"):
                 settings["last_connection_uuid"] = uuid
                 settings["priority_set"] = False
-                _save_settings(settings)
+                pending["last_connection_uuid"] = uuid
+                pending["priority_set"] = False
 
             if uuid and not settings.get("priority_set"):
                 # Bump priority to favor this profile over duplicates on boot.
@@ -927,7 +955,7 @@ class Plugin:
                     uuid, "connection.autoconnect-priority", "100", timeout=T
                 )
                 settings["priority_set"] = True
-                _save_settings(settings)
+                pending["priority_set"] = True
 
             # Power save
             ps_result = self._run_cmd(
@@ -1017,18 +1045,32 @@ class Plugin:
                 # drift that nothing clears. Writing the BSSID we are already
                 # associated to does not disturb the link: NM applies it on the
                 # next activation, so no reconnect is triggered here.
+                # Only follow the connection within the SAME network. Without
+                # this, leaving home with the lock still enabled would pin the
+                # user to the first AP of whatever network they joined next,
+                # which they never asked for and which blocks roaming on it.
+                locked_uuid = settings.get("bssid_lock_connection_uuid", "")
+                same_network = False
+                if locked_uuid == uuid:
+                    same_network = True
+                elif locked_uuid:
+                    locked_ssid = self._get_profile_ssid(locked_uuid, timeout=T)
+                    active_ssid = self._get_profile_ssid(uuid, timeout=T)
+                    same_network = bool(
+                        locked_ssid and active_ssid and locked_ssid == active_ssid
+                    )
+
                 live_bssid = status["live"].get("connected_bssid", "")
                 retargeted = False
-                if live_bssid:
+                if live_bssid and same_network:
                     retarget = self._nmcli_modify(
                         uuid, "802-11-wireless.bssid", live_bssid, timeout=T
                     )
                     retargeted = retarget["success"]
 
                 if retargeted:
-                    settings["bssid_lock_value"] = live_bssid
-                    settings["bssid_lock_connection_uuid"] = uuid
-                    _save_settings(settings)
+                    pending["bssid_lock_value"] = live_bssid
+                    pending["bssid_lock_connection_uuid"] = uuid
                     status["live"]["bssid_lock"] = live_bssid
                     decky.logger.info(
                         f"BSSID lock re-pointed to active profile {uuid} "
@@ -1133,10 +1175,10 @@ class Plugin:
             except Exception:
                 status["live"]["last_enforced"] = 0
 
-            return status
+            return status, pending
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
-            return self._unexpected_response(e)
+            return self._unexpected_response(e), {}
 
     # ---- Optimization setters ----
 
