@@ -305,6 +305,12 @@ def _save_settings(data: dict):
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp creates 0600 and os.replace preserves it, which would
+        # silently narrow this file from the 0644 it has always had and make
+        # it unreadable to the user whose settings it holds. It is not a
+        # secret, and the directory is user-owned anyway, so the mode is set
+        # deliberately rather than inherited from how it happened to be made.
+        os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, SETTINGS_FILE)
     except Exception:
         try:
@@ -1557,8 +1563,15 @@ class Plugin:
                 self._record_reassert("bssid_repoint", retarget["success"])
                 if retarget["success"]:
                     pending["bssid_lock_value"] = action["value"]
-                    pending["bssid_lock_connection_uuid"] = uuid
                     known = list(settings.get("bssid_lock_uuids", []))
+                    # Keep the profile we are moving AWAY from. It still
+                    # carries the address we wrote, and overwriting the single
+                    # slot below is the only record of it - drop it here and
+                    # nothing can ever clear that profile again.
+                    previous = settings.get("bssid_lock_connection_uuid", "")
+                    if previous and previous != uuid and previous not in known:
+                        known.append(previous)
+                    pending["bssid_lock_connection_uuid"] = uuid
                     if uuid not in known:
                         known.append(uuid)
                     pending["bssid_lock_uuids"] = known[
