@@ -587,7 +587,7 @@ function Content() {
 
       {/* Status read failed - say so rather than claiming disconnection */}
       {status?.success === false && (
-        <Banner variant="error" icon="!">
+        <Banner variant="error" icon="⚠">
           {status?.message ?? "Couldn't read WiFi status."}
         </Banner>
       )}
