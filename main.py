@@ -1086,6 +1086,9 @@ class Plugin:
         decky.logger.info(message)
 
     def _band_change_in_flight(self) -> bool:
+        if getattr(self, "_band_change_depth", 0) > 0:
+            return True
+        # Only reachable if a band change never released its count.
         return time.monotonic() < getattr(self, "_band_change_until", 0.0)
 
     def _collect_status(self) -> tuple[dict, dict, list]:
@@ -1521,10 +1524,19 @@ class Plugin:
         try:
             # This setter deliberately clears the BSSID, cycles the radio and
             # re-locks once NM associates on the new band. It awaits in the
-            # middle, so a status poll can land between those steps. Mark the
+            # middle, so a status poll can land between those steps. Hold the
             # window so reconciliation does not write the old BSSID back and
             # leave the profile demanding a band and an AP that contradict.
-            self._band_change_until = time.monotonic() + 30
+            #
+            # The counter is the real gate and `finally` is what releases it;
+            # the deadline behind it is only a failsafe for a process that
+            # dies mid-change. Sized the other way round, a slow
+            # NetworkManager could outlive the deadline - the worst case here
+            # is close to a minute - and it would fail open in exactly the
+            # circumstance where reassociation is slowest and the race most
+            # likely.
+            self._band_change_depth = getattr(self, "_band_change_depth", 0) + 1
+            self._band_change_until = time.monotonic() + 300
 
             if enabled and band not in ("a", "bg"):
                 return {
@@ -1588,7 +1600,11 @@ class Plugin:
             decky.logger.error(f"set_band_preference error: {e}")
             return self._unexpected_response(e)
         finally:
-            self._band_change_until = 0.0
+            self._band_change_depth = max(
+                0, getattr(self, "_band_change_depth", 1) - 1
+            )
+            if self._band_change_depth == 0:
+                self._band_change_until = 0.0
 
     async def set_dns(
         self, enabled: bool, provider: str = "cloudflare", custom_servers: str = ""
@@ -2247,7 +2263,10 @@ systemctl restart plugin_loader 2>/dev/null || true
             await asyncio.sleep(1)
             if has_wlan0_quirk and target == "wpa_supplicant":
                 iface_check = await asyncio.to_thread(self._get_wifi_interface)
-                if iface_check != "wlan0":
+                # Absence is the failure, not the name. An interface that came
+                # back as wlpXsY is working, and treating that as a failure
+                # tells the user to reboot a system that is fine.
+                if not iface_check:
                     needs_reboot = True
 
             # The helper's own recovery only knows about phy0. Try again with
