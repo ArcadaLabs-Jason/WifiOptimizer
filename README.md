@@ -59,7 +59,7 @@ Want to go further? The remaining optimizations are available as individual togg
 | Traffic shaping (CAKE) | Replaces the default network queue with CAKE for fair queuing, bufferbloat prevention, and ACK filtering. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
-| WiFi backend (iwd / wpa_supplicant) | Switches between the default `iwd` and the older `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. | Only available when both backends are installed on the system; some networks (certain WPA3, enterprise setups) behave differently between the two |
+| WiFi backend (iwd / wpa_supplicant) | Switches between `iwd` and `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. On SteamOS 3.8 this goes through the same system service as the setting in SteamOS Settings, so the two agree. | Only shown when the system provides a way to switch; some networks (certain WPA3, enterprise setups) behave differently between the two |
 
 ## Hardware support
 
@@ -77,11 +77,13 @@ The plugin detects your WiFi hardware at startup and applies the right optimizat
 
 The plugin has two parts:
 
-1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It detects when settings have drifted after wake and lets you fix them with one tap.
+1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It notices when settings have drifted after wake: most are restored on their own, and anything left is one tap away.
 
 2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers, CAKE). If you uninstall the plugin, the script removes itself.
 
-No background processes, no polling, no battery impact.
+Nothing runs in the background while the panel is closed. The panel polls for
+live status only while it is open, and the dispatcher script runs only when
+WiFi reconnects.
 
 ## Uninstall
 
