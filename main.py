@@ -950,7 +950,35 @@ class Plugin:
                     current_bssid_lock = parts[1].replace("\\", "").strip()
             status["live"]["bssid_lock"] = current_bssid_lock
             if settings.get("bssid_lock_enabled") and not current_bssid_lock:
-                status["drift"]["bssid_lock"] = True
+                # NetworkManager keeps more than one profile per SSID, and it
+                # is free to autoconnect with a different one than the profile
+                # the lock was written to. When that happens the lock is not
+                # merely mis-reported, it is genuinely absent from the profile
+                # in use, so background scanning is never actually suppressed.
+                #
+                # Re-point the lock at the active profile rather than reporting
+                # drift that nothing clears. Writing the BSSID we are already
+                # associated to does not disturb the link: NM applies it on the
+                # next activation, so no reconnect is triggered here.
+                live_bssid = status["live"].get("connected_bssid", "")
+                retargeted = False
+                if live_bssid:
+                    retarget = self._nmcli_modify(
+                        uuid, "802-11-wireless.bssid", live_bssid, timeout=T
+                    )
+                    retargeted = retarget["success"]
+
+                if retargeted:
+                    settings["bssid_lock_value"] = live_bssid
+                    settings["bssid_lock_connection_uuid"] = uuid
+                    _save_settings(settings)
+                    status["live"]["bssid_lock"] = live_bssid
+                    decky.logger.info(
+                        f"BSSID lock re-pointed to active profile {uuid} "
+                        f"at {live_bssid}"
+                    )
+                else:
+                    status["drift"]["bssid_lock"] = True
 
             # IP address
             ip_result = self._run_cmd(
@@ -1171,6 +1199,21 @@ class Plugin:
                     }
 
                 settings = _load_settings()
+
+                # The lock may have been written to a different profile for the
+                # same SSID before it was re-pointed at the active one. Clear
+                # that profile too, or it keeps a BSSID we are no longer
+                # honouring and NM fails to associate if it ever picks it again.
+                previous_uuid = settings.get("bssid_lock_connection_uuid", "")
+                if previous_uuid and previous_uuid != uuid:
+                    stale = self._nmcli_modify(
+                        previous_uuid, "802-11-wireless.bssid", ""
+                    )
+                    if stale["success"]:
+                        decky.logger.info(
+                            f"Cleared stale BSSID lock from profile {previous_uuid}"
+                        )
+
                 settings["bssid_lock_enabled"] = False
                 settings["bssid_lock_value"] = ""
                 settings["bssid_lock_connection_uuid"] = ""
