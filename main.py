@@ -216,6 +216,13 @@ def _write_no_follow(path: str, data: str) -> bool:
     there can be replaced with a link to a file we should not be touching.
     Plain open(path, "w") follows that link and truncates the target as root.
     O_NOFOLLOW refuses instead, and O_EXCL means we only ever create.
+
+    This covers the FINAL path component only. The directory itself is equally
+    user-owned and could be swapped for a link, redirecting these writes
+    wholesale; closing that means holding the directory open with
+    O_DIRECTORY|O_NOFOLLOW and writing relative to it throughout. Left open
+    deliberately - said here rather than letting the next reader assume the
+    whole path is guarded.
     """
     try:
         try:
