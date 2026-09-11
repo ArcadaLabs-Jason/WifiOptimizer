@@ -913,6 +913,27 @@ class Plugin:
             # running? Divergence would indicate a previous switch got interrupted
             # (plugin_loader crash, external tool, etc.). Log only; user can
             # re-toggle to resolve.
+            # Someone upgrading has a band preference with no record of which
+            # network it belongs to. Treating that as unscoped would keep
+            # enforcing it everywhere, which is what stranded profiles in the
+            # first place, so adopt the current network. If that guess is
+            # wrong the preference simply stops applying and one toggle fixes
+            # it - far better than writing a band into networks that have none.
+            if settings.get("band_preference_enabled") and not settings.get(
+                "band_preference_ssid"
+            ):
+                adopted = self._get_profile_ssid(
+                    settings.get("last_connection_uuid", "")
+                ) or self._get_profile_ssid(
+                    self._get_active_connection_uuid() or ""
+                )
+                if adopted:
+                    settings["band_preference_ssid"] = adopted
+                    _save_settings(settings)
+                    decky.logger.info(
+                        f"Band preference scoped to {adopted!r} on upgrade"
+                    )
+
             # Warm the steamos-manager probe here, off the polling path, so
             # the collector never has to fork or memoise from its thread.
             backend_method = await asyncio.to_thread(self._get_backend_method)
