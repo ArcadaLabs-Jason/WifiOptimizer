@@ -814,8 +814,18 @@ class Plugin:
     # ---- Status ----
 
     async def get_status(self) -> dict:
-        # Use shorter timeout for read-only status queries to avoid blocking
-        # the event loop if NM is unresponsive (~10 commands × 2s = 20s worst case)
+        """Collect status off the event loop.
+
+        The body below makes roughly a dozen blocking subprocess calls and the
+        frontend polls it every few seconds, so running it inline stalled the
+        event loop for as long as NM took to answer. One thread hop covers the
+        whole collection rather than wrapping each call individually.
+        """
+        return await asyncio.to_thread(self._collect_status)
+
+    def _collect_status(self) -> dict:
+        # Short timeout per read-only query so an unresponsive NM bounds the
+        # worst case (~12 commands x 2s) instead of hanging the poll.
         T = 2
 
         try:
@@ -1213,7 +1223,10 @@ class Plugin:
 
             # Re-lock BSSID to whatever AP NM picked on the new band
             if enabled and had_bssid_lock:
-                time.sleep(3)
+                # Give NM time to associate on the new band before reading the
+                # BSSID back. Must not be time.sleep here: this is an async
+                # method, and a blocking sleep stalls the whole event loop.
+                await asyncio.sleep(3)
                 iface = self._get_wifi_interface()
                 if iface:
                     link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
