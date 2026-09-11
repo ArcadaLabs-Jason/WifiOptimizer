@@ -115,6 +115,15 @@ except Exception:
 # use. Digits and dots, with an optional alphanumeric prerelease suffix.
 VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}(-[A-Za-z0-9.]+)?$")
 
+# Interface names are used to build sysfs paths. Kernel names cannot contain a
+# separator, but the value is checked rather than assumed.
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+
+# DNS servers are free text from the panel. They are passed to nmcli as a
+# single argument, so there is no shell involved, but the value is stored and
+# replayed later and should be addresses and nothing else.
+DNS_SERVER_RE = re.compile(r"^[0-9A-Fa-f:.]{2,45}$")
+
 
 DNS_PROVIDERS = {
     "cloudflare": "1.1.1.1 1.0.0.1",
@@ -219,7 +228,14 @@ def _load_settings() -> dict:
             data = json.load(f)
         # Merge with defaults (adds new keys), then strip stale keys
         merged = {**DEFAULT_SETTINGS, **data}
-        return {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
+        merged = {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
+        # This file lives in a directory the desktop user owns, so its types
+        # are not guaranteed. A driver of the wrong type makes the profile
+        # lookup raise on an unhashable key and silently kills the feature.
+        for key, default in DEFAULT_SETTINGS.items():
+            if not isinstance(merged.get(key), type(default)):
+                merged[key] = default
+        return merged
     except Exception:
         return dict(DEFAULT_SETTINGS)
 
@@ -618,7 +634,7 @@ class Plugin:
         try:
             # Discover WiFi PCI device path dynamically
             iface = self._get_wifi_interface()
-            if not iface:
+            if not iface or not IFACE_RE.match(iface):
                 return
             device_link = os.path.realpath(f"/sys/class/net/{iface}/device")
             if not os.path.isdir(device_link):
@@ -1795,6 +1811,15 @@ class Plugin:
                             "message": "Custom DNS servers cannot be empty",
                         }
                     servers = custom_servers.strip()
+                    parts = servers.split()
+                    if len(parts) > 6 or not all(
+                        DNS_SERVER_RE.match(part) for part in parts
+                    ):
+                        return {
+                            "success": False,
+                            "error": "nmcli_failed",
+                            "message": "DNS servers must be a space-separated list of IP addresses.",
+                        }
                 elif provider in DNS_PROVIDERS:
                     servers = DNS_PROVIDERS[provider]
                 else:
