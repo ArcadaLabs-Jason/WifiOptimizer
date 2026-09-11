@@ -1017,7 +1017,11 @@ class Plugin:
             status["live"]["ipv6_method"] = live_ipv6
             if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
                 status["drift"]["ipv6"] = True
-                self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=T)
+                healed = self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=T)
+                decky.logger.info(
+                    f"IPv6 drifted to {live_ipv6!r} on {uuid}, reasserting "
+                    f"disabled: {'ok' if healed['success'] else 'failed'}"
+                )
 
             # Band preference
             band_result = self._run_cmd(
@@ -1039,7 +1043,13 @@ class Plugin:
             expected_band = settings.get("band_preference", "a")
             if settings.get("band_preference_enabled") and live_band != expected_band:
                 status["drift"]["band_preference"] = True
-                self._nmcli_modify(uuid, "802-11-wireless.band", expected_band, timeout=T)
+                healed = self._nmcli_modify(
+                    uuid, "802-11-wireless.band", expected_band, timeout=T
+                )
+                decky.logger.info(
+                    f"Band drifted to {live_band!r} on {uuid}, reasserting "
+                    f"{expected_band!r}: {'ok' if healed['success'] else 'failed'}"
+                )
 
             # Buffer tuning
             sysctl_result = self._run_cmd(
