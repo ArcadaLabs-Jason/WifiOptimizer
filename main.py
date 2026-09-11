@@ -948,16 +948,16 @@ class Plugin:
         """Standard error dict for the catch-all exception handler in every
         setter. Callers log the error separately with the setter name.
 
-        The exception text goes to `detail`, not `message`. The panel prints
-        `message` beneath the control the user just touched, and a raw Python
-        traceback string there is noise to them while the real text stays in
-        the log either way.
+        The exception text is NOT returned. The panel appends `detail` to
+        `message` when it is present, so putting it there would print the
+        traceback under the control the user just touched - and for every
+        setter rather than the few nmcli failures where stderr is useful.
+        Callers log the exception, so nothing is lost.
         """
         return {
             "success": False,
             "error": "unexpected",
             "message": "Something went wrong. Check the Decky log for details.",
-            "detail": str(e)[:200],
         }
 
     def _nmcli_modify(self, uuid: str, key: str, value: str, timeout: int = 5) -> dict:
@@ -1141,23 +1141,37 @@ class Plugin:
                 if not settings.get("cake_enabled"):
                     status["drift"].pop("cake", None)
                     continue
+                # This runs on the event loop, and a kernel without sch_cake
+                # would otherwise retry three subprocesses every three seconds
+                # forever, blocking every other call for as long as it takes.
+                # Give up after a few consecutive failures and leave the drift
+                # flag standing, which is the honest report anyway.
+                if getattr(self, "_cake_reassert_failures", 0) >= 3:
+                    continue
                 iface = action["iface"]
-                modprobe = _first_existing(
-                    ["/usr/bin/modprobe", "/usr/sbin/modprobe"]
-                )
-                if modprobe:
-                    self._run_cmd([modprobe, "sch_cake"], timeout=5)
+                if not getattr(self, "_cake_module_loaded", False):
+                    modprobe = _first_existing(
+                        ["/usr/bin/modprobe", "/usr/sbin/modprobe"]
+                    )
+                    if modprobe:
+                        self._run_cmd([modprobe, "sch_cake"], timeout=5)
+                    self._cake_module_loaded = True
                 applied = self._run_cmd([
                     "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
                     "cake", "unlimited", "diffserv4", "nat", "ack-filter",
                 ], timeout=5)
                 if applied["success"]:
+                    self._cake_reassert_failures = 0
                     self._run_cmd(
                         ["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"],
                         timeout=5,
                     )
                     status["live"]["cake_applied"] = True
                     status["drift"].pop("cake", None)
+                else:
+                    self._cake_reassert_failures = (
+                        getattr(self, "_cake_reassert_failures", 0) + 1
+                    )
                 self._log_throttled(
                     "cake",
                     f"CAKE drifted on {iface}, reasserting: "
@@ -1231,7 +1245,8 @@ class Plugin:
     def _band_change_in_flight(self) -> bool:
         if getattr(self, "_band_change_depth", 0) > 0:
             return True
-        # Only reachable if a band change never released its count.
+        # Failsafe for a change that never released its count. In the normal
+        # case the deadline is already cleared and this returns False.
         return time.monotonic() < getattr(self, "_band_change_until", 0.0)
 
     def _collect_status(self) -> tuple[dict, dict, list]:

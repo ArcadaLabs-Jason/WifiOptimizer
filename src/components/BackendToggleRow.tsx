@@ -17,8 +17,8 @@ const PHASE_TEXT: Record<BackendSwitchPhase, string> = {
 };
 
 const EXPLANATION =
-  "Most handhelds use iwd for WiFi management, though this varies by " +
-  "system and SteamOS 3.8 ships wpa_supplicant. Some devices see " +
+  "Linux handhelds use one of two WiFi backends, and which one your " +
+  "system is on varies by device and OS version. Some devices see " +
   "disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors " +
   "with iwd. Switching to wpa_supplicant trades slightly slower reconnect " +
   "(about 5s vs 1-2s) for broader compatibility and better stability on " +

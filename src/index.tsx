@@ -514,6 +514,10 @@ function Content() {
     !status?.drift?.power_save &&
     s?.bssid_lock_enabled &&
     !status?.drift?.bssid_lock &&
+    // The lock can be enabled but belong to a different network, in which
+    // case nothing has drifted and it is also doing nothing here. Without
+    // this, the panel reports all clear while one of the four is inert.
+    !status?.live?.bssid_lock_other_network &&
     status?.live?.dispatcher_installed &&
     status?.live?.buffer_tuning_applied &&
     !status?.drift?.buffer_tuning;
@@ -581,8 +585,15 @@ function Content() {
         </Banner>
       )}
 
+      {/* Status read failed - say so rather than claiming disconnection */}
+      {status?.success === false && (
+        <Banner variant="error" icon="!">
+          {status?.message ?? "Couldn't read WiFi status."}
+        </Banner>
+      )}
+
       {/* Disconnected banner */}
-      {!connected && (
+      {status?.success !== false && !connected && (
         <Banner variant="error" icon="✕">
           Not connected to WiFi. Connect first, then optimize.
         </Banner>
@@ -660,7 +671,9 @@ function Content() {
           label="Stop background scanning"
           subtitle="Locks to current AP - disable to switch networks or roam"
           explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
-          {...getBadge("bssid_lock", status, errors.bssid_lock ?? null)}
+          {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
+            ? { badge: "unknown" as const, text: "other network" }
+            : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
           checked={s?.bssid_lock_enabled ?? false}
           disabled={isBusy || (!connected && !s?.bssid_lock_enabled)}
           error={errors.bssid_lock}
