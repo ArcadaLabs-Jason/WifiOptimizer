@@ -26,23 +26,38 @@ if [ ! -d "$PLUGIN_DIR" ]; then
     exit 0
 fi
 
-# Read all settings in a single Python call for speed (<50ms)
+# Read all settings in a single Python call for speed (<50ms).
+#
+# This script runs as root, and the settings file lives in a directory the
+# desktop user can write to. Never `eval` anything derived from it: that would
+# turn any value into a root shell command, and it would only take one future
+# setting being added without sanitising for that to become a local privilege
+# escalation. Read the values as plain data, then accept only known-good ones.
 if [ -f "$SETTINGS_FILE" ] && [ -r "$SETTINGS_FILE" ]; then
-    eval $(python3 -c "
+    SETTINGS_RAW=$(python3 -c "
 import json
 try:
     d=json.load(open('$SETTINGS_FILE'))
-    print(f'POWER_SAVE={\"True\" if d.get(\"power_save_disabled\",True) else \"False\"}')
-    print(f'BUFFER_TUNING={\"True\" if d.get(\"buffer_tuning_enabled\",False) else \"False\"}')
-    v=d.get('driver','unknown')
-    print(f'DRIVER={v if v.isalnum() or v.replace(\"_\",\"\").isalnum() else \"unknown\"}')
-    print(f'CAKE={\"True\" if d.get(\"cake_enabled\",False) else \"False\"}')
-except:
-    print('POWER_SAVE=True')
-    print('BUFFER_TUNING=False')
-    print('DRIVER=unknown')
-    print('CAKE=False')
+    print('True' if d.get('power_save_disabled',True) else 'False')
+    print('True' if d.get('buffer_tuning_enabled',False) else 'False')
+    print(str(d.get('driver','unknown')).replace('\n',' ')[:64])
+    print('True' if d.get('cake_enabled',False) else 'False')
+except Exception:
+    print('True'); print('False'); print('unknown'); print('False')
 " 2>/dev/null)
+    {
+        read -r POWER_SAVE
+        read -r BUFFER_TUNING
+        read -r DRIVER
+        read -r CAKE
+    } <<EOF
+$SETTINGS_RAW
+EOF
+    # Whitelist every value. Anything unexpected falls back to a safe default.
+    case "$POWER_SAVE" in True|False) ;; *) POWER_SAVE="True" ;; esac
+    case "$BUFFER_TUNING" in True|False) ;; *) BUFFER_TUNING="False" ;; esac
+    case "$CAKE" in True|False) ;; *) CAKE="False" ;; esac
+    case "$DRIVER" in rtw88|rtw89|ath11k_pci|ath12k|mt7921e|iwlwifi) ;; *) DRIVER="unknown" ;; esac
 else
     POWER_SAVE="True"
     BUFFER_TUNING="False"

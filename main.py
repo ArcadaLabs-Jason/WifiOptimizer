@@ -11,6 +11,7 @@ QoS) on every WiFi reconnect independently of Decky.
 import os
 import pwd
 import json
+import tempfile
 import time
 import asyncio
 import subprocess
@@ -171,6 +172,14 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _first_existing(paths: list[str]) -> str | None:
+    """First path in the list that exists, or None."""
+    for path in paths:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _load_settings() -> dict:
     try:
         with open(SETTINGS_FILE, "r") as f:
@@ -183,12 +192,26 @@ def _load_settings() -> dict:
 
 
 def _save_settings(data: dict):
-    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-    # Atomic write: write to temp file then rename to prevent corruption on crash
-    tmp_path = SETTINGS_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, SETTINGS_FILE)
+    directory = os.path.dirname(SETTINGS_FILE)
+    os.makedirs(directory, exist_ok=True)
+    # Write to a temp file then rename, so a crash cannot leave a half-written
+    # settings file. The temp name is unique per call rather than fixed: with a
+    # shared name, two writers race and the loser's os.replace finds its own
+    # file already renamed away. Every caller is on the event loop today, but
+    # that is not something a future change should have to know.
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".settings-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, SETTINGS_FILE)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _save_settings_with_timestamp(data: dict):
@@ -288,9 +311,21 @@ class Plugin:
         bus = f"/run/user/{uid}/bus"
         if not os.path.exists(bus):
             return None
+
+        # Resolve both binaries rather than assuming /usr/bin. Fedora-based
+        # systems put runuser in /usr/sbin, and PATH is not trustworthy here
+        # because runuser rebuilds it from login.defs. Same approach the
+        # modprobe lookup already uses further down.
+        runuser = _first_existing(
+            ["/usr/bin/runuser", "/usr/sbin/runuser", "/sbin/runuser"]
+        )
+        env_bin = _first_existing(["/usr/bin/env", "/bin/env"])
+        if not runuser or not env_bin:
+            return None
+
         return [
-            "/usr/bin/runuser", "-u", user, "--",
-            "env",
+            runuser, "-u", user, "--",
+            env_bin,
             f"XDG_RUNTIME_DIR=/run/user/{uid}",
             f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}",
         ] + args
@@ -305,20 +340,47 @@ class Plugin:
         result = self._run_cmd(cmd, timeout=5, clean_env=True)
         if not result["success"]:
             return None
-        # "Wi-Fi backend: wpa_supplicant"
-        _, _, value = result.get("stdout", "").partition(":")
-        value = value.strip()
-        return value if value in ("iwd", "wpa_supplicant") else None
+        # Currently "Wi-Fi backend: wpa_supplicant", but match on the value
+        # rather than the wrapping. Requiring the colon would turn a harmless
+        # change of wording into "steamos-manager is unavailable", silently
+        # disabling this whole path on a machine that supports it.
+        out = result.get("stdout", "")
+        for candidate in ("wpa_supplicant", "iwd"):
+            if candidate in out:
+                return candidate
+        return None
+
+    _PROBE_RETRY_SECONDS = 30
 
     def _has_steamos_manager(self) -> bool:
-        """Probe once and remember. This is reached from the status poll, and
-        whether steamos-manager is present cannot change while we are loaded."""
-        cached = getattr(self, "_steamos_manager_available", None)
-        if cached is None:
-            cached = self._steamosctl_backend() is not None
-            self._steamos_manager_available = cached
-            decky.logger.info(f"steamos-manager backend control available: {cached}")
-        return cached
+        """Whether backend switching can go through steamos-manager.
+
+        Only a POSITIVE result is cached. A negative one must not be, because
+        the probe fails for reasons that are temporary rather than structural:
+        the desktop session bus does not exist yet, or the call timed out. The
+        first probe runs from _main at plugin start, which on a cold boot is
+        exactly when the session bus is least likely to be up - caching that
+        miss would route every backend switch for the rest of the session to
+        the legacy helper, which is the failure this path exists to avoid.
+
+        Retries are rate limited because this is reached from the status poll.
+        """
+        if getattr(self, "_steamos_manager_available", False):
+            return True
+        if not os.path.isfile(STEAMOSCTL):
+            return False
+
+        now = time.monotonic()
+        last = getattr(self, "_steamos_manager_probed_at", 0.0)
+        if last and (now - last) < self._PROBE_RETRY_SECONDS:
+            return False
+        self._steamos_manager_probed_at = now
+
+        available = self._steamosctl_backend() is not None
+        if available:
+            self._steamos_manager_available = True
+            decky.logger.info("steamos-manager backend control available")
+        return available
 
     def _get_backend_method(self) -> str:
         """Return 'steamos_manager', 'steamos', 'generic', or 'none'.
@@ -525,7 +587,7 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"PCIe ASPM fix error: {e}")
 
-    def _install_dispatcher(self):
+    def _install_dispatcher(self) -> bool:
         try:
             template_path = os.path.join(
                 decky.DECKY_PLUGIN_DIR, "defaults", "dispatcher.sh.tmpl"
@@ -538,8 +600,10 @@ class Plugin:
                 f.write(script)
             os.chmod(DISPATCHER_PATH, 0o755)
             decky.logger.info("Dispatcher script installed")
+            return True
         except Exception as e:
             decky.logger.error(f"Failed to install dispatcher: {e}")
+            return False
 
     def _remove_dispatcher(self):
         try:
@@ -636,7 +700,7 @@ class Plugin:
             # running? Divergence would indicate a previous switch got interrupted
             # (plugin_loader crash, external tool, etc.). Log only; user can
             # re-toggle to resolve.
-            if self._get_backend_method() != "none":
+            if await asyncio.to_thread(self._get_backend_method) != "none":
                 conf_backend = self._get_current_backend()
                 if conf_backend:
                     active = self._run_cmd(
@@ -892,28 +956,136 @@ class Plugin:
         event loop for as long as NM took to answer. One thread hop covers the
         whole collection rather than wrapping each call individually.
         """
-        status, pending = await asyncio.to_thread(self._collect_status)
-        if pending:
-            # Apply on the event loop, re-reading first and merging only the
-            # keys collection asked to change. Collection runs in a worker
-            # thread, so writing the whole settings dict from there could
-            # clobber a concurrent setter: the thread's snapshot predates the
-            # setter's change and would silently revert it.
-            settings = _load_settings()
-            settings.update(pending)
-            _save_settings(settings)
+        status, pending, actions = await asyncio.to_thread(self._collect_status)
+        if pending or actions:
+            try:
+                self._apply_status_actions(status, pending, actions)
+            except Exception as e:
+                # Never let reconciliation break a status read; the frontend
+                # has no useful response to an RPC error here and would just
+                # keep showing stale values with no signal.
+                decky.logger.error(f"status reconciliation error: {e}")
         return status
 
-    def _collect_status(self) -> tuple[dict, dict]:
+    def _apply_status_actions(self, status: dict, pending: dict, actions: list):
+        """Carry out what _collect_status proposed, on the event loop.
+
+        Every guard is re-checked against a FRESH read of settings rather than
+        the worker thread's snapshot, which may be up to ~20s old. Without
+        that, a poll begun before the user touched a toggle would undo the
+        change they just made.
+        """
+        settings = _load_settings()
+
+        for action in actions:
+            kind = action["kind"]
+            uuid = action["uuid"]
+
+            if kind == "priority":
+                if settings.get("priority_set"):
+                    continue
+                self._nmcli_modify(
+                    uuid, "connection.autoconnect-priority", "100", timeout=2
+                )
+                pending["priority_set"] = True
+
+            elif kind == "ipv6":
+                if not settings.get("ipv6_disabled"):
+                    continue
+                healed = self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=2)
+                self._log_throttled(
+                    "ipv6",
+                    f"IPv6 drifted to {action['observed']!r} on {uuid}, "
+                    f"reasserting disabled: "
+                    f"{'ok' if healed['success'] else 'failed'}",
+                )
+
+            elif kind == "band":
+                if not settings.get("band_preference_enabled"):
+                    continue
+                if settings.get("band_preference") != action["value"]:
+                    continue
+                healed = self._nmcli_modify(
+                    uuid, "802-11-wireless.band", action["value"], timeout=2
+                )
+                self._log_throttled(
+                    "band",
+                    f"Band drifted to {action['observed']!r} on {uuid}, "
+                    f"reasserting {action['value']!r}: "
+                    f"{'ok' if healed['success'] else 'failed'}",
+                )
+
+            elif kind == "bssid_repoint":
+                # The lock may have been switched off while this poll was in
+                # flight. Re-pointing then would restore a BSSID the user just
+                # cleared, leaving the profile pinned with the toggle showing
+                # off and nothing left to clear it.
+                if not settings.get("bssid_lock_enabled"):
+                    continue
+                # A band change clears the BSSID on purpose so NM can find an
+                # AP on the other band, and only re-locks once it associates.
+                # Writing the old BSSID back mid-flight can leave the profile
+                # demanding a band and an AP that cannot both be satisfied,
+                # which stops it associating at all.
+                if self._band_change_in_flight():
+                    continue
+                retarget = self._nmcli_modify(
+                    uuid, "802-11-wireless.bssid", action["value"], timeout=2
+                )
+                if retarget["success"]:
+                    pending["bssid_lock_value"] = action["value"]
+                    pending["bssid_lock_connection_uuid"] = uuid
+                    status["live"]["bssid_lock"] = action["value"]
+                    status["drift"].pop("bssid_lock", None)
+                    decky.logger.info(
+                        f"BSSID lock re-pointed to active profile {uuid} "
+                        f"at {action['value']}"
+                    )
+
+        if pending:
+            settings.update(pending)
+            _save_settings(settings)
+
+    _LOG_THROTTLE_SECONDS = 60
+
+    def _log_throttled(self, key: str, message: str):
+        """Log, but not on every poll.
+
+        Drift reassertion runs every few seconds for as long as the drift
+        lasts. When it keeps failing - a profile NM will not let us modify,
+        say - logging each attempt buries the plugin log in tens of thousands
+        of identical lines a day, in exactly the situation where someone needs
+        to read it. Identical messages are collapsed; a changed message always
+        gets through so a transition is never hidden.
+        """
+        seen = getattr(self, "_log_throttle_state", None)
+        if seen is None:
+            seen = {}
+            self._log_throttle_state = seen
+        now = time.monotonic()
+        last_message, last_at = seen.get(key, (None, 0.0))
+        if message == last_message and (now - last_at) < self._LOG_THROTTLE_SECONDS:
+            return
+        seen[key] = (message, now)
+        decky.logger.info(message)
+
+    def _band_change_in_flight(self) -> bool:
+        return time.monotonic() < getattr(self, "_band_change_until", 0.0)
+
+    def _collect_status(self) -> tuple[dict, dict, list]:
         # Short timeout per read-only query so an unresponsive NM bounds the
         # worst case (~12 commands x 2s) instead of hanging the poll.
         T = 2
 
         try:
             settings = _load_settings()
-            # Settings changes this collection wants made. Returned to the
-            # caller rather than written here; see get_status.
+            # Collection runs in a worker thread, so it must not mutate
+            # anything. Settings changes and NetworkManager writes are both
+            # PROPOSED here and carried out by get_status on the event loop,
+            # where they are serialized against the setters. Doing them here
+            # would race a setter and act on a snapshot up to ~20s stale.
             pending: dict = {}
+            actions: list[dict] = []
             iface = self._get_wifi_interface()
             uuid = self._get_active_connection_uuid()
             connected = iface is not None and uuid is not None
@@ -939,7 +1111,7 @@ class Plugin:
                 status["live"]["dispatcher_installed"] = os.path.isfile(
                     DISPATCHER_PATH
                 )
-                return status, pending
+                return status, pending, actions
 
             # Remember UUID and ensure high autoconnect-priority so NM
             # prefers this profile over duplicates on boot (fixes 2.4GHz issue)
@@ -951,11 +1123,7 @@ class Plugin:
 
             if uuid and not settings.get("priority_set"):
                 # Bump priority to favor this profile over duplicates on boot.
-                self._nmcli_modify(
-                    uuid, "connection.autoconnect-priority", "100", timeout=T
-                )
-                settings["priority_set"] = True
-                pending["priority_set"] = True
+                actions.append({"kind": "priority", "uuid": uuid})
 
             # Power save
             ps_result = self._run_cmd(
@@ -1061,23 +1229,11 @@ class Plugin:
                     )
 
                 live_bssid = status["live"].get("connected_bssid", "")
-                retargeted = False
                 if live_bssid and same_network:
-                    retarget = self._nmcli_modify(
-                        uuid, "802-11-wireless.bssid", live_bssid, timeout=T
-                    )
-                    retargeted = retarget["success"]
-
-                if retargeted:
-                    pending["bssid_lock_value"] = live_bssid
-                    pending["bssid_lock_connection_uuid"] = uuid
-                    status["live"]["bssid_lock"] = live_bssid
-                    decky.logger.info(
-                        f"BSSID lock re-pointed to active profile {uuid} "
-                        f"at {live_bssid}"
-                    )
-                else:
-                    status["drift"]["bssid_lock"] = True
+                    actions.append({
+                        "kind": "bssid_repoint", "uuid": uuid, "value": live_bssid,
+                    })
+                status["drift"]["bssid_lock"] = True
 
             # IP address
             ip_result = self._run_cmd(
@@ -1116,11 +1272,9 @@ class Plugin:
             status["live"]["ipv6_method"] = live_ipv6
             if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
                 status["drift"]["ipv6"] = True
-                healed = self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=T)
-                decky.logger.info(
-                    f"IPv6 drifted to {live_ipv6!r} on {uuid}, reasserting "
-                    f"disabled: {'ok' if healed['success'] else 'failed'}"
-                )
+                actions.append({
+                    "kind": "ipv6", "uuid": uuid, "observed": live_ipv6,
+                })
 
             # Band preference
             band_result = self._run_cmd(
@@ -1142,13 +1296,10 @@ class Plugin:
             expected_band = settings.get("band_preference", "a")
             if settings.get("band_preference_enabled") and live_band != expected_band:
                 status["drift"]["band_preference"] = True
-                healed = self._nmcli_modify(
-                    uuid, "802-11-wireless.band", expected_band, timeout=T
-                )
-                decky.logger.info(
-                    f"Band drifted to {live_band!r} on {uuid}, reasserting "
-                    f"{expected_band!r}: {'ok' if healed['success'] else 'failed'}"
-                )
+                actions.append({
+                    "kind": "band", "uuid": uuid, "value": expected_band,
+                    "observed": live_band,
+                })
 
             # Buffer tuning
             sysctl_result = self._run_cmd(
@@ -1175,10 +1326,10 @@ class Plugin:
             except Exception:
                 status["live"]["last_enforced"] = 0
 
-            return status, pending
+            return status, pending, actions
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
-            return self._unexpected_response(e), {}
+            return self._unexpected_response(e), {}, []
 
     # ---- Optimization setters ----
 
@@ -1231,12 +1382,22 @@ class Plugin:
             settings = _load_settings()
             settings["auto_fix_on_wake"] = enabled
 
+            installed = True
             if enabled:
-                self._install_dispatcher()
+                installed = self._install_dispatcher()
             else:
                 self._remove_dispatcher()
 
             _save_settings_with_timestamp(settings)
+            if enabled and not installed:
+                # os.path.isfile is not proof of success here: a failed write
+                # leaves the PREVIOUS script in place, so the check passes
+                # while the old one is what actually runs.
+                return {
+                    "success": False,
+                    "error": "write_failed",
+                    "message": "Couldn't install the auto-fix script. The filesystem may be read-only.",
+                }
             return {
                 "success": True,
                 "dispatcher_installed": os.path.isfile(DISPATCHER_PATH),
@@ -1322,6 +1483,12 @@ class Plugin:
                         decky.logger.info(
                             f"Cleared stale BSSID lock from profile {previous_uuid}"
                         )
+                    else:
+                        decky.logger.info(
+                            f"Could not clear stale BSSID lock from profile "
+                            f"{previous_uuid} (it may no longer exist): "
+                            f"{stale.get('stderr', '')[:120]}"
+                        )
 
                 settings["bssid_lock_enabled"] = False
                 settings["bssid_lock_value"] = ""
@@ -1336,6 +1503,12 @@ class Plugin:
 
     async def set_band_preference(self, enabled: bool, band: str = "a") -> dict:
         try:
+            # This setter deliberately clears the BSSID, cycles the radio and
+            # re-locks once NM associates on the new band. It awaits in the
+            # middle, so a status poll can land between those steps. Mark the
+            # window so reconciliation does not write the old BSSID back and
+            # leave the profile demanding a band and an AP that contradict.
+            self._band_change_until = time.monotonic() + 30
 
             if enabled and band not in ("a", "bg"):
                 return {
@@ -1398,6 +1571,8 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"set_band_preference error: {e}")
             return self._unexpected_response(e)
+        finally:
+            self._band_change_until = 0.0
 
     async def set_dns(
         self, enabled: bool, provider: str = "cloudflare", custom_servers: str = ""
@@ -1887,6 +2062,21 @@ class Plugin:
             # Stable: update only if newer (strip -beta suffix for comparison)
             if channel == "beta":
                 update_available = latest != current
+            elif "-" in latest:
+                # Stable users must never be offered a prerelease. This only
+                # happens if a beta tag is published without the prerelease
+                # flag, and the version compare below would strip the suffix
+                # and treat it as stable.
+                decky.logger.error(
+                    f"Update check: ignoring prerelease {latest!r} on stable channel"
+                )
+                return {
+                    "success": True,
+                    "current_version": current,
+                    "latest_version": current,
+                    "update_available": False,
+                    "channel": channel,
+                }
             else:
                 current_clean = current.split("-")[0]
                 latest_clean = latest.split("-")[0]
@@ -2147,11 +2337,39 @@ systemctl restart plugin_loader 2>/dev/null || true
         even though wlan0 is gone.
         """
         try:
-            phys = sorted(os.listdir("/sys/class/ieee80211"))
+            phys = os.listdir("/sys/class/ieee80211")
         except Exception:
             return False
         if not phys:
             return False
+
+        def already_has_netdev(phy: str) -> bool:
+            # Adding a second station interface to a phy that already has one
+            # is a genuine mess, and the caller reaches here whenever the
+            # interface is merely named something other than wlan0.
+            try:
+                return bool(os.listdir(f"/sys/class/ieee80211/{phy}/device/net"))
+            except Exception:
+                return False
+
+        def driver_of(phy: str) -> str:
+            try:
+                return os.path.basename(
+                    os.path.realpath(f"/sys/class/ieee80211/{phy}/device/driver")
+                )
+            except Exception:
+                return ""
+
+        phys = [phy for phy in phys if not already_has_netdev(phy)]
+        if not phys:
+            return False
+
+        # Prefer the radio this device is actually built around. With a USB
+        # adapter plugged in there is more than one phy, and picking the wrong
+        # one brings WiFi back on the wrong hardware while the internal radio
+        # stays dead - reported as a successful recovery.
+        wanted = _load_settings().get("driver", "")
+        phys.sort(key=lambda phy: (driver_of(phy) != wanted, phy))
 
         for phy in phys:
             result = self._run_cmd(
@@ -2223,13 +2441,38 @@ systemctl restart plugin_loader 2>/dev/null || true
 
             final_backend = await asyncio.to_thread(self._get_current_backend)
 
-            if final_backend == target:
+            # The backend is read from config, which steamos-manager writes as
+            # part of the switch. That makes it match the target even if the
+            # interface is gone, so it cannot stand alone as proof of success.
+            # iwd destroys the netdev when it stops on ath11k, so confirm an
+            # interface exists and try to bring one back before reporting.
+            iface = await asyncio.to_thread(self._get_wifi_interface)
+            recovery_performed = False
+            if not iface:
+                if await asyncio.to_thread(self._recover_wlan0):
+                    await asyncio.sleep(2)
+                    iface = await asyncio.to_thread(self._get_wifi_interface)
+                    recovery_performed = bool(iface)
+            needs_reboot = not iface
+
+            if needs_reboot:
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "backend": final_backend,
+                    "target": target,
+                    "recovery_performed": recovery_performed,
+                    "needs_reboot": True,
+                    "reconnect_timed_out": reconnect_timed_out,
+                    "message": "Backend switched but the WiFi interface didn't come back. Reboot required.",
+                }
+            elif final_backend == target:
                 self._backend_switch["phase"] = "done"
                 self._backend_switch["result"] = {
                     "success": True,
                     "backend": final_backend,
                     "target": target,
-                    "recovery_performed": False,
+                    "recovery_performed": recovery_performed,
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
                 }
@@ -2239,7 +2482,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "success": False,
                     "backend": final_backend,
                     "target": target,
-                    "recovery_performed": False,
+                    "recovery_performed": recovery_performed,
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
                     "message": f"Expected {target} but got {final_backend}. A reboot may help.",
@@ -2247,7 +2490,9 @@ systemctl restart plugin_loader 2>/dev/null || true
 
             decky.logger.info(
                 f"steamos-manager backend switch: target={target}, "
-                f"final={final_backend}, reconnect_timed_out={reconnect_timed_out}"
+                f"final={final_backend}, iface={iface}, "
+                f"recovery={recovery_performed}, needs_reboot={needs_reboot}, "
+                f"reconnect_timed_out={reconnect_timed_out}"
             )
         except asyncio.CancelledError:
             self._backend_switch["phase"] = "failed"
@@ -2380,7 +2625,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "reason": "invalid_backend",
                     "message": "Backend must be 'iwd' or 'wpa_supplicant'.",
                 }
-            if not self._has_backend_tool():
+            if not await asyncio.to_thread(self._has_backend_tool):
                 return {
                     "accepted": False,
                     "reason": "tool_missing",
@@ -2409,7 +2654,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                 "result": None,
             })
             # Route to the appropriate worker based on backend method
-            method = self._get_backend_method()
+            method = await asyncio.to_thread(self._get_backend_method)
             if method == "steamos_manager":
                 worker = self._steamos_manager_backend_switch_worker(backend)
             elif method == "steamos":
