@@ -571,6 +571,26 @@ class Plugin:
         _, sep, value = result.get("stdout", "").partition(":")
         return value.strip() if sep else None
 
+    def _clear_all_bssid_locks(self):
+        """Remove the BSSID from every profile the lock has been written to.
+
+        The lock follows whichever profile NetworkManager uses, so discarding
+        the settings without clearing them would leave profiles pinned to an
+        access point with nothing left that knows about them - and a pinned
+        profile fails to associate once that access point is out of range.
+        """
+        settings = _load_settings()
+        uuids = list(settings.get("bssid_lock_uuids", []))
+        current = settings.get("bssid_lock_connection_uuid", "")
+        if current and current not in uuids:
+            uuids.append(current)
+        for uuid in uuids:
+            result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+            decky.logger.info(
+                f"Clearing BSSID lock from {uuid}: "
+                f"{'ok' if result['success'] else 'not found'}"
+            )
+
     def _hard_reconnect(self, uuid: str | None = None):
         """Reconnect by cycling WiFi radio to fully reset NM connection state."""
         self._run_cmd(["/usr/bin/nmcli", "radio", "wifi", "off"])
@@ -857,6 +877,7 @@ class Plugin:
     async def _uninstall(self):
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
+            self._clear_all_bssid_locks()
             self._remove_dispatcher()
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
@@ -2272,6 +2293,8 @@ class Plugin:
     async def reset_settings(self) -> dict:
         """Delete settings and revert to defaults."""
         try:
+            # Before the settings naming them are discarded.
+            self._clear_all_bssid_locks()
             # Revert runtime state
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
