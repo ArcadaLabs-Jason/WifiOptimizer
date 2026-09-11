@@ -547,6 +547,38 @@ class Plugin:
         if uuid:
             self._run_cmd(["/usr/bin/nmcli", "con", "up", "uuid", uuid], timeout=10)
 
+    # A driver profile is privileged configuration, not data. Everything in it
+    # is consumed as root: the sysfs paths get opened for write, and the
+    # modprobe options are written into a file the kernel acts on at every
+    # module load, including at boot before anyone logs in. Both are validated
+    # here rather than trusted, because a new adapter profile is the most
+    # ordinary-looking change anyone could send and reviewing it by eye is not
+    # a control.
+    _SYSFS_FIX_RE = re.compile(r"^/sys/module/[A-Za-z0-9_]+/parameters/[A-Za-z0-9_]+$")
+    _MODPROBE_OPT_RE = re.compile(
+        r"^options [a-z0-9_]+(?: [a-z0-9_]+=[A-Za-z0-9,._-]+)+$"
+    )
+
+    def _safe_sysfs_fixes(self, profile: dict) -> list[str]:
+        out = []
+        for path in profile.get("sysfs_power_fixes", []):
+            if isinstance(path, str) and self._SYSFS_FIX_RE.match(path):
+                out.append(path)
+            else:
+                decky.logger.error(f"Refusing sysfs path outside /sys/module: {path!r}")
+        return out
+
+    def _safe_modprobe_options(self, profile: dict) -> list[str]:
+        out = []
+        for opt in profile.get("modprobe_options", []):
+            # `install`, `alias`, `softdep` and `remove` all let modprobe run a
+            # shell command as root. Only parameter assignments are accepted.
+            if isinstance(opt, str) and self._MODPROBE_OPT_RE.match(opt):
+                out.append(opt)
+            else:
+                decky.logger.error(f"Refusing modprobe directive: {opt!r}")
+        return out
+
     def _apply_driver_fixes(self, enable: bool):
         """Apply or revert driver-specific power save fixes from DRIVER_PROFILES.
         Silently no-ops for drivers with no sysfs paths or modprobe options."""
@@ -554,7 +586,7 @@ class Plugin:
         profile = DRIVER_PROFILES.get(settings.get("driver"), {})
 
         val = "Y" if enable else "N"
-        for path in profile.get("sysfs_power_fixes", []):
+        for path in self._safe_sysfs_fixes(profile):
             try:
                 with open(path, "w") as f:
                     f.write(val)
@@ -563,7 +595,7 @@ class Plugin:
             except PermissionError:
                 decky.logger.info(f"sysfs path not writable: {path}")
 
-        options = profile.get("modprobe_options", [])
+        options = self._safe_modprobe_options(profile)
         if enable and options:
             try:
                 os.makedirs(os.path.dirname(MODPROBE_CONF_PATH), exist_ok=True)
