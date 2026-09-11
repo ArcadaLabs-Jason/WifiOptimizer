@@ -9,7 +9,9 @@ QoS) on every WiFi reconnect independently of Decky.
 """
 
 import os
+import re
 import pwd
+import shlex
 import json
 import tempfile
 import time
@@ -107,6 +109,12 @@ try:
 except Exception:
     SETTINGS_FILE = "/tmp/wifi-optimizer/settings.json"
     ENFORCED_FILE = "/tmp/wifi-optimizer/last_enforced"
+
+# A version string from the network ends up in a filename, a URL and a root
+# shell script, so it is validated the moment it is parsed rather than at each
+# use. Digits and dots, with an optional alphanumeric prerelease suffix.
+VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}(-[A-Za-z0-9.]+)?$")
+
 
 DNS_PROVIDERS = {
     "cloudflare": "1.1.1.1 1.0.0.1",
@@ -594,8 +602,13 @@ class Plugin:
             )
             with open(template_path, "r") as f:
                 script = f.read()
-            script = script.replace("__SETTINGS_PATH__", SETTINGS_FILE)
-            script = script.replace("__PLUGIN_DIR__", decky.DECKY_PLUGIN_DIR)
+            # Quote both, rather than trusting that neither path will ever
+            # contain a character the shell reads as syntax. They come from
+            # Decky's environment, not from us.
+            script = script.replace("__SETTINGS_PATH__", shlex.quote(SETTINGS_FILE))
+            script = script.replace(
+                "__PLUGIN_DIR__", shlex.quote(decky.DECKY_PLUGIN_DIR)
+            )
             with open(DISPATCHER_PATH, "w") as f:
                 f.write(script)
             os.chmod(DISPATCHER_PATH, 0o755)
@@ -2094,6 +2107,19 @@ class Plugin:
                 tag = data.get("tag_name", "")
                 latest = tag.lstrip("v")
 
+            if latest and not VERSION_RE.match(latest):
+                # Refuse rather than sanitise. This value reaches a download
+                # URL and a root shell script, and a version that does not
+                # look like a version means something is wrong upstream.
+                decky.logger.error(f"Update check: refusing malformed version {latest!r}")
+                return {
+                    "success": False,
+                    "current_version": current,
+                    "update_available": False,
+                    "channel": channel,
+                    "message": "Received an unexpected version from GitHub.",
+                }
+
             if not latest:
                 msg = data.get("message", "couldn't parse version")
                 decky.logger.error(f"Update check: no version - {msg}")
@@ -2172,19 +2198,44 @@ class Plugin:
                 src_dir = f"WifiOptimizer-{latest}"
                 label = f"v{latest}"
 
-            script = f"""#!/bin/bash
+            # Values reaching the script are passed as ARGUMENTS, never
+            # interpolated, so nothing derived from the network can be read as
+            # shell. PATH is pinned rather than inherited, and every binary is
+            # resolved through it so this still works on distros that lay out
+            # /usr differently.
+            script = """#!/bin/bash
+set -u
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+SELF_DIR="$1"
+PLUGIN_DIR="$2"
+DOWNLOAD_URL="$3"
+SRC_NAME="$4"
+LABEL="$5"
+
 sleep 2
-PLUGIN_DIR="{plugin_dir}"
+
 TMP=$(mktemp -d)
-cleanup() {{ rm -rf "$TMP"; rm -f "$0"; }}
+cleanup() { rm -rf "$TMP"; rm -rf "$SELF_DIR"; }
 trap cleanup EXIT
 
-curl -sL "{download_url}" -o "$TMP/update.tar.gz"
-tar xzf "$TMP/update.tar.gz" -C "$TMP"
-SRC="$TMP/{src_dir}"
-
-if [ ! -f "$SRC/plugin.json" ]; then
+curl -sL --proto '=https' --tlsv1.2 "$DOWNLOAD_URL" -o "$TMP/update.tar.gz" || {
     logger -t wifi-optimizer "Update failed: download error"
+    exit 1
+}
+
+# Recorded so a bad or unexpected payload is traceable after the fact.
+SUM=$(sha256sum "$TMP/update.tar.gz" 2>/dev/null | cut -d' ' -f1)
+logger -t wifi-optimizer "Update payload sha256=$SUM"
+
+tar xzf "$TMP/update.tar.gz" -C "$TMP" --no-same-owner --no-same-permissions || {
+    logger -t wifi-optimizer "Update failed: extract error"
+    exit 1
+}
+SRC="$TMP/$SRC_NAME"
+
+if [ ! -f "$SRC/plugin.json" ] || [ ! -f "$SRC/main.py" ] || [ ! -f "$SRC/dist/index.js" ]; then
+    logger -t wifi-optimizer "Update failed: payload incomplete"
     exit 1
 fi
 
@@ -2197,17 +2248,28 @@ cp "$SRC/dist/index.js" "$PLUGIN_DIR/dist/"
 cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
 cp "$SRC/defaults/dispatcher.sh.tmpl" "$PLUGIN_DIR/defaults/"
 
-logger -t wifi-optimizer "Updated to {label}, restarting plugin_loader"
+logger -t wifi-optimizer "Updated to $LABEL, restarting plugin_loader"
 systemctl restart plugin_loader 2>/dev/null || true
 """
-            script_path = "/tmp/wifi-optimizer-update.sh"
-            with open(script_path, "w") as f:
+            # Not a fixed path under /tmp. That directory is world writable, so
+            # any local user could pre-create the file we are about to write,
+            # keep ownership of it, and have root execute whatever they put in
+            # it. mkdtemp gives a unique directory only root can enter.
+            script_dir = tempfile.mkdtemp(prefix="wifi-optimizer-update-")
+            os.chmod(script_dir, 0o700)
+            script_path = os.path.join(script_dir, "update.sh")
+            fd = os.open(
+                script_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o700,
+            )
+            with os.fdopen(fd, "w") as f:
                 f.write(script)
-            os.chmod(script_path, 0o700)
 
             clean_env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
             subprocess.Popen(
-                ["/bin/bash", script_path],
+                ["/bin/bash", script_path, script_dir, plugin_dir,
+                 download_url, src_dir, label],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
