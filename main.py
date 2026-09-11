@@ -1121,6 +1121,33 @@ class Plugin:
                     f"{'ok' if healed['success'] else 'failed'}",
                 )
 
+            elif kind == "cake":
+                if not settings.get("cake_enabled"):
+                    status["drift"].pop("cake", None)
+                    continue
+                iface = action["iface"]
+                modprobe = _first_existing(
+                    ["/usr/bin/modprobe", "/usr/sbin/modprobe"]
+                )
+                if modprobe:
+                    self._run_cmd([modprobe, "sch_cake"], timeout=5)
+                applied = self._run_cmd([
+                    "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
+                    "cake", "unlimited", "diffserv4", "nat", "ack-filter",
+                ], timeout=5)
+                if applied["success"]:
+                    self._run_cmd(
+                        ["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"],
+                        timeout=5,
+                    )
+                    status["live"]["cake_applied"] = True
+                    status["drift"].pop("cake", None)
+                self._log_throttled(
+                    "cake",
+                    f"CAKE drifted on {iface}, reasserting: "
+                    f"{'ok' if applied['success'] else 'failed'}",
+                )
+
             elif kind == "bssid_repoint":
                 # The lock may have been switched off while this poll was in
                 # flight. Re-pointing then would restore a BSSID the user just
@@ -1348,11 +1375,21 @@ class Plugin:
                     )
 
                 live_bssid = status["live"].get("connected_bssid", "")
-                if live_bssid and same_network:
-                    actions.append({
-                        "kind": "bssid_repoint", "uuid": uuid, "value": live_bssid,
-                    })
-                status["drift"]["bssid_lock"] = True
+                if same_network:
+                    if live_bssid:
+                        actions.append({
+                            "kind": "bssid_repoint", "uuid": uuid,
+                            "value": live_bssid,
+                        })
+                    # Genuinely drifted: this IS the locked network and the
+                    # lock is missing from the profile in use.
+                    status["drift"]["bssid_lock"] = True
+                else:
+                    # A different network. The lock is not missing, it simply
+                    # does not apply here, and saying otherwise offers a "Fix
+                    # now" that would pin the user to the first access point
+                    # of a network they never asked to lock.
+                    status["live"]["bssid_lock_other_network"] = True
 
             # IP address
             ip_result = self._run_cmd(
@@ -1434,6 +1471,12 @@ class Plugin:
             status["live"]["cake_applied"] = cake_active
             if settings.get("cake_enabled") and not cake_active:
                 status["drift"]["cake"] = True
+                # Nothing else clears this. Optimize Safe covers the safe tier
+                # only, so without a reassertion here the drift warning stays
+                # up forever with no control that resolves it. The dispatcher
+                # already reapplies CAKE on every reconnect, so doing it here
+                # matches behaviour the user has already opted into.
+                actions.append({"kind": "cake", "uuid": uuid, "iface": iface})
 
             # Dispatcher
             status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
