@@ -2879,7 +2879,14 @@ systemctl restart plugin_loader 2>/dev/null || true
                             break
                     await asyncio.sleep(1)
 
-            final_backend = await asyncio.to_thread(self._get_current_backend)
+            # Ask steamos-manager rather than reading the config file it
+            # writes. This is the one place the answer decides whether the
+            # user is told the switch worked, so it should come from the
+            # service that performed it; the per-poll reader stays on the
+            # file because it must not fork a process every few seconds.
+            final_backend = await asyncio.to_thread(self._steamosctl_backend)
+            if final_backend is None:
+                final_backend = await asyncio.to_thread(self._get_current_backend)
 
             if needs_reboot:
                 self._backend_switch["phase"] = "failed"
