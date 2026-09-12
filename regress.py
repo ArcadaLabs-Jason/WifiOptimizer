@@ -313,10 +313,11 @@ class Mesh(m.Plugin):
     stub that cannot re-associate tests nothing about what happens after the
     write.
     """
-    def __init__(self, scan, on, reachable=None, band=""):
+    def __init__(self, scan, on, reachable=None, band="", signal_dbm=None):
         super().__init__()
         self.scan, self.on, self.reachable = scan, on, reachable
         self.pinned, self.band, self.mods = "", band, []
+        self.signal_dbm, self.scans = signal_dbm, 0
         self.aps = [
             (f[1], int(f[2]), int(re.match(r"\s*(\d+)", f[3]).group(1)))
             for f in (_fields(l) for l in scan.split("\n"))
@@ -352,6 +353,7 @@ class Mesh(m.Plugin):
         return True
     def _run_cmd(self, cmd, timeout=5, clean_env=False):
         if "wifi" in cmd and "list" in cmd:
+            self.scans += 1
             # Answer the columns actually asked for. _band_is_reachable wants
             # SSID,FREQ while the lock wants SSID,BSSID,SIGNAL,FREQ; handing
             # both the same four makes the former read a BSSID as a frequency,
@@ -367,9 +369,11 @@ class Mesh(m.Plugin):
             return _ok("\n".join(rows))
         if "link" in cmd:
             if not self.on: return _ok("")
+            sig = ("" if self.signal_dbm is None
+                   else f"\tsignal: {self.signal_dbm} dBm\n")
             return _ok(
                 f"Connected to {self.on} (on wlan0)\n"
-                f"\tfreq: {self._freq_of(self.on)}.0\n"
+                f"\tfreq: {self._freq_of(self.on)}.0\n{sig}"
             )
         return _ok()
 
@@ -427,6 +431,28 @@ ok(g.pinned.upper() == "02:00:00:00:00:11",
    "an unreachable access point is rolled back to the one that worked")
 ok(r.get("success") is True and "could not be reached" in r.get("message",""),
    "and the user is told why it stayed put")
+
+# Scanning takes the radio off-channel, so a link that is already healthy
+# should not be disturbed to look for a marginally better one.
+m._save_settings(dict(base_ap))
+g = Mesh(MESH, "02:00:00:00:00:11", signal_dbm=-45)
+asyncio.run(g.set_bssid_lock(True))
+ok(g.scans == 0, "a strong link is not scanned around")
+ok(g.pinned.upper() == "02:00:00:00:00:11",
+   "and it locks to the access point already in use")
+
+m._save_settings(dict(base_ap))
+g = Mesh(MESH, "02:00:00:00:00:11", signal_dbm=-82)
+asyncio.run(g.set_bssid_lock(True))
+ok(g.scans > 0, "a weak link is still looked at properly")
+ok(g.pinned.upper() == "02:00:00:00:00:51",
+   "and still moves to the stronger access point")
+
+# An unreadable signal must fall through to looking, not silently skip it.
+m._save_settings(dict(base_ap))
+g = Mesh(MESH, "02:00:00:00:00:11", signal_dbm=None)
+asyncio.run(g.set_bssid_lock(True))
+ok(g.scans > 0, "an unreadable signal falls through to scanning")
 
 # Nothing to compare against: if the scan cannot see what we are on, staying
 # put is the only defensible choice.

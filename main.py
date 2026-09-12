@@ -1762,6 +1762,14 @@ class Plugin:
         out.append(cur)
         return out
 
+    # Signal at which the access point we are already on is simply good
+    # enough, and looking for a better one is not worth a scan. Scanning takes
+    # the radio off-channel briefly, which is exactly the interruption this
+    # plugin exists to avoid, so it is not something to do speculatively while
+    # someone is streaming. Anything at or above this is a healthy link by any
+    # reading; the case this feature exists for sits far below it.
+    _STRONG_ENOUGH_DBM = -60
+
     # How much stronger another access point must be before locking prefers it
     # over the one we are on. nmcli reports signal as 0-100 quality, and the
     # gap that prompted this was 45 against 100. Twenty points is well clear of
@@ -1865,8 +1873,20 @@ class Plugin:
             "link": link_out, "error": read_error,
         }
 
+    def _link_is_strong(self, link: str) -> bool:
+        """Whether the link we already have is good enough to leave alone.
+
+        Read from the iw output the caller already has, so deciding not to
+        scan costs nothing. An unreadable or absent signal line returns False
+        and we fall through to looking properly, which is the safe direction.
+        """
+        found = re.search(r"^\s*signal:\s*(-?\d+)", link, re.MULTILINE)
+        if not found:
+            return False
+        return int(found.group(1)) >= self._STRONG_ENOUGH_DBM
+
     def _preferred_access_point(
-        self, iface: str, ssid: str, current: str, settings: dict
+        self, iface: str, ssid: str, current: str, settings: dict, link: str = ""
     ) -> tuple[str, int, int] | None:
         """The AP worth moving to, or None to stay where we are.
 
@@ -1881,6 +1901,8 @@ class Plugin:
         band and address contradict, which is the one state that stops it
         associating at all.
         """
+        if self._link_is_strong(link):
+            return None
         aps = self._visible_access_points(iface, ssid)
         if not aps:
             return None
@@ -2618,7 +2640,7 @@ class Plugin:
                 # permanent one, and on a mesh that is the common case rather
                 # than the corner one.
                 moved_to = self._preferred_access_point(
-                    iface, active_ssid or "", bssid, _load_settings()
+                    iface, active_ssid or "", bssid, _load_settings(), link_out
                 )
                 chosen = moved_to[0] if moved_to else bssid
                 if moved_to:
