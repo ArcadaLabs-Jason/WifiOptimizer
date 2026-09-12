@@ -3443,6 +3443,25 @@ class Plugin:
             decky.logger.error(f"set_update_channel error: {e}")
             return self._unexpected_response(e)
 
+    @staticmethod
+    def _version_parts(version: str) -> tuple[tuple[int, ...], int]:
+        """(numbers, release rank) for comparison. A prerelease sorts first.
+
+        "0.12.2-beta" is EARLIER than "0.12.2" and later than "0.12.1", which
+        a plain string compare gets wrong in both directions.
+        """
+        head, _, tail = version.partition("-")
+        numbers = []
+        for piece in head.split("."):
+            try:
+                numbers.append(int(piece))
+            except ValueError:
+                numbers.append(0)
+        return tuple(numbers), 0 if tail else 1
+
+    def _is_older(self, candidate: str, than: str) -> bool:
+        return self._version_parts(candidate) < self._version_parts(than)
+
     async def check_for_update(self) -> dict:
         """Check GitHub for a newer version (stable release or beta branch)."""
         try:
@@ -3544,10 +3563,22 @@ class Plugin:
                     "-beta" in current and latest_tuple >= current_tuple
                 )
 
-            decky.logger.info(f"Update check: current={current}, latest={latest}, channel={channel}, update={update_available}")
+            # On the beta channel any difference counts, which deliberately
+            # includes going BACKWARDS - a beta whose tag was pulled needs a
+            # way home. Saying so is the part that was missing: offered as
+            # "update available", one press silently replaces a newer build
+            # with an older one and nothing tells the user which way it goes.
+            going_back = update_available and self._is_older(latest, current)
+
+            decky.logger.info(
+                f"Update check: current={current}, latest={latest}, "
+                f"channel={channel}, update={update_available}"
+                + (", direction=downgrade" if going_back else "")
+            )
 
             return {
                 "success": True,
+                "is_downgrade": going_back,
                 "current_version": current,
                 "latest_version": latest,
                 "update_available": update_available,

@@ -557,7 +557,9 @@ function Content() {
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" onClick={handleApplyUpdate}>
-              Update to v{updateInfo.latest_version}
+              {updateInfo.is_downgrade
+                ? `Go back to v${updateInfo.latest_version}`
+                : `Update to v${updateInfo.latest_version}`}
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>

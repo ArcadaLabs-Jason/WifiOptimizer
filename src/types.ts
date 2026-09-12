@@ -119,6 +119,7 @@ export interface UpdateCheckResult {
   current_version?: string;
   latest_version?: string;
   update_available?: boolean;
+  is_downgrade?: boolean;
   channel?: string;
   release_url?: string;
   error?: string;

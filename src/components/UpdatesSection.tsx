@@ -58,13 +58,22 @@ export function UpdatesSection({
       ) : updateInfo?.update_available ? (
         <>
           <PanelSectionRow>
-            <div style={{ fontSize: theme.fontSize.body, color: theme.success.text }}>
-              v{updateInfo.latest_version} available (you have v{updateInfo.current_version})
+            <div
+              style={{
+                fontSize: theme.fontSize.body,
+                color: updateInfo.is_downgrade ? theme.info.text : theme.success.text,
+              }}
+            >
+              {updateInfo.is_downgrade
+                ? `v${updateInfo.latest_version} is what the beta channel currently offers, which is older than your v${updateInfo.current_version}`
+                : `v${updateInfo.latest_version} available (you have v${updateInfo.current_version})`}
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
             <ButtonItem layout="below" onClick={onApply}>
-              Update Now
+              {updateInfo.is_downgrade
+                ? `Go back to v${updateInfo.latest_version}`
+                : "Update Now"}
             </ButtonItem>
           </PanelSectionRow>
         </>
