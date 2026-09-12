@@ -1678,6 +1678,39 @@ class Plugin:
                 })
         return out
 
+    def _propose_active_pin_cleanup(
+        self, settings: dict, uuid: str, list_key: str, live_value: str
+    ) -> list[dict]:
+        """Clear a pin left on the ACTIVE profile that nothing is tracking.
+
+        _propose_pin_cleanup only walks the uuids we still remember, so a pin
+        that outlived its tracking list is invisible to it - and invisible in
+        the panel, which shows the preference as off. Nothing would ever look
+        at that profile again, while NetworkManager still honours what is
+        written there.
+
+        Measured on a Deck: an active profile carrying 802-11-wireless.band=a
+        while the plugin reported the band preference off and tracked no
+        profiles at all. That restricts the device to 5 GHz with no way to
+        see it, let alone undo it, from the panel that caused it.
+
+        The active uuid is the one profile we can always check, and the value
+        has already been read for drift, so this costs no extra subprocess.
+        """
+        enabled_key, _, prop = next(
+            e for e in self._PIN_PROPERTIES if e[1] == list_key
+        )
+        if settings.get(enabled_key) or not live_value or not uuid:
+            return []
+        # Already queued by the tracked-list walk; doing it twice would just
+        # spend the same cooldown on the same profile.
+        if uuid in settings.get(list_key, []):
+            return []
+        return [{
+            "kind": "pin_cleanup", "uuid": uuid,
+            "property": prop, "list_key": list_key,
+        }]
+
     def _band_is_reachable(self, iface: str, uuid: str, want: str) -> bool:
         """Whether this network has a visible AP on the wanted band.
 
@@ -1909,6 +1942,11 @@ class Plugin:
                 if len(parts) == 2:
                     current_bssid_lock = parts[1].replace("\\", "").strip()
             status["live"]["bssid_lock"] = current_bssid_lock
+            actions.extend(
+                self._propose_active_pin_cleanup(
+                    settings, uuid, "bssid_lock_uuids", current_bssid_lock
+                )
+            )
             if settings.get("bssid_lock_enabled") and not current_bssid_lock:
                 # NetworkManager keeps more than one profile per SSID, and it
                 # is free to autoconnect with a different one than the profile
@@ -2019,6 +2057,11 @@ class Plugin:
             band_out = band_result.get("stdout", "")
             live_band = band_out.split(":", 1)[1].strip() if ":" in band_out else ""
             status["live"]["band"] = live_band
+            actions.extend(
+                self._propose_active_pin_cleanup(
+                    settings, uuid, "band_preference_uuids", live_band
+                )
+            )
             expected_band = settings.get("band_preference", "a")
             # Only on the network the preference was set on. Enforcing it
             # everywhere writes a band into profiles for networks that may not
