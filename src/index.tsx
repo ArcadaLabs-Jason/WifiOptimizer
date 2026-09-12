@@ -111,6 +111,7 @@ function Content() {
   // --- General status and toggle state ---
   const [status, setStatus] = useState<PluginStatus | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [notices, setNotices] = useState<Record<string, string>>({});
   const [isBusy, setIsBusy] = useState(false);
   const [applyingAll, setApplyingAll] = useState(false);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeSafeResult | null>(null);
@@ -352,10 +353,22 @@ function Content() {
       delete next[key];
       return next;
     });
+    setNotices((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
     setOptimizeResult(null);
 
     try {
       const result = await fn();
+      // A setter can succeed and still have done something other than what
+      // was asked - locking to the access point you were already on because
+      // the stronger one would not take, say. Saying nothing there leaves the
+      // user with a toggle that flipped and no idea why the outcome differs.
+      if (result.success && result.message) {
+        setNotices((prev) => ({ ...prev, [key]: result.message as string }));
+      }
       if (!result.success) {
         const detail = result.detail ? ` (${result.detail})` : "";
         const msg = (result.message ?? ERROR_MESSAGES[result.error ?? ""] ?? "Unknown error") + detail;
@@ -688,6 +701,7 @@ function Content() {
           checked={s?.bssid_lock_enabled ?? false}
           disabled={isBusy || (!connected && !s?.bssid_lock_enabled)}
           error={errors.bssid_lock}
+          notice={notices.bssid_lock}
           onChange={(val: boolean) =>
             handleToggle("bssid_lock", () => backend.setBssidLock(val))
           }
