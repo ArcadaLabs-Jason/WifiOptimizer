@@ -57,6 +57,9 @@ export interface PluginStatus {
   settings: PluginSettings;
   live: LiveStatus;
   drift: Record<string, boolean>;
+  // Settings this plugin did not make, found on the connection. Distinct
+  // from drift, which is our own setting no longer holding.
+  external?: Record<string, boolean>;
   last_applied?: number;
   error?: string;
   message?: string;

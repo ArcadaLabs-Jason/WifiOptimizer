@@ -807,6 +807,12 @@ function Content() {
           subtitle="Use IPv4 only on this network"
           explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine."
           {...getBadge("ipv6", status, errors.ipv6 ?? null)}
+          notice={
+            notices.ipv6 ??
+            (status?.external?.ipv6
+              ? "IPv6 is off on this connection, but not because of this plugin."
+              : undefined)
+          }
           checked={s?.ipv6_disabled ?? false}
           disabled={isBusy || (!connected && !s?.ipv6_disabled)}
           error={errors.ipv6}

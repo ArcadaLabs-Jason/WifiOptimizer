@@ -554,15 +554,17 @@ v = V6(live="disabled")
 st = asyncio.run(v.get_status())
 ok(not any(k == "ipv6.method" for _, k, _ in v.mods),
    "an IPv6 setting we did not make is left alone")
-ok(st.get("drift", {}).get("ipv6") is True,
+ok(st.get("external", {}).get("ipv6") is True,
    "but the disagreement is surfaced rather than hidden")
+ok(not st.get("drift", {}).get("ipv6"),
+   "and it is not called drift, which would blame us for it")
 
 # And no false alarm when they agree.
 m._save_settings({**base_ap, "ipv6_disabled":False, "ipv6_uuids":[]})
 v = V6(live="auto")
 st = asyncio.run(v.get_status())
-ok(not st.get("drift", {}).get("ipv6"),
-   "no drift reported when the connection and the toggle agree")
+ok(not st.get("drift", {}).get("ipv6") and not st.get("external", {}).get("ipv6"),
+   "nothing reported when the connection and the toggle agree")
 
 
 

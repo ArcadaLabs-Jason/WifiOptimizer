@@ -1319,6 +1319,7 @@ class Plugin:
                     "settings": _load_settings(),
                     "live": {},
                     "drift": {},
+                    "external": {},
                 }
 
             # No previous result to hand back. Falling through here is what
@@ -1339,6 +1340,7 @@ class Plugin:
                 "settings": _load_settings(),
                 "live": {},
                 "drift": {},
+                "external": {},
             }
 
         self._collect_depth = getattr(self, "_collect_depth", 0) + 1
@@ -2087,6 +2089,7 @@ class Plugin:
                 "settings": settings,
                 "live": {},
                 "drift": {},
+                "external": {},
             }
 
             # Backend info is system-wide; populate regardless of connection state
@@ -2319,9 +2322,11 @@ class Plugin:
                 # IPv6 off is an ordinary thing for someone to have done
                 # deliberately elsewhere. Silently turning it back on would
                 # be this plugin overriding a choice it did not make. The
-                # badge says the toggle and the connection disagree, which
-                # is the part the user could not otherwise see.
-                status["drift"]["ipv6"] = True
+                # This is reported as something set ELSEWHERE rather than as
+                # drift. "Drifted" means our setting stopped holding, and
+                # saying that here blames the plugin for a state it did not
+                # create and cannot explain.
+                status["external"]["ipv6"] = True
 
             # Band preference
             band_result = self._run_cmd(
@@ -2428,6 +2433,7 @@ class Plugin:
                     "settings": settings,
                     "live": {},
                     "drift": {},
+                    "external": {},
                 },
                 {},
                 [],
