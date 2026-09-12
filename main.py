@@ -3334,6 +3334,196 @@ class Plugin:
                 "message": "Couldn't change the auto-fix script.",
             }
 
+    def _release_lock_from_all_profiles(self) -> dict | None:
+        """Take the address pin off every profile that still carries it.
+
+        Returns an error dict if the pin could not be released, None if it was.
+
+        Works on saved profiles, so it needs no active WiFi - being unable to
+        associate is one of the likelier reasons somebody is turning the lock
+        off, and refusing without a live connection would leave the pin in
+        place with no way to clear it.
+
+        The pin follows whichever profile NetworkManager uses, so over time it
+        may have been written to several copies of the same network. All of
+        them are cleared: one left pinned to an access point we are no longer
+        honouring will fail to associate if NM ever picks it again, and no
+        control would clear it.
+
+        Deliberately await-free, as the rest of this setter's body is.
+        """
+        # Disabling works on saved profiles - no active WiFi needed
+        iface, uuid, _ = self._require_wifi()
+        if not uuid:
+            uuid = self._get_saved_connection_uuid()
+        if not uuid:
+            return {
+                "success": False,
+                "error": "nmcli_failed",
+                "message": "No connection UUID found. Connect to WiFi first.",
+            }
+
+        result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+        if not result["success"]:
+            return {
+                "success": False,
+                "error": "nmcli_failed",
+                "message": "Couldn't unlock BSSID",
+                "detail": result["stderr"],
+            }
+
+        settings = _load_settings()
+
+        # The lock follows whichever profile NM actually uses, so over
+        # time it may have been written to several profiles for the
+        # same SSID. Clear all of them: one left pinned to an access
+        # point we are no longer honouring will fail to associate if
+        # NM ever picks it again, and no control would clear it.
+        stale_uuids = [
+            u for u in settings.get("bssid_lock_uuids", []) if u != uuid
+        ]
+        previous_uuid = settings.get("bssid_lock_connection_uuid", "")
+        if previous_uuid and previous_uuid != uuid and previous_uuid not in stale_uuids:
+            stale_uuids.append(previous_uuid)
+        unresolved = []
+        for stale_uuid in stale_uuids:
+            stale = self._nmcli_modify(
+                stale_uuid, "802-11-wireless.bssid", "", timeout=2
+            )
+            if stale["success"]:
+                decky.logger.info(
+                    f"Cleared stale BSSID lock from profile {stale_uuid}"
+                )
+                continue
+            detail = stale.get("stderr", "")
+            decky.logger.info(
+                f"Could not clear stale BSSID lock from profile "
+                f"{stale_uuid}: {detail[:120]}"
+            )
+            # A profile that is merely gone needs no further thought.
+            # Anything else is still pinned, so keep the record of it
+            # rather than forgetting the only reference to a profile
+            # that will now fail to associate.
+            if "unknown connection" not in detail.lower():
+                unresolved.append(stale_uuid)
+
+        settings["bssid_lock_enabled"] = False
+        settings["bssid_lock_value"] = ""
+        settings["bssid_lock_connection_uuid"] = ""
+        settings["bssid_lock_uuids"] = unresolved
+        _save_settings_with_timestamp(settings)
+        if not self._hard_reconnect(uuid):
+            return dict(self._RADIO_OFF_RESULT)
+
+        return None
+
+    def _settle_band_before_locking(self, current: dict, iface: str, uuid: str,
+                                    bssid: str, link_out: str,
+                                    active_ssid: str | None) -> tuple:
+        """Get onto the preferred band before pinning, or refuse to pin.
+
+        Returns (error, iface, bssid, link_out): an error dict if locking must
+        not go ahead, otherwise None and whatever the reconnect left us on -
+        the interface can come back renamed and the access point will differ.
+
+        Refusing rather than writing a profile that cannot associate. This is
+        reachable from the drift banner's Fix now, which runs Optimize Safe and
+        reconnects immediately after - so getting it wrong strands the user
+        then and there rather than at their next wake.
+
+        Deliberately await-free, like the rest of this setter's body: the
+        event loop is what serializes it against status reconciliation, and a
+        suspension point here would let a poll write to the profile mid-change.
+        """
+        frequency = ""
+        for line in link_out.split("\n"):
+            line = line.strip()
+            if line.startswith("freq:"):
+                frequency = line.split(":", 1)[1].strip()
+                break
+        if self._band_conflicts(current, frequency, active_ssid):
+            # Refusing alone would be a dead end: this is exactly the
+            # state the drift banner reports, its Fix now lands here,
+            # and nothing the panel offers moves the association.
+            #
+            # But cycling the radio can also fail to get back, and a
+            # remedy must not be able to leave the user worse off than
+            # it found them. Only reconnect if an access point on the
+            # wanted band is actually visible for this network.
+            want = current.get("band_preference")
+            if not self._band_is_reachable(iface, uuid, want):
+                other = "5 GHz" if want == "a" else "2.4 GHz"
+                return {
+                    "success": False,
+                    "error": "nmcli_failed",
+                    "message": (
+                        f"No {other} access point is in range for this "
+                        f"network, which it is set to require. Turn the "
+                        f"band preference off to lock anyway."
+                    ),
+                }, iface, bssid, link_out
+            decky.logger.info(
+                "Band conflict before locking; reconnecting to let NM "
+                "pick an access point on the preferred band"
+            )
+            if not self._hard_reconnect(uuid):
+                return dict(self._RADIO_OFF_RESULT), iface, bssid, link_out
+            # A BLOCKING sleep, on purpose, and it must stay one.
+            # This setter's whole body is await-free, which is what
+            # lets the event loop serialize it against status
+            # reconciliation. Turning this into asyncio.sleep would
+            # add a suspension point and let a poll write to the
+            # profile mid-change - the race the reader/applier split
+            # exists to prevent. _hard_reconnect immediately above
+            # already blocks for longer.
+            time.sleep(3)
+            iface = self._get_wifi_interface() or iface
+            link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+            if not link_result["success"]:
+                # Same trap as the wait above: an unread link is not a
+                # band that could not be reached, and reporting it as
+                # one sends the user to change a setting that was
+                # never the problem.
+                detail = (
+                    link_result.get("stderr", "")
+                    or f"iw exited {link_result.get('returncode')}"
+                )
+                decky.logger.error(
+                    f"BSSID lock: could not re-read the link on "
+                    f"{iface} after the band reconnect - {detail[:200]}"
+                )
+                return {
+                    "success": False,
+                    "error": "nmcli_failed",
+                    "message": "Couldn't read the WiFi link.",
+                    "detail": detail,
+                }, iface, bssid, link_out
+            link_out = link_result.get("stdout", "")
+            relinked = self._parse_link(link_out)
+            frequency = relinked.get("frequency", "")
+            bssid = relinked.get("connected_bssid", "")
+
+            if not bssid or self._band_conflicts(
+                current, frequency, active_ssid
+            ):
+                want = current.get("band_preference")
+                other = "5 GHz" if want == "a" else "2.4 GHz"
+                return {
+                    "success": False,
+                    "error": "nmcli_failed",
+                    "message": (
+                        f"Couldn't reach an access point on {other}, "
+                        f"which this network is set to require. Turn "
+                        f"the band preference off to lock anyway."
+                    ),
+                }, iface, bssid, link_out
+
+        # Look before pinning. Locking whichever access point we
+        # happen to be on is how a passing bad choice becomes a
+        # permanent one, and on a mesh that is the common case rather
+
+        return None, iface, bssid, link_out
+
     async def set_bssid_lock(self, enabled: bool) -> dict:
         # Held for the whole call. The enable path awaits while it waits for
         # an association, so a status poll can now land in the middle of this
@@ -3403,101 +3593,13 @@ class Plugin:
                 # runs Optimize Safe, and it reconnects immediately after -
                 # so getting it wrong strands the user then and there rather
                 # than at their next wake.
-                frequency = ""
-                for line in link_out.split("\n"):
-                    line = line.strip()
-                    if line.startswith("freq:"):
-                        frequency = line.split(":", 1)[1].strip()
-                        break
                 current = _load_settings()
                 active_ssid = self._get_profile_ssid(uuid)
-                if self._band_conflicts(current, frequency, active_ssid):
-                    # Refusing alone would be a dead end: this is exactly the
-                    # state the drift banner reports, its Fix now lands here,
-                    # and nothing the panel offers moves the association.
-                    #
-                    # But cycling the radio can also fail to get back, and a
-                    # remedy must not be able to leave the user worse off than
-                    # it found them. Only reconnect if an access point on the
-                    # wanted band is actually visible for this network.
-                    want = current.get("band_preference")
-                    if not self._band_is_reachable(iface, uuid, want):
-                        other = "5 GHz" if want == "a" else "2.4 GHz"
-                        return {
-                            "success": False,
-                            "error": "nmcli_failed",
-                            "message": (
-                                f"No {other} access point is in range for this "
-                                f"network, which it is set to require. Turn the "
-                                f"band preference off to lock anyway."
-                            ),
-                        }
-                    decky.logger.info(
-                        "Band conflict before locking; reconnecting to let NM "
-                        "pick an access point on the preferred band"
-                    )
-                    if not self._hard_reconnect(uuid):
-                        return dict(self._RADIO_OFF_RESULT)
-                    # A BLOCKING sleep, on purpose, and it must stay one.
-                    # This setter's whole body is await-free, which is what
-                    # lets the event loop serialize it against status
-                    # reconciliation. Turning this into asyncio.sleep would
-                    # add a suspension point and let a poll write to the
-                    # profile mid-change - the race the reader/applier split
-                    # exists to prevent. _hard_reconnect immediately above
-                    # already blocks for longer.
-                    time.sleep(3)
-                    iface = self._get_wifi_interface() or iface
-                    link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
-                    if not link_result["success"]:
-                        # Same trap as the wait above: an unread link is not a
-                        # band that could not be reached, and reporting it as
-                        # one sends the user to change a setting that was
-                        # never the problem.
-                        detail = (
-                            link_result.get("stderr", "")
-                            or f"iw exited {link_result.get('returncode')}"
-                        )
-                        decky.logger.error(
-                            f"BSSID lock: could not re-read the link on "
-                            f"{iface} after the band reconnect - {detail[:200]}"
-                        )
-                        return {
-                            "success": False,
-                            "error": "nmcli_failed",
-                            "message": "Couldn't read the WiFi link.",
-                            "detail": detail,
-                        }
-                    link_out = link_result.get("stdout", "")
-                    frequency = ""
-                    bssid = ""
-                    for line in link_out.split("\n"):
-                        line = line.strip()
-                        if line.startswith("freq:"):
-                            frequency = line.split(":", 1)[1].strip()
-                        elif "Connected to" in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                bssid = parts[2]
-
-                    if not bssid or self._band_conflicts(
-                        current, frequency, active_ssid
-                    ):
-                        want = current.get("band_preference")
-                        other = "5 GHz" if want == "a" else "2.4 GHz"
-                        return {
-                            "success": False,
-                            "error": "nmcli_failed",
-                            "message": (
-                                f"Couldn't reach an access point on {other}, "
-                                f"which this network is set to require. Turn "
-                                f"the band preference off to lock anyway."
-                            ),
-                        }
-
-                # Look before pinning. Locking whichever access point we
-                # happen to be on is how a passing bad choice becomes a
-                # permanent one, and on a mesh that is the common case rather
+                err, iface, bssid, link_out = self._settle_band_before_locking(
+                    current, iface, uuid, bssid, link_out, active_ssid
+                )
+                if err:
+                    return err
                 # than the corner one.
                 # A scan can take seconds, so it runs off the event loop.
                 # The reconciliation guard is held across this whole setter,
@@ -3570,68 +3672,9 @@ class Plugin:
                             ),
                         }
             else:
-                # Disabling works on saved profiles - no active WiFi needed
-                iface, uuid, _ = self._require_wifi()
-                if not uuid:
-                    uuid = self._get_saved_connection_uuid()
-                if not uuid:
-                    return {
-                        "success": False,
-                        "error": "nmcli_failed",
-                        "message": "No connection UUID found. Connect to WiFi first.",
-                    }
-
-                result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
-                if not result["success"]:
-                    return {
-                        "success": False,
-                        "error": "nmcli_failed",
-                        "message": "Couldn't unlock BSSID",
-                        "detail": result["stderr"],
-                    }
-
-                settings = _load_settings()
-
-                # The lock follows whichever profile NM actually uses, so over
-                # time it may have been written to several profiles for the
-                # same SSID. Clear all of them: one left pinned to an access
-                # point we are no longer honouring will fail to associate if
-                # NM ever picks it again, and no control would clear it.
-                stale_uuids = [
-                    u for u in settings.get("bssid_lock_uuids", []) if u != uuid
-                ]
-                previous_uuid = settings.get("bssid_lock_connection_uuid", "")
-                if previous_uuid and previous_uuid != uuid and previous_uuid not in stale_uuids:
-                    stale_uuids.append(previous_uuid)
-                unresolved = []
-                for stale_uuid in stale_uuids:
-                    stale = self._nmcli_modify(
-                        stale_uuid, "802-11-wireless.bssid", "", timeout=2
-                    )
-                    if stale["success"]:
-                        decky.logger.info(
-                            f"Cleared stale BSSID lock from profile {stale_uuid}"
-                        )
-                        continue
-                    detail = stale.get("stderr", "")
-                    decky.logger.info(
-                        f"Could not clear stale BSSID lock from profile "
-                        f"{stale_uuid}: {detail[:120]}"
-                    )
-                    # A profile that is merely gone needs no further thought.
-                    # Anything else is still pinned, so keep the record of it
-                    # rather than forgetting the only reference to a profile
-                    # that will now fail to associate.
-                    if "unknown connection" not in detail.lower():
-                        unresolved.append(stale_uuid)
-
-                settings["bssid_lock_enabled"] = False
-                settings["bssid_lock_value"] = ""
-                settings["bssid_lock_connection_uuid"] = ""
-                settings["bssid_lock_uuids"] = unresolved
-                _save_settings_with_timestamp(settings)
-                if not self._hard_reconnect(uuid):
-                    return dict(self._RADIO_OFF_RESULT)
+                err = self._release_lock_from_all_profiles()
+                if err:
+                    return err
 
             return {"success": True, "bssid_locked": enabled, "reconnected": True}
         except Exception as e:
