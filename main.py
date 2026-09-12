@@ -198,6 +198,7 @@ DEFAULT_SETTINGS = {
     "dns_servers": "1.1.1.1 1.0.0.1",
     "dns_enabled": False,
     "ipv6_disabled": False,
+    "ipv6_uuids": [],
     "buffer_tuning_enabled": False,
     "cake_enabled": False,
     "last_connection_uuid": "",
@@ -682,6 +683,11 @@ class Plugin:
         band_uuids = settings.get("band_preference_uuids", [])
         for uuid in {u for u in list(band_uuids) + uuids + [last] if u}:
             self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
+        # Same reasoning as the pins: after teardown nothing is left that
+        # knows this plugin turned IPv6 off, so it has to be undone here or
+        # not at all. Bounded to profiles we recorded writing to.
+        for uuid in {u for u in settings.get("ipv6_uuids", []) if u}:
+            self._nmcli_modify(uuid, "ipv6.method", "auto", timeout=2)
 
     _RADIO_OFF_RESULT = {
         "success": False,
@@ -1514,7 +1520,7 @@ class Plugin:
                 list_key = action["list_key"]
                 prop = action["property"]
                 enabled_key = next(
-                    e for e, l, _ in self._PIN_PROPERTIES if l == list_key
+                    e for e, l, _, _v in self._PIN_PROPERTIES if l == list_key
                 )
                 if settings.get(enabled_key):
                     continue
@@ -1528,7 +1534,9 @@ class Plugin:
                     continue
                 if self._reassert_exhausted(f"pin_cleanup:{list_key}"):
                     continue
-                done = self._nmcli_modify(uuid, prop, "", timeout=2)
+                done = self._nmcli_modify(
+                    uuid, prop, action.get("off_value", ""), timeout=2
+                )
                 detail = done.get("stderr", "")
                 # A profile that no longer exists is resolved, not failed.
                 # Counting it as a failure pushed cleanup into its cooldown
@@ -1539,9 +1547,12 @@ class Plugin:
                     pending[list_key] = [
                         u for u in settings.get(list_key, []) if u != uuid
                     ]
+                    off_value = action.get("off_value", "")
                     self._log_throttled(
                         f"pin_cleanup:{list_key}",
-                        f"Cleared a leftover {prop} from {uuid}",
+                        f"Cleared a leftover {prop} from {uuid}"
+                        if not off_value else
+                        f"Returned {prop} to {off_value} on {uuid}",
                     )
                 else:
                     # Move it to the back. Only the head is attempted each
@@ -1662,9 +1673,16 @@ class Plugin:
             count, _ = state.get(key, (0, 0.0))
             state[key] = (count + 1, time.monotonic())
 
+    # (settings flag, the uuids we wrote it to, the property, what "off" means)
+    #
+    # The last field is not decoration. Clearing a BSSID or a band means
+    # writing nothing and letting NetworkManager decide, but IPv6 has no such
+    # empty state - "not disabled by us" is the method NM would have used
+    # anyway, so turning the toggle off has to name it.
     _PIN_PROPERTIES = (
-        ("bssid_lock_enabled", "bssid_lock_uuids", "802-11-wireless.bssid"),
-        ("band_preference_enabled", "band_preference_uuids", "802-11-wireless.band"),
+        ("bssid_lock_enabled", "bssid_lock_uuids", "802-11-wireless.bssid", ""),
+        ("band_preference_enabled", "band_preference_uuids", "802-11-wireless.band", ""),
+        ("ipv6_disabled", "ipv6_uuids", "ipv6.method", "auto"),
     )
 
     def _propose_pin_cleanup(self, settings: dict) -> list[dict]:
@@ -1676,13 +1694,14 @@ class Plugin:
         it again.
         """
         out = []
-        for enabled_key, list_key, prop in self._PIN_PROPERTIES:
+        for enabled_key, list_key, prop, off_value in self._PIN_PROPERTIES:
             if settings.get(enabled_key):
                 continue
             for stale_uuid in settings.get(list_key, [])[:1]:
                 out.append({
                     "kind": "pin_cleanup", "uuid": stale_uuid,
                     "property": prop, "list_key": list_key,
+                    "off_value": off_value,
                 })
         return out
 
@@ -1705,7 +1724,7 @@ class Plugin:
         The active uuid is the one profile we can always check, and the value
         has already been read for drift, so this costs no extra subprocess.
         """
-        enabled_key, _, prop = next(
+        enabled_key, _, prop, off_value = next(
             e for e in self._PIN_PROPERTIES if e[1] == list_key
         )
         if settings.get(enabled_key) or not live_value or not uuid:
@@ -1717,6 +1736,7 @@ class Plugin:
         return [{
             "kind": "pin_cleanup", "uuid": uuid,
             "property": prop, "list_key": list_key,
+            "off_value": off_value,
         }]
 
     @staticmethod
@@ -2211,6 +2231,24 @@ class Plugin:
                 actions.append({
                     "kind": "ipv6", "uuid": uuid, "observed": live_ipv6,
                 })
+            elif (
+                not settings.get("ipv6_disabled")
+                and live_ipv6 == "disabled"
+                and uuid not in settings.get("ipv6_uuids", [])
+            ):
+                # The profile has IPv6 off while this plugin says it is not
+                # the one turning it off, and there is no record of us ever
+                # having done so. Report it and change nothing.
+                #
+                # The two pins above are cleaned up in this situation, and
+                # IPv6 deliberately is not: nobody sets a BSSID or a band by
+                # hand, so a stray one is ours by elimination, but switching
+                # IPv6 off is an ordinary thing for someone to have done
+                # deliberately elsewhere. Silently turning it back on would
+                # be this plugin overriding a choice it did not make. The
+                # badge says the toggle and the connection disagree, which
+                # is the part the user could not otherwise see.
+                status["drift"]["ipv6"] = True
 
             # Band preference
             band_result = self._run_cmd(
@@ -3003,6 +3041,17 @@ class Plugin:
 
             settings = _load_settings()
             settings["ipv6_disabled"] = disabled
+            known = list(settings.get("ipv6_uuids", []))
+            if disabled:
+                # Remember where we put it. Without this the only profile we
+                # could ever undo is whichever one happens to be active when
+                # the toggle goes off, and NetworkManager keeps more than one
+                # profile per network.
+                if uuid not in known:
+                    known.append(uuid)
+                settings["ipv6_uuids"] = known[-self._MAX_TRACKED_LOCK_UUIDS:]
+            else:
+                settings["ipv6_uuids"] = [u for u in known if u != uuid]
             _save_settings_with_timestamp(settings)
 
             if not self._hard_reconnect(uuid):
