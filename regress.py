@@ -1484,5 +1484,49 @@ st, _p, _a = EscapedPin()._collect_status()
 ok(st["live"].get("bssid_lock") == "02:00:00:00:00:11",
    "the collector reports the address unescaped, as the panel and the link do")
 
+
+section("reading what iw says about the link")
+
+P0 = m.Plugin
+LINK = ("Connected to 02:00:00:00:00:11 (on wlan0)\n"
+        "\tSSID: TestNet\n\tfreq: 5180\n\tsignal: -44 dBm\n"
+        "\ttx bitrate: 866.7 MBit/s VHT-MCS 9 80MHz VHT-NSS 2")
+live = P0._parse_link(LINK)
+ok(live.get("connected_bssid") == "02:00:00:00:00:11", "the access point in use")
+ok(live.get("frequency") == "5180", "the frequency")
+ok(live.get("signal_dbm") == "-44 dBm", "the signal")
+ok(live.get("tx_bitrate").startswith("866.7 MBit/s"), "the transmit rate")
+
+# An absent field is absent, not empty: the panel can tell a missing reading
+# from a reading of nothing, and every consumer of connected_bssid treats the
+# empty string as "we are not associated".
+ok("signal_dbm" not in P0._parse_link("Not connected."),
+   "a link with no signal line reports no signal rather than an empty one")
+ok(P0._parse_link("") == {}, "and nothing at all is read from no output")
+ok("connected_bssid" not in P0._parse_link("Connected to"),
+   "a truncated association line is not read as an address")
+
+# Whichever line comes last wins, which is what a single-interface `iw link`
+# gives and what the collector has always done.
+ok(P0._parse_link("\tsignal: -70 dBm\n\tsignal: -44 dBm")["signal_dbm"] == "-44 dBm",
+   "the last reading in the output is the current one")
+
+section("reading the channel the way the panel shows it")
+
+ok(P0._parse_channel("\tchannel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz")
+   == "36 (80 MHz)", "channel and width are joined into one label")
+ok(P0._parse_channel("\tchannel 36 (5180 MHz)") == "36",
+   "a channel with no width is still the channel")
+ok(P0._parse_channel("Interface wlan0\n\ttype managed") is None,
+   "output with no channel line reports nothing rather than an empty channel")
+ok(P0._parse_channel("") is None, "and so does no output")
+
+# An unfamiliar format is worth showing rather than dropping: it tells whoever
+# reads the panel what the radio actually said.
+ok(P0._parse_channel("channel") == "channel",
+   "a channel line that cannot be taken apart is passed through whole")
+ok(P0._parse_channel("\tchannel 1 (2412 MHz), width: 20 MHz") == "1 (20 MHz)",
+   "2.4 GHz reads the same way")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

@@ -2655,6 +2655,96 @@ class Plugin:
         # there is nothing a deadline here could catch that this does not.
         return getattr(self, "_profile_change_depth", 0) > 0
 
+    @staticmethod
+    def _parse_link(link_out: str) -> dict:
+        """The live values `iw dev X link` reports, as the panel names them.
+
+        Only what is present: a field the link does not mention is left out
+        rather than published as empty, so the panel can tell "no signal
+        reading" from "a signal reading of nothing".
+        """
+        live = {}
+        for line in link_out.split("\n"):
+            line = line.strip()
+            if line.startswith("signal:"):
+                live["signal_dbm"] = line.split(":", 1)[1].strip()
+            elif "tx bitrate:" in line:
+                live["tx_bitrate"] = line.split("tx bitrate:", 1)[1].strip()
+            elif line.startswith("freq:"):
+                live["frequency"] = line.split(":", 1)[1].strip()
+            elif "Connected to" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    live["connected_bssid"] = parts[2]
+        return live
+
+    @staticmethod
+    def _parse_channel(info_out: str) -> str | None:
+        """Channel and width as the panel shows them, or None if not reported.
+
+        Raw: "channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz" becomes
+        "36 (80 MHz)". A line that cannot be taken apart is passed through
+        whole rather than dropped - an unfamiliar format is worth showing.
+        """
+        channel = None
+        for line in info_out.split("\n"):
+            line = line.strip()
+            if not line.startswith("channel"):
+                continue
+            parts = line.split(",")
+            chan_num = ""
+            width = ""
+            if parts:
+                tokens = parts[0].split()
+                if len(tokens) >= 2:
+                    chan_num = tokens[1]
+            for part in parts:
+                part = part.strip()
+                if part.startswith("width:"):
+                    width = part.split(":", 1)[1].strip()
+            if chan_num and width:
+                channel = f"{chan_num} ({width})"
+            elif chan_num:
+                channel = chan_num
+            else:
+                channel = line
+        return channel
+
+    def _status_read_failed(self) -> tuple[dict, dict, list]:
+        """What to answer when the status read itself fell over.
+
+        A COMPLETE shape, not a bare error dict. The panel reads settings,
+        live, drift, connected and version unconditionally, so a bare error
+        renders as "not connected" with every toggle off - telling the user
+        their optimizations are gone rather than that the read failed.
+
+        Nothing is proposed alongside it: a read that failed is no basis for
+        deciding to write anything.
+        """
+        try:
+            settings = _load_settings()
+        except Exception:
+            settings = dict(DEFAULT_SETTINGS)
+        return (
+            {
+                "success": False,
+                "error": "unexpected",
+                "message": "Couldn't read WiFi status.",
+                "connected": False,
+                # Reads settings only, so it is still meaningful here -
+                # hardcoding 3 made the panel announce unrecognised hardware
+                # because an unrelated read failed.
+                "support_tier": self._get_support_tier(),
+                "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
+                "settings": settings,
+                "live": {},
+                "drift": {},
+                "external": {},
+            },
+            {},
+            [],
+        )
+
     def _collect_status(self) -> tuple[dict, dict, list]:
         # Short timeout for the queries that take one. Note this does not
         # bound the whole collection: the interface and connection lookups,
@@ -2765,46 +2855,15 @@ class Plugin:
                 ["/usr/bin/iw", "dev", iface, "link"], timeout=T
             )
             link_out = link_result.get("stdout", "")
-            for line in link_out.split("\n"):
-                line = line.strip()
-                if line.startswith("signal:"):
-                    status["live"]["signal_dbm"] = line.split(":", 1)[1].strip()
-                elif "tx bitrate:" in line:
-                    status["live"]["tx_bitrate"] = line.split("tx bitrate:", 1)[
-                        1
-                    ].strip()
-                elif line.startswith("freq:"):
-                    status["live"]["frequency"] = line.split(":", 1)[1].strip()
-                elif "Connected to" in line:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        status["live"]["connected_bssid"] = parts[2]
+            status["live"].update(self._parse_link(link_out))
 
             # Channel info - parse to "36 (80 MHz)" format
             info_result = self._run_cmd(
                 ["/usr/bin/iw", "dev", iface, "info"], timeout=T
             )
-            for line in info_result.get("stdout", "").split("\n"):
-                line = line.strip()
-                if line.startswith("channel"):
-                    # Raw: "channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz"
-                    parts = line.split(",")
-                    chan_num = ""
-                    width = ""
-                    if parts:
-                        tokens = parts[0].split()
-                        if len(tokens) >= 2:
-                            chan_num = tokens[1]
-                    for part in parts:
-                        part = part.strip()
-                        if part.startswith("width:"):
-                            width = part.split(":", 1)[1].strip()
-                    if chan_num and width:
-                        status["live"]["channel"] = f"{chan_num} ({width})"
-                    elif chan_num:
-                        status["live"]["channel"] = chan_num
-                    else:
-                        status["live"]["channel"] = line
+            channel = self._parse_channel(info_result.get("stdout", ""))
+            if channel is not None:
+                status["live"]["channel"] = channel
 
             # BSSID lock. Read as 802-11-wireless.bssid:AA\:BB\:CC\:DD\:EE\:FF
             current_bssid_lock = self._read_profile_field(
@@ -3034,34 +3093,7 @@ class Plugin:
             return status, pending, actions
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
-            # Hand back a COMPLETE status shape. The panel reads settings,
-            # live, drift, connected and version unconditionally, so a bare
-            # error dict renders as "not connected" with every toggle off -
-            # telling the user their optimizations are gone rather than that
-            # the status read failed.
-            try:
-                settings = _load_settings()
-            except Exception:
-                settings = dict(DEFAULT_SETTINGS)
-            return (
-                {
-                    "success": False,
-                    "error": "unexpected",
-                    "message": "Couldn't read WiFi status.",
-                    "connected": False,
-                    # Reads settings only, so it is still meaningful here -
-                    # hardcoding 3 made the panel announce unrecognised
-                    # hardware because an unrelated read failed.
-                    "support_tier": self._get_support_tier(),
-                    "version": getattr(decky, "DECKY_PLUGIN_VERSION", "?"),
-                    "settings": settings,
-                    "live": {},
-                    "drift": {},
-                    "external": {},
-                },
-                {},
-                [],
-            )
+            return self._status_read_failed()
 
     # ---- Optimization setters ----
 
