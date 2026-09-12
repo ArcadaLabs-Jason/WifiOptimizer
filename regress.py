@@ -748,5 +748,85 @@ asyncio.run(d.get_status()); first = d.listings
 asyncio.run(d.get_status()); asyncio.run(d.get_status())
 ok(d.listings == first, "the check is throttled rather than run every poll")
 
+section("pins left on another saved copy of the same network")
+
+# NetworkManager is free to autoconnect with any copy of an SSID. A pin left
+# on a copy we are not using is invisible twice over - the panel reports the
+# feature off, and the profile being read is not the profile it was written
+# to - yet NetworkManager honours it the moment that copy is chosen.
+RIVAL = "bbbbbbbb-0000-0000-0000-000000000001"
+
+class RivalPins(Dup):
+    def __init__(self, rivals, pins):
+        super().__init__(rivals)
+        self.pins = {u: dict(v) for u, v in pins.items()}
+        self.modifies = []
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        j = " ".join(cmd)
+        if "802-11-wireless.band,802-11-wireless.bssid" in j:
+            for u, props in self.pins.items():
+                if u in cmd:
+                    return {"success":True,
+                            "stdout":"\n".join(f"{k}:{v}" for k, v in props.items()),
+                            "stderr":"","returncode":0}
+            return {"success":True,"stdout":"","stderr":"","returncode":0}
+        return super()._run_cmd(cmd, timeout, clean_env)
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.modifies.append((uuid, key, value))
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+def cleared(d, uuid, prop):
+    return any(u == uuid and k == prop and v == "" for u, k, v in d.modifies)
+
+ONE = {RIVAL: ("Net", "Net", "wpa-psk")}
+
+# The measured case: a rival copy carrying band=a that nothing tracks.
+m._save_settings(dict(base_ap))
+d = RivalPins(ONE, {RIVAL: {"802-11-wireless.band": "a"}})
+asyncio.run(d.get_status())
+ok(cleared(d, RIVAL, "802-11-wireless.band"),
+   "a band pin left on another copy of the same network is cleared")
+
+# The same for an address pin.
+m._save_settings(dict(base_ap))
+d = RivalPins(ONE, {RIVAL: {"802-11-wireless.bssid": "02:00:00:00:00:11"}})
+asyncio.run(d.get_status())
+ok(cleared(d, RIVAL, "802-11-wireless.bssid"),
+   "an address pin left on another copy is cleared")
+
+# While the preference is ON that value is the user's, not litter.
+m._save_settings({**base_ap, "band_preference_enabled":True,
+                  "band_preference":"a", "band_preference_ssid":"Net"})
+d = RivalPins(ONE, {RIVAL: {"802-11-wireless.band": "a"}})
+asyncio.run(d.get_status())
+ok(not cleared(d, RIVAL, "802-11-wireless.band"),
+   "a rival pin is left alone while the preference is still on")
+
+# The elimination boundary: IPv6 is an ordinary thing to have switched off
+# deliberately elsewhere, so a copy we cannot prove we wrote is never
+# overridden - unlike a band or an address, which nobody sets by hand.
+m._save_settings(dict(base_ap))
+d = RivalPins(ONE, {RIVAL: {"802-11-wireless.band": "a",
+                            "ipv6.method": "disabled"}})
+asyncio.run(d.get_status())
+ok(not any(k == "ipv6.method" for _u, k, _v in d.modifies),
+   "IPv6 on another copy is never overridden")
+
+# A copy of a DIFFERENT network is inert until the device goes there.
+m._save_settings(dict(base_ap))
+d = RivalPins({RIVAL: ("Elsewhere", "Elsewhere", "wpa-psk")},
+              {RIVAL: {"802-11-wireless.band": "a"}})
+asyncio.run(d.get_status())
+ok(not any(u == RIVAL for u, _k, _v in d.modifies),
+   "a copy of another network is not touched")
+
+# One write, not one per poll: the cache is consumed optimistically and the
+# throttled duplicate check re-reads the truth.
+m._save_settings(dict(base_ap))
+d = RivalPins(ONE, {RIVAL: {"802-11-wireless.band": "a"}})
+asyncio.run(d.get_status()); first = len(d.modifies)
+asyncio.run(d.get_status()); asyncio.run(d.get_status())
+ok(len(d.modifies) == first, "the rival cleanup is not re-attempted every poll")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

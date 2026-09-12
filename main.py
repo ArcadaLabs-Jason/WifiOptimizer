@@ -1693,6 +1693,12 @@ class Plugin:
         ("ipv6_disabled", "ipv6_uuids", "ipv6.method", "auto"),
     )
 
+    # The pins nobody sets by hand, so a stray one is ours by elimination and
+    # clearing it is safe. IPv6 is deliberately absent: switching it off is an
+    # ordinary thing to have done deliberately somewhere else, so a profile we
+    # have no record of writing is reported rather than overridden.
+    _ELIMINATION_PINS = ("802-11-wireless.band", "802-11-wireless.bssid")
+
     def _propose_pin_cleanup(self, settings: dict) -> list[dict]:
         """One cleanup per property per poll for anything we could not unpin.
 
@@ -1746,6 +1752,80 @@ class Plugin:
             "property": prop, "list_key": list_key,
             "off_value": off_value,
         }]
+
+    def _profile_pins(self, uuid: str, timeout: int = 3) -> dict:
+        """The elimination-safe pins currently written to one profile.
+
+        Both fields in one call, because this runs per rival profile and the
+        point of reading them together is to not spend a subprocess each.
+        """
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", ",".join(self._ELIMINATION_PINS),
+             "con", "show", "uuid", uuid],
+            timeout=timeout,
+        )
+        if not result["success"]:
+            return {}
+        out = {}
+        for line in result.get("stdout", "").split("\n"):
+            name, sep, value = line.partition(":")
+            if not sep:
+                continue
+            # A BSSID arrives with its colons escaped, the same way the
+            # active profile's value is read for drift.
+            value = value.replace("\\", "").strip()
+            if value:
+                out[name.strip()] = value
+        return out
+
+    def _propose_rival_pin_cleanup(self, settings: dict) -> list[dict]:
+        """Clear our pins from the OTHER saved copies of the network in use.
+
+        NetworkManager keeps several profiles per SSID and is free to
+        autoconnect with any of them. A pin left on a copy we are not
+        currently using is invisible twice over - the panel reports the
+        feature as off, and the profile it was written to is not the one
+        being read - yet NetworkManager still honours it the moment that copy
+        is chosen. Nothing else here would ever look at it again.
+
+        Bounded to copies of the ACTIVE network on purpose. A pin on some
+        other network is inert until the device goes there, whereas a copy
+        that can be picked INSTEAD of us is doing harm now. It is also the
+        only set already gathered: the rivals come from the throttled
+        duplicate check, so this costs no extra subprocess of its own.
+
+        Only the elimination-safe properties. Returning IPv6 to auto on a
+        profile we cannot prove we wrote would override a choice made
+        elsewhere, which is the distinction that decided the active-profile
+        case too.
+        """
+        out = []
+        cached = getattr(self, "_rival_pins", None)
+        if not cached:
+            return out
+        for enabled_key, list_key, prop, off_value in self._PIN_PROPERTIES:
+            if prop not in self._ELIMINATION_PINS:
+                continue
+            if settings.get(enabled_key):
+                continue
+            for rival_uuid, pins in cached.items():
+                if not pins.get(prop):
+                    continue
+                # Already queued by the tracked-list walk; doing it twice
+                # would spend the same cooldown on the same profile.
+                if rival_uuid in settings.get(list_key, []):
+                    continue
+                # Optimistic: the next duplicate check re-reads the profile,
+                # so a write that failed comes back rather than being
+                # retried every poll from a cache that cannot learn.
+                pins[prop] = ""
+                out.append({
+                    "kind": "pin_cleanup", "uuid": rival_uuid,
+                    "property": prop, "list_key": list_key,
+                    "off_value": off_value,
+                })
+                break
+        return out
 
     @staticmethod
     def _nmcli_fields(line: str) -> list[str]:
@@ -2533,6 +2613,12 @@ class Plugin:
                 self._dup_conflict = bool(
                     rivals and any(km and km != mine for _u, km in rivals)
                 )
+                # Read on the same throttle as the duplicate check itself.
+                # These profiles are not the active one, so nothing else in
+                # the poll has looked at what is written to them.
+                self._rival_pins = {
+                    other: self._profile_pins(other) for other, _km in rivals
+                }
                 if self._dup_conflict:
                     self._log_throttled(
                         "duplicate_profiles",
@@ -2549,6 +2635,7 @@ class Plugin:
                     settings, uuid, "band_preference_uuids", live_band
                 )
             )
+            actions.extend(self._propose_rival_pin_cleanup(settings))
             expected_band = settings.get("band_preference", "a")
             # Only on the network the preference was set on. Enforcing it
             # everywhere writes a band into profiles for networks that may not
