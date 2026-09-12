@@ -166,6 +166,11 @@ SYSCTL_PARAMS = {
     "net.ipv4.tcp_slow_start_after_idle": "0",
 }
 
+# The one value the status poll checks to decide whether buffer tuning is
+# still in place. Read from what we apply rather than repeated, so changing
+# the tuning above cannot leave the drift check comparing to the old number.
+TUNED_RMEM_MAX = SYSCTL_PARAMS["net.core.rmem_max"]
+
 # Kernel defaults, restored when buffer tuning is disabled.
 SYSCTL_DEFAULTS = {
     "net.core.rmem_max": "212992",
@@ -2655,6 +2660,114 @@ class Plugin:
         # there is nothing a deadline here could catch that this does not.
         return getattr(self, "_profile_change_depth", 0) > 0
 
+    def _collect_backend_state(self, status: dict):
+        """Whether the WiFi backend can be switched here, and which one is up.
+
+        System-wide, so it is reported whether or not there is a connection -
+        the panel offers the control either way.
+
+        Uses the memoised probe result only. Probing here would fork from the
+        worker thread and write to the instance, which the collector promises
+        not to do; _main warms it at startup instead.
+        """
+        backend_available = (
+            getattr(self, "_steamos_manager_available", False)
+            or self._get_backend_method_cached()
+        )
+        status["live"]["backend_tool_available"] = backend_available
+        if backend_available:
+            status["live"]["wifi_backend"] = self._get_current_backend() or ""
+
+    def _propose_precedence(self, settings: dict, uuid: str,
+                            pending: dict, actions: list):
+        """Decide whether this profile needs to outrank its duplicates.
+
+        NetworkManager keeps several profiles per SSID and, with nothing to
+        separate them, falls back to which was used last - which is how one
+        network comes to behave like two, and why a device lands on 2.4 GHz
+        after a reboot. A higher autoconnect priority on the profile actually
+        in use settles it.
+
+        Arriving on a different profile reopens the question: the flag records
+        that a decision was made for the profile named beside it, so both move
+        together or a new profile inherits the old one's answer.
+
+        The priority itself is computed here, in the worker thread, because
+        deciding it means reading the rival profiles; the handler runs on the
+        event loop and would hold it for the duration.
+        """
+        if uuid and uuid != settings.get("last_connection_uuid"):
+            settings["last_connection_uuid"] = uuid
+            settings["priority_set"] = False
+            pending["last_connection_uuid"] = uuid
+            pending["priority_set"] = False
+
+        if uuid and not settings.get("priority_set"):
+            target = self._precedence_priority(uuid)
+            if target is None:
+                # Already outranks them. Nothing to write, and recording it
+                # stops the next poll asking the same question.
+                pending["priority_set"] = True
+            else:
+                actions.append(
+                    {"kind": "priority", "uuid": uuid, "value": target}
+                )
+
+    def _band_preference_applies_here(self, settings: dict, active_ssid) -> bool:
+        """Whether the band preference is ours to enforce on this network.
+
+        Only on the network it was set on. Enforcing it everywhere writes a
+        band into profiles for networks that may not offer it, which then stop
+        connecting - and the panel gives no sign that is what happened. The
+        address pin is scoped the same way.
+
+        Without a recorded network it is enforced nowhere. That is the same
+        rule the conflict test uses: no record means no scope, not every scope.
+        The SSID is only read once both of those are settled, so a preference
+        that is off costs no subprocess.
+        """
+        if not settings.get("band_preference_enabled"):
+            return False
+        band_ssid = settings.get("band_preference_ssid", "")
+        if not band_ssid:
+            return False
+        return active_ssid() == band_ssid
+
+    def _collect_host_tuning(self, settings: dict, uuid: str, iface: str,
+                             status: dict, actions: list, timeout: int = 5):
+        """Whether the tunings that live on the HOST are still in place.
+
+        The settings above belong to a NetworkManager profile and drift when
+        something rewrites the profile. These three are different: the receive
+        buffers are a kernel value, the queueing discipline is attached to the
+        interface, and the dispatcher is a file on disk - so they are lost to
+        an OS update or a reboot rather than to NetworkManager.
+        """
+        current_rmem = self._run_cmd(
+            ["/usr/bin/sysctl", "-n", "net.core.rmem_max"], timeout=timeout
+        ).get("stdout", "").strip()
+        status["live"]["buffer_tuning_applied"] = current_rmem == TUNED_RMEM_MAX
+        if settings.get("buffer_tuning_enabled") and current_rmem != TUNED_RMEM_MAX:
+            status["drift"]["buffer_tuning"] = True
+
+        cake_active = self._get_cake_status(iface)
+        status["live"]["cake_applied"] = cake_active
+        if settings.get("cake_enabled") and not cake_active:
+            status["drift"]["cake"] = True
+            # Nothing else clears this. Optimize Safe covers the safe tier
+            # only, so without a reassertion here the drift warning stays up
+            # forever with no control that resolves it. The dispatcher already
+            # reapplies CAKE on every reconnect, so doing it here matches
+            # behaviour the user has already opted into.
+            actions.append({"kind": "cake", "uuid": uuid, "iface": iface})
+
+        status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
+        try:
+            with open(ENFORCED_FILE, "r") as f:
+                status["live"]["last_enforced"] = int(f.read().strip())
+        except Exception:
+            status["live"]["last_enforced"] = 0
+
     def _read_addressing(self, iface: str, timeout: int = 5) -> dict:
         """The address and resolvers NetworkManager reports for the device.
 
@@ -2910,17 +3023,7 @@ class Plugin:
                 "external": {},
             }
 
-            # Backend info is system-wide; populate regardless of connection state
-            # Uses the memoised probe result only. Probing here would both
-            # fork from the worker thread and write to the instance, which
-            # this function promises not to do; _main warms it instead.
-            backend_available = (
-                getattr(self, "_steamos_manager_available", False)
-                or self._get_backend_method_cached()
-            )
-            status["live"]["backend_tool_available"] = backend_available
-            if backend_available:
-                status["live"]["wifi_backend"] = self._get_current_backend() or ""
+            self._collect_backend_state(status)
 
             # Leftover pins, proposed BEFORE the not-connected return. A pin
             # we failed to clear is what stops a profile associating, so the
@@ -2946,27 +3049,7 @@ class Plugin:
                 )
                 return status, pending, actions
 
-            # Remember UUID and ensure high autoconnect-priority so NM
-            # prefers this profile over duplicates on boot (fixes 2.4GHz issue)
-            if uuid and uuid != settings.get("last_connection_uuid"):
-                settings["last_connection_uuid"] = uuid
-                settings["priority_set"] = False
-                pending["last_connection_uuid"] = uuid
-                pending["priority_set"] = False
-
-            if uuid and not settings.get("priority_set"):
-                # Favour this profile over its duplicates on boot. Computed
-                # here, in the worker thread, because deciding it needs to
-                # read the rivals and the handler runs on the event loop.
-                target = self._precedence_priority(uuid)
-                if target is None:
-                    # Already outranks them. Nothing to write, and recording
-                    # it stops the next poll asking the same question.
-                    pending["priority_set"] = True
-                else:
-                    actions.append(
-                        {"kind": "priority", "uuid": uuid, "value": target}
-                    )
+            self._propose_precedence(settings, uuid, pending, actions)
 
             # Three decisions below need the active profile's SSID, and two of
             # them often do not run, so it is read on first use and reused.
@@ -3083,19 +3166,8 @@ class Plugin:
             )
             actions.extend(self._propose_rival_pin_cleanup(settings))
             expected_band = settings.get("band_preference", "a")
-            # Only on the network the preference was set on. Enforcing it
-            # everywhere writes a band into profiles for networks that may not
-            # offer it, which then stop connecting - and the panel gives no
-            # sign it is happening. The lock above is scoped the same way.
-            band_ssid = settings.get("band_preference_ssid", "")
-            # Same rule as the conflict test: without a recorded network the
-            # preference is not enforced anywhere.
-            band_scope_ok = bool(band_ssid)
-            if settings.get("band_preference_enabled") and band_ssid:
-                band_scope_ok = active_ssid() == band_ssid
             if (
-                settings.get("band_preference_enabled")
-                and band_scope_ok
+                self._band_preference_applies_here(settings, active_ssid)
                 and live_band != expected_band
             ):
                 status["drift"]["band_preference"] = True
@@ -3104,36 +3176,7 @@ class Plugin:
                     "observed": live_band,
                 })
 
-            # Buffer tuning
-            sysctl_result = self._run_cmd(
-                ["/usr/bin/sysctl", "-n", "net.core.rmem_max"], timeout=T
-            )
-            current_rmem = sysctl_result.get("stdout", "").strip()
-            status["live"]["buffer_tuning_applied"] = current_rmem == "16777216"
-            if settings.get("buffer_tuning_enabled") and current_rmem != "16777216":
-                status["drift"]["buffer_tuning"] = True
-
-            # CAKE QoS
-            cake_active = self._get_cake_status(iface)
-            status["live"]["cake_applied"] = cake_active
-            if settings.get("cake_enabled") and not cake_active:
-                status["drift"]["cake"] = True
-                # Nothing else clears this. Optimize Safe covers the safe tier
-                # only, so without a reassertion here the drift warning stays
-                # up forever with no control that resolves it. The dispatcher
-                # already reapplies CAKE on every reconnect, so doing it here
-                # matches behaviour the user has already opted into.
-                actions.append({"kind": "cake", "uuid": uuid, "iface": iface})
-
-            # Dispatcher
-            status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
-
-            # Last enforced by dispatcher
-            try:
-                with open(ENFORCED_FILE, "r") as f:
-                    status["live"]["last_enforced"] = int(f.read().strip())
-            except Exception:
-                status["live"]["last_enforced"] = 0
+            self._collect_host_tuning(settings, uuid, iface, status, actions, T)
 
             return status, pending, actions
         except Exception as e:
