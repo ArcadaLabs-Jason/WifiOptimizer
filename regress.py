@@ -686,5 +686,67 @@ asyncio.run(g3.set_bssid_lock(True))
 ok(g3.pinned.upper() == "02:00:00:00:00:51",
    "so a once-refused access point can be tried again later")
 
+section("one network saved twice, disagreeing about security")
+
+# NetworkManager keeps several profiles for one SSID happily, and with equal
+# priority has no basis to prefer any. When they differ in security each can
+# reach a DIFFERENT set of access points, so which one it picks decides what
+# is even reachable. Measured on a real device: sae and wpa-psk side by side.
+class Dup(Connected):
+    def __init__(self, rivals):
+        super().__init__()
+        self.rivals = rivals   # {uuid: (name, ssid, key_mgmt)}
+        self.listings = 0
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        j = " ".join(cmd)
+        if "UUID,NAME,TYPE" in j:
+            self.listings += 1
+            rows = [f"{U}:Net:802-11-wireless"]
+            rows += [f"{u}:{v[0]}:802-11-wireless" for u, v in self.rivals.items()]
+            return {"success":True,"stdout":"\n".join(rows),"stderr":"","returncode":0}
+        if "802-11-wireless-security.key-mgmt" in j:
+            for u, v in self.rivals.items():
+                if u in cmd: return {"success":True,
+                    "stdout":f"802-11-wireless-security.key-mgmt:{v[2]}",
+                    "stderr":"","returncode":0}
+            return {"success":True,"stdout":"802-11-wireless-security.key-mgmt:sae",
+                    "stderr":"","returncode":0}
+        if "802-11-wireless.ssid" in j:
+            for u, v in self.rivals.items():
+                if u in cmd: return {"success":True,
+                    "stdout":f"802-11-wireless.ssid:{v[1]}","stderr":"","returncode":0}
+            return {"success":True,"stdout":"802-11-wireless.ssid:Net",
+                    "stderr":"","returncode":0}
+        return super()._run_cmd(cmd, timeout, clean_env)
+    def _nmcli_modify(self, *a, **k):
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+m._save_settings(dict(base_ap))
+d = Dup({"bbbbbbbb-0000-0000-0000-000000000001": ("Net", "Net", "wpa-psk")})
+st = asyncio.run(d.get_status())
+ok(st.get("external", {}).get("duplicate_profiles") is True,
+   "a second copy with different security is reported")
+
+# A duplicate that AGREES is not this problem and must not be cried wolf over.
+m._save_settings(dict(base_ap))
+d = Dup({"bbbbbbbb-0000-0000-0000-000000000001": ("Net", "Net", "sae")})
+st = asyncio.run(d.get_status())
+ok(not st.get("external", {}).get("duplicate_profiles"),
+   "a copy that agrees about security is not reported")
+
+# A different network that happens to share nothing must not count.
+m._save_settings(dict(base_ap))
+d = Dup({"bbbbbbbb-0000-0000-0000-000000000001": ("Elsewhere", "Elsewhere", "wpa-psk")})
+st = asyncio.run(d.get_status())
+ok(not st.get("external", {}).get("duplicate_profiles"),
+   "another network is not mistaken for a duplicate")
+
+# It must not re-enumerate every poll.
+m._save_settings(dict(base_ap))
+d = Dup({"bbbbbbbb-0000-0000-0000-000000000001": ("Net", "Net", "wpa-psk")})
+asyncio.run(d.get_status()); first = d.listings
+asyncio.run(d.get_status()); asyncio.run(d.get_status())
+ok(d.listings == first, "the check is throttled rather than run every poll")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

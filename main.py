@@ -1987,6 +1987,49 @@ class Plugin:
             return False
         return int(found.group(1)) >= self._STRONG_ENOUGH_DBM
 
+    # Looking for duplicate saved copies of a network costs a few nmcli calls,
+    # so it is not worth doing on every status poll.
+    _DUPLICATE_CHECK_SECONDS = 300
+
+    def _rival_profiles(self, uuid: str, ssid: str) -> list[tuple[str, str]]:
+        """Other saved profiles for the same network: (uuid, key_mgmt).
+
+        NetworkManager will happily keep several profiles for one SSID, and
+        with equal autoconnect priority it has no basis to prefer any of them.
+        When they differ in security that is not a tidiness problem: each can
+        reach a DIFFERENT SET of access points, so which one NM happens to
+        pick decides whether the strong access point is even a candidate. To
+        the user that looks like connecting to the good one and then falling
+        back, and like being erratic in one room and fine everywhere else.
+
+        Listed by NAME first, which costs one call, because duplicates of one
+        network almost always share it. The SSID is then confirmed per
+        candidate rather than trusted, since a name is only a label.
+        """
+        listing = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "UUID,NAME,TYPE", "con", "show"],
+            timeout=5,
+        )
+        if not listing["success"]:
+            return []
+        mine = ""
+        rows = []
+        for line in listing.get("stdout", "").split("\n"):
+            parts = self._nmcli_fields(line)
+            if len(parts) < 3 or parts[2] != "802-11-wireless":
+                continue
+            rows.append((parts[0], parts[1]))
+            if parts[0] == uuid:
+                mine = parts[1]
+        out = []
+        for other, name in rows:
+            if other == uuid or name != mine:
+                continue
+            if self._get_profile_ssid(other, timeout=3) != ssid:
+                continue
+            out.append((other, self._profile_key_mgmt(other)))
+        return out
+
     def _recent_ap_failures(self, settings: dict) -> set:
         """Access points that refused an association recently.
 
@@ -2470,6 +2513,37 @@ class Plugin:
             band_out = band_result.get("stdout", "")
             live_band = band_out.split(":", 1)[1].strip() if ":" in band_out else ""
             status["live"]["band"] = live_band
+
+            # Several saved copies of one network, disagreeing about security,
+            # is a condition the user cannot see and cannot diagnose, and it
+            # makes everything else here look intermittent. Throttled: this
+            # costs a few nmcli calls and nothing about it changes quickly.
+            now = time.monotonic()
+            if (
+                now - getattr(self, "_dup_checked_at", 0.0)
+                > self._DUPLICATE_CHECK_SECONDS
+                or getattr(self, "_dup_checked_for", None) != uuid
+            ):
+                self._dup_checked_at = now
+                self._dup_checked_for = uuid
+                if active_ssid is None:
+                    active_ssid = self._get_profile_ssid(uuid, timeout=T)
+                mine = self._profile_key_mgmt(uuid)
+                rivals = self._rival_profiles(uuid, active_ssid or "")
+                self._dup_conflict = bool(
+                    rivals and any(km and km != mine for _u, km in rivals)
+                )
+                if self._dup_conflict:
+                    self._log_throttled(
+                        "duplicate_profiles",
+                        f"This network is saved more than once with different "
+                        f"security ({mine} here, "
+                        f"{', '.join(km for _u, km in rivals if km)} elsewhere); "
+                        f"which copy NetworkManager picks changes which access "
+                        f"points are reachable",
+                    )
+            if getattr(self, "_dup_conflict", False):
+                status["external"]["duplicate_profiles"] = True
             actions.extend(
                 self._propose_active_pin_cleanup(
                     settings, uuid, "band_preference_uuids", live_band

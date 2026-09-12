@@ -596,6 +596,18 @@ function Content() {
         </Banner>
       )}
 
+      {/* Several saved copies of this network, disagreeing about security.
+          Worth saying plainly: it is not something the plugin can fix, and it
+          makes every other symptom look intermittent. */}
+      {status?.external?.duplicate_profiles && (
+        <Banner variant="warning" icon="⚠">
+          This network is saved more than once with different security
+          settings. Which copy is used decides which access points can be
+          reached, so the connection may look inconsistent. Forgetting the
+          network and rejoining it once will leave a single copy.
+        </Banner>
+      )}
+
       {/* Drift alert */}
       {connected && !!s?.last_applied && driftCount > 0 && (
         <Banner variant="warning" icon="⚠">
