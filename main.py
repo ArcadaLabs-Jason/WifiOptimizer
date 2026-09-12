@@ -1719,6 +1719,170 @@ class Plugin:
             "property": prop, "list_key": list_key,
         }]
 
+    @staticmethod
+    def _nmcli_fields(line: str) -> list[str]:
+        """Split one `nmcli -t` line on its UNESCAPED colons, unescaping as it goes.
+
+        Terse output escapes a colon inside a value as `\\:`, and both SSIDs and
+        BSSIDs contain them - a BSSID is nothing but colons. Splitting on a bare
+        ":" therefore shreds every MAC address into six fields.
+        """
+        out, cur, esc = [], "", False
+        for ch in line:
+            if esc:
+                cur += ch
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == ":":
+                out.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        out.append(cur)
+        return out
+
+    # How much stronger another access point must be before locking prefers it
+    # over the one we are on. nmcli reports signal as 0-100 quality, and the
+    # gap that prompted this was 45 against 100. Twenty points is well clear of
+    # the few-point drift between consecutive scans, so the lock only moves
+    # when the difference is real.
+    _AP_UPGRADE_MARGIN = 20
+
+    def _visible_access_points(
+        self, iface: str, ssid: str
+    ) -> list[tuple[str, int, int]]:
+        """(bssid, signal, freq_mhz) for this network's visible APs, best first.
+
+        Ordered by signal, then by 5 GHz over 2.4 GHz where the signal is
+        equal. That tie-break is deliberate: a mesh commonly advertises both
+        bands of the same node at full strength, and this plugin exists for
+        game streaming, where the quieter, faster band is the better of two
+        otherwise equal choices.
+
+        BSSIDs come back upper-case from nmcli and lower-case from iw, so they
+        are normalised here and every comparison against them must be too.
+        """
+        if not ssid:
+            return []
+        scan = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "SSID,BSSID,SIGNAL,FREQ", "dev",
+             "wifi", "list", "ifname", iface],
+            timeout=5,
+        )
+        if not scan["success"]:
+            return []
+        want = ssid.replace("\\", "")
+        found: list[tuple[str, int, int]] = []
+        for line in scan.get("stdout", "").split("\n"):
+            parts = self._nmcli_fields(line)
+            if len(parts) < 4:
+                continue
+            name, bssid, signal, freq = parts[0], parts[1], parts[2], parts[3]
+            if name != want or not bssid:
+                continue
+            found_freq = re.match(r"\s*(\d+)", freq.strip())
+            try:
+                found.append((
+                    bssid.upper(),
+                    int(signal),
+                    int(found_freq.group(1)) if found_freq else 0,
+                ))
+            except ValueError:
+                continue
+        found.sort(key=lambda ap: (ap[1], ap[2] >= 5000), reverse=True)
+        return found
+
+    async def _await_association(self, iface: str) -> dict:
+        """Poll iw until the link reports an access point, or the budget runs out.
+
+        Returns {"iface", "bssid", "link", "error"}. The interface comes back
+        because a radio cycle can rename it, and the caller must go on using
+        the name that answered rather than the one it started with.
+
+        This awaits rather than blocking: half a minute of blocked event loop
+        would freeze the whole panel. Callers must hold the reconciliation
+        guard across it, since a status poll can now run in the middle.
+        """
+        deadline = time.monotonic() + self._ASSOCIATION_WAIT_SECONDS
+        link_out = ""
+        bssid = ""
+        read_error = ""
+        while True:
+            link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+            if link_result["success"]:
+                read_error = ""
+                link_out = link_result.get("stdout", "")
+                for line in link_out.split("\n"):
+                    if "Connected to" in line:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            bssid = parts[2]
+                        break
+            else:
+                # A command that FAILED is not an interface that has not
+                # associated yet. Reporting it as "still reconnecting" sends
+                # the user off to wait for something that is never going to
+                # arrive, and buries the real error - which is how a missing
+                # binary or a wedged iw presented as a BSSID that could not
+                # be read.
+                read_error = (
+                    link_result.get("stderr", "")
+                    or f"iw exited {link_result.get('returncode')}"
+                )
+                # A missing binary is the one failure that cannot heal, so
+                # waiting out the full budget only delays the report.
+                # Everything else can: a radio cycle can take the interface
+                # away underneath us, and the re-resolve below recovers.
+                if "Command not found" in read_error:
+                    break
+            if bssid or time.monotonic() >= deadline:
+                break
+            iface = self._get_wifi_interface() or iface
+            await asyncio.sleep(0.5)
+        return {
+            "iface": iface, "bssid": bssid,
+            "link": link_out, "error": read_error,
+        }
+
+    def _preferred_access_point(
+        self, iface: str, ssid: str, current: str, settings: dict
+    ) -> tuple[str, int, int] | None:
+        """The AP worth moving to, or None to stay where we are.
+
+        The lock pins whichever access point you happen to be on. On a mesh
+        that is often not the one you want - a handheld carried between rooms
+        keeps a distant node long after a much closer one appears - and pinning
+        it turns a passing bad choice into a permanent one. So the lock looks
+        first, and only moves when the difference is worth a reconnect.
+
+        A band preference, when set, is a constraint and not a suggestion:
+        choosing an access point on the other band would write a profile whose
+        band and address contradict, which is the one state that stops it
+        associating at all.
+        """
+        aps = self._visible_access_points(iface, ssid)
+        if not aps:
+            return None
+        if settings.get("band_preference_enabled") and settings.get(
+            "band_preference_ssid"
+        ) == ssid:
+            want_5 = settings.get("band_preference") == "a"
+            aps = [ap for ap in aps if (ap[2] >= 5000) == want_5]
+            if not aps:
+                return None
+        best = aps[0]
+        if best[0] == current.upper():
+            return None
+        here = next((ap for ap in aps if ap[0] == current.upper()), None)
+        # Unknown current signal means the scan cannot see what we are on, so
+        # there is nothing to compare and no case for moving.
+        if here is None:
+            return None
+        if best[1] - here[1] < self._AP_UPGRADE_MARGIN:
+            return None
+        return best
+
     def _band_is_reachable(self, iface: str, uuid: str, want: str) -> bool:
         """Whether this network has a visible AP on the wanted band.
 
@@ -2288,47 +2452,9 @@ class Plugin:
                 # inside it; the reconciliation guard held across this call
                 # buys the same thing, by stopping a poll re-pointing the
                 # lock while the change is in flight.
-                deadline = time.monotonic() + self._ASSOCIATION_WAIT_SECONDS
-                link_out = ""
-                bssid = ""
-                read_error = ""
-                while True:
-                    link_result = self._run_cmd(
-                        ["/usr/bin/iw", "dev", iface, "link"]
-                    )
-                    if link_result["success"]:
-                        read_error = ""
-                        link_out = link_result.get("stdout", "")
-                        for line in link_out.split("\n"):
-                            if "Connected to" in line:
-                                parts = line.split()
-                                if len(parts) >= 3:
-                                    bssid = parts[2]
-                                break
-                    else:
-                        # A command that FAILED is not an interface that has
-                        # not associated yet. Reporting it as "still
-                        # reconnecting" sends the user off to wait for
-                        # something that is never going to arrive, and buries
-                        # the real error - which is how a missing binary or a
-                        # wedged iw presented as a BSSID that could not be
-                        # read.
-                        read_error = (
-                            link_result.get("stderr", "")
-                            or f"iw exited {link_result.get('returncode')}"
-                        )
-                        # A missing binary is the one failure that cannot
-                        # heal, so waiting out the full budget only delays
-                        # the report. Everything else can: a radio cycle can
-                        # take the interface away underneath us, and the
-                        # re-resolve below is what recovers from that.
-                        if "Command not found" in read_error:
-                            break
-                    if bssid or time.monotonic() >= deadline:
-                        break
-                    # Re-resolve: a cycle can bring the interface back renamed.
-                    iface = self._get_wifi_interface() or iface
-                    await asyncio.sleep(0.5)
+                assoc = await self._await_association(iface)
+                iface, bssid = assoc["iface"], assoc["bssid"]
+                link_out, read_error = assoc["link"], assoc["error"]
 
                 if not bssid:
                     if read_error:
@@ -2430,7 +2556,22 @@ class Plugin:
                             ),
                         }
 
-                result = self._nmcli_modify(uuid, "802-11-wireless.bssid", bssid)
+                # Look before pinning. Locking whichever access point we
+                # happen to be on is how a passing bad choice becomes a
+                # permanent one, and on a mesh that is the common case rather
+                # than the corner one.
+                moved_to = self._preferred_access_point(
+                    iface, active_ssid or "", bssid, _load_settings()
+                )
+                chosen = moved_to[0] if moved_to else bssid
+                if moved_to:
+                    decky.logger.info(
+                        f"Locking to {chosen} (signal {moved_to[1]}) rather "
+                        f"than {bssid}, which this network also offers more "
+                        f"strongly elsewhere"
+                    )
+
+                result = self._nmcli_modify(uuid, "802-11-wireless.bssid", chosen)
                 if not result["success"]:
                     return {
                         "success": False,
@@ -2441,7 +2582,7 @@ class Plugin:
 
                 settings = _load_settings()
                 settings["bssid_lock_enabled"] = True
-                settings["bssid_lock_value"] = bssid
+                settings["bssid_lock_value"] = chosen
                 settings["bssid_lock_connection_uuid"] = uuid
                 known = list(settings.get("bssid_lock_uuids", []))
                 if uuid not in known:
@@ -2452,6 +2593,36 @@ class Plugin:
                 _save_settings_with_timestamp(settings)
                 if not self._hard_reconnect(uuid):
                     return dict(self._RADIO_OFF_RESULT)
+
+                if moved_to:
+                    # Moving is the one path that can strand the user: the
+                    # access point we pinned was visible in a scan, which is
+                    # not the same as being associable. If it did not take,
+                    # put back the one they were demonstrably on rather than
+                    # leaving a profile pinned to somewhere unreachable.
+                    landed = await self._await_association(iface)
+                    iface = landed["iface"]
+                    if landed["bssid"].upper() != chosen.upper():
+                        decky.logger.error(
+                            f"Could not associate to {chosen} after moving "
+                            f"the lock; restoring {bssid}"
+                        )
+                        self._nmcli_modify(uuid, "802-11-wireless.bssid", bssid)
+                        restored = _load_settings()
+                        restored["bssid_lock_value"] = bssid
+                        _save_settings_with_timestamp(restored)
+                        if not self._hard_reconnect(uuid):
+                            return dict(self._RADIO_OFF_RESULT)
+                        return {
+                            "success": True,
+                            "bssid_locked": True,
+                            "reconnected": True,
+                            "message": (
+                                "Locked to the access point you were already "
+                                "on. A stronger one is in range but could not "
+                                "be reached."
+                            ),
+                        }
             else:
                 # Disabling works on saved profiles - no active WiFi needed
                 iface, uuid, _ = self._require_wifi()
