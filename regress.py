@@ -101,11 +101,56 @@ ok(calls and "bssid_lock" not in st["drift"], "normal re-point applies and clear
 section("purity: collector must not mutate")
 import ast
 tree = ast.parse(open("main.py").read())
+
+# Follow the calls, not just the one body. The collector runs in a worker
+# thread and promises to PROPOSE writes rather than make them, and that
+# promise is what lets get_status apply them on the event loop where they are
+# serialized against the setters. Checking only _collect_status's own body
+# made the check weaker every time a block moved into a helper: the property
+# would still be asserted and no longer be tested.
+_FUNCS = {}
 for n in ast.walk(tree):
-    if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name=="_collect_status":
-        body = ast.dump(n)
-        ok("_save_settings" not in body, "_collect_status does not save settings")
-        ok("_nmcli_modify" not in body, "_collect_status does not modify NM")
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        _FUNCS.setdefault(n.name, n)
+
+def _callees(node):
+    """Everything this function calls as self._x(...) or as a bare name."""
+    out = set()
+    for c in ast.walk(node):
+        if not isinstance(c, ast.Call):
+            continue
+        f = c.func
+        if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id == "self"):
+            out.add(f.attr)
+        elif isinstance(f, ast.Name):
+            out.add(f.id)
+    return out
+
+def _reaches(root, targets):
+    """The call chain from root to any forbidden name, or [] if there is none."""
+    seen, queue = set(), [(root, [root])]
+    while queue:
+        name, path = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in targets:
+            return path
+        node = _FUNCS.get(name)
+        if node is None:
+            continue
+        for callee in sorted(_callees(node)):
+            queue.append((callee, path + [callee]))
+    return []
+
+for targets, label in [
+    (("_save_settings", "_save_settings_with_timestamp"), "save settings"),
+    (("_nmcli_modify",), "modify NM"),
+]:
+    chain = _reaches("_collect_status", targets)
+    ok(not chain, f"_collect_status does not {label}"
+                  + (f" (via {' -> '.join(chain)})" if chain else ""))
 
 section("lifecycle: nothing raises")
 async def life():
@@ -1183,6 +1228,213 @@ ok(Scan(["My\\:Net:5745 MHz"], ssid="Other")._band_is_reachable("wlan0", "u", "a
 ok(Scan(["Net:4980 MHz"])._band_is_reachable("wlan0", "u", "a") is False
    and Scan(["Net:5000 MHz"])._band_is_reachable("wlan0", "u", "a") is True,
    "the 5 GHz boundary is applied at 5000 MHz")
+
+section("turning the lock off clears it from every profile that carries it")
+
+# This whole branch had NO coverage. It is the undo for a feature that writes
+# to more than one profile: the lock follows whichever copy NetworkManager
+# actually uses, so over time the address may have been written to several.
+# A copy left pinned to an access point nobody is honouring will fail to
+# associate if NM ever picks it again, and no control would clear it - which
+# is the stranding shape of issue #6, arrived at from the other direction.
+LIVE_U  = "dddddddd-0000-0000-0000-00000000000a"
+STALE_U = "dddddddd-0000-0000-0000-00000000000b"
+GONE_U  = "dddddddd-0000-0000-0000-00000000000c"
+
+class Unlock(m.Plugin):
+    """The lock being turned off, over profiles that may refuse the write."""
+    def __init__(self, refuse=(), missing=()):
+        super().__init__()
+        self.refuse = set(refuse)
+        self.missing = set(missing)
+        self.modifies = []
+    def _get_wifi_interface(self): return "wlan0"
+    def _get_active_connection_uuid(self): return LIVE_U
+    def _hard_reconnect(self, uuid=None): return True
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.modifies.append((uuid, key, value))
+        if uuid in self.missing:
+            return {"success":False,"stdout":"",
+                    "stderr":"Error: unknown connection '%s'." % uuid,
+                    "returncode":10}
+        if uuid in self.refuse:
+            return {"success":False,"stdout":"","stderr":"permission denied",
+                    "returncode":1}
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+def locked_on(*uuids, **extra):
+    s = {**base_ap, "bssid_lock_enabled": True, "bssid_lock_value": "02:00:00:00:00:11",
+         "bssid_lock_connection_uuid": LIVE_U, "bssid_lock_uuids": list(uuids),
+         "last_connection_uuid": LIVE_U}
+    s.update(extra)
+    return s
+
+def unpinned(d, uuid):
+    return (uuid, "802-11-wireless.bssid", "") in d.modifies
+
+m._save_settings(locked_on(LIVE_U))
+d = Unlock()
+res = asyncio.run(d.set_bssid_lock(False))
+ok(res.get("success") is True, "turning the lock off succeeds")
+ok(unpinned(d, LIVE_U), "the address is cleared from the profile in use")
+after = m._load_settings()
+ok(after.get("bssid_lock_enabled") is False and after.get("bssid_lock_value") == "",
+   "and the setting stops claiming a lock is held")
+ok(after.get("bssid_lock_connection_uuid") == "",
+   "and stops naming a profile it is held on")
+
+# The point of the branch: the copies we are NOT on are cleared too.
+m._save_settings(locked_on(LIVE_U, STALE_U))
+d = Unlock()
+asyncio.run(d.set_bssid_lock(False))
+ok(unpinned(d, STALE_U), "a stale copy is cleared as well")
+ok(m._load_settings().get("bssid_lock_uuids") == [],
+   "and nothing is left on the list once every copy is clear")
+
+# The profile the lock was last held on is cleared even when the list has lost
+# it - it is the one reference to a profile that would otherwise stay pinned.
+m._save_settings(locked_on(LIVE_U, bssid_lock_connection_uuid=STALE_U))
+d = Unlock()
+asyncio.run(d.set_bssid_lock(False))
+ok(unpinned(d, STALE_U),
+   "the profile last recorded as locked is cleared even if the list forgot it")
+
+# A profile that is merely gone is resolved, not failed. Keeping it on the
+# list would retry a write against a profile that no longer exists forever.
+m._save_settings(locked_on(LIVE_U, GONE_U))
+d = Unlock(missing=[GONE_U])
+asyncio.run(d.set_bssid_lock(False))
+ok(m._load_settings().get("bssid_lock_uuids") == [],
+   "a profile that no longer exists is dropped from the list")
+
+# Anything else is still pinned, so the record of it has to survive - drop it
+# and nothing can ever clear that profile again.
+m._save_settings(locked_on(LIVE_U, STALE_U))
+d = Unlock(refuse=[STALE_U])
+asyncio.run(d.set_bssid_lock(False))
+ok(m._load_settings().get("bssid_lock_uuids") == [STALE_U],
+   "a copy that refused the write is kept, because it is still pinned")
+
+# Disabling works with no active connection: the pin lives on a saved profile
+# and being unable to associate is the likeliest reason to be turning it off.
+m._save_settings(locked_on(LIVE_U))
+class UnlockOffline(Unlock):
+    def _get_active_connection_uuid(self): return None
+d = UnlockOffline()
+res = asyncio.run(d.set_bssid_lock(False))
+ok(res.get("success") is True and unpinned(d, LIVE_U),
+   "the lock can be turned off while disconnected")
+
+section("CAKE is reasserted when it drifts")
+
+# The applier had NO coverage. It is the one action that loads a kernel module
+# and runs three subprocesses, on the event loop, and the reason it gives up
+# after a few failures is that a kernel without sch_cake would otherwise
+# block every other call every few seconds forever.
+class Cake(m.Plugin):
+    def __init__(self, tc_ok=True):
+        super().__init__()
+        self.tc_ok = tc_ok
+        self.ran = []
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        self.ran.append(list(cmd))
+        if "qdisc" in cmd and "replace" in cmd:
+            return {"success":self.tc_ok,"stdout":"","stderr":"no such qdisc",
+                    "returncode":0 if self.tc_ok else 2}
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+def cake_action():
+    return [{"kind":"cake","uuid":"u1","iface":"wlan0"}]
+
+def ran_any(d, *needles):
+    return any(all(n in cmd for n in needles) for cmd in d.ran)
+
+m._save_settings({**m.DEFAULT_SETTINGS, "cake_enabled":True})
+d = Cake()
+st = {"live":{},"drift":{"cake":True}}
+d._apply_status_actions(st, {}, cake_action())
+ok(ran_any(d, "qdisc", "replace", "cake"), "the qdisc is replaced")
+ok(ran_any(d, "txqueuelen"), "and the queue length is raised with it")
+ok(st["live"].get("cake_applied") is True and "cake" not in st["drift"],
+   "and the panel is told it is back rather than still drifting")
+
+# sch_cake is loaded once per process, not once per poll. modprobe is looked
+# up by absolute path and does not exist on every host this suite runs on, so
+# the lookup is stubbed: without it the load is never attempted here and the
+# check silently tests nothing.
+_real_first_existing = m._first_existing
+m._first_existing = lambda paths: "/usr/bin/modprobe"
+try:
+    m._save_settings({**m.DEFAULT_SETTINGS, "cake_enabled":True})
+    d = Cake()
+    d._apply_status_actions({"live":{},"drift":{"cake":True}}, {}, cake_action())
+    first = sum(1 for c in d.ran if "sch_cake" in c)
+    d._apply_status_actions({"live":{},"drift":{"cake":True}}, {}, cake_action())
+    ok(first == 1 and sum(1 for c in d.ran if "sch_cake" in c) == 1,
+       "the module is loaded once, not on every reassertion")
+finally:
+    m._first_existing = _real_first_existing
+
+# A kernel that cannot do CAKE: the drift flag stands, which is the honest
+# report, and the attempt stops after the limit rather than running forever.
+m._save_settings({**m.DEFAULT_SETTINGS, "cake_enabled":True})
+d = Cake(tc_ok=False)
+for _ in range(d._MAX_REASSERT_FAILURES + 3):
+    st = {"live":{},"drift":{"cake":True}}
+    d._apply_status_actions(st, {}, cake_action())
+ok(st["drift"].get("cake") is True,
+   "a kernel without CAKE keeps the drift flag rather than claiming success")
+ok(sum(1 for c in d.ran if "replace" in c) <= d._MAX_REASSERT_FAILURES,
+   "and the reassertion gives up instead of retrying every poll forever")
+
+# Switched off mid-poll: the drift is dropped, not acted on.
+m._save_settings({**m.DEFAULT_SETTINGS, "cake_enabled":False})
+d = Cake()
+st = {"live":{},"drift":{"cake":True}}
+d._apply_status_actions(st, {}, cake_action())
+ok(not ran_any(d, "qdisc", "replace") and "cake" not in st["drift"],
+   "CAKE turned off mid-poll drops the drift instead of reasserting it")
+
+section("a failed status read still answers with a complete status")
+
+# Nearly uncovered, and the comment on it records a real bug: the panel reads
+# settings, live, drift, connected and version unconditionally, so a bare
+# error dict renders as "not connected" with every toggle off - telling the
+# user their optimizations are gone rather than that the read failed. The
+# support tier was once hardcoded here, which made the panel announce
+# unrecognised hardware because an unrelated read had failed.
+class Broken(m.Plugin):
+    def _get_wifi_interface(self):
+        raise RuntimeError("nmcli went away")
+
+m._save_settings({**base_ap, "power_save_disabled":True, "cake_enabled":True})
+st, pend, acts = Broken()._collect_status()
+ok(st.get("success") is False and st.get("error") == "unexpected",
+   "the failure is reported as a failure")
+for key, kind in [("settings",dict),("live",dict),("drift",dict),
+                  ("external",dict),("connected",bool),("version",str)]:
+    ok(isinstance(st.get(key), kind), f"the panel's {key} is still present")
+ok(st["settings"].get("power_save_disabled") is True,
+   "the user's settings are returned, not defaults - the toggles keep their state")
+ok(st.get("support_tier") == Broken()._get_support_tier(),
+   "the support tier is read rather than guessed, so the hardware is not misreported")
+ok(pend == {} and acts == [],
+   "and nothing is proposed off the back of a read that failed")
+
+# Settings that cannot be read either: still a complete shape, not an
+# exception escaping into the panel.
+class Broken2(Broken):
+    pass
+saved = m.SETTINGS_FILE
+m.SETTINGS_FILE = "/nonexistent/dir/settings.json"
+try:
+    st2, _p, _a = Broken2()._collect_status()
+    ok(st2.get("success") is False and isinstance(st2.get("settings"), dict),
+       "an unreadable settings file still yields a complete status shape")
+finally:
+    m.SETTINGS_FILE = saved
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
