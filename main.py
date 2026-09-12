@@ -1564,244 +1564,303 @@ class Plugin:
 
         for action in actions:
             kind = action["kind"]
-            uuid = action["uuid"]
 
             if kind == "bssid_repoint" and band_conflict(action):
                 continue
 
             if kind == "priority":
-                # `priority_set` is a one-shot flag, so an install that was
-                # already marked done can never revisit the decision. That is
-                # exactly the state every existing install is in, ties and
-                # all, so the duplicate check is allowed to force a recheck.
-                if settings.get("priority_set") and not action.get("force"):
-                    continue
-                if self._reassert_exhausted("priority"):
-                    continue
-                bumped = self._nmcli_modify(
-                    uuid, "connection.autoconnect-priority",
-                    str(action.get("value", self._PRIORITY_BASE)), timeout=2
-                )
-                self._record_reassert("priority", bumped["success"])
-                if bumped["success"]:
-                    pending["priority_set"] = True
-                else:
-                    # Don't record it as done when it wasn't, or the profile
-                    # never gets the priority that stops NM preferring a
-                    # duplicate on boot.
-                    self._log_throttled(
-                        "priority",
-                        f"Couldn't set autoconnect priority on {uuid}: "
-                        f"{bumped.get('stderr', '')[:120]}",
-                    )
-
+                self._apply_priority(action, settings, status, pending)
             elif kind == "ipv6":
-                if not settings.get("ipv6_disabled"):
-                    status["drift"].pop("ipv6", None)
-                    continue
-                if self._reassert_exhausted("ipv6"):
-                    continue
-                healed = self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=2)
-                self._record_reassert("ipv6", healed["success"])
-                self._log_throttled(
-                    "ipv6",
-                    f"IPv6 drifted to {action['observed']!r} on {uuid}, "
-                    f"reasserting disabled: "
-                    f"{'ok' if healed['success'] else 'failed'}",
-                )
-
+                self._apply_ipv6(action, settings, status, pending)
             elif kind == "band":
-                if not settings.get("band_preference_enabled"):
-                    status["drift"].pop("band_preference", None)
-                    continue
-                if settings.get("band_preference") != action["value"]:
-                    status["drift"].pop("band_preference", None)
-                    continue
-                if self._reassert_exhausted("band"):
-                    continue
-                healed = self._nmcli_modify(
-                    uuid, "802-11-wireless.band", action["value"], timeout=2
-                )
-                self._record_reassert("band", healed["success"])
-                if healed["success"]:
-                    known = list(settings.get("band_preference_uuids", []))
-                    if uuid not in known:
-                        known.append(uuid)
-                        pending["band_preference_uuids"] = known[
-                            -self._MAX_TRACKED_LOCK_UUIDS:
-                        ]
-                self._log_throttled(
-                    "band",
-                    f"Band drifted to {action['observed']!r} on {uuid}, "
-                    f"reasserting {action['value']!r}: "
-                    f"{'ok' if healed['success'] else 'failed'}",
-                )
-
+                self._apply_band(action, settings, status, pending)
             elif kind == "cake":
-                if not settings.get("cake_enabled"):
-                    status["drift"].pop("cake", None)
-                    continue
-                # This runs on the event loop, and a kernel without sch_cake
-                # would otherwise retry three subprocesses every three seconds
-                # forever, blocking every other call for as long as it takes.
-                # Give up after a few consecutive failures and leave the drift
-                # flag standing, which is the honest report anyway.
-                if self._reassert_exhausted("cake"):
-                    continue
-                iface = action["iface"]
-                if not getattr(self, "_cake_module_loaded", False):
-                    modprobe = _first_existing(
-                        ["/usr/bin/modprobe", "/usr/sbin/modprobe"]
-                    )
-                    if modprobe:
-                        self._run_cmd([modprobe, "sch_cake"], timeout=2)
-                    self._cake_module_loaded = True
-                applied = self._run_cmd([
-                    "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
-                    "cake", "unlimited", "diffserv4", "nat", "ack-filter",
-                ], timeout=2)
-                self._record_reassert("cake", applied["success"])
-                if applied["success"]:
-                    self._run_cmd(
-                        ["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"],
-                        timeout=2,
-                    )
-                    status["live"]["cake_applied"] = True
-                    status["drift"].pop("cake", None)
-                self._log_throttled(
-                    "cake",
-                    f"CAKE drifted on {iface}, reasserting: "
-                    f"{'ok' if applied['success'] else 'failed'}",
-                )
-
+                self._apply_cake(action, settings, status, pending)
             elif kind == "pin_cleanup":
-                list_key = action["list_key"]
-                prop = action["property"]
-                enabled_key = next(
-                    e for e, l, _, _v in self._PIN_PROPERTIES if l == list_key
-                )
-                # A stranded release is the one case where the feature being
-                # ON is not a reason to leave the value alone - it is the
-                # reason the value is there and the reason we are offline.
-                stranded = bool(action.get("stranded"))
-                if settings.get(enabled_key) and not stranded:
-                    continue
-                # A setter is mid-change on this profile. Today the band
-                # setter writes the pin and saves the flag with no await
-                # between them, so a poll cannot land in that gap and see a
-                # pin whose flag is not saved yet - but cleanup is a SECOND
-                # writer to the same property, and that invariant is one
-                # edit away from not holding. Skipping costs one poll.
-                if self._profile_change_in_flight():
-                    continue
-                if self._reassert_exhausted(f"pin_cleanup:{list_key}"):
-                    continue
-                done = self._nmcli_modify(
-                    uuid, prop, action.get("off_value", ""), timeout=2
-                )
-                detail = done.get("stderr", "")
-                # A profile that no longer exists is resolved, not failed.
-                # Counting it as a failure pushed cleanup into its cooldown
-                # while it was in fact draining the list.
-                resolved = done["success"] or "unknown connection" in detail.lower()
-                self._record_reassert(f"pin_cleanup:{list_key}", resolved)
-                if resolved:
-                    pending[list_key] = [
-                        u for u in settings.get(list_key, []) if u != uuid
-                    ]
-                    off_value = action.get("off_value", "")
-                    if stranded:
-                        # Record the moment, not a bare flag: the panel should
-                        # still be explaining this once WiFi returns, which is
-                        # the only time the user is there to read it.
-                        self._pin_released_at = time.time()
-                        # And say so on THIS poll. The collector reads the
-                        # timestamp before the actions run, so leaving it to
-                        # the next poll would make the release silent at the
-                        # exact moment it happened.
-                        status.setdefault("external", {})["pin_released"] = True
-                        self._log_throttled(
-                            f"pin_release:{list_key}",
-                            f"Released {prop} on {uuid}: the device had been "
-                            f"offline for over "
-                            f"{self._STRANDED_SECONDS}s and this setting was "
-                            f"the most likely reason",
-                        )
-                    else:
-                        self._log_throttled(
-                            f"pin_cleanup:{list_key}",
-                            f"Cleared a leftover {prop} from {uuid}"
-                            if not off_value else
-                            f"Returned {prop} to {off_value} on {uuid}",
-                        )
-                else:
-                    # Move it to the back. Only the head is attempted each
-                    # poll, so one profile that cannot be cleared would
-                    # otherwise keep every other entry from ever being tried.
-                    rest = [u for u in settings.get(list_key, []) if u != uuid]
-                    if rest:
-                        pending[list_key] = rest + [uuid]
-
+                self._apply_pin_cleanup(action, settings, status, pending)
             elif kind == "bssid_repoint":
-                # The lock may have been switched off while this poll was in
-                # flight. Re-pointing then would restore a BSSID the user just
-                # cleared, leaving the profile pinned with the toggle showing
-                # off and nothing left to clear it.
-                if not settings.get("bssid_lock_enabled"):
-                    # The user turned the lock off while this poll was in
-                    # flight. Nothing has drifted; leaving the flag set shows
-                    # a drift warning for a setting that is no longer on.
-                    status["drift"].pop("bssid_lock", None)
-                    continue
-                # A setter is deliberately changing this profile right now.
-                # A band change clears the BSSID on purpose so NM can find an
-                # AP on the other band, and only re-locks once it associates;
-                # writing the old BSSID back mid-flight can leave the profile
-                # demanding a band and an AP that cannot both be satisfied,
-                # which stops it associating at all. The lock setter holds
-                # this too, because it waits for an association across an
-                # await and this is the write that would race it.
-                if self._profile_change_in_flight():
-                    continue
-                if self._reassert_exhausted("bssid_repoint"):
-                    continue
-                retarget = self._nmcli_modify(
-                    uuid, "802-11-wireless.bssid", action["value"], timeout=2
-                )
-                self._record_reassert("bssid_repoint", retarget["success"])
-                if retarget["success"]:
-                    pending["bssid_lock_value"] = action["value"]
-                    known = list(settings.get("bssid_lock_uuids", []))
-                    # Keep the profile we are moving AWAY from. It still
-                    # carries the address we wrote, and overwriting the single
-                    # slot below is the only record of it - drop it here and
-                    # nothing can ever clear that profile again.
-                    previous = settings.get("bssid_lock_connection_uuid", "")
-                    if previous and previous != uuid and previous not in known:
-                        known.append(previous)
-                    pending["bssid_lock_connection_uuid"] = uuid
-                    if uuid not in known:
-                        known.append(uuid)
-                    pending["bssid_lock_uuids"] = known[
-                        -self._MAX_TRACKED_LOCK_UUIDS:
-                    ]
-                    status["live"]["bssid_lock"] = action["value"]
-                    status["drift"].pop("bssid_lock", None)
-                    self._log_throttled(
-                        "bssid_repoint_ok",
-                        f"BSSID lock re-pointed to active profile {uuid} "
-                        f"at {action['value']}",
-                    )
-                else:
-                    self._log_throttled(
-                        "bssid_repoint",
-                        f"Couldn't re-point BSSID lock to {uuid}: "
-                        f"{retarget.get('stderr', '')[:120]}",
-                    )
+                self._apply_bssid_repoint(action, settings, status, pending)
 
         if pending:
             settings.update(pending)
             _save_settings(settings)
+
+    def _apply_priority(self, action: dict, settings: dict, status: dict,
+                        pending: dict):
+        """Give this profile precedence over the other copies of the network.
+
+        `priority_set` is a one-shot flag, so an install already marked done
+        can never revisit the decision on its own - which is the state every
+        existing install is in, ties and all. That is why the duplicate check
+        is allowed to force a recheck.
+
+        Returning early leaves the action undone and the next poll free to
+        propose it again.
+        """
+        uuid = action["uuid"]
+        if settings.get("priority_set") and not action.get("force"):
+            return
+        if self._reassert_exhausted("priority"):
+            return
+        bumped = self._nmcli_modify(
+            uuid, "connection.autoconnect-priority",
+            str(action.get("value", self._PRIORITY_BASE)), timeout=2
+        )
+        self._record_reassert("priority", bumped["success"])
+        if bumped["success"]:
+            pending["priority_set"] = True
+        else:
+            # Don't record it as done when it wasn't, or the profile
+            # never gets the priority that stops NM preferring a
+            # duplicate on boot.
+            self._log_throttled(
+                "priority",
+                f"Couldn't set autoconnect priority on {uuid}: "
+                f"{bumped.get('stderr', '')[:120]}",
+            )
+
+    def _apply_ipv6(self, action: dict, settings: dict, status: dict,
+                    pending: dict):
+        """Put IPv6 back to disabled after something else turned it on.
+
+        Returning early leaves the action undone and the next poll free to
+        propose it again.
+        """
+        uuid = action["uuid"]
+        if not settings.get("ipv6_disabled"):
+            status["drift"].pop("ipv6", None)
+            return
+        if self._reassert_exhausted("ipv6"):
+            return
+        healed = self._nmcli_modify(uuid, "ipv6.method", "disabled", timeout=2)
+        self._record_reassert("ipv6", healed["success"])
+        self._log_throttled(
+            "ipv6",
+            f"IPv6 drifted to {action['observed']!r} on {uuid}, "
+            f"reasserting disabled: "
+            f"{'ok' if healed['success'] else 'failed'}",
+        )
+
+    def _apply_band(self, action: dict, settings: dict, status: dict,
+                    pending: dict):
+        """Write the preferred band back to the profile in use.
+
+        Returning early leaves the action undone and the next poll free to
+        propose it again.
+        """
+        uuid = action["uuid"]
+        if not settings.get("band_preference_enabled"):
+            status["drift"].pop("band_preference", None)
+            return
+        if settings.get("band_preference") != action["value"]:
+            status["drift"].pop("band_preference", None)
+            return
+        if self._reassert_exhausted("band"):
+            return
+        healed = self._nmcli_modify(
+            uuid, "802-11-wireless.band", action["value"], timeout=2
+        )
+        self._record_reassert("band", healed["success"])
+        if healed["success"]:
+            known = list(settings.get("band_preference_uuids", []))
+            if uuid not in known:
+                known.append(uuid)
+                pending["band_preference_uuids"] = known[
+                    -self._MAX_TRACKED_LOCK_UUIDS:
+                ]
+        self._log_throttled(
+            "band",
+            f"Band drifted to {action['observed']!r} on {uuid}, "
+            f"reasserting {action['value']!r}: "
+            f"{'ok' if healed['success'] else 'failed'}",
+        )
+
+    def _apply_cake(self, action: dict, settings: dict, status: dict,
+                    pending: dict):
+        """Put the queueing discipline back on the interface.
+
+        Nothing else clears this drift: Optimize Safe covers the safe tier
+        only, so without a reassertion the warning would stand forever with no
+        control that resolves it.
+
+        Returning early leaves the action undone and the next poll free to
+        propose it again.
+        """
+        uuid = action["uuid"]
+        if not settings.get("cake_enabled"):
+            status["drift"].pop("cake", None)
+            return
+        # This runs on the event loop, and a kernel without sch_cake
+        # would otherwise retry three subprocesses every three seconds
+        # forever, blocking every other call for as long as it takes.
+        # Give up after a few consecutive failures and leave the drift
+        # flag standing, which is the honest report anyway.
+        if self._reassert_exhausted("cake"):
+            return
+        iface = action["iface"]
+        if not getattr(self, "_cake_module_loaded", False):
+            modprobe = _first_existing(
+                ["/usr/bin/modprobe", "/usr/sbin/modprobe"]
+            )
+            if modprobe:
+                self._run_cmd([modprobe, "sch_cake"], timeout=2)
+            self._cake_module_loaded = True
+        applied = self._run_cmd([
+            "/usr/bin/tc", "qdisc", "replace", "dev", iface, "root",
+            "cake", "unlimited", "diffserv4", "nat", "ack-filter",
+        ], timeout=2)
+        self._record_reassert("cake", applied["success"])
+        if applied["success"]:
+            self._run_cmd(
+                ["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"],
+                timeout=2,
+            )
+            status["live"]["cake_applied"] = True
+            status["drift"].pop("cake", None)
+        self._log_throttled(
+            "cake",
+            f"CAKE drifted on {iface}, reasserting: "
+            f"{'ok' if applied['success'] else 'failed'}",
+        )
+
+    def _apply_pin_cleanup(self, action: dict, settings: dict, status: dict,
+                           pending: dict):
+        """Clear one pin we left behind, or release one that is stranding us.
+
+        Returning early leaves the action undone and the next poll free to
+        propose it again.
+        """
+        uuid = action["uuid"]
+        list_key = action["list_key"]
+        prop = action["property"]
+        enabled_key = next(
+            e for e, l, _, _v in self._PIN_PROPERTIES if l == list_key
+        )
+        # A stranded release is the one case where the feature being
+        # ON is not a reason to leave the value alone - it is the
+        # reason the value is there and the reason we are offline.
+        stranded = bool(action.get("stranded"))
+        if settings.get(enabled_key) and not stranded:
+            return
+        # A setter is mid-change on this profile. Today the band
+        # setter writes the pin and saves the flag with no await
+        # between them, so a poll cannot land in that gap and see a
+        # pin whose flag is not saved yet - but cleanup is a SECOND
+        # writer to the same property, and that invariant is one
+        # edit away from not holding. Skipping costs one poll.
+        if self._profile_change_in_flight():
+            return
+        if self._reassert_exhausted(f"pin_cleanup:{list_key}"):
+            return
+        done = self._nmcli_modify(
+            uuid, prop, action.get("off_value", ""), timeout=2
+        )
+        detail = done.get("stderr", "")
+        # A profile that no longer exists is resolved, not failed.
+        # Counting it as a failure pushed cleanup into its cooldown
+        # while it was in fact draining the list.
+        resolved = done["success"] or "unknown connection" in detail.lower()
+        self._record_reassert(f"pin_cleanup:{list_key}", resolved)
+        if resolved:
+            pending[list_key] = [
+                u for u in settings.get(list_key, []) if u != uuid
+            ]
+            off_value = action.get("off_value", "")
+            if stranded:
+                # Record the moment, not a bare flag: the panel should
+                # still be explaining this once WiFi returns, which is
+                # the only time the user is there to read it.
+                self._pin_released_at = time.time()
+                # And say so on THIS poll. The collector reads the
+                # timestamp before the actions run, so leaving it to
+                # the next poll would make the release silent at the
+                # exact moment it happened.
+                status.setdefault("external", {})["pin_released"] = True
+                self._log_throttled(
+                    f"pin_release:{list_key}",
+                    f"Released {prop} on {uuid}: the device had been "
+                    f"offline for over "
+                    f"{self._STRANDED_SECONDS}s and this setting was "
+                    f"the most likely reason",
+                )
+            else:
+                self._log_throttled(
+                    f"pin_cleanup:{list_key}",
+                    f"Cleared a leftover {prop} from {uuid}"
+                    if not off_value else
+                    f"Returned {prop} to {off_value} on {uuid}",
+                )
+        else:
+            # Move it to the back. Only the head is attempted each
+            # poll, so one profile that cannot be cleared would
+            # otherwise keep every other entry from ever being tried.
+            rest = [u for u in settings.get(list_key, []) if u != uuid]
+            if rest:
+                pending[list_key] = rest + [uuid]
+
+    def _apply_bssid_repoint(self, action: dict, settings: dict, status: dict,
+                             pending: dict):
+        """Move the address pin to the profile NetworkManager is actually using.
+
+        Returning early leaves the action undone and the next poll free to
+        propose it again.
+        """
+        uuid = action["uuid"]
+        # The lock may have been switched off while this poll was in
+        # flight. Re-pointing then would restore a BSSID the user just
+        # cleared, leaving the profile pinned with the toggle showing
+        # off and nothing left to clear it.
+        if not settings.get("bssid_lock_enabled"):
+            # The user turned the lock off while this poll was in
+            # flight. Nothing has drifted; leaving the flag set shows
+            # a drift warning for a setting that is no longer on.
+            status["drift"].pop("bssid_lock", None)
+            return
+        # A setter is deliberately changing this profile right now.
+        # A band change clears the BSSID on purpose so NM can find an
+        # AP on the other band, and only re-locks once it associates;
+        # writing the old BSSID back mid-flight can leave the profile
+        # demanding a band and an AP that cannot both be satisfied,
+        # which stops it associating at all. The lock setter holds
+        # this too, because it waits for an association across an
+        # await and this is the write that would race it.
+        if self._profile_change_in_flight():
+            return
+        if self._reassert_exhausted("bssid_repoint"):
+            return
+        retarget = self._nmcli_modify(
+            uuid, "802-11-wireless.bssid", action["value"], timeout=2
+        )
+        self._record_reassert("bssid_repoint", retarget["success"])
+        if retarget["success"]:
+            pending["bssid_lock_value"] = action["value"]
+            known = list(settings.get("bssid_lock_uuids", []))
+            # Keep the profile we are moving AWAY from. It still
+            # carries the address we wrote, and overwriting the single
+            # slot below is the only record of it - drop it here and
+            # nothing can ever clear that profile again.
+            previous = settings.get("bssid_lock_connection_uuid", "")
+            if previous and previous != uuid and previous not in known:
+                known.append(previous)
+            pending["bssid_lock_connection_uuid"] = uuid
+            if uuid not in known:
+                known.append(uuid)
+            pending["bssid_lock_uuids"] = known[
+                -self._MAX_TRACKED_LOCK_UUIDS:
+            ]
+            status["live"]["bssid_lock"] = action["value"]
+            status["drift"].pop("bssid_lock", None)
+            self._log_throttled(
+                "bssid_repoint_ok",
+                f"BSSID lock re-pointed to active profile {uuid} "
+                f"at {action['value']}",
+            )
+        else:
+            self._log_throttled(
+                "bssid_repoint",
+                f"Couldn't re-point BSSID lock to {uuid}: "
+                f"{retarget.get('stderr', '')[:120]}",
+            )
 
     _LOG_THROTTLE_SECONDS = 60
 
