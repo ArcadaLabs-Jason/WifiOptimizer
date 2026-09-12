@@ -1572,5 +1572,38 @@ ok(scope(TWIN, HERE, "Home", {TWIN: None})[0] is False,
 ok(scope(TWIN, HERE, "", {TWIN: ""})[0] is False,
    "two empty SSIDs are not a match")
 
+
+section("no function grows back past what anyone will read")
+
+# A ceiling, not a target. The three functions that used to sit above it -
+# _collect_status at 450 lines, set_bssid_lock at 307, _apply_status_actions at
+# 278 - got there a few lines at a time, with every single addition reasonable
+# on its own. The limit is what makes the next few lines a decision rather than
+# a drift.
+FUNCTION_LINE_LIMIT = 200
+_tree = ast.parse(open("main.py").read())
+
+def _named_functions(node, prefix=""):
+    for n in ast.iter_child_nodes(node):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield prefix + n.name, n.end_lineno - n.lineno + 1
+            yield from _named_functions(n, prefix + n.name + ".")
+        elif isinstance(n, ast.ClassDef):
+            yield from _named_functions(n, prefix + n.name + ".")
+        else:
+            yield from _named_functions(n, prefix)
+
+_sizes = dict(_named_functions(_tree))
+_over = {n: L for n, L in _sizes.items() if L > FUNCTION_LINE_LIMIT}
+ok(not _over, "no function in main.py is over "
+   f"{FUNCTION_LINE_LIMIT} lines" +
+   (f" (over: {', '.join(f'{n} at {L}' for n, L in sorted(_over.items(), key=lambda kv: -kv[1]))})"
+    if _over else ""))
+
+# The collector is the one that matters most: it decides every drift flag and
+# every write the plugin proposes, and it is the function a poll runs.
+ok(_sizes.get("Plugin._collect_status", 999) <= FUNCTION_LINE_LIMIT,
+   "and the status collector in particular stays inside it")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
