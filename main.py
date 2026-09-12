@@ -461,6 +461,12 @@ class Plugin:
     # entry on the event loop, so an unbounded list is an unbounded stall.
     _MAX_TRACKED_LOCK_UUIDS = 16
 
+    # How long the access point lock waits for an association before giving
+    # up. Sized from a measured Deck OLED on wpa_supplicant, where a radio
+    # cycle took 13-24 s to come back and the "NM says active, iw says
+    # nothing" window ran about 20 s.
+    _ASSOCIATION_WAIT_SECONDS = 30.0
+
     # How many times a reassertion may fail before it stops being attempted.
     # Reconciliation runs on the event loop, so an action that can never
     # succeed - a profile NetworkManager will not let us modify, a kernel with
@@ -1548,12 +1554,15 @@ class Plugin:
                     # a drift warning for a setting that is no longer on.
                     status["drift"].pop("bssid_lock", None)
                     continue
+                # A setter is deliberately changing this profile right now.
                 # A band change clears the BSSID on purpose so NM can find an
-                # AP on the other band, and only re-locks once it associates.
-                # Writing the old BSSID back mid-flight can leave the profile
+                # AP on the other band, and only re-locks once it associates;
+                # writing the old BSSID back mid-flight can leave the profile
                 # demanding a band and an AP that cannot both be satisfied,
-                # which stops it associating at all.
-                if self._band_change_in_flight():
+                # which stops it associating at all. The lock setter holds
+                # this too, because it waits for an association across an
+                # await and this is the write that would race it.
+                if self._profile_change_in_flight():
                     continue
                 if self._reassert_exhausted("bssid_repoint"):
                     continue
@@ -1739,11 +1748,15 @@ class Plugin:
         on_5ghz = int(found.group(1)) >= 5000
         return on_5ghz != (settings.get("band_preference") == "a")
 
-    def _band_change_in_flight(self) -> bool:
+    def _profile_change_in_flight(self) -> bool:
+        # True while a setter is deliberately rewriting the active profile -
+        # a band change or an access point lock. Reconciliation must not
+        # "correct" a profile mid-change back to what it used to say.
+        #
         # The count is released in a finally, including on cancellation, and a
         # process that dies mid-change takes the whole instance with it - so
         # there is nothing a deadline here could catch that this does not.
-        return getattr(self, "_band_change_depth", 0) > 0
+        return getattr(self, "_profile_change_depth", 0) > 0
 
     def _collect_status(self) -> tuple[dict, dict, list]:
         # Short timeout for the queries that take one. Note this does not
@@ -2187,6 +2200,13 @@ class Plugin:
             }
 
     async def set_bssid_lock(self, enabled: bool) -> dict:
+        # Held for the whole call. The enable path awaits while it waits for
+        # an association, so a status poll can now land in the middle of this
+        # setter where previously none could - and the one it would run is
+        # exactly the re-point that writes a BSSID to this profile.
+        self._profile_change_depth = getattr(
+            self, "_profile_change_depth", 0
+        ) + 1
         try:
 
             if enabled:
@@ -2199,30 +2219,82 @@ class Plugin:
                 # Turning the lock OFF ends with a radio cycle, so turning it
                 # straight back on arrives while the interface is still
                 # re-associating and there is no "Connected to" line yet - the
-                # user sees "Could not determine current BSSID" for a network
-                # they are plainly on. Blocking sleep on purpose: this setter's
-                # body must stay await-free, which is what keeps it serialized
-                # against status reconciliation.
+                # user sees an error for a network they are plainly on.
+                #
+                # MEASURED on a Deck OLED against wpa_supplicant, from the
+                # NetworkManager journal: getting back to activated after a
+                # radio cycle took 13 s, 13 s and 24 s, and the window where
+                # NM already reports the connection active while iw still has
+                # no "Connected to" line ran about 20 s. A six-second budget
+                # was shorter than every one of those, so it still failed on
+                # the hardware it was written for. wpa_supplicant is the slow
+                # backend to reassociate and it is kept on purpose for
+                # streaming, so this has to cover it rather than avoid it.
+                #
+                # This awaits instead of blocking: half a minute of blocked
+                # event loop would freeze the whole panel. What kept the
+                # blocking version safe was that no status poll could run
+                # inside it; the reconciliation guard held across this call
+                # buys the same thing, by stopping a poll re-pointing the
+                # lock while the change is in flight.
+                deadline = time.monotonic() + self._ASSOCIATION_WAIT_SECONDS
                 link_out = ""
                 bssid = ""
-                for attempt in range(12):
+                read_error = ""
+                while True:
                     link_result = self._run_cmd(
                         ["/usr/bin/iw", "dev", iface, "link"]
                     )
-                    link_out = link_result.get("stdout", "")
-                    for line in link_out.split("\n"):
-                        if "Connected to" in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                bssid = parts[2]
+                    if link_result["success"]:
+                        read_error = ""
+                        link_out = link_result.get("stdout", "")
+                        for line in link_out.split("\n"):
+                            if "Connected to" in line:
+                                parts = line.split()
+                                if len(parts) >= 3:
+                                    bssid = parts[2]
+                                break
+                    else:
+                        # A command that FAILED is not an interface that has
+                        # not associated yet. Reporting it as "still
+                        # reconnecting" sends the user off to wait for
+                        # something that is never going to arrive, and buries
+                        # the real error - which is how a missing binary or a
+                        # wedged iw presented as a BSSID that could not be
+                        # read.
+                        read_error = (
+                            link_result.get("stderr", "")
+                            or f"iw exited {link_result.get('returncode')}"
+                        )
+                        # A missing binary is the one failure that cannot
+                        # heal, so waiting out the full budget only delays
+                        # the report. Everything else can: a radio cycle can
+                        # take the interface away underneath us, and the
+                        # re-resolve below is what recovers from that.
+                        if "Command not found" in read_error:
                             break
-                    if bssid:
+                    if bssid or time.monotonic() >= deadline:
                         break
                     # Re-resolve: a cycle can bring the interface back renamed.
                     iface = self._get_wifi_interface() or iface
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.5)
 
                 if not bssid:
+                    if read_error:
+                        decky.logger.error(
+                            f"BSSID lock: could not read the link on {iface} "
+                            f"- {read_error[:200]}"
+                        )
+                        return {
+                            "success": False,
+                            "error": "nmcli_failed",
+                            "message": "Couldn't read the WiFi link.",
+                            "detail": read_error,
+                        }
+                    decky.logger.info(
+                        f"BSSID lock: {iface} did not associate within "
+                        f"{self._ASSOCIATION_WAIT_SECONDS:.0f}s; not locking"
+                    )
                     return {
                         "success": False,
                         "error": "no_wifi",
@@ -2397,6 +2469,10 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"set_bssid_lock error: {e}")
             return self._unexpected_response(e)
+        finally:
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
+            )
 
     async def set_band_preference(self, enabled: bool, band: str = "a") -> dict:
         try:
@@ -2411,7 +2487,7 @@ class Plugin:
             # behind it as a failsafe; a slow NetworkManager could outlive
             # that deadline and it failed open in exactly the circumstance
             # where reassociation is slowest and the race most likely.
-            self._band_change_depth = getattr(self, "_band_change_depth", 0) + 1
+            self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
 
             if band not in ("a", "bg"):
                 return {
@@ -2581,8 +2657,8 @@ class Plugin:
             decky.logger.error(f"set_band_preference error: {e}")
             return self._unexpected_response(e)
         finally:
-            self._band_change_depth = max(
-                0, getattr(self, "_band_change_depth", 1) - 1
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
             )
 
     async def set_dns(
