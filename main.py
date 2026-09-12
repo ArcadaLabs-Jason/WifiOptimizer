@@ -2655,6 +2655,113 @@ class Plugin:
         # there is nothing a deadline here could catch that this does not.
         return getattr(self, "_profile_change_depth", 0) > 0
 
+    def _read_addressing(self, iface: str, timeout: int = 5) -> dict:
+        """The address and resolvers NetworkManager reports for the device.
+
+        Reported for the panel only, and nothing here drifts: these follow
+        from the connection rather than from any setting of ours.
+        """
+        live = {}
+        # Format: IP4.ADDRESS[1]:192.168.1.100/24
+        ip_out = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "IP4.ADDRESS", "dev", "show", iface],
+            timeout=timeout,
+        ).get("stdout", "")
+        if ":" in ip_out:
+            live["ip_address"] = ip_out.split(":", 1)[1].split("/")[0].strip()
+        live["dns"] = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "IP4.DNS", "dev", "show", iface],
+            timeout=timeout,
+        ).get("stdout", "")
+        return live
+
+    def _classify_ipv6(self, settings: dict, uuid: str, live_ipv6: str,
+                       status: dict, actions: list):
+        """Decide whether the profile's IPv6 state is ours or someone else's.
+
+        OURS and not holding is drift, and gets reasserted. Off when we are not
+        the ones turning it off, with no record of us having done so, is
+        reported as set ELSEWHERE and changed by nothing.
+
+        The address and band pins are cleaned up in that situation and IPv6
+        deliberately is not: nobody sets a BSSID or a band by hand, so a stray
+        one is ours by elimination, but switching IPv6 off is an ordinary thing
+        for someone to have done deliberately. Turning it back on would be
+        this plugin overriding a choice it did not make.
+
+        The distinction matters to the panel's wording too - "drifted" means
+        our setting stopped holding, and saying that here would blame the
+        plugin for a state it did not create and cannot explain.
+        """
+        if settings.get("ipv6_disabled"):
+            if live_ipv6 != "disabled":
+                status["drift"]["ipv6"] = True
+                actions.append({
+                    "kind": "ipv6", "uuid": uuid, "observed": live_ipv6,
+                })
+        elif (
+            live_ipv6 == "disabled"
+            and uuid not in settings.get("ipv6_uuids", [])
+        ):
+            status["external"]["ipv6"] = True
+
+    def _recheck_rival_profiles(self, settings: dict, uuid: str,
+                                active_ssid, actions: list):
+        """Look again at the other saved copies of the network in use.
+
+        Decides two things and records them for the rest of the poll: whether
+        the copies disagree about security, and whether the active profile is
+        still tied with them on autoconnect priority.
+
+        Several saved copies of one network, disagreeing about security, is a
+        condition the user cannot see and cannot diagnose, and it makes
+        everything else here look intermittent.
+
+        Throttled, because it costs a few nmcli calls per rival and nothing
+        about it changes quickly - so the findings are kept on the instance and
+        re-used by the polls in between.
+        """
+        now = time.monotonic()
+        if (
+            now - getattr(self, "_dup_checked_at", 0.0)
+            <= self._DUPLICATE_CHECK_SECONDS
+            and getattr(self, "_dup_checked_for", None) == uuid
+        ):
+            return
+        self._dup_checked_at = now
+        self._dup_checked_for = uuid
+        mine = self._profile_key_mgmt(uuid)
+        rivals = self._rival_profiles(uuid, active_ssid() or "")
+        self._dup_conflict = bool(
+            rivals and any(km and km != mine for _u, km in rivals)
+        )
+        # Read on the same throttle as the duplicate check itself. These
+        # profiles are not the active one, so nothing else in the poll has
+        # looked at what is written to them.
+        self._rival_pins = {
+            other: self._profile_pins(other) for other, _km in rivals
+        }
+        # An install marked done long ago can still be sitting on a tie - and
+        # with duplicates present that tie is what makes one network behave
+        # like two. Reuse the rivals already read here rather than enumerating
+        # them again.
+        if rivals and settings.get("priority_set"):
+            settled = self._precedence_priority(uuid, rivals=rivals)
+            if settled is not None:
+                actions.append({
+                    "kind": "priority", "uuid": uuid,
+                    "value": settled, "force": True,
+                })
+        if self._dup_conflict:
+            self._log_throttled(
+                "duplicate_profiles",
+                f"This network is saved more than once with different "
+                f"security ({mine} here, "
+                f"{', '.join(km for _u, km in rivals if km)} elsewhere); "
+                f"which copy NetworkManager picks changes which access "
+                f"points are reachable",
+            )
+
     def _lock_is_for_this_network(self, settings: dict, uuid: str,
                                  active_ssid: str | None,
                                  timeout: int = 5) -> bool:
@@ -2953,52 +3060,12 @@ class Plugin:
                     # of a network they never asked to lock.
                     status["live"]["bssid_lock_other_network"] = True
 
-            # IP address
-            ip_result = self._run_cmd(
-                ["/usr/bin/nmcli", "-t", "-f", "IP4.ADDRESS", "dev", "show", iface],
-                timeout=T,
-            )
-            ip_out = ip_result.get("stdout", "")
-            # Format: IP4.ADDRESS[1]:192.168.1.100/24
-            if ":" in ip_out:
-                ip_addr = ip_out.split(":", 1)[1].split("/")[0].strip()
-                status["live"]["ip_address"] = ip_addr
-
-            # DNS
-            dns_result = self._run_cmd(
-                ["/usr/bin/nmcli", "-t", "-f", "IP4.DNS", "dev", "show", iface],
-                timeout=T,
-            )
-            status["live"]["dns"] = dns_result.get("stdout", "")
+            status["live"].update(self._read_addressing(iface, timeout=T))
 
             # IPv6
             live_ipv6 = self._read_profile_field(uuid, "ipv6.method", timeout=T)
             status["live"]["ipv6_method"] = live_ipv6
-            if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
-                status["drift"]["ipv6"] = True
-                actions.append({
-                    "kind": "ipv6", "uuid": uuid, "observed": live_ipv6,
-                })
-            elif (
-                not settings.get("ipv6_disabled")
-                and live_ipv6 == "disabled"
-                and uuid not in settings.get("ipv6_uuids", [])
-            ):
-                # The profile has IPv6 off while this plugin says it is not
-                # the one turning it off, and there is no record of us ever
-                # having done so. Report it and change nothing.
-                #
-                # The two pins above are cleaned up in this situation, and
-                # IPv6 deliberately is not: nobody sets a BSSID or a band by
-                # hand, so a stray one is ours by elimination, but switching
-                # IPv6 off is an ordinary thing for someone to have done
-                # deliberately elsewhere. Silently turning it back on would
-                # be this plugin overriding a choice it did not make. The
-                # This is reported as something set ELSEWHERE rather than as
-                # drift. "Drifted" means our setting stopped holding, and
-                # saying that here blames the plugin for a state it did not
-                # create and cannot explain.
-                status["external"]["ipv6"] = True
+            self._classify_ipv6(settings, uuid, live_ipv6, status, actions)
 
             # Band preference
             live_band = self._read_profile_field(
@@ -3006,49 +3073,7 @@ class Plugin:
             )
             status["live"]["band"] = live_band
 
-            # Several saved copies of one network, disagreeing about security,
-            # is a condition the user cannot see and cannot diagnose, and it
-            # makes everything else here look intermittent. Throttled: this
-            # costs a few nmcli calls and nothing about it changes quickly.
-            now = time.monotonic()
-            if (
-                now - getattr(self, "_dup_checked_at", 0.0)
-                > self._DUPLICATE_CHECK_SECONDS
-                or getattr(self, "_dup_checked_for", None) != uuid
-            ):
-                self._dup_checked_at = now
-                self._dup_checked_for = uuid
-                mine = self._profile_key_mgmt(uuid)
-                rivals = self._rival_profiles(uuid, active_ssid() or "")
-                self._dup_conflict = bool(
-                    rivals and any(km and km != mine for _u, km in rivals)
-                )
-                # Read on the same throttle as the duplicate check itself.
-                # These profiles are not the active one, so nothing else in
-                # the poll has looked at what is written to them.
-                self._rival_pins = {
-                    other: self._profile_pins(other) for other, _km in rivals
-                }
-                # An install marked done long ago can still be sitting on a
-                # tie - and with duplicates present that tie is what makes one
-                # network behave like two. Reuse the rivals already read here
-                # rather than enumerating them again.
-                if rivals and settings.get("priority_set"):
-                    settled = self._precedence_priority(uuid, rivals=rivals)
-                    if settled is not None:
-                        actions.append({
-                            "kind": "priority", "uuid": uuid,
-                            "value": settled, "force": True,
-                        })
-                if self._dup_conflict:
-                    self._log_throttled(
-                        "duplicate_profiles",
-                        f"This network is saved more than once with different "
-                        f"security ({mine} here, "
-                        f"{', '.join(km for _u, km in rivals if km)} elsewhere); "
-                        f"which copy NetworkManager picks changes which access "
-                        f"points are reachable",
-                    )
+            self._recheck_rival_profiles(settings, uuid, active_ssid, actions)
             if getattr(self, "_dup_conflict", False):
                 status["external"]["duplicate_profiles"] = True
             actions.extend(
