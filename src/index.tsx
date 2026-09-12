@@ -597,14 +597,18 @@ function Content() {
       )}
 
       {/* Several saved copies of this network, disagreeing about security.
-          Worth saying plainly: it is not something the plugin can fix, and it
-          makes every other symptom look intermittent. */}
+          The old wording here told people to forget the network and rejoin.
+          That throws away their settings and gambles on which security the
+          new copy gets, when the actual problem is only that the copies rank
+          equally. Say what was done instead, and how to choose the other. */}
       {status?.external?.duplicate_profiles && (
         <Banner variant="warning" icon="⚠">
           This network is saved more than once with different security
           settings. Which copy is used decides which access points can be
-          reached, so the connection may look inconsistent. Forgetting the
-          network and rejoining it once will leave a single copy.
+          reached, so the connection can look inconsistent. The copy in use
+          has been given priority, so the choice stays the same from now on.
+          To use the other one instead, connect with it once and it takes
+          priority.
         </Banner>
       )}
 

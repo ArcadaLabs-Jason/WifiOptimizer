@@ -933,5 +933,86 @@ out = d._propose_stranded_pin_release(m._load_settings(), True)
 ok(out == [] and getattr(d, "_offline_since", "unset") is None,
    "reconnecting resets the offline clock")
 
+section("one network saved twice: making NetworkManager's choice deterministic")
+
+# Writing a fixed priority on whichever profile is active looks like it
+# establishes precedence and does the opposite: each copy is active at some
+# point, each gets the same number, and NM is left deciding on last-used
+# timestamp - which flips. Measured on a real device: both copies at 100.
+RIV = "bbbbbbbb-0000-0000-0000-000000000002"
+
+class Prio(Dup):
+    def __init__(self, rivals, priorities):
+        super().__init__(rivals)
+        self.priorities = dict(priorities)
+        self.modifies = []
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        j = " ".join(cmd)
+        if "connection.autoconnect-priority" in j and "show" in j:
+            for u, v in self.priorities.items():
+                if u in cmd:
+                    return {"success":True,
+                            "stdout":f"connection.autoconnect-priority:{v}",
+                            "stderr":"","returncode":0}
+            return {"success":True,"stdout":"connection.autoconnect-priority:0",
+                    "stderr":"","returncode":0}
+        return super()._run_cmd(cmd, timeout, clean_env)
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.modifies.append((uuid, key, value))
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+def prio_writes(d):
+    return [(u, v) for u, k, v in d.modifies
+            if k == "connection.autoconnect-priority"]
+
+ONE_RIVAL = {RIV: ("Net", "Net", "wpa-psk")}
+
+m._save_settings({**base_ap, "priority_set": False})
+d = Prio(ONE_RIVAL, {U: 100, RIV: 100})
+asyncio.run(d.get_status())
+ok(prio_writes(d) == [(U, "101")],
+   "the active profile is raised above a duplicate sharing its priority")
+ok(not any(u == RIV for u, _v in prio_writes(d)),
+   "and the duplicate is read but never written to")
+
+m._save_settings({**base_ap, "priority_set": False})
+d = Prio(ONE_RIVAL, {U: 150, RIV: 100})
+asyncio.run(d.get_status())
+ok(prio_writes(d) == [],
+   "a profile that already outranks its duplicate is left alone")
+
+m._save_settings({**base_ap, "priority_set": False})
+d = Prio({}, {U: 0})
+asyncio.run(d.get_status())
+ok(prio_writes(d) == [(U, "100")],
+   "a network with a single saved copy gets the base priority")
+
+m._save_settings({**base_ap, "priority_set": False})
+d = Prio({}, {U: 100})
+asyncio.run(d.get_status())
+ok(prio_writes(d) == [], "and is not rewritten once it already has it")
+
+# Every existing install is already marked done, ties and all, so the one-shot
+# flag must not be allowed to freeze the tie in place forever.
+# last_connection_uuid must match, or the collector resets the flag and the
+# early path handles it - which is not the state a real install is in.
+m._save_settings({**base_ap, "priority_set": True, "last_connection_uuid": U})
+d = Prio(ONE_RIVAL, {U: 100, RIV: 100})
+asyncio.run(d.get_status())
+ok(prio_writes(d) == [(U, "101")],
+   "an install already marked done still gets a settled tie corrected")
+
+m._save_settings({**base_ap, "priority_set": True, "last_connection_uuid": U})
+d = Prio(ONE_RIVAL, {U: 150, RIV: 100})
+asyncio.run(d.get_status())
+ok(prio_writes(d) == [],
+   "and one that already outranks is still not written to")
+
+m._save_settings({**base_ap, "priority_set": False})
+d = Prio(ONE_RIVAL, {U: 0, RIV: 999})
+asyncio.run(d.get_status())
+ok(prio_writes(d) == [(U, "999")],
+   "the priority never exceeds NetworkManager's ceiling")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

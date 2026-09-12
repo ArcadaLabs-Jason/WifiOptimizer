@@ -1425,12 +1425,17 @@ class Plugin:
                 continue
 
             if kind == "priority":
-                if settings.get("priority_set"):
+                # `priority_set` is a one-shot flag, so an install that was
+                # already marked done can never revisit the decision. That is
+                # exactly the state every existing install is in, ties and
+                # all, so the duplicate check is allowed to force a recheck.
+                if settings.get("priority_set") and not action.get("force"):
                     continue
                 if self._reassert_exhausted("priority"):
                     continue
                 bumped = self._nmcli_modify(
-                    uuid, "connection.autoconnect-priority", "100", timeout=2
+                    uuid, "connection.autoconnect-priority",
+                    str(action.get("value", self._PRIORITY_BASE)), timeout=2
                 )
                 self._record_reassert("priority", bumped["success"])
                 if bumped["success"]:
@@ -2204,6 +2209,59 @@ class Plugin:
             out.append((other, self._profile_key_mgmt(other)))
         return out
 
+    # NetworkManager's ceiling for connection.autoconnect-priority.
+    _PRIORITY_MAX = 999
+    # What a network with a single saved copy gets. Keeping the historical
+    # number means existing installs are not rewritten for no reason.
+    _PRIORITY_BASE = 100
+
+    def _profile_priority(self, uuid: str, timeout: int = 3) -> int:
+        """A profile's autoconnect priority, or 0 if it cannot be read."""
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "connection.autoconnect-priority",
+             "con", "show", "uuid", uuid],
+            timeout=timeout,
+        )
+        if not result["success"]:
+            return 0
+        _, sep, value = result.get("stdout", "").partition(":")
+        if not sep:
+            return 0
+        try:
+            return int(value.strip())
+        except ValueError:
+            return 0
+
+    def _precedence_priority(
+        self, uuid: str, rivals: list | None = None
+    ) -> int | None:
+        """The priority this profile needs in order to actually outrank its
+        duplicates, or None when nothing needs writing.
+
+        Writing a FIXED number on whichever profile is active looks like it
+        establishes precedence and does the opposite. NetworkManager keeps
+        several profiles per SSID and each one is the active profile at some
+        point, so each in turn gets the same number - and the result is the
+        tie we started with, resolved on last-used timestamp, which flips
+        whenever the other copy connects. That is the whole reason one network
+        can behave differently from one hour to the next.
+
+        Only ever raises OUR profile; a rival is read but never written, so
+        this cannot disturb a value somebody else set deliberately. It also
+        converges: once this profile outranks the others NetworkManager stops
+        switching, so nothing bumps again.
+        """
+        mine = self._profile_priority(uuid)
+        if rivals is None:
+            ssid = self._get_profile_ssid(uuid)
+            rivals = self._rival_profiles(uuid, ssid) if ssid else []
+        if not rivals:
+            return None if mine == self._PRIORITY_BASE else self._PRIORITY_BASE
+        highest = max(self._profile_priority(other) for other, _km in rivals)
+        if mine > highest:
+            return None
+        return min(highest + 1, self._PRIORITY_MAX)
+
     def _recent_ap_failures(self, settings: dict) -> set:
         """Access points that refused an association recently.
 
@@ -2479,8 +2537,18 @@ class Plugin:
                 pending["priority_set"] = False
 
             if uuid and not settings.get("priority_set"):
-                # Bump priority to favor this profile over duplicates on boot.
-                actions.append({"kind": "priority", "uuid": uuid})
+                # Favour this profile over its duplicates on boot. Computed
+                # here, in the worker thread, because deciding it needs to
+                # read the rivals and the handler runs on the event loop.
+                target = self._precedence_priority(uuid)
+                if target is None:
+                    # Already outranks them. Nothing to write, and recording
+                    # it stops the next poll asking the same question.
+                    pending["priority_set"] = True
+                else:
+                    actions.append(
+                        {"kind": "priority", "uuid": uuid, "value": target}
+                    )
 
             # Resolved lazily by the blocks below that need it; declared here
             # so every path has it, and None keeps meaning "not established".
@@ -2724,6 +2792,17 @@ class Plugin:
                 self._rival_pins = {
                     other: self._profile_pins(other) for other, _km in rivals
                 }
+                # An install marked done long ago can still be sitting on a
+                # tie - and with duplicates present that tie is what makes one
+                # network behave like two. Reuse the rivals already read here
+                # rather than enumerating them again.
+                if rivals and settings.get("priority_set"):
+                    settled = self._precedence_priority(uuid, rivals=rivals)
+                    if settled is not None:
+                        actions.append({
+                            "kind": "priority", "uuid": uuid,
+                            "value": settled, "force": True,
+                        })
                 if self._dup_conflict:
                     self._log_throttled(
                         "duplicate_profiles",
