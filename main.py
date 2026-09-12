@@ -126,6 +126,10 @@ IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z")
 # NetworkManager connection uuids, as stored in our own settings.
 UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}\Z")
 
+# Access point addresses are read back out of the settings file, which the
+# desktop user owns, before being compared against scan results.
+BSSID_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
+
 # DNS servers are free text from the panel. They are passed to nmcli as a
 # single argument, so there is no shell involved, but the value is stored and
 # replayed later and should be addresses and nothing else.
@@ -199,6 +203,8 @@ DEFAULT_SETTINGS = {
     "dns_enabled": False,
     "ipv6_disabled": False,
     "ipv6_uuids": [],
+    # Access points that accepted a scan but refused an association, and when.
+    "ap_move_failures": {},
     "buffer_tuning_enabled": False,
     "cake_enabled": False,
     "last_connection_uuid": "",
@@ -1772,17 +1778,53 @@ class Plugin:
     # reading; the case this feature exists for sits far below it.
     _STRONG_ENOUGH_DBM = -60
 
-    # How much stronger another access point must be before locking prefers it
-    # over the one we are on. nmcli reports signal as 0-100 quality, and the
-    # gap that prompted this was 45 against 100. Twenty points is well clear of
-    # the few-point drift between consecutive scans, so the lock only moves
-    # when the difference is real.
-    _AP_UPGRADE_MARGIN = 20
+    # Long enough for nmcli to refresh a stale scan cache rather than time out.
+    _SCAN_SECONDS = 15
+
+    # How many scans to average before deciding anything. Measured on a Deck:
+    # ONE access point read 35, 39, 45 and 61 across consecutive scans, so a
+    # single sample carries about as much noise as the difference the decision
+    # turns on. Two samples is the cheapest thing that makes the comparison
+    # mean something, and this only runs when the user asks for the lock and
+    # the link is already weak, so the seconds are affordable.
+    _SCAN_SAMPLES = 2
+
+    # How long to leave an access point alone after it accepted a scan but
+    # refused an association. MEASURED on a Deck: a mesh node visible at
+    # signal 56 answered no authentication at all - wpa_supplicant reported
+    # CONN_FAILED and NetworkManager gave up with "association took too long".
+    # A loud beacon from a distant node says the radio can HEAR it, not that
+    # it can be heard BACK, and nothing in a scan distinguishes the two. So
+    # the only way to know is to try, and the only way not to keep paying for
+    # it is to remember.
+    #
+    # Fifteen minutes: long enough that a user toggling the lock again does
+    # not repeat the same failed reconnect, short enough that carrying the
+    # device to another room forgets it soon after.
+    _AP_FAILURE_COOLDOWN = 15 * 60
+    _MAX_TRACKED_AP_FAILURES = 16
+
+    # How much stronger another access point must be, on the AVERAGED signal,
+    # before locking prefers it over the one we are on. nmcli reports signal
+    # as 0-100 quality.
+    #
+    # This is deliberately smaller than it would need to be for a single scan.
+    # Raw readings of one access point varied by about 26 points on a measured
+    # Deck; averaging over _SCAN_SAMPLES scans removes most of that, and a
+    # margin sized for the noise rather than the averaged signal would refuse
+    # every real improvement. Measured case: 39 against 57 after averaging,
+    # roughly eleven decibels, which a twenty-point margin declined to act on.
+    #
+    # Erring small is the right direction here. The move happens once, when
+    # the user asks for the lock, so a needless one costs a single reconnect;
+    # refusing a real one costs a worse connection for as long as the lock
+    # stays on. There is no continuous re-evaluation to flap.
+    _AP_UPGRADE_MARGIN = 12
 
     def _visible_access_points(
-        self, iface: str, ssid: str
-    ) -> list[tuple[str, int, int]]:
-        """(bssid, signal, freq_mhz) for this network's visible APs, best first.
+        self, iface: str, ssid: str, rescan: bool = False
+    ) -> list[tuple[str, int, int, str]]:
+        """(bssid, signal, freq_mhz, security) for this network, best first.
 
         Ordered by signal, then by 5 GHz over 2.4 GHz where the signal is
         equal. That tie-break is deliberate: a mesh commonly advertises both
@@ -1795,12 +1837,27 @@ class Plugin:
         """
         if not ssid:
             return []
+        # nmcli serves a cached list, but refreshes it itself when the cache
+        # is stale - and a real scan takes several seconds. Measured on a Deck:
+        # the same call answered in 0.02 s warm and timed out at five seconds
+        # cold, which is exactly the state the lock runs in, because turning it
+        # on straight after turning it off follows a radio cycle. A budget the
+        # common path cannot meet turned "look for a better access point" into
+        # "silently find none".
         scan = self._run_cmd(
             ["/usr/bin/nmcli", "-t", "-f", "SSID,BSSID,SIGNAL,FREQ,SECURITY",
-             "dev", "wifi", "list", "ifname", iface],
-            timeout=5,
+             "dev", "wifi", "list", "ifname", iface]
+            + (["--rescan", "yes"] if rescan else []),
+            timeout=self._SCAN_SECONDS,
         )
         if not scan["success"]:
+            # Saying nothing here is how this failed invisibly: no candidates
+            # looks identical to no better access point, and the lock pins
+            # where it stands with nothing to explain why.
+            decky.logger.error(
+                f"Could not list access points on {iface}: "
+                f"{(scan.get('stderr', '') or 'timed out')[:160]}"
+            )
             return []
         want = ssid.replace("\\", "")
         found: list[tuple[str, int, int, str]] = []
@@ -1930,6 +1987,69 @@ class Plugin:
             return False
         return int(found.group(1)) >= self._STRONG_ENOUGH_DBM
 
+    def _recent_ap_failures(self, settings: dict) -> set:
+        """Access points that refused an association recently.
+
+        The stored value comes from a file the desktop user owns, so both the
+        address and the timestamp are validated rather than trusted; anything
+        malformed is simply not a reason to skip an access point.
+        """
+        now = time.time()
+        out = set()
+        for bssid, when in (settings.get("ap_move_failures") or {}).items():
+            if not isinstance(bssid, str) or not BSSID_RE.match(bssid):
+                continue
+            if not isinstance(when, (int, float)):
+                continue
+            if 0 < now - when < self._AP_FAILURE_COOLDOWN:
+                out.add(bssid.upper())
+        return out
+
+    def _record_ap_failure(self, bssid: str):
+        """Remember that this access point would not accept us."""
+        if not bssid or not BSSID_RE.match(bssid):
+            return
+        settings = _load_settings()
+        failures = dict(settings.get("ap_move_failures") or {})
+        failures[bssid.upper()] = int(time.time())
+        # Keep the newest few. Unbounded growth in a file parsed on every
+        # status poll is its own problem.
+        if len(failures) > self._MAX_TRACKED_AP_FAILURES:
+            failures = dict(
+                sorted(failures.items(), key=lambda kv: kv[1], reverse=True)
+                [: self._MAX_TRACKED_AP_FAILURES]
+            )
+        settings["ap_move_failures"] = failures
+        _save_settings_with_timestamp(settings)
+
+    def _sampled_access_points(
+        self, iface: str, ssid: str
+    ) -> list[tuple[str, int, int, str]]:
+        """Access points with their signal averaged over several scans.
+
+        Signal from a single scan is too noisy to decide on - see
+        _SCAN_SAMPLES. Each sample forces a real scan rather than accepting
+        whatever nmcli last cached, because two reads of one cache are one
+        sample wearing two hats.
+
+        An access point missing from a sample is not counted in its own
+        average; it stays a candidate on the evidence that exists.
+        """
+        totals: dict[str, list[int]] = {}
+        facts: dict[str, tuple[int, str]] = {}
+        for _ in range(max(1, self._SCAN_SAMPLES)):
+            for bssid, signal, freq, security in self._visible_access_points(
+                iface, ssid, rescan=True
+            ):
+                totals.setdefault(bssid, []).append(signal)
+                facts.setdefault(bssid, (freq, security))
+        averaged = [
+            (bssid, round(sum(seen) / len(seen)), facts[bssid][0], facts[bssid][1])
+            for bssid, seen in totals.items() if seen
+        ]
+        averaged.sort(key=lambda ap: (ap[1], ap[2] >= 5000), reverse=True)
+        return averaged
+
     def _preferred_access_point(
         self, iface: str, ssid: str, current: str, settings: dict,
         link: str = "", uuid: str = ""
@@ -1949,7 +2069,7 @@ class Plugin:
         """
         if self._link_is_strong(link):
             return None
-        aps = self._visible_access_points(iface, ssid)
+        aps = self._sampled_access_points(iface, ssid)
         if not aps:
             return None
         # An access point that cannot accept this profile's credentials is not
@@ -1964,6 +2084,11 @@ class Plugin:
         ) == ssid:
             want_5 = settings.get("band_preference") == "a"
             aps = [ap for ap in aps if (ap[2] >= 5000) == want_5]
+            if not aps:
+                return None
+        refused = self._recent_ap_failures(settings)
+        if refused:
+            aps = [ap for ap in aps if ap[0] not in refused]
             if not aps:
                 return None
         best = aps[0]
@@ -2696,7 +2821,11 @@ class Plugin:
                 # happen to be on is how a passing bad choice becomes a
                 # permanent one, and on a mesh that is the common case rather
                 # than the corner one.
-                moved_to = self._preferred_access_point(
+                # A scan can take seconds, so it runs off the event loop.
+                # The reconciliation guard is held across this whole setter,
+                # which is what makes awaiting here safe.
+                moved_to = await asyncio.to_thread(
+                    self._preferred_access_point,
                     iface, active_ssid or "", bssid, _load_settings(), link_out,
                     uuid,
                 )
@@ -2742,8 +2871,10 @@ class Plugin:
                     if landed["bssid"].upper() != chosen.upper():
                         decky.logger.error(
                             f"Could not associate to {chosen} after moving "
-                            f"the lock; restoring {bssid}"
+                            f"the lock; restoring {bssid} and leaving it "
+                            f"alone for a while"
                         )
+                        self._record_ap_failure(chosen)
                         self._nmcli_modify(uuid, "802-11-wireless.bssid", bssid)
                         restored = _load_settings()
                         restored["bssid_lock_value"] = bssid

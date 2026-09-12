@@ -603,5 +603,88 @@ r = asyncio.run(Chan("99.0.0").check_for_update())
 ok(r.get("update_available") is True and not r.get("is_downgrade"),
    "a genuinely newer build is not labelled a downgrade")
 
+section("access point lock: one scan is not evidence")
+
+# A real Deck read the SAME access point at 35, 39, 45 and 61 across
+# consecutive scans. A decision taken on one sample is a decision taken on
+# noise, so the signal is averaged over several.
+class Noisy(Mesh):
+    def __init__(self, rounds, on):
+        super().__init__(rounds[0], on)
+        self.rounds, self.round_at, self.rescans = rounds, 0, 0
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        if "wifi" in cmd and "list" in cmd:
+            if "--rescan" in cmd: self.rescans += 1
+            self.scan = self.rounds[min(self.round_at, len(self.rounds) - 1)]
+            self.round_at += 1
+        return super()._run_cmd(cmd, timeout, clean_env)
+
+LOW  = "Net:02\\:00\\:00\\:00\\:00\\:52:40:5220 MHz:WPA2 WPA3\nNet:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3"
+HIGH = "Net:02\\:00\\:00\\:00\\:00\\:52:90:5220 MHz:WPA2 WPA3\nNet:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3"
+
+m._save_settings(dict(base_ap))
+g = Noisy([LOW, HIGH], "02:00:00:00:00:11")
+aps = getattr(g, "_sampled_access_points", lambda *a: [])("wlan0", "Net")
+by = {a[0]: a[1] for a in aps}
+ok(by.get("02:00:00:00:00:52") == 65,
+   "a noisy access point is averaged across samples, not taken at its best")
+ok(by.get("02:00:00:00:00:11") == 45,
+   "a steady one keeps its value")
+ok(g.rescans >= 2,
+   "each sample forces a real scan rather than re-reading one cache")
+
+# Averaging has to be able to change the outcome, or it is decoration.
+m._save_settings(dict(base_ap))
+g = Noisy([LOW, LOW], "02:00:00:00:00:11")
+asyncio.run(g.set_bssid_lock(True))
+ok(g.pinned.upper() == "02:00:00:00:00:11",
+   "two low samples leave the lock where it is")
+
+# An access point seen in only one sample is still judged on what was seen.
+ONLY_ONCE = "Net:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3"
+m._save_settings(dict(base_ap))
+g = Noisy([HIGH, ONLY_ONCE], "02:00:00:00:00:11")
+aps = getattr(g, "_sampled_access_points", lambda *a: [])("wlan0", "Net")
+ok(any(a[0] == "02:00:00:00:00:52" and a[1] == 90 for a in aps),
+   "an access point missing from a sample is judged on the samples it appeared in")
+
+section("access point lock: do not keep retrying one that refuses us")
+
+# Measured on hardware: a mesh node visible at signal 56 answered no
+# authentication at all. A loud beacon says the radio can hear the access
+# point, not that it can be heard back, and a scan cannot tell the two apart.
+m._save_settings(dict(base_ap))
+g = Mesh(MESH, "02:00:00:00:00:11", reachable={"02:00:00:00:00:11"})
+r = asyncio.run(g.set_bssid_lock(True))
+ok(g.pinned.upper() == "02:00:00:00:00:11", "it falls back when refused")
+failed = m._load_settings().get("ap_move_failures", {})
+ok("02:00:00:00:00:51" in failed,
+   "the access point that refused us is remembered")
+
+# The whole point: the next attempt must not repeat the same failed reconnect.
+g2 = Mesh(MESH, "02:00:00:00:00:11", reachable={"02:00:00:00:00:11"})
+asyncio.run(g2.set_bssid_lock(True))
+ok(g2.pinned.upper() == "02:00:00:00:00:11", "still lands somewhere usable")
+ok(not any("Locking to" in str(c) for c in g2.mods),
+   "and does not write the refused address again")
+chose = getattr(g2, "_preferred_access_point")(
+    "wlan0", "Net", "02:00:00:00:00:11", m._load_settings(), "", "u1")
+ok(chose is None or chose[0] != "02:00:00:00:00:51",
+   "the refused access point is not chosen again while it is in cooldown")
+
+# A stale or malformed record must not silently veto an access point.
+m._save_settings({**base_ap, "ap_move_failures": {
+    "02:00:00:00:00:51": 1,               # long expired
+    "not-a-bssid": 99999999999,
+    "02:00:00:00:00:24": "yesterday",
+}})
+g3 = Mesh(MESH, "02:00:00:00:00:11")
+refused = g3._recent_ap_failures(m._load_settings())
+ok(refused == set(),
+   "expired and malformed failure records are ignored")
+asyncio.run(g3.set_bssid_lock(True))
+ok(g3.pinned.upper() == "02:00:00:00:00:51",
+   "so a once-refused access point can be tried again later")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
