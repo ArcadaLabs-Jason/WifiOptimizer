@@ -670,6 +670,24 @@ class Plugin:
         settings = _load_settings()
         return settings.get("last_connection_uuid") or settings.get("bssid_lock_connection_uuid") or None
 
+    def _read_profile_field(self, uuid: str, field: str, timeout: int = 5) -> str:
+        """What nmcli reports for one field of a saved profile, "" if nothing.
+
+        Terse output is `field:value` and a value may contain colons of its
+        own - a BSSID is nothing but colons - so the split is on the FIRST one
+        only. Escaping is left to the caller: only some fields carry it, and
+        unescaping one that does not would be guessing at the value.
+
+        _get_profile_ssid and _profile_key_mgmt read the same shape but carry
+        their own sentinels for an unreadable profile, so they stay separate.
+        """
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", field, "con", "show", "uuid", uuid],
+            timeout=timeout,
+        )
+        _, sep, value = result.get("stdout", "").partition(":")
+        return value.strip() if sep else ""
+
     def _get_profile_ssid(self, uuid: str, timeout: int = 5) -> str | None:
         """SSID of a saved connection profile, or None if it cannot be read."""
         if not uuid:
@@ -2788,27 +2806,10 @@ class Plugin:
                     else:
                         status["live"]["channel"] = line
 
-            # BSSID lock
-            bssid_result = self._run_cmd(
-                [
-                    "/usr/bin/nmcli",
-                    "-t",
-                    "-f",
-                    "802-11-wireless.bssid",
-                    "con",
-                    "show",
-                    "uuid",
-                    uuid,
-                ],
-                timeout=T,
-            )
-            bssid_out = bssid_result.get("stdout", "")
-            current_bssid_lock = ""
-            if ":" in bssid_out:
-                # Format: 802-11-wireless.bssid:AA\:BB\:CC\:DD\:EE\:FF
-                parts = bssid_out.split(":", 1)
-                if len(parts) == 2:
-                    current_bssid_lock = parts[1].replace("\\", "").strip()
+            # BSSID lock. Read as 802-11-wireless.bssid:AA\:BB\:CC\:DD\:EE\:FF
+            current_bssid_lock = self._read_profile_field(
+                uuid, "802-11-wireless.bssid", timeout=T
+            ).replace("\\", "")
             status["live"]["bssid_lock"] = current_bssid_lock
             actions.extend(
                 self._propose_active_pin_cleanup(
@@ -2886,21 +2887,7 @@ class Plugin:
             status["live"]["dns"] = dns_result.get("stdout", "")
 
             # IPv6
-            ipv6_result = self._run_cmd(
-                [
-                    "/usr/bin/nmcli",
-                    "-t",
-                    "-f",
-                    "ipv6.method",
-                    "con",
-                    "show",
-                    "uuid",
-                    uuid,
-                ],
-                timeout=T,
-            )
-            ipv6_out = ipv6_result.get("stdout", "")
-            live_ipv6 = ipv6_out.split(":", 1)[1].strip() if ":" in ipv6_out else ""
+            live_ipv6 = self._read_profile_field(uuid, "ipv6.method", timeout=T)
             status["live"]["ipv6_method"] = live_ipv6
             if settings.get("ipv6_disabled") and live_ipv6 != "disabled":
                 status["drift"]["ipv6"] = True
@@ -2929,21 +2916,9 @@ class Plugin:
                 status["external"]["ipv6"] = True
 
             # Band preference
-            band_result = self._run_cmd(
-                [
-                    "/usr/bin/nmcli",
-                    "-t",
-                    "-f",
-                    "802-11-wireless.band",
-                    "con",
-                    "show",
-                    "uuid",
-                    uuid,
-                ],
-                timeout=T,
+            live_band = self._read_profile_field(
+                uuid, "802-11-wireless.band", timeout=T
             )
-            band_out = band_result.get("stdout", "")
-            live_band = band_out.split(":", 1)[1].strip() if ":" in band_out else ""
             status["live"]["band"] = live_band
 
             # Several saved copies of one network, disagreeing about security,

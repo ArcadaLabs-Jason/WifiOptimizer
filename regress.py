@@ -1436,5 +1436,53 @@ try:
 finally:
     m.SETTINGS_FILE = saved
 
+
+section("one profile field, read the same way everywhere")
+
+# Terse nmcli output is `field:value`, and a BSSID is nothing but colons, so
+# the split has to be on the first one only. Only some fields arrive escaped,
+# which is why unescaping is the caller's job and is tested here rather than
+# reasoned about.
+class Field(m.Plugin):
+    def __init__(self, out):
+        super().__init__()
+        self.out = out
+        self.asked = []
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        self.asked.append(list(cmd))
+        return {"success":True,"stdout":self.out,"stderr":"","returncode":0}
+
+d = Field("802-11-wireless.bssid:AA\\:BB\\:CC\\:DD\\:EE\\:FF")
+raw = d._read_profile_field("u", "802-11-wireless.bssid")
+ok(raw == "AA\\:BB\\:CC\\:DD\\:EE\\:FF", "everything after the first colon is the value")
+ok(raw.replace("\\", "") == "AA:BB:CC:DD:EE:FF",
+   "and an escaped address unescapes to the address itself")
+ok(d.asked == [["/usr/bin/nmcli","-t","-f","802-11-wireless.bssid",
+                "con","show","uuid","u"]],
+   "read with one nmcli call and no extra arguments")
+ok(Field("ipv6.method:auto")._read_profile_field("u","ipv6.method") == "auto",
+   "an unescaped field comes back as itself")
+ok(Field("802-11-wireless.band:")._read_profile_field("u","802-11-wireless.band") == "",
+   "a field that is set to nothing reads as empty")
+ok(Field("")._read_profile_field("u","802-11-wireless.band") == "",
+   "and so does a profile that answered nothing at all")
+ok(Field("ipv6.method:  auto  ")._read_profile_field("u","ipv6.method") == "auto",
+   "surrounding whitespace is not part of the value")
+
+# The collector publishes the unescaped address, which is what the panel shows
+# and what every comparison against a live BSSID is made against.
+class EscapedPin(Connected):
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        if "802-11-wireless.bssid" in " ".join(cmd) and "con" in cmd:
+            return {"success":True,
+                    "stdout":"802-11-wireless.bssid:02\\:00\\:00\\:00\\:00\\:11",
+                    "stderr":"","returncode":0}
+        return super()._run_cmd(cmd, timeout, clean_env)
+
+m._save_settings(dict(base_ap))
+st, _p, _a = EscapedPin()._collect_status()
+ok(st["live"].get("bssid_lock") == "02:00:00:00:00:11",
+   "the collector reports the address unescaped, as the panel and the link do")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
