@@ -2655,6 +2655,30 @@ class Plugin:
         # there is nothing a deadline here could catch that this does not.
         return getattr(self, "_profile_change_depth", 0) > 0
 
+    def _lock_is_for_this_network(self, settings: dict, uuid: str,
+                                 active_ssid: str | None,
+                                 timeout: int = 5) -> bool:
+        """Whether the address pin was set for the network we are on now.
+
+        The lock follows whichever profile NetworkManager actually uses, so
+        the profile it was written to is often not the one in use - a second
+        saved copy of the same network still counts as the locked network, and
+        matching on the profile alone would report drift that nothing clears.
+
+        A DIFFERENT network does not: leaving home with the lock still enabled
+        would otherwise pin the user to the first access point of whatever
+        network they joined next, which they never asked for and which blocks
+        roaming on it. An SSID that cannot be read answers no, because holding
+        off is the safe way to be wrong here.
+        """
+        locked_uuid = settings.get("bssid_lock_connection_uuid", "")
+        if locked_uuid == uuid:
+            return True
+        if not locked_uuid:
+            return False
+        locked_ssid = self._get_profile_ssid(locked_uuid, timeout=timeout)
+        return bool(locked_ssid and active_ssid and locked_ssid == active_ssid)
+
     @staticmethod
     def _parse_link(link_out: str) -> dict:
         """The live values `iw dev X link` reports, as the panel names them.
@@ -2837,9 +2861,21 @@ class Plugin:
                         {"kind": "priority", "uuid": uuid, "value": target}
                     )
 
-            # Resolved lazily by the blocks below that need it; declared here
-            # so every path has it, and None keeps meaning "not established".
-            active_ssid: str | None = None
+            # Three decisions below need the active profile's SSID, and two of
+            # them often do not run, so it is read on first use and reused.
+            resolved_ssid: str | None = None
+
+            def active_ssid() -> str | None:
+                """The SSID of the profile in use, read at most once a poll.
+
+                A read that failed is deliberately not cached: None keeps
+                meaning "could not tell", and the next caller is entitled to
+                its own attempt, which is what the separate reads did.
+                """
+                nonlocal resolved_ssid
+                if resolved_ssid is None:
+                    resolved_ssid = self._get_profile_ssid(uuid, timeout=T)
+                return resolved_ssid
 
             # Power save
             ps_result = self._run_cmd(
@@ -2886,25 +2922,15 @@ class Plugin:
                 # drift that nothing clears. Writing the BSSID we are already
                 # associated to does not disturb the link: NM applies it on the
                 # next activation, so no reconnect is triggered here.
-                # Only follow the connection within the SAME network. Without
-                # this, leaving home with the lock still enabled would pin the
-                # user to the first AP of whatever network they joined next,
-                # which they never asked for and which blocks roaming on it.
-                # Resolved once, here, because two things need it: deciding
-                # whether this is the locked network, and telling the applier
-                # which network the pin would land on so it can honour the
-                # band preference's scope. None means "could not tell", and
-                # every consumer treats that as a reason to hold off.
-                active_ssid = self._get_profile_ssid(uuid, timeout=T)
-                locked_uuid = settings.get("bssid_lock_connection_uuid", "")
-                same_network = False
-                if locked_uuid == uuid:
-                    same_network = True
-                elif locked_uuid:
-                    locked_ssid = self._get_profile_ssid(locked_uuid, timeout=T)
-                    same_network = bool(
-                        locked_ssid and active_ssid and locked_ssid == active_ssid
-                    )
+                # Resolved here, before the decision, because two things need
+                # it: whether this is the locked network, and telling the
+                # applier which network the pin would land on so it can honour
+                # the band preference's scope. None means "could not tell",
+                # and every consumer treats that as a reason to hold off.
+                here = active_ssid()
+                same_network = self._lock_is_for_this_network(
+                    settings, uuid, here, timeout=T
+                )
 
                 live_bssid = status["live"].get("connected_bssid", "")
                 if same_network:
@@ -2915,7 +2941,7 @@ class Plugin:
                             # Carried on the action rather than published in
                             # `live`: the applier is its only consumer and the
                             # panel has no use for it.
-                            "active_ssid": active_ssid,
+                            "active_ssid": here,
                         })
                     # Genuinely drifted: this IS the locked network and the
                     # lock is missing from the profile in use.
@@ -2992,10 +3018,8 @@ class Plugin:
             ):
                 self._dup_checked_at = now
                 self._dup_checked_for = uuid
-                if active_ssid is None:
-                    active_ssid = self._get_profile_ssid(uuid, timeout=T)
                 mine = self._profile_key_mgmt(uuid)
-                rivals = self._rival_profiles(uuid, active_ssid or "")
+                rivals = self._rival_profiles(uuid, active_ssid() or "")
                 self._dup_conflict = bool(
                     rivals and any(km and km != mine for _u, km in rivals)
                 )
@@ -3043,11 +3067,7 @@ class Plugin:
             # preference is not enforced anywhere.
             band_scope_ok = bool(band_ssid)
             if settings.get("band_preference_enabled") and band_ssid:
-                # active_ssid was resolved with the BSSID lock above. Reading
-                # it again would be a second subprocess for the same answer.
-                if active_ssid is None:
-                    active_ssid = self._get_profile_ssid(uuid, timeout=T)
-                band_scope_ok = active_ssid == band_ssid
+                band_scope_ok = active_ssid() == band_ssid
             if (
                 settings.get("band_preference_enabled")
                 and band_scope_ok

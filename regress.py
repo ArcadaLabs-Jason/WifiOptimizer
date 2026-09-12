@@ -1528,5 +1528,49 @@ ok(P0._parse_channel("channel") == "channel",
 ok(P0._parse_channel("\tchannel 1 (2412 MHz), width: 20 MHz") == "1 (20 MHz)",
    "2.4 GHz reads the same way")
 
+
+section("is the address pin ours to enforce on the network we are on")
+
+# The pin follows whichever profile NetworkManager actually uses, so the
+# profile it was written to is often not the one in use. Getting this wrong in
+# one direction reports drift nothing can clear; in the other it pins the user
+# to the first access point of a network they never asked to lock.
+class Scoped(m.Plugin):
+    def __init__(self, ssids):
+        super().__init__()
+        self.ssids = dict(ssids)
+        self.reads = []
+    def _get_profile_ssid(self, uuid, timeout=5):
+        self.reads.append(uuid)
+        return self.ssids.get(uuid)
+
+HERE, TWIN, AWAY = "u-here", "u-twin", "u-away"
+NETS = {HERE:"Home", TWIN:"Home", AWAY:"Cafe"}
+
+def scope(locked, uuid, ssid, ssids=NETS):
+    d = Scoped(ssids)
+    return d._lock_is_for_this_network(
+        {"bssid_lock_connection_uuid": locked}, uuid, ssid), d
+
+held, d = scope(HERE, HERE, "Home")
+ok(held is True, "the profile the lock was written to is the locked network")
+ok(d.reads == [], "and answering that needs no further reads")
+
+ok(scope(TWIN, HERE, "Home")[0] is True,
+   "a second saved copy of the same network counts as the locked network")
+ok(scope(AWAY, HERE, "Home")[0] is False,
+   "a different network does not, so leaving home does not pin anyone")
+ok(scope("", HERE, "Home")[0] is False,
+   "a lock with no profile recorded is not enforced anywhere")
+
+# "Could not tell" has to answer no: the cost of a wrong yes is a pin the user
+# never asked for on a network they are merely passing through.
+ok(scope(TWIN, HERE, None)[0] is False,
+   "an unreadable active SSID holds off rather than guessing")
+ok(scope(TWIN, HERE, "Home", {TWIN: None})[0] is False,
+   "and so does an unreadable locked profile")
+ok(scope(TWIN, HERE, "", {TWIN: ""})[0] is False,
+   "two empty SSIDs are not a match")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
