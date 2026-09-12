@@ -1518,6 +1518,14 @@ class Plugin:
                 )
                 if settings.get(enabled_key):
                     continue
+                # A setter is mid-change on this profile. Today the band
+                # setter writes the pin and saves the flag with no await
+                # between them, so a poll cannot land in that gap and see a
+                # pin whose flag is not saved yet - but cleanup is a SECOND
+                # writer to the same property, and that invariant is one
+                # edit away from not holding. Skipping costs one poll.
+                if self._profile_change_in_flight():
+                    continue
                 if self._reassert_exhausted(f"pin_cleanup:{list_key}"):
                     continue
                 done = self._nmcli_modify(uuid, prop, "", timeout=2)
