@@ -2195,21 +2195,38 @@ class Plugin:
                 if err:
                     return err
 
-                link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
-                link_out = link_result.get("stdout", "")
+                # Wait for an association rather than demanding one instantly.
+                # Turning the lock OFF ends with a radio cycle, so turning it
+                # straight back on arrives while the interface is still
+                # re-associating and there is no "Connected to" line yet - the
+                # user sees "Could not determine current BSSID" for a network
+                # they are plainly on. Blocking sleep on purpose: this setter's
+                # body must stay await-free, which is what keeps it serialized
+                # against status reconciliation.
+                link_out = ""
                 bssid = ""
-                for line in link_out.split("\n"):
-                    if "Connected to" in line:
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            bssid = parts[2]
+                for attempt in range(12):
+                    link_result = self._run_cmd(
+                        ["/usr/bin/iw", "dev", iface, "link"]
+                    )
+                    link_out = link_result.get("stdout", "")
+                    for line in link_out.split("\n"):
+                        if "Connected to" in line:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                bssid = parts[2]
+                            break
+                    if bssid:
                         break
+                    # Re-resolve: a cycle can bring the interface back renamed.
+                    iface = self._get_wifi_interface() or iface
+                    time.sleep(0.5)
 
                 if not bssid:
                     return {
                         "success": False,
                         "error": "no_wifi",
-                        "message": "Could not determine current BSSID",
+                        "message": "WiFi hasn't finished reconnecting. Wait a moment and try again.",
                     }
 
                 # Refuse rather than write a profile that cannot associate.
