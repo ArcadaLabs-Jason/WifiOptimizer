@@ -1530,7 +1530,11 @@ class Plugin:
                 enabled_key = next(
                     e for e, l, _, _v in self._PIN_PROPERTIES if l == list_key
                 )
-                if settings.get(enabled_key):
+                # A stranded release is the one case where the feature being
+                # ON is not a reason to leave the value alone - it is the
+                # reason the value is there and the reason we are offline.
+                stranded = bool(action.get("stranded"))
+                if settings.get(enabled_key) and not stranded:
                     continue
                 # A setter is mid-change on this profile. Today the band
                 # setter writes the pin and saves the flag with no await
@@ -1556,12 +1560,30 @@ class Plugin:
                         u for u in settings.get(list_key, []) if u != uuid
                     ]
                     off_value = action.get("off_value", "")
-                    self._log_throttled(
-                        f"pin_cleanup:{list_key}",
-                        f"Cleared a leftover {prop} from {uuid}"
-                        if not off_value else
-                        f"Returned {prop} to {off_value} on {uuid}",
-                    )
+                    if stranded:
+                        # Record the moment, not a bare flag: the panel should
+                        # still be explaining this once WiFi returns, which is
+                        # the only time the user is there to read it.
+                        self._pin_released_at = time.time()
+                        # And say so on THIS poll. The collector reads the
+                        # timestamp before the actions run, so leaving it to
+                        # the next poll would make the release silent at the
+                        # exact moment it happened.
+                        status.setdefault("external", {})["pin_released"] = True
+                        self._log_throttled(
+                            f"pin_release:{list_key}",
+                            f"Released {prop} on {uuid}: the device had been "
+                            f"offline for over "
+                            f"{self._STRANDED_SECONDS}s and this setting was "
+                            f"the most likely reason",
+                        )
+                    else:
+                        self._log_throttled(
+                            f"pin_cleanup:{list_key}",
+                            f"Cleared a leftover {prop} from {uuid}"
+                            if not off_value else
+                            f"Returned {prop} to {off_value} on {uuid}",
+                        )
                 else:
                     # Move it to the back. Only the head is attempted each
                     # poll, so one profile that cannot be cleared would
@@ -1699,6 +1721,17 @@ class Plugin:
     # have no record of writing is reported rather than overridden.
     _ELIMINATION_PINS = ("802-11-wireless.band", "802-11-wireless.bssid")
 
+    # How long the device must be CONTINUOUSLY offline before a pin we wrote
+    # is treated as the reason it is offline. Comfortably longer than a radio
+    # cycle and the association budget, so an ordinary reconnect - or the lock
+    # setter's own deliberate cycle - never trips it.
+    _STRANDED_SECONDS = 60
+
+    # How long the panel keeps explaining a release after it happens. Without
+    # this the notice would clear the instant WiFi returned, which is exactly
+    # when the user is there to read it.
+    _RELEASE_NOTICE_SECONDS = 600
+
     def _propose_pin_cleanup(self, settings: dict) -> list[dict]:
         """One cleanup per property per poll for anything we could not unpin.
 
@@ -1825,6 +1858,67 @@ class Plugin:
                     "off_value": off_value,
                 })
                 break
+        return out
+
+    def _propose_stranded_pin_release(
+        self, settings: dict, connected: bool
+    ) -> list[dict]:
+        """Release a pin we wrote once it is the likely reason we are offline.
+
+        `_propose_pin_cleanup` already runs before the not-connected return,
+        for exactly this reason - but it skips any property whose feature is
+        still ENABLED, which is precisely when the pin exists. So the one
+        state it cannot help with is the one that actually strands a device:
+        the lock is on, the access point it names is no longer there, and
+        nothing reconsiders it. The user is left re-entering credentials,
+        which makes a SECOND copy of the network and orphans the pin on the
+        first.
+
+        A pin is a preference, not a requirement. Being offline because of
+        our own preference is strictly worse than being online without it,
+        and clearing one only ever WIDENS what NetworkManager may associate
+        to, so this cannot cost reachability. The feature stays on, so the
+        ordinary path re-applies a reachable value on the next connection.
+
+        Bounded to profiles we recorded writing, and to the pins nothing else
+        sets - the same boundary that decided the active and rival cases.
+        """
+        if connected:
+            self._offline_since = None
+            return []
+        if self._profile_change_in_flight():
+            return []
+        now = time.monotonic()
+        if getattr(self, "_offline_since", None) is None:
+            self._offline_since = now
+            return []
+        if now - self._offline_since < self._STRANDED_SECONDS:
+            return []
+        uuid = self._get_saved_connection_uuid()
+        if not uuid:
+            return []
+        # Read what is actually written before proposing. Otherwise a profile
+        # with no pin at all gets a pointless write and a log line claiming
+        # something was cleared.
+        live = self._profile_pins(uuid)
+        if not live:
+            return []
+        out = []
+        for enabled_key, list_key, prop, off_value in self._PIN_PROPERTIES:
+            if prop not in self._ELIMINATION_PINS:
+                continue
+            # Disabled features are already handled by the ordinary cleanup.
+            if not settings.get(enabled_key):
+                continue
+            if uuid not in settings.get(list_key, []):
+                continue
+            if not live.get(prop):
+                continue
+            out.append({
+                "kind": "pin_cleanup", "uuid": uuid,
+                "property": prop, "list_key": list_key,
+                "off_value": off_value, "stranded": True,
+            })
         return out
 
     @staticmethod
@@ -2358,6 +2452,17 @@ class Plugin:
             # and this needs neither an interface nor an active connection,
             # only a saved profile.
             actions.extend(self._propose_pin_cleanup(settings))
+            # The case the cleanup above cannot reach: a pin whose feature is
+            # still enabled, which is what actually strands a device.
+            actions.extend(
+                self._propose_stranded_pin_release(settings, connected)
+            )
+            released_at = getattr(self, "_pin_released_at", 0)
+            if (
+                released_at
+                and time.time() - released_at < self._RELEASE_NOTICE_SECONDS
+            ):
+                status["external"]["pin_released"] = True
 
             if not connected:
                 status["live"]["dispatcher_installed"] = os.path.isfile(

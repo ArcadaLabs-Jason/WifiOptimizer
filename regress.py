@@ -828,5 +828,110 @@ asyncio.run(d.get_status()); first = len(d.modifies)
 asyncio.run(d.get_status()); asyncio.run(d.get_status())
 ok(len(d.modifies) == first, "the rival cleanup is not re-attempted every poll")
 
+section("a pin that is keeping the device offline is released")
+
+# GitHub issue #6: "Optimize Safe" pins the access point in use, the access
+# point later stops being reachable, and nothing reconsiders it. The ordinary
+# cleanup runs while disconnected on purpose but skips any property whose
+# feature is still ENABLED - which is exactly when the pin exists. The user is
+# left re-entering credentials, which makes a second copy of the network.
+OFFU = "cccccccc-0000-0000-0000-000000000001"
+
+class Offline(Connected):
+    """No active connection, over a saved profile carrying the given pins."""
+    def __init__(self, pins):
+        super().__init__()
+        self.pins = dict(pins)
+        self.modifies = []
+    def _get_active_connection_uuid(self):
+        return None
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        if "802-11-wireless.band,802-11-wireless.bssid" in " ".join(cmd):
+            return {"success":True,
+                    "stdout":"\n".join(f"{k}:{v}" for k,v in self.pins.items()),
+                    "stderr":"","returncode":0}
+        return super()._run_cmd(cmd, timeout, clean_env)
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.modifies.append((uuid, key, value))
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+def off_settings(**extra):
+    base = {**base_ap, "bssid_lock_enabled": True,
+            "bssid_lock_connection_uuid": OFFU, "bssid_lock_uuids": [OFFU],
+            "last_connection_uuid": OFFU}
+    base.update(extra)
+    return base
+
+def rel(d, prop):
+    return any(u == OFFU and k == prop and v == "" for u, k, v in d.modifies)
+
+def strand(d):
+    """Run one poll, then age the offline clock past the threshold and re-poll."""
+    asyncio.run(d.get_status())
+    d._offline_since = time.monotonic() - (d._STRANDED_SECONDS + 5)
+    return asyncio.run(d.get_status())
+
+# A brief outage must not cost anyone their lock.
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+asyncio.run(d.get_status())
+ok(not rel(d, "802-11-wireless.bssid"),
+   "a pin is not released the moment the device goes offline")
+
+# Past the threshold it is, and the user is told why.
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+st = strand(d)
+ok(rel(d, "802-11-wireless.bssid"),
+   "a pin we wrote is released once it is the likely reason we are offline")
+ok(st.get("external", {}).get("pin_released") is True,
+   "and the panel is told, so the change is not silent")
+
+# A band preference strands a device the same way.
+m._save_settings(off_settings(band_preference_enabled=True, band_preference="a",
+                              band_preference_ssid="TestNet",
+                              band_preference_uuids=[OFFU]))
+d = Offline({"802-11-wireless.band": "a"})
+strand(d)
+ok(rel(d, "802-11-wireless.band"), "a stranding band preference is released too")
+
+# Only what we recorded writing.
+m._save_settings(off_settings(bssid_lock_uuids=[]))
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+strand(d)
+ok(not rel(d, "802-11-wireless.bssid"),
+   "a pin on a profile we never recorded writing is left alone")
+
+# The elimination boundary holds here too.
+m._save_settings(off_settings(ipv6_disabled=True, ipv6_uuids=[OFFU]))
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11",
+             "ipv6.method": "disabled"})
+strand(d)
+ok(not any(k == "ipv6.method" for _u, k, _v in d.modifies),
+   "IPv6 is never released this way")
+
+# Never fight a setter that is mid-change - its own radio cycle looks exactly
+# like being offline.
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+d._profile_change_in_flight = lambda: True
+strand(d)
+ok(not rel(d, "802-11-wireless.bssid"),
+   "nothing is released while a setter is mid-change")
+
+# Nothing written when there is no pin to release.
+m._save_settings(off_settings())
+d = Offline({})
+strand(d)
+ok(not d.modifies, "a profile with no pin is not written to needlessly")
+
+# Reconnecting restarts the clock, so outages do not accumulate.
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+d._offline_since = time.monotonic() - 999
+out = d._propose_stranded_pin_release(m._load_settings(), True)
+ok(out == [] and getattr(d, "_offline_since", "unset") is None,
+   "reconnecting resets the offline clock")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

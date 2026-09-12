@@ -608,6 +608,17 @@ function Content() {
         </Banner>
       )}
 
+      {/* A setting we wrote was the likely reason the device could not
+          connect, so it was released. Worth stating plainly: nothing the user
+          did caused it, and the preference is not lost. */}
+      {status?.external?.pin_released && (
+        <Banner variant="warning" icon="⚠">
+          WiFi could not connect for a while, so the locked access point or
+          band preference was released to let it reconnect. The setting is
+          still on and applies again to whichever access point works.
+        </Banner>
+      )}
+
       {/* Drift alert */}
       {connected && !!s?.last_applied && driftCount > 0 && (
         <Banner variant="warning" icon="⚠">
