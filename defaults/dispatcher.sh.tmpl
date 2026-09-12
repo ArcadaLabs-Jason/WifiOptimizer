@@ -140,6 +140,9 @@ fi
 ENFORCED_FILE="$SETTINGS_DIR/last_enforced"
 ENFORCED_TMP=$(mktemp "$SETTINGS_DIR/.last_enforced.XXXXXX" 2>/dev/null)
 if [ -n "$ENFORCED_TMP" ]; then
+    # mktemp creates 0600; this file has always been world readable and the
+    # mode should not change as a side effect of how it is written.
+    chmod 644 "$ENFORCED_TMP" 2>/dev/null
     if date +%s 2>/dev/null > "$ENFORCED_TMP"; then
         # -T so a directory planted at the destination is not moved INTO;
         # that would silently stop the timestamp updating and leave a temp
