@@ -26,6 +26,7 @@ import type {
   UpdateCheckResult,
   BadgeStatus,
   BackendSwitchStatus,
+  RegdomainInfo,
 } from "./types";
 import { ERROR_MESSAGES } from "./types";
 import { InfoRow } from "./components/InfoRow";
@@ -57,6 +58,35 @@ function getBadge(
   if (driftKey && status?.drift?.[driftKey]) return { badge: "drifted", text: "drifted" };
   return null;
 }
+
+// Regions the selector offers. A regulatory domain is a legal constraint on
+// transmit power and which channels may be used, so this is a deliberate
+// short list of ISO country codes rather than free text.
+const REGION_OPTIONS = [
+  { data: "00", label: "World (00) - most restrictive" },
+  { data: "US", label: "United States (US)" },
+  { data: "CA", label: "Canada (CA)" },
+  { data: "GB", label: "United Kingdom (GB)" },
+  { data: "IE", label: "Ireland (IE)" },
+  { data: "DE", label: "Germany (DE)" },
+  { data: "FR", label: "France (FR)" },
+  { data: "ES", label: "Spain (ES)" },
+  { data: "IT", label: "Italy (IT)" },
+  { data: "NL", label: "Netherlands (NL)" },
+  { data: "SE", label: "Sweden (SE)" },
+  { data: "NO", label: "Norway (NO)" },
+  { data: "DK", label: "Denmark (DK)" },
+  { data: "FI", label: "Finland (FI)" },
+  { data: "PL", label: "Poland (PL)" },
+  { data: "PT", label: "Portugal (PT)" },
+  { data: "AU", label: "Australia (AU)" },
+  { data: "NZ", label: "New Zealand (NZ)" },
+  { data: "JP", label: "Japan (JP)" },
+  { data: "KR", label: "South Korea (KR)" },
+  { data: "BR", label: "Brazil (BR)" },
+  { data: "MX", label: "Mexico (MX)" },
+  { data: "IN", label: "India (IN)" },
+];
 
 const DNS_OPTIONS = [
   { data: "cloudflare", label: "Cloudflare (1.1.1.1)" },
@@ -115,6 +145,20 @@ function Content() {
   const [isBusy, setIsBusy] = useState(false);
   const [applyingAll, setApplyingAll] = useState(false);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeSafeResult | null>(null);
+  const [regdomain, setRegdomainInfo] = useState<RegdomainInfo | null>(null);
+
+  // The wireless region is a device-level fact that does not change on its
+  // own, so it is read once rather than added to the status poll.
+  const refreshRegdomain = useCallback(() => {
+    backend
+      .getRegdomain()
+      .then((info) => setRegdomainInfo(info))
+      .catch(() => setRegdomainInfo(null));
+  }, []);
+
+  useEffect(() => {
+    refreshRegdomain();
+  }, [refreshRegdomain]);
   const [customDnsInput, setCustomDnsInput] = useState("");
 
   // --- Update flow state ---
@@ -761,6 +805,35 @@ function Content() {
 
       {/* Advanced */}
       <PanelSection title="Advanced">
+        {/* A radio that carries its own regulatory domain ignores this
+            setting entirely. Offering a control that cannot do anything is
+            worse than offering none, so the two cases render differently:
+            a selector where it works, an explanation where it does not. */}
+        {regdomain?.readable && regdomain.changeable && (
+          <PanelSectionRow>
+            <DropdownItem
+              label="WiFi region"
+              description="Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely."
+              rgOptions={REGION_OPTIONS}
+              selectedOption={regdomain.setting || regdomain.governing || "00"}
+              disabled={isBusy}
+              onChange={(option: { data: string }) => {
+                void handleToggle("regdomain", () =>
+                  backend.setRegdomain(option.data)
+                ).then(refreshRegdomain);
+              }}
+            />
+          </PanelSectionRow>
+        )}
+        {regdomain?.readable && !regdomain.changeable && (
+          <PanelSectionRow>
+            <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
+              WiFi region: {regdomain.governing || "unknown"}. This device's
+              WiFi card sets its own region, so it cannot be changed here. That
+              is normal on the Steam Deck and does not mean a band is missing.
+            </div>
+          </PanelSectionRow>
+        )}
         <InfoRow
           label={supports6GHz ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band"}
           subtitle="Avoid 2.4 GHz Bluetooth interference"

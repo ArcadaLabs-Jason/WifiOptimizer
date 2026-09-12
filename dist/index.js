@@ -102,6 +102,8 @@ const checkForUpdate = callable("check_for_update");
 const applyUpdate = callable("apply_update");
 const startBackendSwitch = callable("start_backend_switch");
 const getBackendSwitchStatus = callable("get_backend_switch_status");
+const getRegdomain = callable("get_regdomain");
+const setRegdomain = callable("set_regdomain");
 const getDiagnosticInfo = callable("get_diagnostic_info");
 const saveDiagnosticInfo = callable("save_diagnostic_info");
 
@@ -501,6 +503,34 @@ function getBadge(driftKey, status, errorKey) {
         return { badge: "drifted", text: "drifted" };
     return null;
 }
+// Regions the selector offers. A regulatory domain is a legal constraint on
+// transmit power and which channels may be used, so this is a deliberate
+// short list of ISO country codes rather than free text.
+const REGION_OPTIONS = [
+    { data: "00", label: "World (00) - most restrictive" },
+    { data: "US", label: "United States (US)" },
+    { data: "CA", label: "Canada (CA)" },
+    { data: "GB", label: "United Kingdom (GB)" },
+    { data: "IE", label: "Ireland (IE)" },
+    { data: "DE", label: "Germany (DE)" },
+    { data: "FR", label: "France (FR)" },
+    { data: "ES", label: "Spain (ES)" },
+    { data: "IT", label: "Italy (IT)" },
+    { data: "NL", label: "Netherlands (NL)" },
+    { data: "SE", label: "Sweden (SE)" },
+    { data: "NO", label: "Norway (NO)" },
+    { data: "DK", label: "Denmark (DK)" },
+    { data: "FI", label: "Finland (FI)" },
+    { data: "PL", label: "Poland (PL)" },
+    { data: "PT", label: "Portugal (PT)" },
+    { data: "AU", label: "Australia (AU)" },
+    { data: "NZ", label: "New Zealand (NZ)" },
+    { data: "JP", label: "Japan (JP)" },
+    { data: "KR", label: "South Korea (KR)" },
+    { data: "BR", label: "Brazil (BR)" },
+    { data: "MX", label: "Mexico (MX)" },
+    { data: "IN", label: "India (IN)" },
+];
 const DNS_OPTIONS = [
     { data: "cloudflare", label: "Cloudflare (1.1.1.1)" },
     { data: "google", label: "Google (8.8.8.8)" },
@@ -547,6 +577,17 @@ function Content() {
     const [isBusy, setIsBusy] = SP_REACT.useState(false);
     const [applyingAll, setApplyingAll] = SP_REACT.useState(false);
     const [optimizeResult, setOptimizeResult] = SP_REACT.useState(null);
+    const [regdomain, setRegdomainInfo] = SP_REACT.useState(null);
+    // The wireless region is a device-level fact that does not change on its
+    // own, so it is read once rather than added to the status poll.
+    const refreshRegdomain = SP_REACT.useCallback(() => {
+        getRegdomain()
+            .then((info) => setRegdomainInfo(info))
+            .catch(() => setRegdomainInfo(null));
+    }, []);
+    SP_REACT.useEffect(() => {
+        refreshRegdomain();
+    }, [refreshRegdomain]);
     const [customDnsInput, setCustomDnsInput] = SP_REACT.useState("");
     // --- Update flow state ---
     const [updateInfo, setUpdateInfo] = SP_REACT.useState(null);
@@ -1004,7 +1045,9 @@ function Content() {
                                 ? "All good"
                                 : "Optimize Safe" }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Power & stability", children: [SP_JSX.jsx(InfoRow, { label: "Prevent lag spikes", subtitle: "Disables WiFi power save and PCIe power states", explanation: "The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal.", ...getBadge("power_save", status, errors.power_save ?? null), checked: s?.power_save_disabled ?? false, disabled: isBusy, error: errors.power_save, onChange: (val) => handleToggle("power_save", () => setPowerSave(val)) }), SP_JSX.jsx(InfoRow, { label: "Stop background scanning", subtitle: "Locks to current AP - disable to switch networks or roam", explanation: "Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point.", ...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
                             ? { badge: "unknown", text: "other network" }
-                            : getBadge("bssid_lock", status, errors.bssid_lock ?? null)), checked: s?.bssid_lock_enabled ?? false, disabled: isBusy || (!connected && !s?.bssid_lock_enabled), error: errors.bssid_lock, notice: notices.bssid_lock, onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy, error: errors.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [SP_JSX.jsx(InfoRow, { label: supports6GHz ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""}. Using 5 GHz${supports6GHz ? " or 6 GHz" : ""} for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`, ...getBadge("band_preference", status, errors.band_preference ?? null), checked: s?.band_preference_enabled ?? false, disabled: isBusy || (!connected && !s?.band_preference_enabled), error: errors.band_preference, onChange: (val) => handleToggle("band_preference", () => setBandPreference(val, s?.band_preference ?? "a")) }), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge(undefined, status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput)), children: s?.dns_enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "DNS Provider", rgOptions: DNS_OPTIONS, selectedOption: s?.dns_provider ?? "cloudflare", onChange: (option) => {
+                            : getBadge("bssid_lock", status, errors.bssid_lock ?? null)), checked: s?.bssid_lock_enabled ?? false, disabled: isBusy || (!connected && !s?.bssid_lock_enabled), error: errors.bssid_lock, notice: notices.bssid_lock, onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy, error: errors.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: REGION_OPTIONS, selectedOption: regdomain.setting || regdomain.governing || "00", disabled: isBusy, onChange: (option) => {
+                                void handleToggle("regdomain", () => setRegdomain(option.data)).then(refreshRegdomain);
+                            } }) })), regdomain?.readable && !regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", opacity: 0.8, padding: "4px 0" }, children: ["WiFi region: ", regdomain.governing || "unknown", ". This device's WiFi card sets its own region, so it cannot be changed here. That is normal on the Steam Deck and does not mean a band is missing."] }) })), SP_JSX.jsx(InfoRow, { label: supports6GHz ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""}. Using 5 GHz${supports6GHz ? " or 6 GHz" : ""} for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`, ...getBadge("band_preference", status, errors.band_preference ?? null), checked: s?.band_preference_enabled ?? false, disabled: isBusy || (!connected && !s?.band_preference_enabled), error: errors.band_preference, onChange: (val) => handleToggle("band_preference", () => setBandPreference(val, s?.band_preference ?? "a")) }), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge(undefined, status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput)), children: s?.dns_enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "DNS Provider", rgOptions: DNS_OPTIONS, selectedOption: s?.dns_provider ?? "cloudflare", onChange: (option) => {
                                             const custom = option.data === "custom" ? customDnsInput : "";
                                             handleToggle("dns", () => setDns(true, option.data, custom));
                                         } }) }), s?.dns_provider === "custom" && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "DNS servers (space-separated)", value: customDnsInput, onChange: (e) => setCustomDnsInput(e.target.value), onBlur: () => {

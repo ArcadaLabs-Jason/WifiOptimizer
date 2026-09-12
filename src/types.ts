@@ -140,3 +140,22 @@ export const ERROR_MESSAGES: Record<string, string> = {
   parse_error: "Settings were reset to defaults.",
   unexpected: "Something went wrong. Check the Decky log for details.",
 };
+
+export interface RegdomainPhy {
+  phy: string;
+  self_managed: boolean;
+  country: string;
+}
+
+export interface RegdomainInfo extends MethodResult {
+  readable: boolean;
+  // False when the radio carries its own regulatory domain, in which case
+  // changing this setting is cosmetic and the panel must say so rather than
+  // offering a control that does nothing.
+  changeable: boolean;
+  self_managed: boolean;
+  global: string;
+  governing: string;
+  phys: RegdomainPhy[];
+  setting: string;
+}

@@ -1014,5 +1014,104 @@ asyncio.run(d.get_status())
 ok(prio_writes(d) == [(U, "999")],
    "the priority never exceeds NetworkManager's ceiling")
 
+section("wireless region: reading it honestly, and setting it safely")
+
+# Verbatim shape of a Steam Deck OLED, measured 2026-09-12. The global block
+# is printed first and says country 00 with everything PASSIVE-SCAN, while the
+# phy carries its own US domain with the full 6 GHz range. Reading the first
+# block and stopping is exactly the misreading this parser exists to prevent.
+SELF_MANAGED = """global
+country 00: DFS-UNSET
+	(2402 - 2472 @ 40), (N/A, 20), (N/A)
+	(5170 - 5250 @ 80), (N/A, 20), (N/A), AUTO-BW, PASSIVE-SCAN
+
+phy#0 (self-managed)
+country US: DFS-FCC
+	(5170 - 5250 @ 80), (6, 24), (N/A), AUTO-BW
+	(5925 - 7125 @ 160), (N/A, 24), (N/A), NO-OUTDOOR, AUTO-BW
+"""
+
+# A radio that does NOT manage its own domain: the global entry governs, and
+# this is the device the region selector exists for.
+PLAIN = """global
+country 00: DFS-UNSET
+	(2402 - 2472 @ 40), (N/A, 20), (N/A)
+
+phy#1
+country 00: DFS-UNSET
+	(2402 - 2472 @ 40), (N/A, 20), (N/A)
+"""
+
+r = m.Plugin()._parse_reg(SELF_MANAGED)
+ok(r["global"] == "00", "the global domain is read")
+ok(r["self_managed"] is True, "a self-managed phy is recognised")
+ok(r["governing"] == "US",
+   "and its own domain is reported as the one that governs, not the global 00")
+
+r2 = m.Plugin()._parse_reg(PLAIN)
+ok(r2["self_managed"] is False, "a phy that manages nothing is not mistaken for one")
+ok(r2["governing"] == "00", "and the global domain governs it")
+
+ok(m.Plugin()._parse_reg("")["governing"] == "",
+   "unreadable output yields no claim about the region")
+
+class Reg(m.Plugin):
+    def __init__(self, reg_text, ok_set=True):
+        super().__init__()
+        self.reg_text = reg_text
+        self.ok_set = ok_set
+        self.sets = []
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        if cmd[:3] == ["/usr/bin/iw", "reg", "get"]:
+            return {"success":True,"stdout":self.reg_text,"stderr":"","returncode":0}
+        if cmd[:3] == ["/usr/bin/iw", "reg", "set"]:
+            self.sets.append(cmd[3])
+            return {"success":self.ok_set,"stdout":"","stderr":"nope","returncode":0}
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+# A regulatory domain is a legal constraint and the value reaches a
+# subprocess, so anything that is not a country is refused outright.
+for bad in ["US; rm -rf /", "$(id)", "`id`", "USA", "u", "../../etc", "US US"]:
+    m._save_settings(dict(base_ap))
+    d = Reg(PLAIN)
+    res = asyncio.run(d.set_regdomain(bad))
+    ok(res.get("success") is False and not d.sets,
+       f"region {bad!r} is refused and never reaches iw")
+
+m._save_settings(dict(base_ap))
+d = Reg(PLAIN)
+res = asyncio.run(d.set_regdomain("de"))
+ok(res.get("success") is True and d.sets == ["DE"],
+   "a lowercase region is accepted and applied uppercase")
+ok(m._load_settings().get("regdomain") == "DE", "and remembered")
+
+# Turning it off restores what was there before we touched it.
+m._save_settings(dict(base_ap))
+d = Reg(PLAIN)
+asyncio.run(d.set_regdomain("DE"))
+ok(m._load_settings().get("regdomain_previous") == "00",
+   "the region in place before our first change is recorded")
+d.sets.clear()
+asyncio.run(d.set_regdomain(""))
+ok(d.sets == ["00"], "and is restored when the setting is turned off")
+ok(m._load_settings().get("regdomain") == "", "with nothing left claiming to manage it")
+
+# The silent no-op is the failure shape to avoid: on a self-managed radio the
+# command succeeds and changes nothing, so the result has to say so.
+m._save_settings(dict(base_ap))
+d = Reg(SELF_MANAGED)
+res = asyncio.run(d.set_regdomain("DE"))
+ok(res.get("self_managed") is True and bool(res.get("message")),
+   "setting a region on a self-managed radio explains that nothing changed")
+
+m._save_settings(dict(base_ap))
+d = Reg(SELF_MANAGED)
+info = asyncio.run(d.get_regdomain())
+ok(info.get("changeable") is False,
+   "and the panel is told the setting cannot change anything here")
+m._save_settings(dict(base_ap))
+ok(asyncio.run(Reg(PLAIN).get_regdomain()).get("changeable") is True,
+   "while a radio that does not manage its own domain can be changed")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

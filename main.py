@@ -130,6 +130,13 @@ UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}\Z")
 # desktop user owns, before being compared against scan results.
 BSSID_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 
+# An ISO 3166-1 alpha-2 country, or 00 for the world-roaming domain. This one
+# is strict for a specific reason: the value reaches `iw reg set` and a
+# modprobe option the kernel reads at every module load, before anyone logs
+# in. A regulatory domain is also a legal constraint on transmit power, so a
+# malformed one is not merely a bad setting.
+REGDOMAIN_RE = re.compile(r"^(?:[A-Z]{2}|00)\Z")
+
 # DNS servers are free text from the panel. They are passed to nmcli as a
 # single argument, so there is no shell involved, but the value is stored and
 # replayed later and should be addresses and nothing else.
@@ -209,6 +216,12 @@ DEFAULT_SETTINGS = {
     "cake_enabled": False,
     "last_connection_uuid": "",
     "priority_set": False,
+    # The wireless region, when the user has asked us to manage it. Empty
+    # means we are not managing it and whatever the system has is left alone.
+    "regdomain": "",
+    # What the region was before our first change, so turning the setting off
+    # restores it rather than guessing at a default.
+    "regdomain_previous": "",
     "distro_id": "unknown",
     "distro_name": "Unknown",
     "update_channel": "stable",
@@ -930,6 +943,15 @@ class Plugin:
             distro = self._detect_distro()
             settings["distro_id"] = distro["id"]
             settings["distro_name"] = distro["name"]
+            # `iw reg set` does not survive a reboot, so a region the user
+            # chose has to be put back here. This runs when the plugin loads,
+            # which can be after the first association - so the very first
+            # connection of a boot may still use the old domain.
+            chosen_region = settings.get("regdomain", "")
+            if chosen_region and REGDOMAIN_RE.match(chosen_region):
+                self._run_cmd(
+                    ["/usr/bin/iw", "reg", "set", chosen_region], timeout=5
+                )
             if settings.get("auto_fix_on_wake", True):
                 if not self._install_dispatcher():
                     # Don't leave the toggle reading on with nothing installed.
@@ -1220,6 +1242,90 @@ class Plugin:
 
     # ---- Diagnostics ----
 
+    async def get_regdomain(self) -> dict:
+        """The wireless region, with enough context for the panel to be honest."""
+        try:
+            info = await asyncio.to_thread(self._regdomain_info)
+            info["success"] = True
+            info["setting"] = _load_settings().get("regdomain", "")
+            return info
+        except Exception as e:
+            decky.logger.error(f"get_regdomain error: {e}")
+            return {"success": False, "error": str(e), "readable": False,
+                    "changeable": False, "self_managed": False,
+                    "global": "", "governing": "", "phys": [], "setting": ""}
+
+    async def set_regdomain(self, country: str) -> dict:
+        """Set the wireless region, or pass "" to stop managing it.
+
+        Some radios carry their own regulatory domain and ignore this
+        entirely. Rather than appearing to succeed and changing nothing, the
+        result says so: a silent no-op that imitates a working setting is the
+        worst shape this could take.
+        """
+        try:
+            country = (country or "").strip().upper()
+            if country and not REGDOMAIN_RE.match(country):
+                return {
+                    "success": False, "error": "invalid_region",
+                    "message": "A region is two letters, like US or DE.",
+                }
+            info = await asyncio.to_thread(self._regdomain_info)
+            if not info.get("readable"):
+                return {
+                    "success": False, "error": "unreadable",
+                    "message": "Couldn't read the current wireless region.",
+                }
+            settings = _load_settings()
+            if country:
+                # Record what was there before OUR first change, so turning
+                # this off restores it instead of guessing at a default.
+                if not settings.get("regdomain"):
+                    settings["regdomain_previous"] = info.get("global", "")
+                target = country
+            else:
+                target = settings.get("regdomain_previous") or "00"
+            if not REGDOMAIN_RE.match(target):
+                return {
+                    "success": False, "error": "invalid_region",
+                    "message": "A region is two letters, like US or DE.",
+                }
+            applied = await asyncio.to_thread(
+                self._run_cmd, ["/usr/bin/iw", "reg", "set", target], 5
+            )
+            if not applied["success"]:
+                return {
+                    "success": False, "error": "iw_failed",
+                    "message": "Couldn't set the wireless region.",
+                    "detail": (applied.get("stderr") or "")[:200],
+                }
+            settings["regdomain"] = country
+            _save_settings(settings)
+            after = await asyncio.to_thread(self._regdomain_info)
+            result = {
+                "success": True,
+                "regdomain": country,
+                "governing": after.get("governing", ""),
+                "self_managed": after.get("self_managed", False),
+                "changeable": after.get("changeable", False),
+            }
+            if after.get("self_managed"):
+                result["message"] = (
+                    "This device's WiFi carries its own region "
+                    f"({after.get('governing', 'unknown')}) and ignores this "
+                    "setting, so the channels available to you have not "
+                    "changed. That is normal on the Steam Deck and does not "
+                    "mean a band is missing."
+                )
+            decky.logger.info(
+                f"regdomain set to {target!r}: governing="
+                f"{after.get('governing')!r} self_managed={after.get('self_managed')}"
+            )
+            return result
+        except Exception as e:
+            decky.logger.error(f"set_regdomain error: {e}")
+            return self._unexpected_response(e)
+
     async def get_diagnostic_info(self) -> dict:
         """Collect system info for remote debugging. Sanitized (no passwords)."""
         try:
@@ -1241,6 +1347,11 @@ class Plugin:
                 "wifi_interface": iface,
                 "iw_dev": iw_dev.get("stdout", ""),
                 "iw_reg": iw_reg.get("stdout", ""),
+                # The raw block above is kept, but it leads with the GLOBAL
+                # domain, which a self-managed radio ignores. Anyone reading
+                # it sees `country 00: DFS-UNSET` and concludes their 6 GHz is
+                # crippled. Ship the interpretation alongside it.
+                "regdomain": self._parse_reg(iw_reg.get("stdout", "")),
                 "kernel": uname.get("stdout", "").strip(),
                 "os_release": os_release,
                 "distro_id": distro["id"],
@@ -2261,6 +2372,63 @@ class Plugin:
         if mine > highest:
             return None
         return min(highest + 1, self._PRIORITY_MAX)
+
+    @staticmethod
+    def _parse_reg(text: str) -> dict:
+        """Split `iw reg get` into the global domain and each phy's own.
+
+        The global block is printed FIRST and is the one people read, but a
+        SELF-MANAGED phy carries its own regulatory domain and the global
+        entry does not govern it. On a Steam Deck OLED the global block says
+        `country 00: DFS-UNSET` with every band PASSIVE-SCAN, while the phy
+        sits at `country US: DFS-FCC` with the full 5925-7125 range - so
+        anyone reading the raw output reasonably concludes their 6 GHz is
+        crippled when it is not. That misreading is a support-noise
+        generator, and it is the reason this parser exists rather than the
+        raw text being shown.
+        """
+        out = {"global": "", "phys": [], "self_managed": False, "governing": ""}
+        section = None
+        for raw in (text or "").split("\n"):
+            line = raw.strip()
+            if line.startswith("global"):
+                section = {"phy": "", "self_managed": False, "country": ""}
+                out["_global_section"] = section
+                continue
+            if line.startswith("phy#"):
+                name = line.split()[0].replace("#", "")
+                section = {
+                    "phy": name,
+                    "self_managed": "self-managed" in line,
+                    "country": "",
+                }
+                out["phys"].append(section)
+                continue
+            if line.startswith("country") and section is not None and not section["country"]:
+                # "country US: DFS-FCC" -> "US"
+                rest = line.split(None, 1)[1] if len(line.split(None, 1)) > 1 else ""
+                section["country"] = rest.split(":", 1)[0].strip()
+        g = out.pop("_global_section", None)
+        out["global"] = (g or {}).get("country", "")
+        managed = [p for p in out["phys"] if p["self_managed"] and p["country"]]
+        out["self_managed"] = bool(managed)
+        # What actually governs this radio: the self-managed phy when there is
+        # one, otherwise the global domain.
+        out["governing"] = managed[0]["country"] if managed else out["global"]
+        return out
+
+    def _regdomain_info(self) -> dict:
+        """The regulatory picture, already interpreted.
+
+        `changeable` is the field that matters to the UI: on a self-managed
+        phy setting a region is COSMETIC, and saying so is the difference
+        between a feature that does nothing and a feature that explains why.
+        """
+        result = self._run_cmd(["/usr/bin/iw", "reg", "get"], timeout=3)
+        parsed = self._parse_reg(result.get("stdout", "") if result["success"] else "")
+        parsed["readable"] = bool(result["success"])
+        parsed["changeable"] = bool(result["success"]) and not parsed["self_managed"]
+        return parsed
 
     def _recent_ap_failures(self, settings: dict) -> set:
         """Access points that refused an association recently.
