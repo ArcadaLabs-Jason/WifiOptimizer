@@ -282,11 +282,20 @@ section("access point lock: choosing which access point to pin")
 # A mesh advertising one network on several nodes: a strong pair on the
 # router and weaker nodes further away.
 MESH = "\n".join([
-    "Net:02\\:00\\:00\\:00\\:00\\:51:100:5180 MHz",
-    "Net:02\\:00\\:00\\:00\\:00\\:24:100:2462 MHz",
-    "Net:02\\:00\\:00\\:00\\:00\\:52:54:5220 MHz",
-    "Net:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz",
-    "Other:AA\\:BB\\:CC\\:DD\\:EE\\:FF:99:5180 MHz",
+    "Net:02\\:00\\:00\\:00\\:00\\:51:100:5180 MHz:WPA2 WPA3",
+    "Net:02\\:00\\:00\\:00\\:00\\:24:100:2462 MHz:WPA2 WPA3",
+    "Net:02\\:00\\:00\\:00\\:00\\:52:54:5220 MHz:WPA2 WPA3",
+    "Net:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3",
+    "Other:AA\\:BB\\:CC\\:DD\\:EE\\:FF:99:5180 MHz:WPA2 WPA3",
+])
+
+# One SSID, two generations of hardware: a strong pair that only speaks WPA2
+# beside weaker nodes that also offer WPA3. Taken from a real network.
+MIXED = "\n".join([
+    "Net:02\\:00\\:00\\:00\\:00\\:51:100:5180 MHz:WPA2",
+    "Net:02\\:00\\:00\\:00\\:00\\:24:95:2462 MHz:WPA2",
+    "Net:02\\:00\\:00\\:00\\:00\\:52:80:5220 MHz:WPA2 WPA3",
+    "Net:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3",
 ])
 
 def _ok(out=""):
@@ -313,16 +322,18 @@ class Mesh(m.Plugin):
     stub that cannot re-associate tests nothing about what happens after the
     write.
     """
-    def __init__(self, scan, on, reachable=None, band="", signal_dbm=None):
+    def __init__(self, scan, on, reachable=None, band="", signal_dbm=None,
+                 key_mgmt="wpa-psk"):
         super().__init__()
         self.scan, self.on, self.reachable = scan, on, reachable
         self.pinned, self.band, self.mods = "", band, []
-        self.signal_dbm, self.scans = signal_dbm, 0
+        self.signal_dbm, self.scans, self.key_mgmt = signal_dbm, 0, key_mgmt
         self.aps = [
             (f[1], int(f[2]), int(re.match(r"\s*(\d+)", f[3]).group(1)))
             for f in (_fields(l) for l in scan.split("\n"))
-            if len(f) >= 4 and f[0] == "Net"
+            if len(f) >= 5 and f[0] == "Net"
         ]
+    def _profile_key_mgmt(self, uuid): return self.key_mgmt
     def _freq_of(self, bssid):
         for b, _, f in self.aps:
             if b.upper() == (bssid or "").upper(): return f
@@ -362,9 +373,9 @@ class Mesh(m.Plugin):
             rows = []
             for line in self.scan.split("\n"):
                 got = _fields(line)
-                if len(got) < 4: continue
+                if len(got) < 5: continue
                 by = {"SSID": got[0], "BSSID": got[1].replace(":", "\\:"),
-                      "SIGNAL": got[2], "FREQ": got[3]}
+                      "SIGNAL": got[2], "FREQ": got[3], "SECURITY": got[4]}
                 rows.append(":".join(by.get(f, "") for f in fields))
             return _ok("\n".join(rows))
         if "link" in cmd:
@@ -395,13 +406,13 @@ g = Mesh(MESH, "02:00:00:00:00:11")
 aps = getattr(g, "_visible_access_points", lambda *a: [])("wlan0", "Net")
 ok(bool(aps) and aps[0][0] == "02:00:00:00:00:51" and aps[0][2] >= 5000,
    "at equal signal the 5 GHz radio is preferred")
-ok(bool(aps) and all(b != "AA:BB:CC:DD:EE:FF" for b, _, _ in aps),
+ok(bool(aps) and all(ap[0] != "AA:BB:CC:DD:EE:FF" for ap in aps),
    "another network's access points are not considered")
 
 # A small difference is not worth a reconnect.
 NEAR = "\n".join([
-    "Net:02\\:00\\:00\\:00\\:00\\:51:60:5180 MHz",
-    "Net:02\\:00\\:00\\:00\\:00\\:11:50:5745 MHz",
+    "Net:02\\:00\\:00\\:00\\:00\\:51:60:5180 MHz:WPA2 WPA3",
+    "Net:02\\:00\\:00\\:00\\:00\\:11:50:5745 MHz:WPA2 WPA3",
 ])
 m._save_settings(dict(base_ap))
 g = Mesh(NEAR, "02:00:00:00:00:11")
@@ -432,6 +443,41 @@ ok(g.pinned.upper() == "02:00:00:00:00:11",
 ok(r.get("success") is True and "could not be reached" in r.get("message",""),
    "and the user is told why it stayed put")
 
+# The failure this was written for: one SSID served by a strong pair that
+# only speaks WPA2 and weaker nodes that also offer WPA3. A profile saved as
+# WPA3-only cannot associate with the strong ones however loud they are, and
+# choosing one produced a reconnect that could only ever fail.
+m._save_settings(dict(base_ap))
+g = Mesh(MIXED, "02:00:00:00:00:11", key_mgmt="sae")
+asyncio.run(g.set_bssid_lock(True))
+ok(g.pinned.upper() == "02:00:00:00:00:52",
+   "a WPA3-only profile moves to the best access point that offers WPA3")
+ok(g.pinned.upper() != "02:00:00:00:00:51",
+   "and never to the stronger one it could not authenticate with")
+
+# The same network from a profile that CAN use WPA2 should take the strong one.
+m._save_settings(dict(base_ap))
+g = Mesh(MIXED, "02:00:00:00:00:11", key_mgmt="wpa-psk")
+asyncio.run(g.set_bssid_lock(True))
+ok(g.pinned.upper() == "02:00:00:00:00:51",
+   "a WPA2 profile is free to take the strongest access point")
+
+# Unreadable key management must not filter everything away.
+m._save_settings(dict(base_ap))
+g = Mesh(MIXED, "02:00:00:00:00:11", key_mgmt="")
+asyncio.run(g.set_bssid_lock(True))
+ok(g.pinned.upper() == "02:00:00:00:00:51",
+   "unknown key management leaves the choice as it was")
+
+accepts = getattr(m.Plugin, "_ap_accepts", None)
+for sec, km, want, label in [
+    ("WPA2", "sae", False, "WPA2 only cannot take a WPA3 profile"),
+    ("WPA2 WPA3", "sae", True, "WPA2/WPA3 can"),
+    ("WPA2", "wpa-psk", True, "WPA2 takes a WPA2 profile"),
+    ("", "none", True, "an open network takes an open profile"),
+    ("WPA2", "none", False, "an open profile does not take a secured access point"),
+]:
+    ok((accepts(sec, km) if accepts else None) is want, label)
 # Scanning takes the radio off-channel, so a link that is already healthy
 # should not be disturbed to look for a marginally better one.
 m._save_settings(dict(base_ap))

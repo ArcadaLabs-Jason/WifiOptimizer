@@ -1794,19 +1794,19 @@ class Plugin:
         if not ssid:
             return []
         scan = self._run_cmd(
-            ["/usr/bin/nmcli", "-t", "-f", "SSID,BSSID,SIGNAL,FREQ", "dev",
-             "wifi", "list", "ifname", iface],
+            ["/usr/bin/nmcli", "-t", "-f", "SSID,BSSID,SIGNAL,FREQ,SECURITY",
+             "dev", "wifi", "list", "ifname", iface],
             timeout=5,
         )
         if not scan["success"]:
             return []
         want = ssid.replace("\\", "")
-        found: list[tuple[str, int, int]] = []
+        found: list[tuple[str, int, int, str]] = []
         for line in scan.get("stdout", "").split("\n"):
             parts = self._nmcli_fields(line)
-            if len(parts) < 4:
+            if len(parts) < 5:
                 continue
-            name, bssid, signal, freq = parts[0], parts[1], parts[2], parts[3]
+            name, bssid, signal, freq, security = parts[:5]
             if name != want or not bssid:
                 continue
             found_freq = re.match(r"\s*(\d+)", freq.strip())
@@ -1815,11 +1815,54 @@ class Plugin:
                     bssid.upper(),
                     int(signal),
                     int(found_freq.group(1)) if found_freq else 0,
+                    security.strip().upper(),
                 ))
             except ValueError:
                 continue
         found.sort(key=lambda ap: (ap[1], ap[2] >= 5000), reverse=True)
         return found
+
+    @staticmethod
+    def _ap_accepts(security: str, key_mgmt: str) -> bool:
+        """Whether an access point can accept a profile's key management.
+
+        One SSID does not mean one set of credentials. A network can be
+        served by a modern access point offering WPA3 alongside an older one
+        that only speaks WPA2, and a profile saved as WPA3-only cannot
+        associate with the latter no matter how strong its signal is.
+
+        Measured: a device sat on a mesh node at signal 61 while the router
+        advertised the same SSID at 100 on two radios, WPA2 only, against a
+        key-mgmt of sae. Ranking by signal alone chose an access point it
+        could never join.
+
+        Unknown or unreadable key management returns True rather than
+        filtering everything out, which keeps an unfamiliar setup working the
+        way it did before.
+        """
+        sec, km = security.upper(), (key_mgmt or "").strip().lower()
+        if km == "sae":
+            return "WPA3" in sec
+        if km.startswith("wpa-psk"):
+            return "WPA1" in sec or "WPA2" in sec
+        if km == "owe":
+            return "OWE" in sec
+        if km.startswith("wpa-eap"):
+            return "802.1X" in sec
+        if km == "none":
+            return sec == ""
+        return True
+
+    def _profile_key_mgmt(self, uuid: str) -> str:
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "802-11-wireless-security.key-mgmt",
+             "con", "show", "uuid", uuid],
+            timeout=5,
+        )
+        if not result["success"]:
+            return ""
+        _, sep, value = result.get("stdout", "").partition(":")
+        return value.strip() if sep else ""
 
     async def _await_association(self, iface: str) -> dict:
         """Poll iw until the link reports an access point, or the budget runs out.
@@ -1886,8 +1929,9 @@ class Plugin:
         return int(found.group(1)) >= self._STRONG_ENOUGH_DBM
 
     def _preferred_access_point(
-        self, iface: str, ssid: str, current: str, settings: dict, link: str = ""
-    ) -> tuple[str, int, int] | None:
+        self, iface: str, ssid: str, current: str, settings: dict,
+        link: str = "", uuid: str = ""
+    ) -> tuple[str, int, int, str] | None:
         """The AP worth moving to, or None to stay where we are.
 
         The lock pins whichever access point you happen to be on. On a mesh
@@ -1906,6 +1950,13 @@ class Plugin:
         aps = self._visible_access_points(iface, ssid)
         if not aps:
             return None
+        # An access point that cannot accept this profile's credentials is not
+        # a candidate however strong it is.
+        key_mgmt = self._profile_key_mgmt(uuid) if uuid else ""
+        if key_mgmt:
+            aps = [ap for ap in aps if self._ap_accepts(ap[3], key_mgmt)]
+            if not aps:
+                return None
         if settings.get("band_preference_enabled") and settings.get(
             "band_preference_ssid"
         ) == ssid:
@@ -2640,7 +2691,8 @@ class Plugin:
                 # permanent one, and on a mesh that is the common case rather
                 # than the corner one.
                 moved_to = self._preferred_access_point(
-                    iface, active_ssid or "", bssid, _load_settings(), link_out
+                    iface, active_ssid or "", bssid, _load_settings(), link_out,
+                    uuid,
                 )
                 chosen = moved_to[0] if moved_to else bssid
                 if moved_to:
