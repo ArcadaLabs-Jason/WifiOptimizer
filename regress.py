@@ -1132,5 +1132,57 @@ m._save_settings(dict(base_ap))
 ok(asyncio.run(Reg(PLAIN).get_regdomain()).get("changeable") is True,
    "while a radio that does not manage its own domain can be changed")
 
+section("is the wanted band actually reachable")
+
+# Checked before cycling the radio, because a cycle that cannot get back
+# leaves the user disconnected, which is worse than the state it was meant to
+# improve. It had no coverage, and it parses nmcli terse output by hand.
+class Scan(m.Plugin):
+    def __init__(self, rows, ssid="Net", scan_ok=True):
+        super().__init__()
+        self.rows = rows
+        self.ssid = ssid
+        self.scan_ok = scan_ok
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        j = " ".join(cmd)
+        if "SSID,FREQ" in j:
+            return {"success": self.scan_ok, "stdout": "\n".join(self.rows),
+                    "stderr": "", "returncode": 0}
+        if "802-11-wireless.ssid" in j:
+            return {"success": True, "stdout": f"802-11-wireless.ssid:{self.ssid}",
+                    "stderr": "", "returncode": 0}
+        return {"success": True, "stdout": "", "stderr": "", "returncode": 0}
+
+FIVE = "Net:5745 MHz"
+TWO  = "Net:2437 MHz"
+OTHER_FIVE = "Elsewhere:5745 MHz"
+
+ok(Scan([TWO, FIVE])._band_is_reachable("wlan0", "u", "a") is True,
+   "a 5 GHz access point for this network makes the 5 GHz preference reachable")
+ok(Scan([TWO])._band_is_reachable("wlan0", "u", "a") is False,
+   "a network offering only 2.4 GHz does not")
+ok(Scan([TWO])._band_is_reachable("wlan0", "u", "bg") is True,
+   "and 2.4 GHz is reachable when that is what was asked for")
+ok(Scan([FIVE])._band_is_reachable("wlan0", "u", "bg") is False,
+   "while a 5 GHz only network cannot satisfy a 2.4 GHz preference")
+ok(Scan([OTHER_FIVE])._band_is_reachable("wlan0", "u", "a") is False,
+   "another network's access points do not count")
+ok(Scan([FIVE], scan_ok=False)._band_is_reachable("wlan0", "u", "a") is False,
+   "a scan that failed is not evidence the band is reachable")
+ok(Scan([FIVE], ssid="")._band_is_reachable("wlan0", "u", "a") is False,
+   "and neither is a profile whose SSID cannot be read")
+
+# A BSSID is nothing but colons and an SSID may contain one, which is why
+# nmcli escapes them. The band check does its own unescaping.
+ok(Scan(["My\\:Net:5745 MHz"], ssid="My\\:Net")._band_is_reachable("wlan0", "u", "a") is True,
+   "an SSID containing a colon still matches its own access point")
+ok(Scan(["My\\:Net:5745 MHz"], ssid="Other")._band_is_reachable("wlan0", "u", "a") is False,
+   "and is not confused with a different network")
+
+# The boundary itself: 5 GHz starts at 5000.
+ok(Scan(["Net:4980 MHz"])._band_is_reachable("wlan0", "u", "a") is False
+   and Scan(["Net:5000 MHz"])._band_is_reachable("wlan0", "u", "a") is True,
+   "the 5 GHz boundary is applied at 5000 MHz")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
