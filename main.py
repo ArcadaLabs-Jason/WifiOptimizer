@@ -2567,6 +2567,25 @@ class Plugin:
                     time.sleep(3)
                     iface = self._get_wifi_interface() or iface
                     link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+                    if not link_result["success"]:
+                        # Same trap as the wait above: an unread link is not a
+                        # band that could not be reached, and reporting it as
+                        # one sends the user to change a setting that was
+                        # never the problem.
+                        detail = (
+                            link_result.get("stderr", "")
+                            or f"iw exited {link_result.get('returncode')}"
+                        )
+                        decky.logger.error(
+                            f"BSSID lock: could not re-read the link on "
+                            f"{iface} after the band reconnect - {detail[:200]}"
+                        )
+                        return {
+                            "success": False,
+                            "error": "nmcli_failed",
+                            "message": "Couldn't read the WiFi link.",
+                            "detail": detail,
+                        }
                     link_out = link_result.get("stdout", "")
                     frequency = ""
                     bssid = ""
@@ -2876,6 +2895,16 @@ class Plugin:
                 landed_on = self._get_active_connection_uuid()
                 if iface and landed_on == uuid:
                     link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+                    if not link_result["success"]:
+                        # Not fatal - reconciliation re-points the lock on a
+                        # later poll - but silence here left the lock enabled
+                        # in settings and absent from the profile with nothing
+                        # said about why.
+                        decky.logger.error(
+                            f"Band change: could not read the link on {iface} "
+                            f"to restore the access point lock - "
+                            f"{(link_result.get('stderr', '') or '')[:200]}"
+                        )
                     link_text = link_result.get("stdout", "")
                     seen_freq = ""
                     for line in link_text.split("\n"):
