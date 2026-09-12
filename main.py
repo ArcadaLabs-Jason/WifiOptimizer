@@ -301,11 +301,22 @@ def _load_settings() -> dict:
             value = merged.get(key, "")
             if value and not UUID_RE.match(value):
                 merged[key] = ""
-        for key in ("bssid_lock_uuids", "band_preference_uuids"):
+        # ipv6_uuids belongs here too: it is the third tracked list, it is
+        # handed to nmcli on exactly the same path, and leaving it out meant
+        # the one list whose entries were never checked was also the one the
+        # cleanup refuses to act on without a record.
+        for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids"):
             merged[key] = [
                 u for u in merged.get(key, [])
                 if isinstance(u, str) and UUID_RE.match(u)
             ]
+        # The region reaches `iw reg set`. Both the setter and the startup
+        # reapply check it, but a value that cannot be valid has no business
+        # surviving a load either.
+        for key in ("regdomain", "regdomain_previous"):
+            value = merged.get(key, "")
+            if value and not REGDOMAIN_RE.match(value):
+                merged[key] = ""
         return merged
     except Exception:
         return dict(DEFAULT_SETTINGS)

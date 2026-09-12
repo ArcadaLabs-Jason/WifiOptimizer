@@ -58,6 +58,25 @@ open(m.SETTINGS_FILE,"w").write(json.dumps({"driver":[], "cake_enabled":"yes"}))
 s = m._load_settings()
 ok(isinstance(s["driver"], str) and isinstance(s["cake_enabled"], bool), "settings type coercion")
 
+# This file belongs to the desktop user and root parses it on every poll, so
+# every value that reaches a root subprocess is checked on the way in, not
+# only at the point of use.
+open(m.SETTINGS_FILE, "w").write(json.dumps({
+    "bssid_lock_uuids": ["aa0fd3f5-5fba-4291-8cf0-3b38838338d3", "../../etc", 7],
+    "band_preference_uuids": ["not-a-uuid"],
+    "ipv6_uuids": ["aa0fd3f5-5fba-4291-8cf0-3b38838338d3", "; rm -rf /", None],
+    "regdomain": "US; id",
+    "regdomain_previous": "TOOLONG",
+}))
+s = m._load_settings()
+ok(s["bssid_lock_uuids"] == ["aa0fd3f5-5fba-4291-8cf0-3b38838338d3"],
+   "junk is dropped from the tracked lock uuids")
+ok(s["band_preference_uuids"] == [], "and from the tracked band uuids")
+ok(s["ipv6_uuids"] == ["aa0fd3f5-5fba-4291-8cf0-3b38838338d3"],
+   "and from the tracked IPv6 uuids, which reach nmcli the same way")
+ok(s["regdomain"] == "" and s["regdomain_previous"] == "",
+   "a region that cannot be valid does not survive a load")
+
 section("concurrency: reconciliation guards")
 calls=[]
 class P(m.Plugin):
