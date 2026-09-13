@@ -1605,5 +1605,403 @@ ok(not _over, "no function in main.py is over "
 ok(_sizes.get("Plugin._collect_status", 999) <= FUNCTION_LINE_LIMIT,
    "and the status collector in particular stays inside it")
 
+
+section("setting the band preference")
+
+# 196 lines, 38 branches and NO coverage before this section, which made it the
+# largest untested function in the file - and it is a setter that writes a band
+# into a NetworkManager profile, clears the address pin, cycles the radio and
+# re-pins afterwards. A profile left demanding a band its network does not offer
+# will not associate, so every failure path here can strand the device.
+BU   = "eeeeeeee-0000-0000-0000-00000000000a"   # the profile in use
+BOLD = "eeeeeeee-0000-0000-0000-00000000000b"   # one we wrote to previously
+BX   = "eeeeeeee-0000-0000-0000-00000000000c"   # one that no longer exists
+
+class Band(m.Plugin):
+    """The band setter, over a profile whose writes can be made to fail."""
+    def __init__(self, ssid="Home", active=BU, refuse=(), missing=(),
+                 reconnect=True, link="Connected to 02:00:00:00:00:11\n\tfreq: 5180",
+                 landed=None):
+        super().__init__()
+        self.ssid = ssid
+        self.active = active
+        self.refuse = set(refuse)          # (uuid, key) pairs that fail hard
+        self.missing = set(missing)        # uuids nmcli says it does not know
+        self.reconnect = reconnect
+        self.link = link
+        self.landed = landed               # who we came back on, if not `active`
+        self.mods = []
+        self.reconnects = 0
+        self.depth_seen = []
+    def _get_wifi_interface(self): return "wlan0"
+    def _get_active_connection_uuid(self):
+        if self.landed is not None and self.reconnects:
+            return self.landed
+        return self.active
+    def _get_profile_ssid(self, uuid, timeout=5): return self.ssid or None
+    def _hard_reconnect(self, uuid=None):
+        self.reconnects += 1
+        # the guard must be held across the reconnect, or a poll lands in the
+        # middle of the change and writes the old address back
+        self.depth_seen.append(getattr(self, "_profile_change_depth", 0))
+        return self.reconnect
+    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        if cmd[:2] == ["/usr/bin/iw", "dev"] and "link" in cmd:
+            return {"success":True,"stdout":self.link,"stderr":"","returncode":0}
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.mods.append((uuid, key, value))
+        if uuid in self.missing:
+            return {"success":False,"stdout":"",
+                    "stderr":f"Error: unknown connection '{uuid}'.","returncode":10}
+        if (uuid, key) in self.refuse:
+            return {"success":False,"stdout":"","stderr":"permission denied","returncode":1}
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+def band_settings(**extra):
+    s = {**base_ap, "last_connection_uuid": BU}
+    s.update(extra)
+    return s
+
+def wrote(d, uuid, value):
+    return (uuid, "802-11-wireless.band", value) in d.mods
+
+# A blocking 3s wait sits on the re-lock path. Skipping it keeps this section
+# quick; the suite already takes over two minutes.
+_real_sleep = asyncio.sleep
+async def _no_sleep(_s, *a, **k): return None
+
+# --- refusing before anything is written ------------------------------------
+
+# The band reaches a subprocess and a wrong one silently reduces the channels a
+# device may use, so anything that is not a band it knows is refused outright.
+for bad in ["ac", "", "5", "a; rm -rf /", "A", "bg2"]:
+    m._save_settings(band_settings())
+    d = Band()
+    res = asyncio.run(d.set_band_preference(True, bad))
+    ok(res.get("success") is False and not d.mods,
+       f"band {bad!r} is refused and never reaches nmcli")
+ok(m._load_settings().get("band_preference_enabled") is not True,
+   "and a refused band is not recorded as enabled")
+
+# Both bands it does know are accepted.
+for good in ("a", "bg"):
+    m._save_settings(band_settings())
+    d = Band()
+    res = asyncio.run(d.set_band_preference(True, good))
+    ok(res.get("success") is True and wrote(d, BU, good), f"band {good!r} is applied")
+
+# ⭐ The network is established BEFORE anything is written, so a failure here
+# needs no rollback. Recording the preference as on with no network attached
+# would leave it enforced nowhere while the toggle reads on, and would let
+# Force Reapply write the band into an unrelated network.
+m._save_settings(band_settings())
+d = Band(ssid="")
+res = asyncio.run(d.set_band_preference(True, "a"))
+ok(res.get("success") is False, "an unreadable network refuses the enable")
+ok(not d.mods, "and nothing at all was written first")
+after = m._load_settings()
+ok(after.get("band_preference_enabled") is not True
+   and not after.get("band_preference_ssid"),
+   "so no half-enabled state is left behind")
+
+# Disabling needs no network - the band lives on a saved profile and being
+# unable to associate is a likely reason to be turning it off.
+m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
+                               band_preference_ssid="Home",
+                               band_preference_uuids=[BU]))
+d = Band(ssid="")
+res = asyncio.run(d.set_band_preference(False))
+ok(res.get("success") is True and wrote(d, BU, ""),
+   "the preference can be turned off without a readable network")
+
+# --- what the enable records -------------------------------------------------
+
+m._save_settings(band_settings())
+d = Band()
+asyncio.run(d.set_band_preference(True, "bg"))
+s = m._load_settings()
+ok(s.get("band_preference_enabled") is True and s.get("band_preference") == "bg",
+   "the enable is recorded with the band asked for")
+ok(s.get("band_preference_ssid") == "Home",
+   "and the network it was set on is recorded, which is what scopes it")
+ok(BU in s.get("band_preference_uuids", []),
+   "and the profile is tracked, so it can be cleared later")
+
+# ⭐ THE SUBTLE ONE: reapply_all calls this setter too, so re-claiming the
+# network on every call would move a preference set at home onto whatever
+# network Force Reapply happened to be pressed on.
+m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
+                               band_preference_ssid="Home",
+                               band_preference_uuids=[BU]))
+d = Band(ssid="Cafe")
+asyncio.run(d.set_band_preference(True, "a"))
+ok(m._load_settings().get("band_preference_ssid") == "Home",
+   "an already-claimed network is not re-claimed on a later enable")
+
+# ...while a fresh enable does claim whatever it is on.
+m._save_settings(band_settings(band_preference_ssid=""))
+d = Band(ssid="Cafe")
+asyncio.run(d.set_band_preference(True, "a"))
+ok(m._load_settings().get("band_preference_ssid") == "Cafe",
+   "but a fresh enable claims the network it is on")
+
+# The tracked list is bounded, like the lock's.
+many = [f"eeeeeeee-0000-0000-0000-{i:012d}" for i in range(40)]
+m._save_settings(band_settings(band_preference_uuids=list(many)))
+d = Band()
+asyncio.run(d.set_band_preference(True, "a"))
+ok(len(m._load_settings().get("band_preference_uuids", [])) <= d._MAX_TRACKED_LOCK_UUIDS,
+   "the tracked profile list stays bounded")
+
+# --- turning it off reaches every profile ------------------------------------
+
+m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
+                               band_preference_ssid="Home",
+                               band_preference_uuids=[BU, BOLD]))
+d = Band()
+asyncio.run(d.set_band_preference(False))
+ok(wrote(d, BU, "") and wrote(d, BOLD, ""),
+   "turning it off clears the band from every profile it was written to")
+s = m._load_settings()
+ok(s.get("band_preference_uuids") == [] and s.get("band_preference_ssid") == "",
+   "and stops claiming a network once they are all clear")
+ok(s.get("band_preference_enabled") is False, "and records the preference as off")
+
+# A profile that no longer exists is resolved, not failed - keeping it would
+# retry a write against nothing forever.
+m._save_settings(band_settings(band_preference_enabled=True,
+                               band_preference_uuids=[BU, BX]))
+d = Band(missing=[BX])
+asyncio.run(d.set_band_preference(False))
+ok(m._load_settings().get("band_preference_uuids") == [],
+   "a profile nmcli no longer knows is dropped from the list")
+
+# Anything else is still demanding a band, so the record has to survive.
+m._save_settings(band_settings(band_preference_enabled=True,
+                               band_preference_uuids=[BU, BOLD]))
+d = Band(refuse=[(BOLD, "802-11-wireless.band")])
+asyncio.run(d.set_band_preference(False))
+ok(m._load_settings().get("band_preference_uuids") == [BOLD],
+   "a profile that refused the clear is kept, because it is still pinned to a band")
+
+# --- the address pin, which is the path that can strand the device -----------
+
+# The pin is released first so NM is free to find an access point on the new
+# band; a profile demanding this band and an address on the other one is
+# satisfiable by nothing.
+m._save_settings(band_settings(bssid_lock_enabled=True,
+                               bssid_lock_value="02:00:00:00:00:99",
+                               bssid_lock_connection_uuid=BU))
+d = Band()
+asyncio.run(d.set_band_preference(True, "a"))
+ok((BU, "802-11-wireless.bssid", "") in d.mods,
+   "the address pin is released so NM can move to the new band")
+ok(d.mods.index((BU, "802-11-wireless.band", "a"))
+   < d.mods.index((BU, "802-11-wireless.bssid", "")),
+   "the band is written before the pin is released, so no window has neither")
+
+# ⭐ AND IF THE RELEASE FAILS, the band write is undone rather than left beside
+# an address from the other band - the combination nothing can satisfy.
+m._save_settings(band_settings(bssid_lock_enabled=True,
+                               bssid_lock_value="02:00:00:00:00:99",
+                               bssid_lock_connection_uuid=BU,
+                               band_preference_enabled=False))
+d = Band(refuse=[(BU, "802-11-wireless.bssid")])
+res = asyncio.run(d.set_band_preference(True, "a"))
+ok(res.get("success") is False, "a pin that will not release fails the band change")
+ok(d.mods.count((BU, "802-11-wireless.band", "")) == 1,
+   "and the band write is rolled back, not left demanding a band with a foreign pin")
+ok(d.reconnects == 0, "and the radio is never cycled onto that state")
+
+# --- coming back, and who we came back as ------------------------------------
+
+asyncio.sleep = _no_sleep
+try:
+    # Re-pinned to whatever access point NM chose on the new band.
+    m._save_settings(band_settings(bssid_lock_enabled=True,
+                                   bssid_lock_connection_uuid=BU))
+    d = Band(link="Connected to 02:00:00:00:00:42\n\tfreq: 5180")
+    asyncio.run(d.set_band_preference(True, "a"))
+    ok((BU, "802-11-wireless.bssid", "02:00:00:00:00:42") in d.mods,
+       "the pin is restored to the access point NM landed on")
+    ok(m._load_settings().get("bssid_lock_value") == "02:00:00:00:00:42",
+       "and the recorded pin matches what was written")
+
+    # ⭐ A reconnect can land on a DIFFERENT profile - a duplicate for the same
+    # network, which is the situation this plugin exists to handle. Pinning what
+    # we see onto the profile we meant to change would write a foreign address,
+    # possibly from the other band, into a profile that now demands this one.
+    m._save_settings(band_settings(bssid_lock_enabled=True,
+                                   bssid_lock_connection_uuid=BU))
+    d = Band(landed=BOLD, link="Connected to 02:00:00:00:00:77\n\tfreq: 5180")
+    asyncio.run(d.set_band_preference(True, "a"))
+    ok(not any(k == "802-11-wireless.bssid" and v for _u, k, v in d.mods),
+       "nothing is re-pinned when the reconnect landed on another profile")
+
+    # Nor when the radio came back on the band this network no longer wants.
+    m._save_settings(band_settings(bssid_lock_enabled=True,
+                                   bssid_lock_connection_uuid=BU))
+    d = Band(link="Connected to 02:00:00:00:00:55\n\tfreq: 2437")
+    asyncio.run(d.set_band_preference(True, "a"))
+    ok(not any(k == "802-11-wireless.bssid" and v for _u, k, v in d.mods),
+       "and nothing is re-pinned while the radio is on the wrong band for it")
+
+    # An unreadable link is not fatal: reconciliation re-points the pin later.
+    m._save_settings(band_settings(bssid_lock_enabled=True,
+                                   bssid_lock_connection_uuid=BU))
+    d = Band(link="")
+    res = asyncio.run(d.set_band_preference(True, "a"))
+    ok(res.get("success") is True,
+       "a link that cannot be read still leaves the band change successful")
+
+    # With no pin in play, none is written back.
+    m._save_settings(band_settings(bssid_lock_enabled=False))
+    d = Band()
+    asyncio.run(d.set_band_preference(True, "a"))
+    ok(not any(k == "802-11-wireless.bssid" for _u, k, _v in d.mods),
+       "no address pin is touched when the lock is off")
+finally:
+    asyncio.sleep = _real_sleep
+
+# --- failures the user has to be told about ----------------------------------
+
+m._save_settings(band_settings())
+d = Band(refuse=[(BU, "802-11-wireless.band")])
+res = asyncio.run(d.set_band_preference(True, "a"))
+ok(res.get("success") is False and res.get("error") == "nmcli_failed",
+   "a band write that fails is reported")
+ok(m._load_settings().get("band_preference_enabled") is not True,
+   "and is not recorded as enabled")
+ok(d.reconnects == 0, "and the radio is not cycled after it")
+
+# A radio that does not come back is the one failure the user cannot diagnose
+# from the panel, so it has its own message rather than a generic one.
+m._save_settings(band_settings())
+d = Band(reconnect=False)
+res = asyncio.run(d.set_band_preference(True, "a"))
+ok(res.get("success") is False and res.get("error") == "iw_failed",
+   "a radio that does not come back is reported as such")
+
+# --- the reconciliation guard ------------------------------------------------
+
+# This setter clears the pin, cycles the radio and re-pins across an await, so
+# a status poll can land in the middle. The guard is what stops reconciliation
+# writing the old address back onto a profile that now demands the other band.
+m._save_settings(band_settings())
+d = Band()
+asyncio.run(d.set_band_preference(True, "a"))
+ok(d.depth_seen and all(n >= 1 for n in d.depth_seen),
+   "the profile-change guard is held across the radio cycle")
+ok(getattr(d, "_profile_change_depth", 0) == 0,
+   "and released once the change is done")
+
+# Released on the way out of a failure too, or every later poll is suppressed
+# for the life of the process.
+m._save_settings(band_settings())
+d = Band()
+d._resolve_uuid = lambda msg=None: (_ for _ in ()).throw(RuntimeError("boom"))
+res = asyncio.run(d.set_band_preference(True, "a"))
+ok(res.get("success") is False, "an unexpected failure is reported, not raised")
+ok(getattr(d, "_profile_change_depth", 0) == 0,
+   "and the guard is released even then, so later polls are not suppressed forever")
+
+
+# The last four statements in this setter are a refusal and three error logs on
+# nested-failure paths, where the log is the ONLY thing that tells anyone the
+# profile may be left in a state that cannot associate. Silence there is the
+# failure shape the comments around them were written about.
+
+class NoProfile(Band):
+    """Never connected: no active connection and nothing saved either."""
+    def _get_active_connection_uuid(self): return None
+    def _get_saved_connection_uuid(self): return None
+
+m._save_settings(band_settings(last_connection_uuid="", bssid_lock_connection_uuid=""))
+res = asyncio.run(NoProfile().set_band_preference(True, "a"))
+ok(res.get("success") is False and res.get("error") == "no_wifi",
+   "enabling with no WiFi at all asks the user to connect first")
+
+m._save_settings(band_settings(last_connection_uuid="", bssid_lock_connection_uuid=""))
+d = NoProfile()
+res = asyncio.run(d.set_band_preference(False))
+ok(res.get("success") is False and not d.mods,
+   "and turning it off with no profile to turn it off on writes nothing")
+
+class NthFails(Band):
+    """Fails the Nth write of a given property, counting from 1.
+
+    The same property is written more than once on these paths - the band is
+    written and then rolled back, the pin released and then restored - so a
+    blanket refusal aborts the run before it reaches the branch under test.
+    """
+    def __init__(self, nth, **kw):
+        super().__init__(**kw)
+        self.nth = dict(nth)
+        self.seen = {}
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.mods.append((uuid, key, value))
+        self.seen[key] = self.seen.get(key, 0) + 1
+        if self.seen[key] in self.nth.get(key, ()):
+            return {"success":False,"stdout":"","stderr":"permission denied",
+                    "returncode":1}
+        return {"success":True,"stdout":"","stderr":"","returncode":0}
+
+asyncio.sleep = _no_sleep
+try:
+    # ⭐ THE WORST CASE: the pin will not release, so the band write is rolled
+    # back - and the rollback fails too. The profile is then left demanding a
+    # band with an address from possibly the other band beside it, which is the
+    # combination nothing satisfies. Nothing here can fix it; the log line is
+    # the only record that it happened.
+    m._save_settings(band_settings(bssid_lock_enabled=True,
+                                   bssid_lock_connection_uuid=BU,
+                                   band_preference_enabled=True,
+                                   band_preference="bg"))
+    # band: the first write succeeds, the ROLLBACK (second) fails.
+    # bssid: the release (first) fails, which is what triggers the rollback.
+    d = NthFails({"802-11-wireless.band": (2,), "802-11-wireless.bssid": (1,)})
+    res = asyncio.run(d.set_band_preference(True, "a"))
+    ok(res.get("success") is False,
+       "a pin release that fails and a rollback that also fails is still reported")
+    ok(d.mods.count((BU, "802-11-wireless.band", "bg")) == 1,
+       "the rollback was attempted, back to the band that was in force")
+    ok(d.reconnects == 0,
+       "and the radio is not cycled onto a profile that may not associate")
+
+    # The link cannot be read at all when restoring the pin. Not fatal - a later
+    # poll re-points it - but it must not pass silently, or the lock reads as
+    # enabled in settings while being absent from the profile.
+    class DeadLink(Band):
+        def _run_cmd(self, cmd, timeout=5, clean_env=False):
+            if cmd[:2] == ["/usr/bin/iw", "dev"] and "link" in cmd:
+                return {"success":False,"stdout":"","stderr":"No such device",
+                        "returncode":237}
+            return {"success":True,"stdout":"","stderr":"","returncode":0}
+    m._save_settings(band_settings(bssid_lock_enabled=True,
+                                   bssid_lock_connection_uuid=BU))
+    d = DeadLink()
+    res = asyncio.run(d.set_band_preference(True, "a"))
+    ok(res.get("success") is True,
+       "a link that cannot be read leaves the band change successful")
+    ok(not any(k == "802-11-wireless.bssid" and v for _u, k, v in d.mods),
+       "and no address is invented to pin when the link could not be read")
+
+    # The re-lock write itself fails: the release (first bssid write) succeeds,
+    # the restore (second) does not. Recording a pin that was not applied would
+    # report it as present forever, so the recorded value must not move.
+    m._save_settings(band_settings(bssid_lock_enabled=True,
+                                   bssid_lock_connection_uuid=BU,
+                                   bssid_lock_value="02:00:00:00:00:99"))
+    d = NthFails({"802-11-wireless.bssid": (2,)},
+                 link="Connected to 02:00:00:00:00:42\n\tfreq: 5180")
+    res = asyncio.run(d.set_band_preference(True, "a"))
+    ok((BU, "802-11-wireless.bssid", "02:00:00:00:00:42") in d.mods,
+       "the re-lock is attempted after the reconnect")
+    ok(m._load_settings().get("bssid_lock_value") != "02:00:00:00:00:42",
+       "but a re-lock that failed is not recorded as the pin in force")
+finally:
+    asyncio.sleep = _real_sleep
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
