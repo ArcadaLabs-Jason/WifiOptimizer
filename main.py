@@ -1686,7 +1686,6 @@ class Plugin:
         Returning early leaves the action undone and the next poll free to
         propose it again.
         """
-        uuid = action["uuid"]
         if not settings.get("cake_enabled"):
             status["drift"].pop("cake", None)
             return
@@ -3353,7 +3352,7 @@ class Plugin:
         Deliberately await-free, as the rest of this setter's body is.
         """
         # Disabling works on saved profiles - no active WiFi needed
-        iface, uuid, _ = self._require_wifi()
+        _iface, uuid, _err = self._require_wifi()
         if not uuid:
             uuid = self._get_saved_connection_uuid()
         if not uuid:
