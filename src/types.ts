@@ -46,6 +46,7 @@ export interface LiveStatus {
   dispatcher_installed?: boolean;
   last_enforced?: number;
   wifi_backend?: string;
+  pins_inactive_iwd?: boolean;
   backend_tool_available?: boolean;
 }
 

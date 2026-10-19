@@ -38,10 +38,20 @@ DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 SYSFS_NET = "/sys/class/net"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
-BACKEND_HELPER = "/usr/bin/steamos-polkit-helpers/steamos-wifi-set-backend-privileged"
+# SteamOS after 3.9 moves to Valve's "holo" packaging, which ships the same
+# helper under a new name and nothing at the old path. Resolved once at load;
+# an OS update reboots, so the plugin always loads against the current image.
+_STEAMOS_BACKEND_HELPER = "/usr/bin/steamos-polkit-helpers/steamos-wifi-set-backend-privileged"
+_HOLO_BACKEND_HELPER = "/usr/bin/holo-polkit-helpers/holo-wifi-set-backend-privileged"
+BACKEND_HELPER = (
+    _HOLO_BACKEND_HELPER
+    if not os.path.isfile(_STEAMOS_BACKEND_HELPER) and os.path.isfile(_HOLO_BACKEND_HELPER)
+    else _STEAMOS_BACKEND_HELPER
+)
 STEAMOSCTL = "/usr/bin/steamosctl"
 WIFI_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-valve-wifi-backend.conf"
 NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-steamos-defaults.conf"
+HOLO_NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-holo-defaults.conf"
 GENERIC_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf"
 BAZZITE_IWD_CONF = "/etc/NetworkManager/conf.d/iwd.conf"
 
@@ -131,10 +141,16 @@ DMI_SUBSTRING_DEVICES = [
 
 try:
     SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
-    ENFORCED_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "last_enforced")
+    LEGACY_ENFORCED_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "last_enforced")
 except Exception:
     SETTINGS_FILE = "/tmp/wifi-optimizer/settings.json"
-    ENFORCED_FILE = "/tmp/wifi-optimizer/last_enforced"
+    LEGACY_ENFORCED_FILE = "/tmp/wifi-optimizer/last_enforced"
+
+# When the dispatcher last reapplied the settings. In /run, which only root
+# can write, rather than beside the settings: that directory belongs to the
+# desktop user, and anything root writes there can be raced with a symlink.
+# /run is cleared at boot, which is fine for a "last applied" time.
+ENFORCED_FILE = "/run/wifi-optimizer/last_enforced"
 
 # A version string from the network ends up in a filename, a URL and a root
 # shell script, so it is validated the moment it is parsed rather than at each
@@ -153,9 +169,8 @@ UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}\Z")
 BSSID_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 
 # An ISO 3166-1 alpha-2 country, or 00 for the world-roaming domain. This one
-# is strict for a specific reason: the value reaches `iw reg set` and a
-# modprobe option the kernel reads at every module load, before anyone logs
-# in. A regulatory domain is also a legal constraint on transmit power, so a
+# is strict for a specific reason: the value reaches `iw reg set` as root. A
+# regulatory domain is also a legal constraint on transmit power, so a
 # malformed one is not merely a bad setting.
 REGDOMAIN_RE = re.compile(r"^(?:[A-Z]{2}|00)\Z")
 
@@ -226,6 +241,16 @@ DEFAULT_SETTINGS = {
     # single slot loses the earlier ones and leaves them pinned to an access
     # point with nothing able to clear it.
     "bssid_lock_uuids": [],
+    # Which kinds of pin this plugin has ever written on this install. A band
+    # or BSSID on a profile is only cleared as a leftover of ours when we have
+    # written that kind before: people also set them by hand (nmcli, the KDE
+    # network settings), and clearing those silently undid their choice.
+    "pins_owned": [],
+    # Bumped by one-time migrations in _main.
+    "settings_version": 0,
+    # What Valve's NetworkManager file said for wifi.powersave before this
+    # plugin took power save over: "0"-"3", "" for nothing, "?" not recorded.
+    "valve_powersave_before": "?",
     # Same reasoning for the band: a profile left demanding a band its
     # network does not offer will not associate, and only the one profile
     # that happened to be active was ever cleared.
@@ -338,6 +363,37 @@ def _write_no_follow(path: str, data: str) -> bool:
         return False
 
 
+def _with_pin(settings: dict, prop: str) -> list:
+    """settings["pins_owned"] with prop added."""
+    owned = list(settings.get("pins_owned", []))
+    if prop not in owned:
+        owned.append(prop)
+    return owned
+
+
+def _is_regular(mode: int) -> bool:
+    """stat.S_ISREG without importing stat, which is kept off the list of
+    modules this file relies on Decky's build to bundle."""
+    return (mode & 0o170000) == 0o100000
+
+
+def _read_small_int(path: str) -> int:
+    """An integer from a small regular file, or 0. Not following a link and
+    not blocking on a FIFO, and never reading more than a few bytes."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return 0
+    try:
+        if not _is_regular(os.fstat(fd).st_mode):
+            return 0
+        return int(os.read(fd, 32).decode("ascii", "replace").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+    finally:
+        os.close(fd)
+
+
 def _first_existing(paths: list[str]) -> str | None:
     """First path in the list that exists, or None."""
     for path in paths:
@@ -381,13 +437,22 @@ def _clean_sysctl_baseline(value) -> dict:
     return {"kernel": kernel, "values": kept} if kernel and kept else {}
 
 
+# NetworkManager's wifi.powersave values: default, ignore, disable, enable.
+_VALVE_POWERSAVE_VALUES = ("0", "1", "2", "3")
+
+
 def _load_settings() -> dict:
     try:
         # Bounded read. This file belongs to the desktop user and root parses
         # it on every status poll, so an oversized one is a way to make the
         # plugin allocate arbitrarily much, repeatedly. The dispatcher applies
         # the same cap.
-        with open(SETTINGS_FILE, "rb") as f:
+        # Not blocking on a FIFO planted at this name, which would hang the
+        # plugin on its first read; and only ever a regular file.
+        fd = os.open(SETTINGS_FILE, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            if not _is_regular(os.fstat(f.fileno()).st_mode):
+                raise ValueError("settings file is not a regular file")
             raw = f.read(65536)
             if f.read(1):
                 raise ValueError("settings file too large")
@@ -433,6 +498,19 @@ def _load_settings() -> dict:
         merged["sysctl_baseline"] = _clean_sysctl_baseline(
             merged.get("sysctl_baseline")
         )
+        # Older versions saved DNS off as provider "custom" with no servers,
+        # and turning it on from there is refused with no field to fill in.
+        if (not merged.get("dns_enabled") and merged.get("dns_provider") == "custom"
+                and not str(merged.get("dns_servers", "")).strip()):
+            merged["dns_provider"] = "cloudflare"
+        merged["pins_owned"] = [
+            p for p in merged.get("pins_owned", [])
+            if p in ("802-11-wireless.band", "802-11-wireless.bssid")
+        ]
+        # Written back into a NetworkManager file as root, so nothing but the
+        # values NetworkManager defines may come through.
+        if merged.get("valve_powersave_before") not in _VALVE_POWERSAVE_VALUES + ("", "?"):
+            merged["valve_powersave_before"] = "?"
         return merged
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -452,12 +530,12 @@ def _save_settings(data: dict):
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        # mkstemp creates 0600 and os.replace preserves it, which would
-        # silently narrow this file from the 0644 it has always had and make
-        # it unreadable to the user whose settings it holds. It is not a
-        # secret, and the directory is user-owned anyway, so the mode is set
-        # deliberately rather than inherited from how it happened to be made.
-        os.chmod(tmp_path, 0o644)
+            # mkstemp creates 0600 and os.replace preserves it, which would
+            # silently narrow this file from the 0644 it has always had and
+            # make it unreadable to the user whose settings it holds. Set on
+            # the open file, not by name: the directory is the user's, and a
+            # chmod by path follows whatever link was swapped in meanwhile.
+            os.fchmod(f.fileno(), 0o644)
         os.replace(tmp_path, SETTINGS_FILE)
     except Exception:
         try:
@@ -725,6 +803,7 @@ class Plugin:
             BAZZITE_IWD_CONF,
             WIFI_BACKEND_CONF,
             NM_DEFAULT_CONF,
+            HOLO_NM_DEFAULT_CONF,
         ):
             try:
                 with open(path, "r") as f:
@@ -882,6 +961,14 @@ class Plugin:
         gone = any("unknown connection" in (r.get("stderr") or "").lower()
                    for r in results)
         return gone or all(r["success"] for r in results)
+
+    # What a profile setter answers while another is still mid-change. Two at
+    # once interleave their radio cycles and pin writes on one profile.
+    _BUSY_RESULT = {
+        "success": False,
+        "error": "busy",
+        "message": "Another WiFi change is still in progress. Try again in a moment.",
+    }
 
     _RADIO_OFF_RESULT = {
         "success": False,
@@ -1071,9 +1158,23 @@ class Plugin:
             script = script.replace(
                 "__PLUGIN_DIR__", _sh_quote(decky.DECKY_PLUGIN_DIR)
             )
-            with open(DISPATCHER_PATH, "w") as f:
+            # Written beside it and renamed over it. NetworkManager runs
+            # this on every connect, and writing in place let a connect that
+            # landed mid-write run half a script. Hidden and not executable
+            # until complete, so the dispatcher never picks up the temp file.
+            tmp = os.path.join(
+                os.path.dirname(DISPATCHER_PATH),
+                "." + os.path.basename(DISPATCHER_PATH) + ".new",
+            )
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(script)
-            os.chmod(DISPATCHER_PATH, 0o755)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, DISPATCHER_PATH)
             decky.logger.info("Dispatcher script installed")
             return True
         except Exception as e:
@@ -1100,7 +1201,8 @@ class Plugin:
         """
         try:
             log_dir = getattr(decky, "DECKY_PLUGIN_LOG_DIR", None)
-            if not log_dir or not os.path.isdir(log_dir):
+            # A linked log directory would point these deletions anywhere.
+            if not log_dir or os.path.islink(log_dir) or not os.path.isdir(log_dir):
                 return
             files = [
                 os.path.join(log_dir, f)
@@ -1153,6 +1255,9 @@ class Plugin:
                 self._run_cmd(
                     ["/usr/bin/iw", "reg", "set", chosen_region], timeout=5
                 )
+            self._migrate_settings(settings)
+            self._heal_orphaned_iwd_conf()
+            await self._unpin_if_iwd()
             if settings.get("auto_fix_on_wake", True):
                 if not self._install_dispatcher():
                     # Don't leave the toggle reading on with nothing installed.
@@ -1162,6 +1267,10 @@ class Plugin:
                     # afterwards is discarded, and the volatile-apply block
                     # then re-reads the stale value and writes it back.
                     settings["auto_fix_on_wake"] = False
+                    # And not leave an older version's script behind, still
+                    # run by NetworkManager on every connect under a toggle
+                    # that now reads off.
+                    self._remove_dispatcher()
                     decky.logger.error(
                         "Auto-fix disabled: the dispatcher could not be installed"
                     )
@@ -1206,6 +1315,9 @@ class Plugin:
             # first place, so adopt the current network. If that guess is
             # wrong the preference simply stops applying and one toggle fixes
             # it - far better than writing a band into networks that have none.
+            # Fresh: the setters above saved their own changes since the read
+            # at the top, and saving that older copy would undo them.
+            settings = _load_settings()
             if settings.get("band_preference_enabled") and not settings.get(
                 "band_preference_ssid"
             ):
@@ -1258,6 +1370,46 @@ class Plugin:
             decky.logger.error(f"WiFi Optimizer _main error: {e}")
         self._stranded_task = asyncio.create_task(self._stranded_watch())
 
+    _SETTINGS_VERSION = 2
+
+    def _migrate_settings(self, settings: dict):
+        """Bring settings from an older version up to what this one tracks.
+
+        Versions before the tracking lists recorded only the one profile in
+        use, so an upgrade arrives with pins on profiles nothing knows about.
+        Seeded here so the safety nets that walk those lists (the stranded
+        pin release, turning a feature off everywhere) cover them too. And
+        whether a kind of pin was ever ours is inferred from what the old
+        settings show, because a pin with no such evidence is treated as set
+        by hand and left alone.
+        """
+        if settings.get("settings_version", 0) >= self._SETTINGS_VERSION:
+            return
+        owned = list(settings.get("pins_owned", []))
+        if any(settings.get(k) for k in ("bssid_lock_enabled", "bssid_lock_uuids",
+                                         "bssid_lock_connection_uuid", "bssid_lock_value")):
+            owned = _with_pin({"pins_owned": owned}, "802-11-wireless.bssid")
+        if any(settings.get(k) for k in ("band_preference_enabled",
+                                         "band_preference_uuids", "band_preference_ssid")):
+            owned = _with_pin({"pins_owned": owned}, "802-11-wireless.band")
+        settings["pins_owned"] = owned
+
+        lock_uuid = settings.get("bssid_lock_connection_uuid", "")
+        if settings.get("bssid_lock_enabled") and lock_uuid and not settings.get("bssid_lock_uuids"):
+            settings["bssid_lock_uuids"] = [lock_uuid]
+
+        last = settings.get("last_connection_uuid", "")
+        if (settings.get("band_preference_enabled") and last
+                and not settings.get("band_preference_uuids")
+                and self._read_profile_field(last, "802-11-wireless.band", timeout=3)
+                == settings.get("band_preference", "a")):
+            settings["band_preference_uuids"] = [last]
+        if settings.get("dns_enabled") and last and not settings.get("dns_uuids"):
+            settings["dns_uuids"] = [last]
+
+        settings["settings_version"] = self._SETTINGS_VERSION
+        decky.logger.info(f"Settings migrated to version {self._SETTINGS_VERSION}")
+
     async def _unload(self):
         try:
             decky.logger.info("WiFi Optimizer unloading")
@@ -1276,8 +1428,9 @@ class Plugin:
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
             self._revert_queue_tuning(_load_settings())
+            self._release_valve_powersave(_load_settings())
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
-                         SETTINGS_FILE, ENFORCED_FILE]:
+                         SETTINGS_FILE, ENFORCED_FILE, LEGACY_ENFORCED_FILE]:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -1339,6 +1492,11 @@ class Plugin:
                         info["name"] = line.split("=", 1)[1].strip().strip('"')
         except Exception:
             pass
+        # Valve's newer images can identify as holo, the name of the layer
+        # SteamOS is built from. Everything this plugin does differently on
+        # SteamOS applies there unchanged.
+        if info["id"] == "holo":
+            info["id"] = "steamos"
         return info
 
     async def get_device_info(self) -> dict:
@@ -1479,14 +1637,15 @@ class Plugin:
                     "message": "Couldn't read the current wireless region.",
                 }
             settings = _load_settings()
+            previous = settings.get("regdomain_previous", "")
             if country:
                 # Record what was there before OUR first change, so turning
                 # this off restores it instead of guessing at a default.
                 if not settings.get("regdomain"):
-                    settings["regdomain_previous"] = info.get("global", "")
+                    previous = info.get("global", "")
                 target = country
             else:
-                target = settings.get("regdomain_previous") or "00"
+                target = previous or "00"
             if not REGDOMAIN_RE.match(target):
                 return {
                     "success": False, "error": "invalid_region",
@@ -1501,6 +1660,10 @@ class Plugin:
                     "message": "Couldn't set the wireless region.",
                     "detail": (applied.get("stderr") or "")[:200],
                 }
+            # Re-read: anything saved while iw ran would otherwise be undone
+            # by writing back the copy taken before it.
+            settings = _load_settings()
+            settings["regdomain_previous"] = previous
             settings["regdomain"] = country
             _save_settings(settings)
             after = await asyncio.to_thread(self._regdomain_info)
@@ -1607,26 +1770,17 @@ class Plugin:
         # the panel renders every toggle from them and handing back a snapshot
         # taken before the user's change makes the toggle spring back.
         if getattr(self, "_collect_depth", 0) > 0:
-            last = getattr(self, "_last_status", None)
-            if last is not None:
-                # deepcopy, not dict(): a shallow copy shares live and drift
-                # with the cached object, so anything that later mutates them
-                # after this early return would corrupt every future reply.
-                cached = copy.deepcopy(last)
-                try:
-                    cached["settings"] = _load_settings()
-                except Exception:
-                    pass
-                return cached
             # A collection that never returns would otherwise hold this
-            # branch forever and leave the panel blank with nothing to say.
+            # branch forever: the panel blank with nothing to say or, once a
+            # pass has completed, frozen on its values as if all were well.
             # subprocess.run waits again after killing a timed-out child, so
             # a process stuck against a wedged driver can do exactly that.
             started = getattr(self, "_collect_started_at", 0.0)
             if started and (time.monotonic() - started) > 90:
-                decky.logger.error(
+                self._log_throttled(
+                    "collect_wedged",
                     "Status collection has not returned in 90s; reporting a "
-                    "read failure rather than leaving the panel empty"
+                    "read failure rather than leaving the panel empty",
                 )
                 return {
                     "success": False,
@@ -1641,6 +1795,17 @@ class Plugin:
                     "external": {},
                 }
 
+            last = getattr(self, "_last_status", None)
+            if last is not None:
+                # deepcopy, not dict(): a shallow copy shares live and drift
+                # with the cached object, so anything that later mutates them
+                # after this early return would corrupt every future reply.
+                cached = copy.deepcopy(last)
+                try:
+                    cached["settings"] = _load_settings()
+                except Exception:
+                    pass
+                return cached
             # No previous result to hand back. Falling through here is what
             # the guard exists to prevent: the first collection of a cold boot
             # routinely outlives the poll interval, so every caller would
@@ -1669,6 +1834,13 @@ class Plugin:
             status, pending, actions = await asyncio.to_thread(self._collect_status)
         finally:
             self._collect_depth = max(0, getattr(self, "_collect_depth", 1) - 1)
+        if status.get("live", {}).get("pins_inactive_iwd"):
+            # Proposed with both pins treated as off, so the fresh read of
+            # settings the applier makes must not stop them as still on.
+            for action in actions:
+                if (action["kind"] == "pin_cleanup"
+                        and action["property"] in self._ELIMINATION_PINS):
+                    action["iwd"] = True
         if pending or actions:
             try:
                 self._apply_status_actions(status, pending, actions)
@@ -1701,12 +1873,12 @@ class Plugin:
         change they just made.
 
         This deliberately runs ON the event loop rather than in a thread.
-        Every setter but one is an await-free coroutine, so the loop is what
-        serializes them against this. The exception is set_band_preference,
-        which sleeps mid-way and is covered separately by the band-change
-        gate. Moving this to a thread would make it concurrent with all of
-        them, which a lock could still handle - but that is an eight-setter
-        refactor, not a property of the current arrangement. The cost is
+        Most setters are await-free coroutines, so the loop is what
+        serializes them against this. The profile setters that do await (the
+        lock, the band, Allow WPA2) hold the reconciliation guard across the
+        whole call instead. Moving this to a thread would make it concurrent
+        with all of them, which a lock could still handle - but that is an
+        eight-setter refactor, not a property of the current arrangement. The cost is
         that it holds the loop, so every call here is given a short timeout
         and nothing runs in steady state - actions exist only while something
         has actually drifted.
@@ -1833,6 +2005,7 @@ class Plugin:
         )
         self._record_reassert("band", healed["success"])
         if healed["success"]:
+            pending["pins_owned"] = _with_pin(settings, "802-11-wireless.band")
             known = list(settings.get("band_preference_uuids", []))
             if uuid not in known:
                 known.append(uuid)
@@ -1910,7 +2083,7 @@ class Plugin:
         # ON is not a reason to leave the value alone - it is the
         # reason the value is there and the reason we are offline.
         stranded = bool(action.get("stranded"))
-        if settings.get(enabled_key) and not stranded:
+        if settings.get(enabled_key) and not stranded and not action.get("iwd"):
             return
         # A setter is mid-change on this profile. Today the band
         # setter writes the pin and saves the flag with no await
@@ -1931,16 +2104,20 @@ class Plugin:
         # while it was in fact draining the list.
         resolved = done["success"] or "unknown connection" in detail.lower()
         self._record_reassert(f"pin_cleanup:{list_key}", resolved)
+        # Build on what an earlier action in this pass already decided for
+        # the list, or the last one written wins and undoes the others.
+        tracked = pending.get(list_key, settings.get(list_key, []))
         if resolved:
-            pending[list_key] = [
-                u for u in settings.get(list_key, []) if u != uuid
-            ]
+            pending[list_key] = [u for u in tracked if u != uuid]
             off_value = action.get("off_value", "")
             if stranded:
                 # Record the moment, not a bare flag: the panel should
                 # still be explaining this once WiFi returns, which is
                 # the only time the user is there to read it.
                 self._pin_released_at = time.time()
+                self._released_at = {
+                    **getattr(self, "_released_at", {}), prop: time.time()
+                }
                 # The setting is still on and should land on whichever access
                 # point works once we are back. With the panel closed only the
                 # background watch can make that happen, so tell it to.
@@ -1968,7 +2145,7 @@ class Plugin:
             # Move it to the back. Only the head is attempted each
             # poll, so one profile that cannot be cleared would
             # otherwise keep every other entry from ever being tried.
-            rest = [u for u in settings.get(list_key, []) if u != uuid]
+            rest = [u for u in tracked if u != uuid]
             if rest:
                 pending[list_key] = rest + [uuid]
 
@@ -2017,6 +2194,7 @@ class Plugin:
             if previous and previous != uuid and previous not in known:
                 known.append(previous)
             pending["bssid_lock_connection_uuid"] = uuid
+            pending["pins_owned"] = _with_pin(settings, "802-11-wireless.bssid")
             if uuid not in known:
                 known.append(uuid)
             pending["bssid_lock_uuids"] = known[
@@ -2119,6 +2297,9 @@ class Plugin:
     # pins is on. One nmcli call each time; nothing more runs unless offline.
     _STRANDED_WATCH_SECONDS = 20
 
+    # How many recently pinned profiles per kind the release looks at.
+    _STRANDED_CANDIDATES = 6
+
     async def _stranded_watch(self):
         """Run the stranded-pin check whether or not the panel is open.
 
@@ -2136,6 +2317,7 @@ class Plugin:
                 decky.logger.error(f"stranded watch error: {e}")
 
     async def _stranded_watch_once(self):
+        await self._unpin_if_iwd()
         settings = _load_settings()
         if not any(
             settings.get(enabled_key)
@@ -2143,17 +2325,16 @@ class Plugin:
             if prop in self._ELIMINATION_PINS
         ):
             return
-        result = await asyncio.to_thread(
-            self._run_cmd, ["/usr/bin/nmcli", "-t", "-f", "STATE", "general"], 5
-        )
-        if not result["success"]:
+        state, radio = await asyncio.to_thread(self._nm_general_state)
+        if state is None:
             return
-        state = result.get("stdout", "").strip()
         # Online in any form means no pin of ours is keeping it off. So does
-        # asleep: that is the system's doing, and the offline clock must not
-        # carry a stretch of it into the next real outage. Resetting here
-        # matters, because nothing else does while the panel is closed.
-        if state.startswith("connected") or state == "asleep":
+        # asleep, or the radio switched off: that is the system's or the
+        # user's doing, and the offline clock must not carry a stretch of it
+        # into the next real outage. Resetting here matters, because nothing
+        # else does while the panel is closed.
+        if (state.startswith("connected") or state == "asleep"
+                or radio != "enabled"):
             self._offline_since = None
             # Back online after we released a pin: one poll, so the setting
             # that is still on settles on the access point that works now.
@@ -2210,6 +2391,9 @@ class Plugin:
             e for e in self._PIN_PROPERTIES if e[1] == list_key
         )
         if settings.get(enabled_key) or not live_value or not uuid:
+            return []
+        # Never written by us on this install, so it was set by hand.
+        if prop not in settings.get("pins_owned", []):
             return []
         # Already queued by the tracked-list walk; doing it twice would just
         # spend the same cooldown on the same profile.
@@ -2276,6 +2460,8 @@ class Plugin:
                 continue
             if settings.get(enabled_key):
                 continue
+            if prop not in settings.get("pins_owned", []):
+                continue
             for rival_uuid, pins in cached.items():
                 if not pins.get(prop):
                     continue
@@ -2315,13 +2501,37 @@ class Plugin:
         to, so this cannot cost reachability. The feature stays on, so the
         ordinary path re-applies a reachable value on the next connection.
 
+        But it must be the pin. Offline with the radio off, the router
+        rebooting or the network out of range is not something a pin did,
+        and releasing then re-pointed the lock to whatever access point came
+        back first. So a pin is released only when this network IS in range
+        on an access point the pin rules out.
+
         Bounded to profiles we recorded writing, and to the pins nothing else
         sets - the same boundary that decided the active and rival cases.
         """
-        if connected:
+        if not any(
+            settings.get(enabled_key)
+            for enabled_key, _lk, prop, _off in self._PIN_PROPERTIES
+            if prop in self._ELIMINATION_PINS
+        ):
             self._offline_since = None
             return []
-        if self._profile_change_in_flight():
+        # Read NetworkManager's own verdict rather than trusting an active
+        # profile. A profile waiting on a password is ACTIVATING, and that is
+        # exactly the state a pin that cannot associate leaves it in, so
+        # counting it as online reset the clock for as long as the prompt sat
+        # there. One call also says whether the radio is on.
+        state, radio = self._nm_general_state()
+        if connected and (state is None or state.startswith("connected")):
+            self._offline_since = None
+            return []
+        if (state is None or state == "asleep" or radio != "enabled"
+                or self._profile_change_in_flight()
+                or self._system_change_in_flight()):
+            # None of these is a pin's doing, and a stretch of one must not
+            # be carried into the next real outage either.
+            self._offline_since = None
             return []
         now = time.monotonic()
         if getattr(self, "_offline_since", None) is None:
@@ -2329,32 +2539,129 @@ class Plugin:
             return []
         if now - self._offline_since < self._STRANDED_SECONDS:
             return []
-        uuid = self._get_saved_connection_uuid()
-        if not uuid:
-            return []
-        # Read what is actually written before proposing. Otherwise a profile
-        # with no pin at all gets a pointless write and a log line claiming
-        # something was cleared.
-        live = self._profile_pins(uuid)
-        if not live:
+        visible = self._visible_networks()
+        if not visible:
             return []
         out = []
-        for enabled_key, list_key, prop, off_value in self._PIN_PROPERTIES:
-            if prop not in self._ELIMINATION_PINS:
+        for uuid, props in self._stranded_candidates(settings).items():
+            live = self._profile_pins(uuid)
+            if not live:
                 continue
-            # Disabled features are already handled by the ordinary cleanup.
-            if not settings.get(enabled_key):
+            ssid = (self._get_profile_ssid(uuid, timeout=3) or "").replace("\\", "")
+            aps = visible.get(ssid)
+            if not aps:
                 continue
-            if uuid not in settings.get(list_key, []):
-                continue
-            if not live.get(prop):
-                continue
-            out.append({
-                "kind": "pin_cleanup", "uuid": uuid,
-                "property": prop, "list_key": list_key,
-                "off_value": off_value, "stranded": True,
-            })
+            for enabled_key, list_key, prop, off_value in self._PIN_PROPERTIES:
+                if prop not in props or not live.get(prop):
+                    continue
+                if not self._pin_rules_out(prop, live[prop], aps):
+                    continue
+                out.append({
+                    "kind": "pin_cleanup", "uuid": uuid,
+                    "property": prop, "list_key": list_key,
+                    "off_value": off_value, "stranded": True,
+                })
         return out
+
+    def _nm_general_state(self) -> tuple:
+        """(state, wifi radio) from NetworkManager, or (None, None) unread."""
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "STATE,WIFI", "general"], timeout=3
+        )
+        if not result["success"]:
+            return None, None
+        fields = self._nmcli_fields(result.get("stdout", "").strip())
+        if len(fields) < 2:
+            return None, None
+        return fields[0].strip(), fields[1].strip()
+
+    def _system_change_in_flight(self) -> bool:
+        """A backend switch or an update is taking WiFi down on purpose."""
+        switch = getattr(self, "_backend_switch", None) or {}
+        return bool(switch.get("in_progress")) or self._update_running()
+
+    def _stranded_candidates(self, settings: dict) -> dict:
+        """uuid -> the pin properties we may release on it.
+
+        Every profile we recorded pinning, not just the last one in use: the
+        profile a device fails to rejoin is often not the one it last held,
+        and an upgrade arrives with only the lock's own profile recorded. The
+        lock's and the last profile are added when this install has written
+        that kind of pin, which is the evidence the tracking lists stand in for.
+        """
+        owned = settings.get("pins_owned", [])
+        extra = [settings.get("bssid_lock_connection_uuid", ""),
+                 settings.get("last_connection_uuid", "")]
+        out: dict = {}
+        for enabled_key, list_key, prop, _off in self._PIN_PROPERTIES:
+            if prop not in self._ELIMINATION_PINS or not settings.get(enabled_key):
+                continue
+            # Each costs two nmcli calls while offline, so the most recent
+            # few per kind - capped per kind, so a long lock list cannot
+            # crowd out every band candidate.
+            uuids = list(settings.get(list_key, []))[-self._STRANDED_CANDIDATES:]
+            if prop in owned:
+                uuids += extra
+            for uuid in uuids:
+                if uuid:
+                    out.setdefault(uuid, set()).add(prop)
+        return out
+
+    def _visible_networks(self) -> dict:
+        """SSID -> [(bssid, freq_mhz, signal)] from NetworkManager's cached scan.
+
+        Cached on purpose: NetworkManager keeps scanning while disconnected,
+        and forcing a fresh one from here would hold up the status poll.
+        """
+        scan = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "SSID,BSSID,SIGNAL,FREQ", "dev", "wifi",
+             "list", "--rescan", "no"],
+            timeout=5,
+        )
+        if not scan["success"]:
+            return {}
+        out: dict = {}
+        for line in scan.get("stdout", "").split("\n"):
+            parts = self._nmcli_fields(line)
+            if len(parts) < 4 or not parts[0]:
+                continue
+            found = re.match(r"\s*(\d+)", parts[3])
+            signal = re.match(r"\s*(\d+)", parts[2])
+            out.setdefault(parts[0], []).append((
+                parts[1].upper(),
+                int(found.group(1)) if found else 0,
+                int(signal.group(1)) if signal else 0,
+            ))
+        return out
+
+    # How much stronger another access point must be before a visible pinned
+    # one counts as the reason we cannot connect.
+    _STRANDED_SIGNAL_MARGIN = 20
+
+    def _pin_rules_out(self, prop: str, value: str, aps: list) -> bool:
+        """Whether this pin is what keeps us off a network that is in range.
+
+        Not merely whether it excludes some access point: a router lists its
+        other band and a mesh its other nodes, so that is nearly always true
+        and would release on any outage at all - a changed password, a DHCP
+        failure, the user disconnecting. An address pin is the reason when
+        its access point is gone, or far weaker than one it rules out; a band
+        pin when nothing on that band is in range.
+        """
+        if prop == "802-11-wireless.bssid":
+            pinned = value.replace("\\", "").upper()
+            mine = [sig for bssid, _f, sig in aps if bssid == pinned]
+            if not mine:
+                return True
+            best_other = max((sig for bssid, _f, sig in aps if bssid != pinned),
+                             default=0)
+            return best_other - max(mine) >= self._STRANDED_SIGNAL_MARGIN
+        if prop == "802-11-wireless.band":
+            known = [freq for _b, freq, _s in aps if freq]
+            return bool(known) and not any(
+                self._freq_band(freq) == value for freq in known
+            )
+        return False
 
     @staticmethod
     def _nmcli_fields(line: str) -> list[str]:
@@ -2431,7 +2738,7 @@ class Plugin:
     _AP_UPGRADE_MARGIN = 12
 
     def _visible_access_points(
-        self, iface: str, ssid: str, rescan: bool = False
+        self, iface: str, ssid: str, rescan: bool = False, cached_only: bool = False
     ) -> list[tuple[str, int, int, str]]:
         """(bssid, signal, freq_mhz, security) for this network, best first.
 
@@ -2456,7 +2763,8 @@ class Plugin:
         scan = self._run_cmd(
             ["/usr/bin/nmcli", "-t", "-f", "SSID,BSSID,SIGNAL,FREQ,SECURITY",
              "dev", "wifi", "list", "ifname", iface]
-            + (["--rescan", "yes"] if rescan else []),
+            + (["--rescan", "yes"] if rescan
+               else ["--rescan", "no"] if cached_only else []),
             timeout=self._SCAN_SECONDS,
         )
         if not scan["success"]:
@@ -2849,8 +3157,8 @@ class Plugin:
         if settings.get("band_preference_enabled") and settings.get(
             "band_preference_ssid"
         ) == ssid:
-            want_5 = settings.get("band_preference") == "a"
-            aps = [ap for ap in aps if (ap[2] >= 5000) == want_5]
+            want = settings.get("band_preference")
+            aps = [ap for ap in aps if self._freq_band(ap[2]) == want]
             if not aps:
                 return None
         refused = self._recent_ap_failures(settings)
@@ -2895,6 +3203,27 @@ class Plugin:
             "message": f"No {name} access point for this network is in range, so this would disconnect you.",
         }
 
+    @staticmethod
+    def _freq_band(freq) -> str:
+        """The band property value that admits this frequency, "" if none does.
+
+        NetworkManager's band "a" is the 5 GHz band only. A 6 GHz access point
+        fails its compatibility check against a profile pinned to "a", so a
+        6 GHz association is neither "a" nor "bg", and counting it as 5 GHz
+        let the plugin write a band that pushes the device off 6 GHz.
+        """
+        found = re.match(r"\s*(\d+)", str(freq or ""))
+        if not found:
+            return ""
+        mhz = int(found.group(1))
+        if 2400 <= mhz < 2500:
+            return "bg"
+        # The top of NetworkManager's own 5 GHz table, the list band "a" hands
+        # wpa_supplicant to associate within.
+        if 4900 <= mhz <= 5825:
+            return "a"
+        return ""
+
     def _band_is_reachable(self, iface: str, uuid: str, want: str) -> bool:
         """Whether this network has a visible AP on the wanted band.
 
@@ -2933,10 +3262,7 @@ class Plugin:
             # unescaped scan result fails for any SSID containing : or \.
             if name.replace("\\", "") != ssid.replace("\\", ""):
                 continue
-            found = re.match(r"\s*(\d+)", freq.strip())
-            if not found:
-                continue
-            if (int(found.group(1)) >= 5000) == (want == "a"):
+            if self._freq_band(freq) == want:
                 return True
         return False
 
@@ -2969,15 +3295,129 @@ class Plugin:
             return False
         # Take the leading number whatever follows it. iw has reported this as
         # "5180", "5180 MHz" and "5180.0" across versions, and a form we
-        # cannot read must refuse rather than guess.
-        found = re.match(r"\s*(\d+)", str(frequency or ""))
-        if not found:
+        # cannot read must refuse rather than guess. A 6 GHz association
+        # satisfies neither band, so it conflicts with both.
+        return self._freq_band(frequency) != settings.get("band_preference")
+
+    def _propose_band(self, settings: dict, uuid: str, live_band: str,
+                      active_ssid, status: dict, actions: list):
+        """Report band drift, and propose writing it back when that is safe."""
+        expected_band = settings.get("band_preference", "a")
+        if (
+            not self._band_preference_applies_here(settings, active_ssid)
+            or live_band == expected_band
+        ):
+            return
+        status["drift"]["band_preference"] = True
+        if self._band_reassert_is_safe(status, expected_band, active_ssid() or ""):
+            actions.append({
+                "kind": "band", "uuid": uuid, "value": expected_band,
+                "observed": live_band,
+            })
+
+    def _band_reassert_is_safe(self, status: dict, want: str, ssid: str) -> bool:
+        """Whether writing the preferred band back cannot strand the device.
+
+        Writing a band does not move the association, so the harm comes at
+        the next reconnect: a device on 2.4 GHz because 5 GHz is out of reach
+        gets a profile that demands 5 GHz, fails to rejoin, has the pin
+        released after a minute, and then has it written straight back. So
+        not for a while after a release, and otherwise only while the device
+        is on the wanted band or the network shows an access point on it.
+        """
+        released = getattr(self, "_released_at", {}).get(
+            "802-11-wireless.band", 0
+        )
+        if released and time.time() - released < self._RELEASE_NOTICE_SECONDS:
+            return False
+        if self._freq_band(status.get("live", {}).get("frequency", "")) == want:
             return True
-        # NetworkManager's band property has no 6 GHz value; a 6 GHz
-        # association is satisfied by "a", so anything at or above 5 GHz
-        # counts as the 5 GHz band here.
-        on_5ghz = int(found.group(1)) >= 5000
-        return on_5ghz != (settings.get("band_preference") == "a")
+        return any(
+            self._freq_band(freq) == want
+            for _bssid, freq, _signal in self._visible_networks().get(
+                ssid.replace("\\", ""), []
+            )
+        )
+
+    # Why the access point lock and the band preference stand down under iwd.
+    _NEEDS_WPA_SUPPLICANT = (
+        "needs the wpa_supplicant WiFi backend. Under iwd, NetworkManager "
+        "cannot bring up a network pinned this way, so it would ask for the "
+        "password instead of connecting."
+    )
+
+    def _backend_is_iwd(self) -> bool:
+        return self._get_current_backend() == "iwd"
+
+    def _pins_for_backend(self, settings: dict, status: dict) -> dict:
+        """The settings this pass acts on, with both pins off under iwd.
+
+        NetworkManager's iwd backend lists every access point with a made-up
+        address on a fixed 2.4 GHz frequency, and only brings a profile up
+        through one it finds compatible. A profile pinned to a real address,
+        or to 5 GHz, matches none of them, so every activation NetworkManager
+        makes for it fails and SteamOS asks for the password again. iwd's own
+        autoconnect gets past that check, which is why it looks fine until
+        anything reconnects. So under iwd neither pin is written, and the ones
+        we wrote are cleared; the settings stay on for when wpa_supplicant is
+        back. The status still shows the user's real settings.
+        """
+        if not (settings.get("bssid_lock_enabled") or settings.get("band_preference_enabled")
+                or settings.get("bssid_lock_uuids") or settings.get("band_preference_uuids")):
+            return settings
+        if not self._backend_is_iwd():
+            return settings
+        status["live"]["pins_inactive_iwd"] = True
+        return {**settings, "bssid_lock_enabled": False, "band_preference_enabled": False}
+
+    async def _unpin_if_iwd(self):
+        """Clear every lock and band pin of ours once iwd is found in use.
+
+        The status pass clears them one profile at a time, and only while the
+        panel polls. A switch to iwd made outside the plugin (Steam's own
+        developer setting, or an install already on iwd when it upgrades)
+        would otherwise leave the profile in use pinned, and the next
+        reconnect NetworkManager makes for it fails.
+        """
+        settings = _load_settings()
+        if not any(settings.get(k) for k in (
+            "bssid_lock_enabled", "band_preference_enabled",
+            "bssid_lock_uuids", "band_preference_uuids",
+        )):
+            return
+        if not await asyncio.to_thread(self._backend_is_iwd):
+            self._iwd_unpinned = False
+            return
+        if getattr(self, "_iwd_unpinned", False) or self._profile_change_in_flight():
+            return
+        await asyncio.to_thread(self._clear_lock_and_band_pins)
+        self._iwd_unpinned = True
+        decky.logger.info("iwd is in use: cleared our access point and band pins")
+
+    def _clear_lock_and_band_pins(self):
+        """Take our address and band pins off every profile we wrote them to.
+
+        Run before switching to iwd, where a pinned profile cannot be brought
+        up by NetworkManager. The tracking lists are kept, so the pins come
+        back on their own if the switch fails or wpa_supplicant returns.
+        """
+        settings = _load_settings()
+        owned = settings.get("pins_owned", [])
+        last = settings.get("last_connection_uuid", "")
+        lock = set(settings.get("bssid_lock_uuids", []))
+        if settings.get("bssid_lock_connection_uuid"):
+            lock.add(settings["bssid_lock_connection_uuid"])
+        band = set(settings.get("band_preference_uuids", []))
+        # The profile last in use, when this install is known to write that
+        # kind of pin: it is the one most likely to be reconnected next.
+        if last and "802-11-wireless.bssid" in owned:
+            lock.add(last)
+        if last and "802-11-wireless.band" in owned:
+            band.add(last)
+        for uuid in lock:
+            self._nmcli_modify(uuid, "802-11-wireless.bssid", "", timeout=2)
+        for uuid in band:
+            self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
 
     def _profile_change_in_flight(self) -> bool:
         # True while a setter is deliberately rewriting the active profile -
@@ -3091,11 +3531,7 @@ class Plugin:
             actions.append({"kind": "cake", "uuid": uuid, "iface": iface})
 
         status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
-        try:
-            with open(ENFORCED_FILE, "r") as f:
-                status["live"]["last_enforced"] = int(f.read().strip())
-        except Exception:
-            status["live"]["last_enforced"] = 0
+        status["live"]["last_enforced"] = _read_small_int(ENFORCED_FILE)
 
     def _read_addressing(self, iface: str, timeout: int = 5) -> dict:
         """The address and resolvers NetworkManager reports for the device.
@@ -3239,7 +3675,9 @@ class Plugin:
         self._wpa2_blocked = None
         if self._profile_key_mgmt(uuid) != "sae" or not ssid:
             return
-        aps = self._visible_access_points(iface, ssid)
+        # The cached list: this runs inside the status poll, and letting nmcli
+        # decide to rescan there held the poll for seconds.
+        aps = self._visible_access_points(iface, ssid, cached_only=True)
         blocked = [
             ap for ap in aps
             if not self._ap_accepts(ap[3], "sae")
@@ -3263,7 +3701,10 @@ class Plugin:
         it, so this only widens what can be joined. If the profile cannot
         connect afterwards it is put back as it was.
         """
+        if self._profile_change_in_flight() or self._update_running():
+            return dict(self._BUSY_RESULT)
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
+        held = True
         try:
             uuid, err = self._resolve_uuid("Connect to WiFi first")
             if err:
@@ -3292,15 +3733,21 @@ class Plugin:
             # The lock picks its access point from those the profile can join,
             # so with the stronger one now eligible, let it choose again.
             if _load_settings().get("bssid_lock_enabled"):
+                # Hand the guard to the lock setter rather than hold it
+                # across the call, or it refuses as busy. Nothing awaits
+                # between the release and the setter taking it.
+                self._profile_change_depth = max(0, self._profile_change_depth - 1)
+                held = False
                 await self.set_bssid_lock(True)
             return {"success": True, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"allow_wpa2 error: {e}")
             return self._unexpected_response(e)
         finally:
-            self._profile_change_depth = max(
-                0, getattr(self, "_profile_change_depth", 1) - 1
-            )
+            if held:
+                self._profile_change_depth = max(
+                    0, getattr(self, "_profile_change_depth", 1) - 1
+                )
 
     # How long a setter waits for its profile to come back after a reconnect.
     # `nmcli con up` can outlast its own call's timeout while the activation
@@ -3311,10 +3758,25 @@ class Plugin:
         if not self._hard_reconnect(uuid):
             return False
         for _ in range(self._RECONNECT_WAIT_SECONDS):
-            if await asyncio.to_thread(self._get_active_connection_uuid) == uuid:
+            if await asyncio.to_thread(self._connection_activated, uuid):
                 return True
             await asyncio.sleep(1)
         return False
+
+    def _connection_activated(self, uuid: str) -> bool:
+        """Whether this profile is fully up, not merely being brought up.
+
+        An active profile is listed from the moment it starts activating,
+        including while it waits on a password or the handshake, so taking
+        the listing as success counted a move to an access point that went
+        on to refuse us.
+        """
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "UUID,STATE", "con", "show", "--active"]
+        )
+        if not result["success"]:
+            return False
+        return f"{uuid}:activated" in result.get("stdout", "").split("\n")
 
     def _recheck_rival_profiles(self, settings: dict, uuid: str,
                                 active_ssid, actions: list):
@@ -3522,6 +3984,7 @@ class Plugin:
             }
 
             self._collect_backend_state(status)
+            settings = self._pins_for_backend(settings, status)
 
             # Leftover pins, proposed BEFORE the not-connected return. A pin
             # we failed to clear is what stops a profile associating, so the
@@ -3594,6 +4057,9 @@ class Plugin:
                 uuid, "802-11-wireless.bssid", timeout=T
             ).replace("\\", "")
             status["live"]["bssid_lock"] = current_bssid_lock
+            if (current_bssid_lock and not settings.get("bssid_lock_enabled")
+                    and "802-11-wireless.bssid" not in settings.get("pins_owned", [])):
+                status["external"]["bssid_lock"] = True
             actions.extend(
                 self._propose_active_pin_cleanup(
                     settings, uuid, "bssid_lock_uuids", current_bssid_lock
@@ -3653,6 +4119,9 @@ class Plugin:
                 uuid, "802-11-wireless.band", timeout=T
             )
             status["live"]["band"] = live_band
+            if (live_band and not settings.get("band_preference_enabled")
+                    and "802-11-wireless.band" not in settings.get("pins_owned", [])):
+                status["external"]["band"] = True
 
             self._recheck_rival_profiles(settings, uuid, active_ssid, actions)
             if getattr(self, "_dup_conflict", False):
@@ -3664,16 +4133,8 @@ class Plugin:
                 )
             )
             actions.extend(self._propose_rival_pin_cleanup(settings))
-            expected_band = settings.get("band_preference", "a")
-            if (
-                self._band_preference_applies_here(settings, active_ssid)
-                and live_band != expected_band
-            ):
-                status["drift"]["band_preference"] = True
-                actions.append({
-                    "kind": "band", "uuid": uuid, "value": expected_band,
-                    "observed": live_band,
-                })
+            self._propose_band(settings, uuid, live_band, active_ssid,
+                               status, actions)
 
             self._collect_host_tuning(settings, uuid, iface, status, actions, T)
 
@@ -3704,7 +4165,16 @@ class Plugin:
                     }
 
             # Write or remove NM config (persistent layer)
+            before = _load_settings().get("valve_powersave_before")
             if disabled:
+                # What Valve's file said before we first took power save
+                # over, so stopping can put it back. "" records "nothing".
+                if not os.path.exists(NM_CONF_PATH):
+                    found = self._valve_powersave()
+                    before = (
+                        "" if found is None
+                        else found if found in _VALVE_POWERSAVE_VALUES else "?"
+                    )
                 os.makedirs(os.path.dirname(NM_CONF_PATH), exist_ok=True)
                 with open(NM_CONF_PATH, "w") as f:
                     f.write("[connection]\nwifi.powersave = 2\n")
@@ -3713,6 +4183,8 @@ class Plugin:
                     os.remove(NM_CONF_PATH)
                 except FileNotFoundError:
                     pass
+                self._release_valve_powersave(_load_settings())
+                before = "?"
 
             self._apply_driver_fixes(disabled)
             not_applied = self._apply_pcie_aspm_fix(disabled)
@@ -3720,6 +4192,7 @@ class Plugin:
             # Save settings only after success
             settings = _load_settings()
             settings["power_save_disabled"] = disabled
+            settings["valve_powersave_before"] = before
             _save_settings_with_timestamp(settings)
 
             result = {"success": True, "power_save_off": disabled}
@@ -3883,9 +4356,10 @@ class Plugin:
         reconnects immediately after - so getting it wrong strands the user
         then and there rather than at their next wake.
 
-        Deliberately await-free, like the rest of this setter's body: the
-        event loop is what serializes it against status reconciliation, and a
-        suspension point here would let a poll write to the profile mid-change.
+        Runs in a worker thread: a scan here can take 15 s and a radio cycle
+        more, which used to freeze every other call for as long. The setter
+        holds the reconciliation guard across it, so no poll writes to the
+        profile mid-change, and no second profile setter can start.
         """
         frequency = ""
         for line in link_out.split("\n"):
@@ -3920,14 +4394,7 @@ class Plugin:
             )
             if not self._hard_reconnect(uuid):
                 return dict(self._RADIO_OFF_RESULT), iface, bssid, link_out
-            # A BLOCKING sleep, on purpose, and it must stay one.
-            # This setter's whole body is await-free, which is what
-            # lets the event loop serialize it against status
-            # reconciliation. Turning this into asyncio.sleep would
-            # add a suspension point and let a poll write to the
-            # profile mid-change - the race the reader/applier split
-            # exists to prevent. _hard_reconnect immediately above
-            # already blocks for longer.
+            # Blocking is fine: this runs in a worker thread.
             time.sleep(3)
             iface = self._get_wifi_interface() or iface
             link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
@@ -3981,12 +4448,17 @@ class Plugin:
         # an association, so a status poll can now land in the middle of this
         # setter where previously none could - and the one it would run is
         # exactly the re-point that writes a BSSID to this profile.
+        if self._profile_change_in_flight() or self._update_running():
+            return dict(self._BUSY_RESULT)
         self._profile_change_depth = getattr(
             self, "_profile_change_depth", 0
         ) + 1
         try:
 
             if enabled:
+                if await asyncio.to_thread(self._backend_is_iwd):
+                    return {"success": False, "error": "needs_wpa_supplicant",
+                            "message": "The access point lock " + self._NEEDS_WPA_SUPPLICANT}
                 # Enabling requires active WiFi to read current BSSID
                 iface, uuid, err = self._require_wifi()
                 if err:
@@ -4047,8 +4519,9 @@ class Plugin:
                 # than at their next wake.
                 current = _load_settings()
                 active_ssid = self._get_profile_ssid(uuid)
-                err, iface, bssid, link_out = self._settle_band_before_locking(
-                    current, iface, uuid, bssid, link_out, active_ssid
+                err, iface, bssid, link_out = await asyncio.to_thread(
+                    self._settle_band_before_locking,
+                    current, iface, uuid, bssid, link_out, active_ssid,
                 )
                 if err:
                     return err
@@ -4082,6 +4555,7 @@ class Plugin:
                 settings["bssid_lock_enabled"] = True
                 settings["bssid_lock_value"] = chosen
                 settings["bssid_lock_connection_uuid"] = uuid
+                settings["pins_owned"] = _with_pin(settings, "802-11-wireless.bssid")
                 known = list(settings.get("bssid_lock_uuids", []))
                 if uuid not in known:
                     known.append(uuid)
@@ -4137,20 +4611,85 @@ class Plugin:
                 0, getattr(self, "_profile_change_depth", 1) - 1
             )
 
+    def _relock_after_band_change(self, uuid: str):
+        """Pin the access point NetworkManager chose on the new band.
+
+        Only while the lock is still on: the band setter awaits before this,
+        and the lock can have been turned off in between.
+        """
+        if not _load_settings().get("bssid_lock_enabled"):
+            return
+        iface = self._get_wifi_interface()
+        # The reconnect may have landed on a different profile - a
+        # duplicate for the same network, which is the situation this
+        # plugin exists to handle. Pinning what we see onto the profile
+        # we meant to change would write a foreign address, possibly on
+        # the other band, into a profile that now demands this one.
+        landed_on = self._get_active_connection_uuid()
+        if iface and landed_on == uuid:
+            link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+            if not link_result["success"]:
+                # Not fatal - reconciliation re-points the lock on a
+                # later poll - but silence here left the lock enabled
+                # in settings and absent from the profile with nothing
+                # said about why.
+                decky.logger.error(
+                    f"Band change: could not read the link on {iface} "
+                    f"to restore the access point lock - "
+                    f"{(link_result.get('stderr', '') or '')[:200]}"
+                )
+            link_text = link_result.get("stdout", "")
+            seen_freq = ""
+            for line in link_text.split("\n"):
+                st = line.strip()
+                if st.startswith("freq:"):
+                    seen_freq = st.split(":", 1)[1].strip()
+            if self._band_conflicts(_load_settings(), seen_freq, None):
+                decky.logger.info(
+                    "Not re-locking after the band change: the radio is "
+                    "not on the band this network now requires"
+                )
+                link_text = ""
+            for line in link_text.split("\n"):
+                if "Connected to" in line:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        new_bssid = parts[2]
+                        relocked = self._nmcli_modify(
+                            uuid, "802-11-wireless.bssid", new_bssid
+                        )
+                        if relocked["success"]:
+                            settings = _load_settings()
+                            settings["bssid_lock_value"] = new_bssid
+                            _save_settings(settings)
+                            decky.logger.info(
+                                f"Re-locked BSSID to {new_bssid} after band change"
+                            )
+                        else:
+                            # Recording a lock that was not applied
+                            # would report it as present forever.
+                            decky.logger.error(
+                                f"Could not re-lock BSSID after band change: "
+                                f"{relocked.get('stderr', '')[:120]}"
+                            )
+                    break
+
     async def set_band_preference(self, enabled: bool, band: str = "a") -> dict:
+        # This setter deliberately clears the BSSID, cycles the radio and
+        # re-locks once NM associates on the new band. It awaits in the
+        # middle, so a status poll can land between those steps. Hold the
+        # window so reconciliation does not write the old BSSID back and
+        # leave the profile demanding a band and an AP that contradict.
+        #
+        # The counter is the whole gate and `finally` is what releases
+        # it, including on cancellation. An earlier version put a deadline
+        # behind it as a failsafe; a slow NetworkManager could outlive
+        # that deadline and it failed open in exactly the circumstance
+        # where reassociation is slowest and the race most likely.
+        if self._profile_change_in_flight() or self._update_running():
+            return dict(self._BUSY_RESULT)
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
-            # This setter deliberately clears the BSSID, cycles the radio and
-            # re-locks once NM associates on the new band. It awaits in the
-            # middle, so a status poll can land between those steps. Hold the
-            # window so reconciliation does not write the old BSSID back and
-            # leave the profile demanding a band and an AP that contradict.
-            #
-            # The counter is the whole gate and `finally` is what releases
-            # it, including on cancellation. An earlier version put a deadline
-            # behind it as a failsafe; a slow NetworkManager could outlive
-            # that deadline and it failed open in exactly the circumstance
-            # where reassociation is slowest and the race most likely.
-            self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
 
             if band not in ("a", "bg"):
                 return {
@@ -4158,6 +4697,9 @@ class Plugin:
                     "error": "nmcli_failed",
                     "message": f"Invalid band '{band}'. Must be 'a' (5 GHz) or 'bg' (2.4 GHz).",
                 }
+            if enabled and await asyncio.to_thread(self._backend_is_iwd):
+                return {"success": False, "error": "needs_wpa_supplicant",
+                        "message": "The band preference " + self._NEEDS_WPA_SUPPLICANT}
 
             uuid, err = self._resolve_uuid(
                 "Connect to WiFi first to set band preference" if enabled else None
@@ -4179,7 +4721,9 @@ class Plugin:
                         "error": "nmcli_failed",
                         "message": "Couldn't identify this network. Try again in a moment.",
                     }
-                refused = self._band_unreachable(uuid, band)
+                # A scan can take 15 s; the guard above is what makes
+                # awaiting it safe.
+                refused = await asyncio.to_thread(self._band_unreachable, uuid, band)
                 if refused:
                     return refused
 
@@ -4250,6 +4794,7 @@ class Plugin:
                 settings["band_preference_uuids"] = unresolved_bands
                 settings["band_preference_ssid"] = ""
             if enabled:
+                settings["pins_owned"] = _with_pin(settings, "802-11-wireless.band")
                 known = list(settings.get("band_preference_uuids", []))
                 if uuid not in known:
                     known.append(uuid)
@@ -4273,60 +4818,7 @@ class Plugin:
                 # BSSID back. Must not be time.sleep here: this is an async
                 # method, and a blocking sleep stalls the whole event loop.
                 await asyncio.sleep(3)
-                iface = self._get_wifi_interface()
-                # The reconnect may have landed on a different profile - a
-                # duplicate for the same network, which is the situation this
-                # plugin exists to handle. Pinning what we see onto the profile
-                # we meant to change would write a foreign address, possibly on
-                # the other band, into a profile that now demands this one.
-                landed_on = self._get_active_connection_uuid()
-                if iface and landed_on == uuid:
-                    link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
-                    if not link_result["success"]:
-                        # Not fatal - reconciliation re-points the lock on a
-                        # later poll - but silence here left the lock enabled
-                        # in settings and absent from the profile with nothing
-                        # said about why.
-                        decky.logger.error(
-                            f"Band change: could not read the link on {iface} "
-                            f"to restore the access point lock - "
-                            f"{(link_result.get('stderr', '') or '')[:200]}"
-                        )
-                    link_text = link_result.get("stdout", "")
-                    seen_freq = ""
-                    for line in link_text.split("\n"):
-                        st = line.strip()
-                        if st.startswith("freq:"):
-                            seen_freq = st.split(":", 1)[1].strip()
-                    if self._band_conflicts(_load_settings(), seen_freq, None):
-                        decky.logger.info(
-                            "Not re-locking after the band change: the radio is "
-                            "not on the band this network now requires"
-                        )
-                        link_text = ""
-                    for line in link_text.split("\n"):
-                        if "Connected to" in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                new_bssid = parts[2]
-                                relocked = self._nmcli_modify(
-                                    uuid, "802-11-wireless.bssid", new_bssid
-                                )
-                                if relocked["success"]:
-                                    settings = _load_settings()
-                                    settings["bssid_lock_value"] = new_bssid
-                                    _save_settings(settings)
-                                    decky.logger.info(
-                                        f"Re-locked BSSID to {new_bssid} after band change"
-                                    )
-                                else:
-                                    # Recording a lock that was not applied
-                                    # would report it as present forever.
-                                    decky.logger.error(
-                                        f"Could not re-lock BSSID after band change: "
-                                        f"{relocked.get('stderr', '')[:120]}"
-                                    )
-                            break
+                self._relock_after_band_change(uuid)
 
             return {"success": True, "band": value, "reconnected": True}
         except Exception as e:
@@ -4356,7 +4848,9 @@ class Plugin:
                             "error": "nmcli_failed",
                             "message": "Custom DNS servers cannot be empty",
                         }
-                    servers = custom_servers.strip()
+                    # Older versions stored the field as typed, and nmcli
+                    # also accepts commas, so a list saved that way is valid.
+                    servers = " ".join(custom_servers.replace(",", " ").split())
                     parts = servers.split()
                     if len(parts) > 6 or not all(
                         DNS_SERVER_RE.match(part) for part in parts
@@ -4524,8 +5018,16 @@ class Plugin:
         release = _kernel_release()
         values = _stock_sysctl_defaults(release)
         baseline = settings.get("sysctl_baseline") or {}
-        if baseline.get("kernel") == release:
-            values.update(baseline.get("values", {}))
+        if baseline.get("kernel") != release:
+            return values
+        for key, recorded in baseline.get("values", {}).items():
+            # Within a sane band of the defaults only. The file this comes
+            # from is the desktop user's, and a backlog of 1 or a buffer of
+            # 0 written back as root would break networking until a reboot.
+            low = max(1, int(values[key]) // 16)
+            high = max(int(values[key]), int(SYSCTL_PARAMS[key])) * 16
+            if low <= int(recorded) <= high:
+                values[key] = recorded
         return values
 
     def _restore_buffer_sysctls(self, settings: dict) -> int:
@@ -4709,10 +5211,15 @@ class Plugin:
             if r.get("success"):
                 applied += 1
 
-            r = await self.set_bssid_lock(True)
-            results["bssid_lock"] = r
-            if r.get("success"):
-                applied += 1
+            # Under iwd the lock would only stop NetworkManager reconnecting,
+            # so Optimize Safe leaves it out rather than report it failed.
+            if await asyncio.to_thread(self._backend_is_iwd):
+                total -= 1
+            else:
+                r = await self.set_bssid_lock(True)
+                results["bssid_lock"] = r
+                if r.get("success"):
+                    applied += 1
 
             r = await self.set_power_save(True)
             results["power_save"] = r
@@ -4747,6 +5254,10 @@ class Plugin:
         if settings.get("last_applied", 0) != last_changed:
             settings["last_applied"] = last_changed
             _save_settings(settings)
+        try:
+            os.makedirs(os.path.dirname(ENFORCED_FILE), mode=0o755, exist_ok=True)
+        except OSError:
+            pass
         _write_no_follow(ENFORCED_FILE, str(int(time.time())))
 
     async def reapply_volatile(self) -> dict:
@@ -4816,7 +5327,19 @@ class Plugin:
                     applied += 1
 
             # Reconnecting (each does hard_reconnect)
-            if settings.get("bssid_lock_enabled"):
+            here_uuid = self._get_active_connection_uuid() or ""
+            if self._backend_is_iwd():
+                # Neither pin can be used under iwd; see _pins_for_backend.
+                settings = {**settings, "bssid_lock_enabled": False,
+                            "band_preference_enabled": False}
+            if settings.get("bssid_lock_enabled") and not self._lock_is_for_this_network(
+                settings, here_uuid, self._get_profile_ssid(here_uuid)
+            ):
+                # The same reasoning as the band below: reapplying the lock
+                # here would pin the first access point of a network nobody
+                # asked to lock, and block roaming on it.
+                decky.logger.info("Skipping access point lock: it belongs to another network")
+            elif settings.get("bssid_lock_enabled"):
                 total += 1
                 r = await self.set_bssid_lock(True)
                 results["bssid_lock"] = r
@@ -4984,6 +5507,7 @@ class Plugin:
                 os.remove(NM_CONF_PATH)
             except FileNotFoundError:
                 pass
+            self._release_valve_powersave(_load_settings())
             try:
                 os.remove(MODPROBE_CONF_PATH)
             except FileNotFoundError:
@@ -4992,10 +5516,11 @@ class Plugin:
                 os.remove(SETTINGS_FILE)
             except FileNotFoundError:
                 pass
-            try:
-                os.remove(ENFORCED_FILE)
-            except FileNotFoundError:
-                pass
+            for path in (ENFORCED_FILE, LEGACY_ENFORCED_FILE):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
             try:
                 os.remove(GENERIC_BACKEND_CONF)
             except FileNotFoundError:
@@ -5070,7 +5595,7 @@ class Plugin:
                 result = await asyncio.to_thread(
                     self._run_cmd,
                     [
-                        "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
+                        "/usr/bin/curl", "-sL", "--proto", "=https", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.raw+json",
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/contents/package.json?ref=beta",
                     ],
@@ -5080,7 +5605,7 @@ class Plugin:
                 result = await asyncio.to_thread(
                     self._run_cmd,
                     [
-                        "/usr/bin/curl", "-sL", "--connect-timeout", "3", "--max-time", "10",
+                        "/usr/bin/curl", "-sL", "--proto", "=https", "--connect-timeout", "3", "--max-time", "10",
                         "-H", "Accept: application/vnd.github.v3+json",
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest",
                     ],
@@ -5198,6 +5723,10 @@ class Plugin:
                 return {"success": False, "message": "Wait for the WiFi backend switch to finish."}
             if self._update_running():
                 return {"success": False, "message": "An update is already being installed."}
+            if self._profile_change_in_flight():
+                # Decky restarts at the end, which would cut a lock or band
+                # change off between its pin write and its reconnect.
+                return {"success": False, "message": "Wait for the current WiFi change to finish."}
             # Claimed before the first await, or two requests both pass the
             # check above while the version lookup runs.
             self._update_starting = True
@@ -5299,6 +5828,7 @@ mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults" || {
     exit 1
 }
 for f in $FILES; do
+    rm -f "$PLUGIN_DIR/$f.wifiopt-new"
     cp "$SRC/$f" "$PLUGIN_DIR/$f.wifiopt-new" || {
         logger -t wifi-optimizer "Update failed: could not copy $f"
         exit 1
@@ -5310,6 +5840,7 @@ for f in $FILES; do
         exit 1
     }
 done
+rm -f "$PLUGIN_DIR/dist/index.js.map"
 cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
 
 if systemctl restart plugin_loader; then
@@ -5333,18 +5864,28 @@ fi
             )
             with os.fdopen(fd, "w") as f:
                 f.write(script)
+            try:
+                subprocess.Popen(
+                    ["/bin/bash", script_path, script_dir, plugin_dir,
+                     download_url, src_dir, label, latest],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=_child_env(),
+                )
+            except Exception:
+                # Nothing started, so nothing will remove the directory, and
+                # its presence would read as an update running until Decky
+                # restarts - refusing every later update and backend switch.
+                for leftover in (script_path, script_dir):
+                    try:
+                        (os.remove if leftover == script_path else os.rmdir)(leftover)
+                    except OSError:
+                        pass
+                raise
             # The script removes its own directory when it exits, so while
             # the directory exists an update is running.
             self._update_dir = script_dir
-
-            subprocess.Popen(
-                ["/bin/bash", script_path, script_dir, plugin_dir,
-                 download_url, src_dir, label, latest],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=_child_env(),
-            )
 
             decky.logger.info(f"Update to {label} initiated (channel={channel})")
             return {"success": True, "message": f"Updating to {label}..."}
@@ -5384,9 +5925,16 @@ fi
                 f"backend switch: calling helper write_config target={target} "
                 f"(euid={os.geteuid()}, helper={BACKEND_HELPER})"
             )
+            valve_before = await asyncio.to_thread(self._valve_powersave)
             write_result = await asyncio.to_thread(
                 self._run_cmd, [BACKEND_HELPER, "write_config", target], 5
             )
+            # Valve's helper rewrites the file with the backend line only,
+            # dropping the power save line Steam's own setting keeps there.
+            # Put it back before NetworkManager restarts and reads it.
+            if (valve_before in _VALVE_POWERSAVE_VALUES
+                    and await asyncio.to_thread(self._valve_powersave) != valve_before):
+                await asyncio.to_thread(self._set_valve_powersave, valve_before)
             decky.logger.info(
                 f"backend switch: write_config result rc={write_result.get('returncode')} "
                 f"stdout={write_result.get('stdout', '')[:200]!r} "
@@ -5633,17 +6181,37 @@ fi
                 }
                 return
 
+            valve_before = await asyncio.to_thread(self._valve_powersave)
             result = await asyncio.to_thread(self._run_cmd, cmd, 45)
+            # steamos-manager rewrites Valve's file from the merged config,
+            # ours included, so our power save value lands in it. Put Valve's
+            # own back, whatever the outcome of the switch.
+            if (await asyncio.to_thread(self._valve_powersave) != valve_before
+                    and os.path.exists(NM_CONF_PATH)
+                    and valve_before in _VALVE_POWERSAVE_VALUES + (None,)):
+                await asyncio.to_thread(self._set_valve_powersave, valve_before)
             if not result["success"]:
                 detail = (result.get("stderr") or result.get("stdout") or "")[:200]
+                decky.logger.error(f"steamos-manager switch failed: {detail!r}")
+                # A failure can come after the old backend was already
+                # stopped - steamos-manager 26.2.1 failed exactly there on any
+                # wiphy other than phy0 - so leave the device with an
+                # interface if one can be had, whichever backend won.
+                in_force = (
+                    await asyncio.to_thread(self._steamosctl_backend)
+                    or await asyncio.to_thread(self._get_current_backend)
+                )
+                iface, recovered = await self._settle_interface(in_force)
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
+                    "backend": in_force,
+                    "recovery_performed": recovered,
+                    "needs_reboot": not iface,
                     "message": self._friendly_backend_error(detail),
                     "detail": detail,
                 }
-                decky.logger.error(f"steamos-manager switch failed: {detail!r}")
                 return
 
             # Recover the interface BEFORE waiting for a reconnection. iwd
@@ -5652,17 +6220,7 @@ fi
             # not exist yet, then reporting "WiFi didn't reconnect" about a
             # switch that recovered and works.
             self._backend_switch["phase"] = "reconnecting"
-            # Let the restart settle before deciding the interface is missing.
-            # Checking immediately can catch the moment it is down and add a
-            # second station netdev to a phy that was about to get its own.
-            await asyncio.sleep(2)
-            iface = await asyncio.to_thread(self._get_wifi_interface)
-            recovery_performed = False
-            if not iface:
-                if await asyncio.to_thread(self._recover_wlan0):
-                    await asyncio.sleep(2)
-                    iface = await asyncio.to_thread(self._get_wifi_interface)
-                    recovery_performed = bool(iface)
+            iface, recovery_performed = await self._settle_interface(target)
             needs_reboot = not iface
 
             # Only now is it meaningful to wait for an association.
@@ -5749,6 +6307,34 @@ fi
         finally:
             self._backend_switch["in_progress"] = False
 
+    async def _settle_interface(self, backend: str | None) -> tuple:
+        """(interface, whether we recreated it) once a backend restart settles.
+
+        Recreating wlan0 is the wpa_supplicant case only. iwd creates its own
+        netdev and names it after the phy (wlan31 on a Deck OLED), so adding
+        one under it puts a second station interface on the phy iwd is about
+        to claim; under iwd the right move is to give it longer.
+        """
+        # Let the restart settle before deciding the interface is missing.
+        # Checking immediately can catch the moment it is down and add a
+        # second station netdev to a phy that was about to get its own.
+        await asyncio.sleep(2)
+        iface = await asyncio.to_thread(self._get_wifi_interface)
+        if iface:
+            return iface, False
+        if backend == "iwd":
+            for _ in range(8):
+                await asyncio.sleep(1)
+                iface = await asyncio.to_thread(self._get_wifi_interface)
+                if iface:
+                    break
+            return iface, False
+        if not await asyncio.to_thread(self._recover_wlan0):
+            return None, False
+        await asyncio.sleep(2)
+        iface = await asyncio.to_thread(self._get_wifi_interface)
+        return iface, bool(iface)
+
     def _merged_nm_backend(self) -> str | None:
         """The backend NetworkManager's merged configuration names, from NM
         itself, so the order conf.d files are read in is NM's own."""
@@ -5775,8 +6361,151 @@ fi
         active = self._run_cmd(["/usr/bin/systemctl", "is-active", configured], timeout=3)
         return configured if active.get("stdout", "").strip() == "active" else None
 
+    _IWD_UNITS = (
+        "/usr/lib/systemd/system/iwd.service",
+        "/lib/systemd/system/iwd.service",
+        "/etc/systemd/system/iwd.service",
+    )
+
+    def _heal_orphaned_iwd_conf(self) -> bool:
+        """Undo our switch to iwd on a system that no longer has iwd.
+
+        Bazzite dropped iwd from its images in 2026 and migrates its own
+        settings back, but our conf file outlives that: NetworkManager keeps
+        being told to use a backend that is not installed, and the device has
+        no WiFi at all, before anyone can reach a panel to switch back.
+        """
+        try:
+            with open(GENERIC_BACKEND_CONF) as f:
+                text = f.read(4096)
+        except OSError:
+            return False
+        if not re.search(r"^\s*wifi\.backend\s*=\s*iwd\s*$", text, re.M):
+            return False
+        if any(os.path.exists(unit) for unit in self._IWD_UNITS):
+            return False
+        try:
+            os.remove(GENERIC_BACKEND_CONF)
+        except OSError as e:
+            decky.logger.error(f"Could not remove the stale iwd backend setting: {e}")
+            return False
+        decky.logger.info(
+            "iwd is no longer installed but our backend setting still named it; "
+            "removed it and restarted NetworkManager on wpa_supplicant"
+        )
+        # Our earlier switch to iwd disabled wpa_supplicant, which also removes
+        # the D-Bus alias NetworkManager starts it through.
+        for cmd in (["/usr/bin/systemctl", "enable", "wpa_supplicant"],
+                    ["/usr/bin/systemctl", "restart", "NetworkManager"]):
+            self._run_cmd(cmd, timeout=15)
+        return True
+
+    # Valve's default for wifi.powersave when its file names none (3, enable).
+    _VALVE_POWERSAVE_DEFAULT = "3"
+    _POWERSAVE_LINE_RE = re.compile(r"^\s*wifi\.powersave\s*=\s*(\S*)\s*$")
+
+    def _valve_powersave(self) -> str | None:
+        """wifi.powersave in Valve's NetworkManager file, None if it names none.
+
+        steamos-manager writes this file from NetworkManager's MERGED config
+        whenever it switches the backend, and our own file is part of that
+        merge. So a backend switch run from here copied our power save value
+        into Valve's file, where it outlived our Reset and uninstall. Steam's
+        own Wi-Fi power management setting writes the same line.
+        """
+        try:
+            with open(WIFI_BACKEND_CONF) as f:
+                lines = f.read(8192).splitlines()
+        except OSError:
+            return None
+        section = ""
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("["):
+                section = stripped
+                continue
+            found = self._POWERSAVE_LINE_RE.match(line)
+            if section == "[connection]" and found:
+                return found.group(1)
+        return None
+
+    def _set_valve_powersave(self, value: str | None) -> bool:
+        """Put Valve's wifi.powersave back to value, removing it for None.
+
+        Only an existing file is touched, and only that one line: the backend
+        line beside it is Valve's to own.
+        """
+        try:
+            with open(WIFI_BACKEND_CONF) as f:
+                lines = f.read(8192).splitlines()
+        except OSError:
+            return False
+        out, section, done = [], "", False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("["):
+                if section == "[connection]" and not done and value is not None:
+                    out.append(f"wifi.powersave={value}")
+                    done = True
+                section = stripped
+            elif section == "[connection]" and self._POWERSAVE_LINE_RE.match(line):
+                if value is not None and not done:
+                    out.append(f"wifi.powersave={value}")
+                done = True
+                continue
+            out.append(line)
+        if value is not None and not done:
+            if section != "[connection]":
+                out.append("[connection]")
+            out.append(f"wifi.powersave={value}")
+        tmp = WIFI_BACKEND_CONF + ".wifiopt-new"
+        try:
+            with open(tmp, "w") as f:
+                f.write("\n".join(out) + "\n")
+            os.replace(tmp, WIFI_BACKEND_CONF)
+        except OSError as e:
+            decky.logger.error(f"Could not restore Valve's power save setting: {e}")
+            return False
+        decky.logger.info(f"Valve's wifi.powersave put back to {value or 'unset'}")
+        return True
+
+    def _release_valve_powersave(self, settings: dict):
+        """Undo our power save value in Valve's file when we stop managing it.
+
+        Put back what was there when the plugin took power save over. With
+        no record of that (an install from before it was recorded), a 2 there
+        is taken as ours and returned to Valve's default: a backend switch
+        from this plugin is how nearly every such file got its 2, and Steam's
+        own setting shows the result either way, so it can be changed back.
+        """
+        if self._valve_powersave() != "2":
+            return
+        before = settings.get("valve_powersave_before", "?")
+        if before == "2":
+            return
+        if before not in _VALVE_POWERSAVE_VALUES + ("",):
+            before = self._VALVE_POWERSAVE_DEFAULT
+        self._set_valve_powersave(before or None)
+
+    def _put_back_backend_conf(self, before: str | None):
+        """Return our backend conf file to what it held before a switch."""
+        try:
+            if before is None:
+                os.remove(GENERIC_BACKEND_CONF)
+            else:
+                with open(GENERIC_BACKEND_CONF, "w") as f:
+                    f.write(before)
+        except OSError as e:
+            decky.logger.error(f"restoring backend conf: {e}")
+
     def _restore_generic_backend(self, backend: str):
-        """Point NM back at a backend and start it, after a failed switch."""
+        """Point NM back at a backend and start it, after a failed switch.
+
+        The one we tried is stopped and disabled first: left enabled, both
+        start at the next boot and fight over the interface.
+        """
+        tried = "iwd" if backend == "wpa_supplicant" else "wpa_supplicant"
+        self._run_cmd(["/usr/bin/systemctl", "disable", "--now", tried], timeout=15)
         try:
             with open(GENERIC_BACKEND_CONF, "w") as f:
                 if backend == "iwd":
@@ -5800,12 +6529,35 @@ fi
             decky.logger.info(f"generic backend switch: {other} -> {target}")
 
             os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
+            try:
+                with open(GENERIC_BACKEND_CONF) as f:
+                    before = f.read(4096)
+            except OSError:
+                before = None
             if target == "iwd":
                 with open(GENERIC_BACKEND_CONF, "w") as f:
                     f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
             else:
                 with open(GENERIC_BACKEND_CONF, "w") as f:
                     f.write("[device]\nwifi.backend=wpa_supplicant\n")
+
+            # Ask NetworkManager which backend it will now use BEFORE stopping
+            # anything. Another conf.d file can outrank ours, and stopping the
+            # backend it still names leaves no WiFi at all.
+            merged = await asyncio.to_thread(self._merged_nm_backend)
+            if merged is not None and merged != target:
+                self._put_back_backend_conf(before)
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "backend": merged,
+                    "target": target,
+                    "message": (
+                        f"Another NetworkManager setting on this system keeps "
+                        f"{merged} in force, so nothing was changed."
+                    ),
+                }
+                return
 
             # Stop old, enable + start new, restart NM
             for cmd in [
@@ -5883,6 +6635,10 @@ fi
                     "reconnect_timed_out": reconnect_timed_out,
                 }
             else:
+                # Put the previous backend back rather than leave a half
+                # switch: the new one is not in force and the old one is
+                # stopped and disabled.
+                await asyncio.to_thread(self._restore_generic_backend, other)
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
@@ -5892,8 +6648,8 @@ fi
                     "needs_reboot": False,
                     "reconnect_timed_out": reconnect_timed_out,
                     "message": (
-                        f"Expected {target} but the system reports "
-                        f"{final_backend or 'no backend'}. A reboot may help."
+                        f"{target} did not take over, so {other} was put back. "
+                        f"A reboot may help."
                     ),
                 }
 
@@ -5977,6 +6733,11 @@ fi
                     "message": f"Backend is already {backend}.",
                     "backend": current,
                 }
+
+            if backend == "iwd":
+                # A pinned profile cannot be brought up by NetworkManager under
+                # iwd, and the switch ends with exactly such a reconnect.
+                await asyncio.to_thread(self._clear_lock_and_band_pins)
 
             # Route to the appropriate worker based on backend method
             if method == "steamos_manager":

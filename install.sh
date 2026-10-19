@@ -32,7 +32,12 @@ fi
 
 # Fetch latest release tag from GitHub
 echo "Checking for latest release..."
-LATEST_TAG=$(curl -sL "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+LATEST_TAG=$(curl -sL --proto '=https' --connect-timeout 15 --max-time 60 "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+# Only a plain version tag goes into the download URL and the folder name.
+case "$LATEST_TAG" in
+    v[0-9]*) case "$LATEST_TAG" in *[!A-Za-z0-9.-]*) LATEST_TAG="" ;; esac ;;
+    *) LATEST_TAG="" ;;
+esac
 
 if [ -z "$LATEST_TAG" ]; then
     echo "Warning: Couldn't fetch latest release, falling back to main branch"
@@ -60,7 +65,7 @@ echo "Installing $PLUGIN_NAME..."
 
 # Download and extract
 echo "Downloading..."
-curl -sSL --fail --connect-timeout 15 --max-time 300 "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz"
+curl -sSL --fail --proto '=https' --connect-timeout 15 --max-time 300 "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz"
 tar xzf "$TMP_DIR/plugin.tar.gz" -C "$TMP_DIR"
 
 SRC="$TMP_DIR/$DIR_NAME"

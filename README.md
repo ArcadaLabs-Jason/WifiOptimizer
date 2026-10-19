@@ -49,7 +49,7 @@ Want to go further? The remaining optimizations are available as individual togg
 | Optimization | What it does |
 |---|---|
 | Prevent lag spikes | Disables WiFi power management and PCIe power states that cause packet batching, latency spikes, and throughput degradation during sustained streaming. |
-| Stop background scanning | Pins your connection to one access point so your device stops scanning for other networks every few minutes. On a mesh it pins the strongest access point your network offers rather than whichever one you happen to be on, preferring 5 GHz where the signal is equal, and stays put if the one you are on is already healthy. If the stronger one turns out not to accept the connection, the previous one is restored. If the pinned access point later stops being reachable and the device has been offline for a minute, the pin is released so you can connect again, and reapplied to whichever access point works. Disable before switching networks, or if you need to roam between access points. |
+| Stop background scanning | Pins your connection to one access point so your device stops scanning for other networks every few minutes. On a mesh it pins the strongest access point your network offers rather than whichever one you happen to be on, preferring 5 GHz where the signal is equal, and stays put if the one you are on is already healthy. If the stronger one turns out not to accept the connection, the previous one is restored. If the pinned access point later stops being reachable and the device has been offline for a minute, the pin is released so you can connect again, and reapplied to whichever access point works. Disable before switching networks, or if you need to roam between access points. Needs the `wpa_supplicant` backend: under `iwd`, NetworkManager can't reconnect a network pinned this way, so the lock is paused, and its pins removed, while `iwd` is in use. |
 | Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects - works even if Decky isn't running |
 | Network buffer tuning | Increases kernel buffer sizes and TX queue length to handle bursty streaming traffic without dropping packets |
 
@@ -57,12 +57,12 @@ Want to go further? The remaining optimizations are available as individual togg
 
 | Optimization | What it does | Why it's manual |
 |---|---|---|
-| Force 5 GHz band | Locks WiFi to 5 GHz to avoid Bluetooth interference on 2.4 GHz | Won't connect if your network is 2.4 GHz only, and keeps a 6 GHz capable device off 6 GHz. Refused when no 5 GHz access point for your network is in range. |
+| Force 5 GHz band | Locks WiFi to 5 GHz to avoid Bluetooth interference on 2.4 GHz | Won't connect if your network is 2.4 GHz only, and keeps a 6 GHz capable device off 6 GHz. Refused when no 5 GHz access point for your network is in range. Paused while the `iwd` backend is in use, for the same reason as the access point lock. |
 | Traffic shaping (CAKE) | Replaces the default network queue with CAKE for fair queuing, bufferbloat prevention, and ACK filtering. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
 | WiFi region | Sets the wireless regulatory domain, which decides the channels your device may use. The wrong region can hide 5 GHz and 6 GHz channels entirely. | Only offered on devices whose WiFi card does not carry its own region. Steam Deck cards do, so the panel reports the region in use and offers no control there. |
-| WiFi backend (iwd / wpa_supplicant) | Switches between `iwd` and `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. On SteamOS 3.8 this goes through the same system service as the setting in SteamOS Settings, so the two agree. | Only shown when the system provides a way to switch; some networks (certain WPA3, enterprise setups) behave differently between the two |
+| WiFi backend (iwd / wpa_supplicant) | Switches between `iwd` and `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. On SteamOS 3.8 this goes through the same system service as the setting in SteamOS Settings, so the two agree. Switching to `iwd` pauses the access point lock and Force 5 GHz. | Only shown when the system provides a way to switch; some networks (certain WPA3, enterprise setups) behave differently between the two |
 
 ## Hardware support
 
@@ -91,7 +91,7 @@ volatile settings shortly after a game launches.
 
 ## Uninstall
 
-**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. Power save then follows the plugin's defaults until you uninstall. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
+**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. Power save then follows the plugin's defaults until you uninstall. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
 
 Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
 

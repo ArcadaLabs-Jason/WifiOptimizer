@@ -285,7 +285,8 @@ class Reach(m.Plugin):
     def __init__(self, km, aps):
         super().__init__(); self.km = km; self.aps = aps
     def _profile_key_mgmt(self, uuid): return self.km
-    def _visible_access_points(self, iface, ssid, rescan=False): return list(self.aps)
+    def _visible_access_points(self, iface, ssid, rescan=False, cached_only=False):
+        self.cached_only = cached_only; return list(self.aps)
 
 r = Reach("sae", JASONS_ROOM)
 r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
@@ -328,8 +329,12 @@ class Allow(m.Plugin):
     def _hard_reconnect(self, uuid=None): return True
     def _get_active_connection_uuid(self):
         return WU if (self.connects or self.km == "sae") else None
+    def _connection_activated(self, uuid):
+        return uuid == self._get_active_connection_uuid()
     async def set_bssid_lock(self, enabled):
-        self.lock_calls += 1; return {"success": True}
+        self.lock_calls += 1
+        self.busy_at_lock = self._profile_change_in_flight()
+        return {"success": True}
 
 _real_sleep = asyncio.sleep
 async def _no_sleep(*_a, **_k): return None
@@ -345,6 +350,8 @@ try:
     a = Allow(lock=True)
     asyncio.run(a.allow_wpa2())
     ok(a.lock_calls == 1, "with the lock on, it chooses again now the stronger radio is eligible")
+    ok(a.busy_at_lock is False and getattr(a, "_profile_change_depth", 0) == 0,
+       "and hands the in-flight guard over, since the lock setter refuses while it is held")
 
     a = Allow(connects=False)
     res = asyncio.run(a.allow_wpa2())
@@ -617,17 +624,38 @@ class Pinned(Connected):
 
 base = {**m.DEFAULT_SETTINGS, "driver":"ath11k_pci", "distro_id":"steamos"}
 
-m._save_settings({**base, "band_preference_enabled":False, "band_preference_uuids":[]})
+m._save_settings({**base, "band_preference_enabled":False, "band_preference_uuids":[],
+                  "pins_owned":["802-11-wireless.band"]})
 pin = Pinned(band="a")
 asyncio.run(pin.get_status())
 ok(("802-11-wireless.band", "") in [(k, v) for _, k, v in pin.mods],
    "an untracked band pin on the active profile is cleared")
 
-m._save_settings({**base, "bssid_lock_enabled":False, "bssid_lock_uuids":[]})
+m._save_settings({**base, "bssid_lock_enabled":False, "bssid_lock_uuids":[],
+                  "pins_owned":["802-11-wireless.bssid"]})
 pin = Pinned(bssid="02\\:00\\:00\\:00\\:00\\:11")
 asyncio.run(pin.get_status())
 ok(("802-11-wireless.bssid", "") in [(k, v) for _, k, v in pin.mods],
    "an untracked access point pin on the active profile is cleared")
+
+# Without evidence the plugin ever wrote that kind of pin, it was set by hand
+# (nmcli, KDE's editor) and turning our feature off must not erase it. It is
+# reported instead, so the panel can still say why the device is pinned.
+m._save_settings({**base, "band_preference_enabled":False, "band_preference_uuids":[],
+                  "pins_owned":[]})
+pin = Pinned(band="a")
+st = asyncio.run(pin.get_status())
+ok(("802-11-wireless.band", "") not in [(k, v) for _, k, v in pin.mods]
+   and st.get("external", {}).get("band"),
+   "a band pin the plugin never wrote is reported, not cleared")
+
+m._save_settings({**base, "bssid_lock_enabled":False, "bssid_lock_uuids":[],
+                  "pins_owned":[]})
+pin = Pinned(bssid="02\\:00\\:00\\:00\\:00\\:11")
+st = asyncio.run(pin.get_status())
+ok(("802-11-wireless.bssid", "") not in [(k, v) for _, k, v in pin.mods]
+   and st.get("external", {}).get("bssid_lock"),
+   "an access point pin the plugin never wrote is reported, not cleared")
 
 # The other half: a preference that is ON must never be cleaned up, or the
 # cleanup would undo the feature on every poll.
@@ -1159,18 +1187,28 @@ def cleared(d, uuid, prop):
 ONE = {RIVAL: ("Net", "Net", "wpa-psk")}
 
 # The measured case: a rival copy carrying band=a that nothing tracks.
-m._save_settings(dict(base_ap))
+OWNED = ["802-11-wireless.band", "802-11-wireless.bssid"]
+m._save_settings({**base_ap, "pins_owned":OWNED})
 d = RivalPins(ONE, {RIVAL: {"802-11-wireless.band": "a"}})
 asyncio.run(d.get_status())
 ok(cleared(d, RIVAL, "802-11-wireless.band"),
    "a band pin left on another copy of the same network is cleared")
 
 # The same for an address pin.
-m._save_settings(dict(base_ap))
+m._save_settings({**base_ap, "pins_owned":OWNED})
 d = RivalPins(ONE, {RIVAL: {"802-11-wireless.bssid": "02:00:00:00:00:11"}})
 asyncio.run(d.get_status())
 ok(cleared(d, RIVAL, "802-11-wireless.bssid"),
    "an address pin left on another copy is cleared")
+
+# And neither, when nothing shows the plugin ever wrote that kind of pin.
+m._save_settings({**base_ap, "pins_owned":[]})
+d = RivalPins(ONE, {RIVAL: {"802-11-wireless.band": "a",
+                            "802-11-wireless.bssid": "02:00:00:00:00:11"}})
+asyncio.run(d.get_status())
+ok(not cleared(d, RIVAL, "802-11-wireless.band")
+   and not cleared(d, RIVAL, "802-11-wireless.bssid"),
+   "a rival copy's hand-set pins are left alone")
 
 # While the preference is ON that value is the user's, not litter.
 m._save_settings({**base_ap, "band_preference_enabled":True,
@@ -1215,19 +1253,31 @@ section("a pin that is keeping the device offline is released")
 # left re-entering credentials, which makes a second copy of the network.
 OFFU = "cccccccc-0000-0000-0000-000000000001"
 
+# The network is in range on an access point no pin below names, on 2.4 GHz,
+# so both an address pin and a 5 GHz band pin rule it out.
+IN_RANGE = "TestNet:AA\\:BB\\:CC\\:00\\:00\\:01:70:2437 MHz"
+
 class Offline(Connected):
     """No active connection, over a saved profile carrying the given pins."""
-    def __init__(self, pins):
+    def __init__(self, pins, state="disconnected", radio="enabled", scan=IN_RANGE,
+                 active=None):
         super().__init__()
         self.pins = dict(pins)
         self.modifies = []
+        self.state, self.radio, self.scan, self.active = state, radio, scan, active
     def _get_active_connection_uuid(self):
-        return None
+        return self.active
     def _run_cmd(self, cmd, timeout=5):
-        if "802-11-wireless.band,802-11-wireless.bssid" in " ".join(cmd):
+        j = " ".join(cmd)
+        if "802-11-wireless.band,802-11-wireless.bssid" in j:
             return {"success":True,
                     "stdout":"\n".join(f"{k}:{v}" for k,v in self.pins.items()),
                     "stderr":"","returncode":0}
+        if "STATE,WIFI general" in j:
+            return {"success":True,"stdout":f"{self.state}:{self.radio}",
+                    "stderr":"","returncode":0}
+        if "SSID,BSSID,SIGNAL,FREQ dev wifi list" in j:
+            return {"success":True,"stdout":self.scan,"stderr":"","returncode":0}
         return super()._run_cmd(cmd, timeout)
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.modifies.append((uuid, key, value))
@@ -1305,9 +1355,100 @@ d = Offline({})
 strand(d)
 ok(not d.modifies, "a profile with no pin is not written to needlessly")
 
+# Every profile we pinned, not just the last one in use. The profile a device
+# fails to rejoin is often not the one it last held.
+OTHER = "cccccccc-0000-0000-0000-000000000002"
+m._save_settings(off_settings(bssid_lock_uuids=[OTHER, OFFU],
+                              last_connection_uuid=OTHER))
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+strand(d)
+ok(rel(d, "802-11-wireless.bssid"),
+   "a pinned profile that is not the last one used is released too")
+
+# An upgrade from 0.11 records only the lock's own profile, in a field the
+# tracking list never saw. With evidence the plugin wrote locks, it counts.
+m._save_settings(off_settings(bssid_lock_uuids=[], last_connection_uuid="",
+                              pins_owned=["802-11-wireless.bssid"]))
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+strand(d)
+ok(rel(d, "802-11-wireless.bssid"),
+   "the lock's own profile is covered when the plugin is known to write locks")
+
+# A profile waiting on a password is ACTIVATING, which is exactly where a pin
+# that cannot associate leaves it. Treating that as online reset the clock
+# for as long as the prompt sat there.
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"},
+            state="connecting", active=OFFU)
+strand(d)
+ok(rel(d, "802-11-wireless.bssid"),
+   "a profile stuck activating counts as offline, so the clock runs")
+
+# The pin must be what is keeping it off. Each of these is offline for some
+# other reason, and releasing then re-pointed the lock to whatever came back.
+for label, kw in [
+    ("the radio is off",          {"radio": "disabled"}),
+    ("the network is not in range", {"scan": "Elsewhere:AA\\:BB\\:CC\\:00\\:00\\:09:70:2437 MHz"}),
+    ("only the pinned access point is in range",
+                                  {"scan": "TestNet:02\\:00\\:00\\:00\\:00\\:11:70:5180 MHz"}),
+    ("NetworkManager cannot answer", {"state": "", "radio": ""}),
+    ("the system is asleep",      {"state": "asleep"}),
+]:
+    m._save_settings(off_settings())
+    d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"}, **kw)
+    strand(d)
+    ok(not rel(d, "802-11-wireless.bssid"), f"nothing is released when {label}")
+
+m._save_settings(off_settings(bssid_lock_enabled=False, band_preference_enabled=True,
+                              band_preference="a", band_preference_ssid="TestNet",
+                              band_preference_uuids=[OFFU]))
+d = Offline({"802-11-wireless.band": "a"},
+            scan="TestNet:AA\\:BB\\:CC\\:00\\:00\\:01:70:5180 MHz")
+strand(d)
+ok(not rel(d, "802-11-wireless.band"),
+   "a band pin is kept while the network is in range on that band")
+
+# A router lists its other band and a mesh its other nodes, so "some access
+# point the pin excludes is visible" is true on nearly every network, and
+# released the lock on any outage at all (a changed password, DHCP failing).
+DUAL = ("TestNet:02\\:00\\:00\\:00\\:00\\:11:70:5180 MHz\n"
+        "TestNet:02\\:00\\:00\\:00\\:00\\:12:65:2437 MHz")
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"}, scan=DUAL)
+strand(d)
+ok(not rel(d, "802-11-wireless.bssid"),
+   "a pinned access point still in range at full strength is not released")
+FAR = ("TestNet:02\\:00\\:00\\:00\\:00\\:11:20:5180 MHz\n"
+       "TestNet:02\\:00\\:00\\:00\\:00\\:12:80:5745 MHz")
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"}, scan=FAR)
+strand(d)
+ok(rel(d, "802-11-wireless.bssid"),
+   "but one far weaker than another node of the network is")
+m._save_settings(off_settings(bssid_lock_enabled=False, band_preference_enabled=True,
+                              band_preference="a", band_preference_ssid="TestNet",
+                              band_preference_uuids=[OFFU]))
+d = Offline({"802-11-wireless.band": "a"}, scan=DUAL)
+strand(d)
+ok(not rel(d, "802-11-wireless.band"),
+   "a band pin on a dual-band network with that band in range is kept")
+
+# A backend switch or an update takes WiFi down on purpose.
+for label, setup in [
+    ("a backend switch", lambda d: setattr(d, "_backend_switch", {"in_progress": True})),
+    ("an update", lambda d: setattr(d, "_update_starting", True)),
+]:
+    m._save_settings(off_settings())
+    d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+    setup(d)
+    strand(d)
+    ok(not rel(d, "802-11-wireless.bssid") and d._offline_since is None,
+       f"{label} neither releases nor runs the offline clock")
+
 # Reconnecting restarts the clock, so outages do not accumulate.
 m._save_settings(off_settings())
 d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"})
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"}, state="connected")
 d._offline_since = time.monotonic() - 999
 out = d._propose_stranded_pin_release(m._load_settings(), True)
 ok(out == [] and getattr(d, "_offline_since", "unset") is None,
@@ -1323,9 +1464,10 @@ class Watched(m.Plugin):
         super().__init__(); self.state = state; self.ok_ = ok_
         self.nm_calls = 0; self.polls = 0
     def _run_cmd(self, cmd, timeout=5):
-        if cmd == ["/usr/bin/nmcli", "-t", "-f", "STATE", "general"]:
+        if cmd == ["/usr/bin/nmcli", "-t", "-f", "STATE,WIFI", "general"]:
             self.nm_calls += 1
-            return {"success": self.ok_, "stdout": self.state, "stderr": "", "returncode": 0}
+            out = self.state if ":" in self.state else f"{self.state}:enabled"
+            return {"success": self.ok_, "stdout": out, "stderr": "", "returncode": 0}
         return {"success": False, "stdout": "", "stderr": "", "returncode": 1}
     async def get_status(self):
         self.polls += 1
@@ -1374,6 +1516,12 @@ w._repoll_after_release = True
 asyncio.run(w._stranded_watch_once())
 ok(w.polls == 0 and w._repoll_after_release,
    "but not while asleep, which is not back online")
+
+w = Watched("disconnected:disabled")
+w._offline_since = 123.0
+asyncio.run(w._stranded_watch_once())
+ok(w.polls == 0 and w._offline_since is None,
+   "the radio switched off resets the clock and polls nothing")
 
 w = Watched("", ok_=False)
 w._offline_since = 123.0
@@ -1623,10 +1771,25 @@ ok(Scan(["My\\:Net:5745 MHz"], ssid="My\\:Net")._band_is_reachable("wlan0", "u",
 ok(Scan(["My\\:Net:5745 MHz"], ssid="Other")._band_is_reachable("wlan0", "u", "a") is False,
    "and is not confused with a different network")
 
-# The boundary itself: 5 GHz starts at 5000.
-ok(Scan(["Net:4980 MHz"])._band_is_reachable("wlan0", "u", "a") is False
-   and Scan(["Net:5000 MHz"])._band_is_reachable("wlan0", "u", "a") is True,
-   "the 5 GHz boundary is applied at 5000 MHz")
+# The boundaries are NetworkManager's own: band "a" hands wpa_supplicant its
+# 5 GHz table, 4915 to 5825 MHz, and nothing on 6 GHz. Counting 6 GHz as "a"
+# let the plugin write a band that pushes a 6 GHz device back to 5 GHz.
+ok(Scan(["Net:5825 MHz"])._band_is_reachable("wlan0", "u", "a") is True
+   and Scan(["Net:4980 MHz"])._band_is_reachable("wlan0", "u", "a") is True,
+   "the 5 GHz band runs to the top of NetworkManager's 5 GHz table")
+ok(Scan(["Net:5955 MHz"])._band_is_reachable("wlan0", "u", "a") is False
+   and Scan(["Net:6115 MHz"])._band_is_reachable("wlan0", "u", "bg") is False,
+   "a 6 GHz access point satisfies neither band")
+_fb = getattr(m.Plugin, "_freq_band", lambda f: None)
+for freq, want in [("2412", "bg"), ("2484 MHz", "bg"), ("5180.0", "a"),
+                   ("5825", "a"), ("5955", ""), ("6115 MHz", ""), ("", ""), ("junk", "")]:
+    ok(_fb(freq) == want, f"{freq!r} is band {want!r}")
+_six = {**m.DEFAULT_SETTINGS, "band_preference_enabled": True,
+        "band_preference": "a", "band_preference_ssid": "Net"}
+ok(m.Plugin()._band_conflicts(_six, "6115.0", "Net") is True,
+   "a 6 GHz association conflicts with a 5 GHz preference, so no address is pinned over it")
+ok(m.Plugin()._band_conflicts(_six, "5180.0", "Net") is False,
+   "while a 5 GHz one does not")
 
 section("turning the lock off clears it from every profile that carries it")
 
@@ -2793,6 +2956,726 @@ ok(_script.rindex("package.json") > _script.index('FILES="') and
    "package.json, which carries the version, is moved into place last")
 ok('"$GOT" != "$EXPECTED"' in _script, "a payload of the wrong version is refused")
 ok("if systemctl restart plugin_loader" in _script, "a failed restart is not reported as success")
+
+section("files the desktop user owns: read and written without trusting them")
+try:
+
+    _real_settings = m.SETTINGS_FILE
+    try:
+        # A FIFO planted at the settings path used to hang the plugin's first read.
+        _d = tempfile.mkdtemp(); m.SETTINGS_FILE = os.path.join(_d, "settings.json")
+        os.mkfifo(m.SETTINGS_FILE)
+        ok(m._load_settings() == m.DEFAULT_SETTINGS,
+           "a FIFO in place of the settings file is refused, not waited on")
+        os.remove(m.SETTINGS_FILE)
+        # The saved file keeps its 0644 whatever mkstemp made it.
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        ok(os.stat(m.SETTINGS_FILE).st_mode & 0o777 == 0o644, "settings are saved readable, 0644")
+        # Values that end up written as root are filtered on the way in.
+        m._save_settings({**m.DEFAULT_SETTINGS, "pins_owned": ["802-11-wireless.band", "ipv4.dns"],
+                          "valve_powersave_before": "2\n[device]\nwifi.backend=iwd"})
+        s_ = m._load_settings()
+        ok(s_["pins_owned"] == ["802-11-wireless.band"], "only the two pin kinds can be recorded as ours")
+        ok(s_["valve_powersave_before"] == "?",
+           "a power save value that is not one of NetworkManager's is discarded")
+        for v in ("0", "1", "2", "3", "", "?"):
+            m._save_settings({**m.DEFAULT_SETTINGS, "valve_powersave_before": v})
+            ok(m._load_settings()["valve_powersave_before"] == v, f"power save record {v!r} survives a load")
+        # DNS saved off as custom-with-nothing by older versions turns on cleanly.
+        m._save_settings({**m.DEFAULT_SETTINGS, "dns_enabled": False, "dns_provider": "custom",
+                          "dns_servers": ""})
+        ok(m._load_settings()["dns_provider"] == "cloudflare",
+           "an empty custom DNS from an older version loads as a provider that can be turned on")
+    finally:
+        m.SETTINGS_FILE = _real_settings
+
+    _d = tempfile.mkdtemp()
+    _p = os.path.join(_d, "n"); open(_p, "w").write("1234\n")
+    ok(m._read_small_int(_p) == 1234, "the enforcement time is read from a plain file")
+    _l = os.path.join(_d, "link"); os.symlink(_p, _l)
+    ok(m._read_small_int(_l) == 0, "but not through a link")
+    _f = os.path.join(_d, "fifo"); os.mkfifo(_f)
+    ok(m._read_small_int(_f) == 0, "and not from a FIFO, which would block")
+    ok('ENFORCED_FILE = "/run/wifi-optimizer/last_enforced"' in open("main.py").read(),
+       "the enforcement time lives in /run, which only root writes")
+    _tmpl = open("defaults/dispatcher.sh.tmpl").read()
+    ok("/run/wifi-optimizer/last_enforced" in _tmpl and "SETTINGS_DIR/last_enforced" not in _tmpl,
+       "and the dispatcher writes it there too")
+
+    class LinkedLogs(m.Plugin):
+        pass
+    _logs = tempfile.mkdtemp(); _victim = tempfile.mkdtemp()
+    for i in range(15):
+        open(os.path.join(_victim, f"{i}.log"), "w").write("x")
+    os.rmdir(_logs); os.symlink(_victim, _logs)
+    _saved_dir = getattr(m.decky, "DECKY_PLUGIN_LOG_DIR", None)
+    try:
+        m.decky.DECKY_PLUGIN_LOG_DIR = _logs
+        LinkedLogs()._rotate_logs()
+        ok(len(os.listdir(_victim)) == 15, "log rotation does not follow a linked log directory")
+    finally:
+        m.decky.DECKY_PLUGIN_LOG_DIR = _saved_dir
+
+    # A recorded sysctl baseline is the user's file: written back as root, a
+    # backlog of 1 or a buffer of 0 would break networking until a reboot.
+    _rel = m._kernel_release()
+    _stock = m._stock_sysctl_defaults(_rel)
+    _k = "net.core.netdev_max_backlog"
+    _src_all = open("main.py").read()
+    _vals = m.Plugin()._sysctl_restore_values(
+        {"sysctl_baseline": {"kernel": _rel, "values": {_k: "1"}}})
+    ok(_vals[_k] == _stock[_k],
+       "a recorded sysctl baseline far below the default is not written back")
+    _ok_val = str(int(_stock[_k]) * 2)
+    _vals = m.Plugin()._sysctl_restore_values(
+        {"sysctl_baseline": {"kernel": _rel, "values": {_k: _ok_val}}})
+    ok(_vals[_k] == _ok_val, "while one within reason is")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("updates and installs: https only, and nothing planted is followed")
+try:
+    ok(_src_all.count('"--proto", "=https"') >= 2, "the update check's curl calls refuse anything but https")
+    _inst = open("install.sh").read()
+    ok(_inst.count("--proto '=https'") >= 2, "and so do the installer's")
+    ok("*[!A-Za-z0-9.-]*) LATEST_TAG=\"\"" in _inst, "the installer only puts a plain version tag in a URL")
+    ok('rm -f "$PLUGIN_DIR/$f.wifiopt-new"' in _script,
+       "the update removes anything planted at its staging name before copying")
+    ok('rm -f "$PLUGIN_DIR/dist/index.js.map"' in _script, "and at the source map's name")
+
+    class PopenFails(m.Plugin):
+        async def check_for_update(self):
+            return {"update_available": True, "channel": "stable", "latest_version": "9.9.9"}
+    _real_popen = m.subprocess.Popen
+    _made = []
+    _real_mkdtemp = m.tempfile.mkdtemp
+    def _track_mkdtemp(*a, **k):
+        d = _real_mkdtemp(*a, **k); _made.append(d); return d
+    def _boom(*a, **k): raise OSError("no bash")
+    try:
+        m.subprocess.Popen = _boom; m.tempfile.mkdtemp = _track_mkdtemp
+        pf = PopenFails()
+        r = asyncio.run(pf.apply_update())
+        ok(r.get("success") is False and not pf._update_running(),
+           "an update that could not start does not read as running afterwards")
+        ok(_made and not os.path.exists(_made[-1]), "and its script directory is removed")
+    finally:
+        m.subprocess.Popen = _real_popen; m.tempfile.mkdtemp = _real_mkdtemp
+
+    class MidChange(m.Plugin):
+        async def check_for_update(self):
+            raise AssertionError("should not get this far")
+    mc = MidChange(); mc._profile_change_depth = 1
+    ok(asyncio.run(mc.apply_update()).get("success") is False,
+       "no update while a lock or band change is mid-flight")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("upgrading from 0.11: what the old settings show is carried over")
+try:
+
+    class Upgrade(m.Plugin):
+        def __init__(self, band=""):
+            super().__init__(); self.band = band
+        def _read_profile_field(self, uuid, field, timeout=5):
+            return self.band if field == "802-11-wireless.band" else ""
+    LU = "dddddddd-0000-0000-0000-0000000000aa"
+    old = {**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True, "bssid_lock_connection_uuid": LU,
+           "bssid_lock_uuids": [], "last_connection_uuid": LU, "band_preference_enabled": True,
+           "band_preference": "a", "band_preference_ssid": "", "band_preference_uuids": [],
+           "dns_enabled": True, "dns_uuids": [], "pins_owned": [], "settings_version": 0}
+    st_ = dict(old); Upgrade(band="a")._migrate_settings(st_)
+    ok(st_["bssid_lock_uuids"] == [LU], "the lock's profile is seeded into the tracking list")
+    ok(st_["band_preference_uuids"] == [LU], "a band the last profile still carries is seeded")
+    ok(st_["dns_uuids"] == [LU], "and DNS set on it")
+    ok(set(st_["pins_owned"]) == {"802-11-wireless.bssid", "802-11-wireless.band"},
+       "and both kinds of pin are recorded as ours")
+    ok(st_["settings_version"] == m.Plugin._SETTINGS_VERSION, "the migration is recorded")
+    st_ = dict(old); Upgrade(band="")._migrate_settings(st_)
+    ok(st_["band_preference_uuids"] == [], "a profile without the band is not claimed")
+    st_ = {**m.DEFAULT_SETTINGS, "settings_version": 0}; Upgrade()._migrate_settings(st_)
+    ok(st_["pins_owned"] == [], "a fresh install owns no pins")
+    st_ = {**old, "settings_version": m.Plugin._SETTINGS_VERSION}
+    Upgrade(band="a")._migrate_settings(st_)
+    ok(st_["bssid_lock_uuids"] == [], "an install already migrated is left alone")
+
+    _main_src = _src_all[_src_all.index("    async def _main(self):"):_src_all.index("    async def _unload(self):")]
+    ok(_main_src.index("self._remove_dispatcher()") < _main_src.index("_save_settings(settings)"),
+       "a dispatcher that cannot be updated is removed rather than left running the old script")
+    ok("settings = _load_settings()" in _main_src[_main_src.index("Fresh: the setters above"):],
+       "startup re-reads settings before its last save")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("custom DNS: a list saved with commas is still a list")
+try:
+    class DnsComma(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.mods = []
+        def _resolve_uuid(self, msg=None): return "dddddddd-0000-0000-0000-0000000000bb", None
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            self.mods.append((k, v)); return _ok()
+        def _hard_reconnect(self, uuid=None): return True
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    dc = DnsComma()
+    r = asyncio.run(dc.set_dns(True, "custom", "1.1.1.1, 9.9.9.9"))
+    ok(r.get("success") and ("ipv4.dns", "1.1.1.1 9.9.9.9") in dc.mods,
+       "comma-separated servers from an older version are accepted")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("6 GHz and the band: what a released pin may and may not be written back over")
+try:
+    class BandSafe(m.Plugin):
+        def __init__(self, scan=""):
+            super().__init__(); self.scan = scan
+        def _run_cmd(self, cmd, timeout=5):
+            if "SSID,BSSID,SIGNAL,FREQ" in " ".join(cmd):
+                return _ok(self.scan)
+            return _ok()
+    bs = BandSafe()
+    ok(bs._band_reassert_is_safe({"live": {"frequency": "5180.0"}}, "a", "Net") is True,
+       "writing the band back is safe while the device is on that band")
+    ok(bs._band_reassert_is_safe({"live": {"frequency": "2437"}}, "a", "Net") is False,
+       "but not from 2.4 GHz with nothing on 5 GHz in range, which is how the device got stranded")
+    bs = BandSafe("Net:AA\\:BB\\:CC\\:00\\:00\\:01:70:5180 MHz")
+    ok(bs._band_reassert_is_safe({"live": {"frequency": "2437"}}, "a", "Net") is True,
+       "and is from 2.4 GHz when the network shows a 5 GHz access point")
+    bs._released_at = {"802-11-wireless.band": time.time()}
+    ok(bs._band_reassert_is_safe({"live": {"frequency": "5180"}}, "a", "Net") is False,
+       "never within ten minutes of releasing the band for stranding the device")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("the backend switch: an interface back, and not a second one")
+try:
+    class Settle(m.Plugin):
+        def __init__(self, ifaces, recovers=True):
+            super().__init__(); self.ifaces = list(ifaces); self.recovered = 0; self.recovers = recovers
+        def _get_wifi_interface(self):
+            return self.ifaces.pop(0) if self.ifaces else None
+        def _recover_wlan0(self):
+            self.recovered += 1
+            if self.recovers: self.ifaces = ["wlan0"]
+            return self.recovers
+    _real_sleep2 = asyncio.sleep
+    asyncio.sleep = _no_sleep
+    try:
+        st = Settle([None, None, None, "wlan31"])
+        iface, rec = asyncio.run(st._settle_interface("iwd"))
+        ok(iface == "wlan31" and st.recovered == 0 and rec is False,
+           "under iwd the plugin waits for iwd's own interface instead of adding wlan0")
+        st = Settle([None])
+        iface, rec = asyncio.run(st._settle_interface("wpa_supplicant"))
+        ok(iface == "wlan0" and st.recovered == 1 and rec is True,
+           "under wpa_supplicant a missing wlan0 is recreated")
+
+        class FailedSwitch(Settle):
+            def __init__(self):
+                super().__init__([None]); self._ensure_backend_switch_state()
+            def _session_bus_cmd(self, args): return ["steamosctl"] + args[1:]
+            def _run_cmd(self, cmd, timeout=5):
+                return {"success": False, "stdout": "", "stderr": "no phy0", "returncode": 1}
+            def _steamosctl_backend(self): return "wpa_supplicant"
+            def _valve_powersave(self): return None
+        fs = FailedSwitch()
+        asyncio.run(fs._steamos_manager_backend_switch_worker("wpa_supplicant"))
+        res = fs._backend_switch["result"]
+        ok(res["success"] is False and fs.recovered == 1 and res.get("needs_reboot") is False,
+           "a switch that fails part way still leaves the device with an interface")
+    finally:
+        asyncio.sleep = _real_sleep2
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("the backend switch on other systems: nothing stopped that NetworkManager still needs")
+try:
+    class Outranked(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.cmds = []; self._ensure_backend_switch_state()
+        def _merged_nm_backend(self): return "iwd"
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(cmd); return _ok()
+    _real_conf = m.GENERIC_BACKEND_CONF
+    try:
+        m.GENERIC_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "99-backend.conf")
+        o = Outranked()
+        asyncio.run(o._generic_backend_switch_worker("wpa_supplicant"))
+        ok(o._backend_switch["result"]["success"] is False and not o.cmds,
+           "when another file keeps the old backend in force, nothing is stopped")
+        ok(not os.path.exists(m.GENERIC_BACKEND_CONF), "and our file is put back as it was")
+
+        class NeverTakes(Outranked):
+            def _merged_nm_backend(self): return None
+            def _effective_generic_backend(self): return None
+            def _get_wifi_interface(self): return None
+        asyncio.sleep = _no_sleep
+        try:
+            nt = NeverTakes()
+            asyncio.run(nt._generic_backend_switch_worker("iwd"))
+        finally:
+            asyncio.sleep = _real_sleep2
+        ok(nt._backend_switch["result"]["success"] is False
+           and ["/usr/bin/systemctl", "start", "wpa_supplicant"] in nt.cmds,
+           "and a switch that never takes over puts the previous backend back")
+
+        # Bazzite dropped iwd; our file naming it would leave no WiFi at all.
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
+        class NoIwd(m.Plugin):
+            _IWD_UNITS = ("/nonexistent/iwd.service",)
+            def __init__(self):
+                super().__init__(); self.cmds = []
+            def _run_cmd(self, cmd, timeout=5):
+                self.cmds.append(cmd); return _ok()
+        ni = NoIwd()
+        ok(ni._heal_orphaned_iwd_conf() is True and not os.path.exists(m.GENERIC_BACKEND_CONF)
+           and ["/usr/bin/systemctl", "restart", "NetworkManager"] in ni.cmds,
+           "a backend setting naming an iwd that is no longer installed is removed at startup")
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        class HasIwd(NoIwd):
+            _IWD_UNITS = (m.GENERIC_BACKEND_CONF,)
+        ok(HasIwd()._heal_orphaned_iwd_conf() is False and os.path.exists(m.GENERIC_BACKEND_CONF),
+           "but left alone while iwd is installed")
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=wpa_supplicant\n")
+        ok(NoIwd()._heal_orphaned_iwd_conf() is False, "and when it names wpa_supplicant")
+    finally:
+        m.GENERIC_BACKEND_CONF = _real_conf
+    ok("self._heal_orphaned_iwd_conf()" in _main_src, "_main runs that check")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Valve's power save setting: ours is not left in it")
+try:
+    _real_valve = m.WIFI_BACKEND_CONF
+    try:
+        m.WIFI_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "99-valve-wifi-backend.conf")
+        vp = m.Plugin()
+        ok(vp._valve_powersave() is None, "no file reads as no value")
+        open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=wpa_supplicant\n")
+        ok(vp._valve_powersave() == "2", "the value is read from the connection section")
+        vp._set_valve_powersave("3")
+        _txt = open(m.WIFI_BACKEND_CONF).read()
+        ok(vp._valve_powersave() == "3" and "wifi.backend=wpa_supplicant" in _txt,
+           "and put back without touching Valve's backend line")
+        vp._set_valve_powersave(None)
+        _txt = open(m.WIFI_BACKEND_CONF).read()
+        ok(vp._valve_powersave() is None and "wifi.backend=wpa_supplicant" in _txt,
+           "or removed when there was none")
+        open(m.WIFI_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        vp._set_valve_powersave("3")
+        ok(vp._valve_powersave() == "3" and "wifi.backend=iwd" in open(m.WIFI_BACKEND_CONF).read(),
+           "a file without a connection section gains one")
+
+        for before, expect, label in [
+            ("?", "3", "with nothing recorded, a 2 goes back to Valve's default"),
+            ("", None, "a file that named nothing before goes back to naming nothing"),
+            ("3", "3", "a recorded value is what is put back"),
+            ("2", "2", "a 2 that was there before the plugin is the user's and stays"),
+        ]:
+            open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=wpa_supplicant\n")
+            vp._release_valve_powersave({"valve_powersave_before": before})
+            ok(vp._valve_powersave() == expect, label)
+        open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=3\n")
+        vp._release_valve_powersave({"valve_powersave_before": "?"})
+        ok(vp._valve_powersave() == "3", "a value other than ours is never touched")
+
+        # Taking power save over records what Valve's file said; giving it back restores it.
+        _real_nm = m.NM_CONF_PATH
+        try:
+            m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+            class PS(m.Plugin):
+                def _get_wifi_interface(self): return None
+                def _apply_driver_fixes(self, d): pass
+                def _apply_pcie_aspm_fix(self, d): return []
+            open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=3\n[device]\nwifi.backend=wpa_supplicant\n")
+            m._save_settings(dict(m.DEFAULT_SETTINGS))
+            asyncio.run(PS().set_power_save(True))
+            ok(m._load_settings()["valve_powersave_before"] == "3",
+               "turning power save off records Valve's value first")
+            # A backend switch then copies our 2 into Valve's file...
+            open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=iwd\n")
+            asyncio.run(PS().set_power_save(False))
+            ok(vp._valve_powersave() == "3" and m._load_settings()["valve_powersave_before"] == "?",
+               "and giving it back restores that value")
+        finally:
+            m.NM_CONF_PATH = _real_nm
+
+        class ValveSwitch(m.Plugin):
+            def __init__(self):
+                super().__init__(); self._ensure_backend_switch_state()
+            def _session_bus_cmd(self, args): return ["steamosctl"] + args[1:]
+            def _run_cmd(self, cmd, timeout=5):
+                if cmd[0] == "steamosctl":
+                    open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=iwd\n")
+                return _ok()
+            async def _settle_interface(self, backend): return "wlan31", False
+            def _get_active_connection_uuid(self): return "u"
+            def _steamosctl_backend(self): return "iwd"
+        _real_nm = m.NM_CONF_PATH
+        try:
+            m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+            open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+            open(m.WIFI_BACKEND_CONF, "w").write("[device]\nwifi.backend=wpa_supplicant\n")
+            asyncio.sleep = _no_sleep
+            try:
+                vs = ValveSwitch()
+                asyncio.run(vs._steamos_manager_backend_switch_worker("iwd"))
+            finally:
+                asyncio.sleep = _real_sleep2
+            _txt = open(m.WIFI_BACKEND_CONF).read()
+            ok(vs._backend_switch["result"]["success"] and "wifi.powersave" not in _txt
+               and "wifi.backend=iwd" in _txt,
+               "a backend switch does not leave our power save value in Valve's file")
+        finally:
+            m.NM_CONF_PATH = _real_nm
+    finally:
+        m.WIFI_BACKEND_CONF = _real_valve
+    for name in ("reset_settings", "_uninstall"):
+        body = _src_all[_src_all.index(f"    async def {name}(self"):]
+        body = body[:body.index("\n    async def ", 10)]
+        ok("self._release_valve_powersave(" in body, f"{name} gives Valve's power save setting back")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("SteamOS after 3.9: Valve's holo names")
+try:
+    ok(m._HOLO_BACKEND_HELPER == "/usr/bin/holo-polkit-helpers/holo-wifi-set-backend-privileged",
+       "the renamed backend helper is known")
+    ok("HOLO_NM_DEFAULT_CONF," in _src_all[_src_all.index("def _get_current_backend"):][:1500],
+       "and the renamed NetworkManager defaults are read for the backend")
+    class Holo(m.Plugin): pass
+    _real_open = open
+    import builtins
+    def _fake_open(path, *a, **k):
+        if path == "/etc/os-release":
+            import io; return io.StringIO('ID=holo\nPRETTY_NAME="SteamOS Holo"\n')
+        return _real_open(path, *a, **k)
+    builtins.open = _fake_open
+    try:
+        ok(Holo()._detect_distro() == {"id": "steamos", "name": "SteamOS Holo"},
+           "an image that identifies as holo is treated as SteamOS")
+    finally:
+        builtins.open = _real_open
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("concurrency: one profile change at a time")
+try:
+    for name, call in [("set_bssid_lock", lambda p: p.set_bssid_lock(True)),
+                       ("set_band_preference", lambda p: p.set_band_preference(True, "a")),
+                       ("allow_wpa2", lambda p: p.allow_wpa2())]:
+        p = m.Plugin(); p._profile_change_depth = 1
+        r = asyncio.run(call(p))
+        ok(r.get("error") == "busy" and p._profile_change_depth == 1,
+           f"{name} refuses while another profile change is mid-flight, and leaves its guard alone")
+        p = m.Plugin(); p._update_starting = True
+        ok(asyncio.run(call(p)).get("error") == "busy", f"{name} refuses while an update installs")
+    _lock_src = _src_all[_src_all.index("    async def set_bssid_lock"):_src_all.index("    async def set_band_preference")]
+    ok("await asyncio.to_thread(\n                    self._settle_band_before_locking" in _lock_src,
+       "the lock's band settling (a scan and a radio cycle) runs off the event loop")
+    _band_src = _src_all[_src_all.index("    async def set_band_preference"):]
+    ok("await asyncio.to_thread(self._band_unreachable" in _band_src[:6000],
+       "and so does the band setter's 15 second scan")
+
+    class Relock(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.mods = []
+        def _get_wifi_interface(self): return "wlan0"
+        def _get_active_connection_uuid(self): return "u"
+        def _run_cmd(self, cmd, timeout=5): return _ok("Connected to 02:00:00:00:00:22 (on wlan0)\n\tfreq: 5180\n")
+        def _nmcli_modify(self, u, k, v, timeout=5): self.mods.append((k, v)); return _ok()
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": False})
+    rl = Relock(); rl._relock_after_band_change("u")
+    ok(not rl.mods, "a lock turned off while the band changed is not put back")
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True})
+    rl = Relock(); rl._relock_after_band_change("u")
+    ok(("802-11-wireless.bssid", "02:00:00:00:00:22") in rl.mods, "one still on is")
+
+    # Two cleanups for one list in one pass must both land.
+    class TwoCleanups(m.Plugin):
+        def _nmcli_modify(self, u, k, v, timeout=5): return _ok()
+    A1, A2 = "dddddddd-0000-0000-0000-0000000000c1", "dddddddd-0000-0000-0000-0000000000c2"
+    _st = {**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True, "bssid_lock_uuids": [A1, A2]}
+    _pending = {}; _status = {"external": {}, "drift": {}}
+    tc = TwoCleanups()
+    for u in (A1, A2):
+        tc._apply_pin_cleanup({"kind": "pin_cleanup", "uuid": u, "property": "802-11-wireless.bssid",
+                               "list_key": "bssid_lock_uuids", "off_value": "", "stranded": True},
+                              _st, _status, _pending)
+    ok(_pending.get("bssid_lock_uuids") == [], "two releases on one list in one pass both stick")
+
+    # set_regdomain must not write back a copy taken before iw ran.
+    class RegRace(m.Plugin):
+        def _regdomain_info(self): return {"readable": True, "global": "00"}
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[:3] == ["/usr/bin/iw", "reg", "set"]:
+                s2 = m._load_settings(); s2["cake_enabled"] = True; m._save_settings(s2)
+            return _ok()
+    m._save_settings({**m.DEFAULT_SETTINGS, "cake_enabled": False})
+    asyncio.run(RegRace().set_regdomain("DE"))
+    _after = m._load_settings()
+    ok(_after["cake_enabled"] is True and _after["regdomain"] == "DE" and _after["regdomain_previous"] == "00",
+       "setting the region keeps a change saved while it ran")
+
+    # A collector that never returns is reported, cached result or not.
+    class Wedged(m.Plugin): pass
+    w_ = Wedged(); w_._collect_depth = 1; w_._collect_started_at = time.monotonic() - 120
+    w_._last_status = {"success": True, "connected": True, "settings": {}}
+    ok(asyncio.run(w_.get_status()).get("success") is False,
+       "a wedged status read is reported even when an older result could be handed back")
+    w_._collect_started_at = time.monotonic()
+    ok(asyncio.run(w_.get_status()).get("connected") is True, "while a merely slow one reuses it")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("the access point move: up means activated, not activating")
+try:
+    class Act(m.Plugin):
+        def __init__(self, out): super().__init__(); self.out = out
+        def _run_cmd(self, cmd, timeout=5): return _ok(self.out)
+    ok(Act("u1:activated\nu2:activating")._connection_activated("u1") is True, "activated counts")
+    ok(Act("u1:activating")._connection_activated("u1") is False,
+       "activating does not, since that is where a refused handshake sits")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Force Reapply: the lock stays on the network it was set for")
+try:
+    class Reapply(m.Plugin):
+        def __init__(self, here):
+            super().__init__(); self.here = here; self.locks = 0
+        def _get_active_connection_uuid(self): return "dddddddd-0000-0000-0000-0000000000d2"
+        def _get_profile_ssid(self, uuid, timeout=5):
+            return {"dddddddd-0000-0000-0000-0000000000d1": "Home"}.get(uuid, self.here)
+        async def set_bssid_lock(self, enabled): self.locks += 1; return {"success": True}
+        async def set_power_save(self, d): return {"success": True}
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True, "auto_fix_on_wake": False,
+                      "bssid_lock_connection_uuid": "dddddddd-0000-0000-0000-0000000000d1"})
+    ra = Reapply("Cafe"); asyncio.run(ra.reapply_all())
+    ok(ra.locks == 0, "reapplying on another network does not pin its access point")
+    ra = Reapply("Home"); asyncio.run(ra.reapply_all())
+    ok(ra.locks == 1, "while another saved copy of the locked network does get it")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("dispatcher: written whole, and inert without python3")
+try:
+    _real_disp = m.DISPATCHER_PATH; _real_pdir = m.decky.DECKY_PLUGIN_DIR
+    try:
+        m.DISPATCHER_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer")
+        m.decky.DECKY_PLUGIN_DIR = os.getcwd()
+        ok(m.Plugin()._install_dispatcher() is True
+           and os.stat(m.DISPATCHER_PATH).st_mode & 0o777 == 0o755
+           and os.listdir(os.path.dirname(m.DISPATCHER_PATH)) == ["99-wifi-optimizer"],
+           "the dispatcher is renamed into place, executable, with no temp file left")
+    finally:
+        m.DISPATCHER_PATH = _real_disp; m.decky.DECKY_PLUGIN_DIR = _real_pdir
+    ok(_tmpl.index("command -v python3") < _tmpl.index("SETTINGS_RAW=$(python3"),
+       "without python3 the dispatcher applies nothing rather than its fallbacks")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("reach check: the cached scan only")
+try:
+    r = Reach("sae", JASONS_ROOM)
+    r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+    ok(r.cached_only is True, "the poll's security check never makes nmcli rescan")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("frontend: failures said, controls held during an update")
+try:
+    _tsx = open("src/index.tsx").read()
+    _ht = _tsx[_tsx.index("const handleToggle = async"):]
+    _ht = _ht[:_ht.index("return outcome;")]
+    ok("} catch (e) {" in _ht, "a toggle whose call throws shows an error instead of nothing")
+    ok("disabled={isBusy}" not in _tsx and _tsx.count("isBusy || updating") >= 15,
+       "every control is held while an update installs")
+    ok("const UPDATE_TIMEOUT_MS = 6 * 60 * 1000;" in _tsx,
+       "the panel waits longer for an update than the script allows its download")
+    _bp = _tsx[_tsx.index("const beginBackendPoll"):]
+    _bp = _bp[:_bp.index("}, BACKEND_POLL_INTERVAL);")]
+    ok("if (inFlight) return;" in _bp, "backend switch polls never overlap")
+    ok("failures >= BACKEND_POLL_MAX_FAILURES" in _bp, "one failed poll does not abandon a switch")
+    ok("BACKEND_SWITCH_MAX_S" in _bp, "and a switch that never reports back releases the panel")
+    _rs = _tsx[_tsx.index("backend.resetSettings()") - 400:_tsx.index("backend.resetSettings()")]
+    ok("resetDnsDraft();" in _rs and "setNotices({});" in _rs,
+       "Reset clears the DNS draft and the notices along with everything else")
+    ok(not re.search(r"<span[^>]*onClick=\{handle(AllowWpa2|RepairDrift)\}", _tsx)
+       and "onClick={handleAllowWpa2}" in _tsx and "onClick={handleRepairDrift}" in _tsx,
+       "Allow WPA2 and Fix now are buttons the D-pad can reach, not clickable text")
+    ok("anyone nearby can broadcast your network's name" in _tsx,
+       "Allow WPA2 warns that a same-named access point may not be yours")
+    ok("this.setState({ err: null })" in _tsx, "the error screen offers a way back without restarting")
+    _dist = open("dist/index.js").read()
+    ok("Couldn't reach the plugin's backend" in _dist and "Try again" in _dist,
+       "and the built bundle carries these")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("iwd: the lock and the band stand down, because NetworkManager cannot use them there")
+try:
+    # NetworkManager's iwd backend lists access points with made-up addresses on a
+    # fixed 2.4 GHz frequency, and only activates a profile through one it finds
+    # compatible: a real address pin or band "a" matches none, so every
+    # reconnect NetworkManager makes asks for the password (issue #6).
+    class OnIwd(m.Plugin):
+        def _backend_is_iwd(self): return True
+    class OnWpa(m.Plugin):
+        def _backend_is_iwd(self): return False
+    _lockset = {**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True, "band_preference_enabled": True}
+    _st = {"live": {}}
+    _eff = OnIwd()._pins_for_backend(_lockset, _st)
+    ok(not _eff["bssid_lock_enabled"] and not _eff["band_preference_enabled"]
+       and _st["live"].get("pins_inactive_iwd") is True,
+       "under iwd a status pass treats both pins as off, and says so")
+    _st = {"live": {}}
+    ok(OnWpa()._pins_for_backend(_lockset, _st) is _lockset and not _st["live"],
+       "under wpa_supplicant nothing changes")
+    r = asyncio.run(OnIwd().set_bssid_lock(True))
+    ok(r.get("error") == "needs_wpa_supplicant", "turning the lock on under iwd is refused with the reason")
+    r = asyncio.run(OnIwd().set_band_preference(True, "a"))
+    ok(r.get("error") == "needs_wpa_supplicant", "and so is the band preference")
+    class IwdOff(OnIwd):
+        def _release_lock_from_all_profiles(self): self.released = True; return None
+    io = IwdOff(); r = asyncio.run(io.set_bssid_lock(False))
+    ok(r.get("success") and io.released, "turning the lock off still works under iwd")
+
+    class IwdOptimize(OnIwd):
+        def __init__(self):
+            super().__init__(); self.locked = False
+        async def set_auto_fix(self, e): return {"success": True}
+        async def set_buffer_tuning(self, e): return {"success": True}
+        async def set_power_save(self, d): return {"success": True}
+        async def set_bssid_lock(self, e): self.locked = True; return {"success": True}
+    io = IwdOptimize(); r = asyncio.run(io.optimize_safe())
+    ok(not io.locked and r.get("total") == 3 and r.get("applied") == 3,
+       "Optimize Safe leaves the lock out under iwd instead of reporting it failed")
+
+    # Pins we wrote are cleared under iwd, even with the setting still on.
+    LOCKU = "dddddddd-0000-0000-0000-0000000000e1"
+    class PinnedIwd(Pinned):
+        def _backend_is_iwd(self): return True
+        def _get_active_connection_uuid(self): return LOCKU
+    m._save_settings({**base, "bssid_lock_enabled": True, "bssid_lock_uuids": [LOCKU],
+                      "bssid_lock_connection_uuid": LOCKU,
+                      "pins_owned": ["802-11-wireless.bssid"]})
+    pin = PinnedIwd(bssid="02\\:00\\:00\\:00\\:00\\:11")
+    st = asyncio.run(pin.get_status())
+    ok((LOCKU, "802-11-wireless.bssid", "") in pin.mods
+       and not any(k == "802-11-wireless.bssid" and v for _u, k, v in pin.mods),
+       "a lock pin we wrote is cleared under iwd and no new one is written")
+    ok(m._load_settings()["bssid_lock_enabled"] is True and st.get("live", {}).get("pins_inactive_iwd"),
+       "while the setting stays on for when wpa_supplicant is back")
+
+    class ToIwd(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.cleared = False
+        def _has_backend_tool(self): return True
+        def _get_current_backend(self): return "wpa_supplicant"
+        def _get_backend_method(self): return "steamos_manager"
+        def _clear_lock_and_band_pins(self): self.cleared = True
+        async def _steamos_manager_backend_switch_worker(self, target): await asyncio.sleep(0)
+    ti = ToIwd(); r = asyncio.run(ti.start_backend_switch("iwd"))
+    ok(r.get("accepted") and ti.cleared, "switching to iwd takes our pins off first")
+    ti = ToIwd(); ti._get_current_backend = lambda: "iwd"
+    r = asyncio.run(ti.start_backend_switch("wpa_supplicant"))
+    ok(r.get("accepted") and not ti.cleared, "switching away from iwd leaves them to come back")
+    ok("IWD_PIN_NOTICE" in open("src/index.tsx").read()
+       and "Paused while the WiFi backend is iwd" in open("dist/index.js").read(),
+       "the panel says why the lock and band are not applied under iwd")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("review round: what the fixes themselves got wrong")
+try:
+    # iwd reached without the plugin's switch: every pin of ours comes off
+    # at once, whether or not the panel is open.
+    class UnpinIwd(m.Plugin):
+        def __init__(self, iwd=True):
+            super().__init__(); self.iwd = iwd; self.mods = []
+        def _backend_is_iwd(self): return self.iwd
+        def _nmcli_modify(self, u, k, v, timeout=5): self.mods.append((u, k, v)); return _ok()
+    P1, P2 = "dddddddd-0000-0000-0000-0000000000f1", "dddddddd-0000-0000-0000-0000000000f2"
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                      "bssid_lock_uuids": [P1, P2], "band_preference_uuids": [P2],
+                      "pins_owned": ["802-11-wireless.bssid"]})
+    ui = UnpinIwd(); asyncio.run(ui._unpin_if_iwd())
+    ok({(P1, "802-11-wireless.bssid", ""), (P2, "802-11-wireless.bssid", ""),
+        (P2, "802-11-wireless.band", "")} <= set(ui.mods),
+       "under iwd every profile we pinned is unpinned in one go")
+    n = len(ui.mods); asyncio.run(ui._unpin_if_iwd())
+    ok(len(ui.mods) == n, "and only once while iwd stays in use")
+    ui.iwd = False; asyncio.run(ui._unpin_if_iwd()); ui.iwd = True
+    asyncio.run(ui._unpin_if_iwd())
+    ok(len(ui.mods) > n, "but again after a spell back on wpa_supplicant")
+    ok("await self._unpin_if_iwd()" in open("main.py").read().split("async def _stranded_watch_once")[1][:300],
+       "the background watch runs it, so it does not wait for the panel")
+
+    # The iwd tag lifts the enabled check for the two pins only, never IPv6.
+    class IwdTag(m.Plugin):
+        def _collect_status(self):
+            return ({"success": True, "live": {"pins_inactive_iwd": True}, "drift": {},
+                     "external": {}, "settings": {}}, {},
+                    [{"kind": "pin_cleanup", "uuid": "u", "property": "ipv6.method",
+                      "list_key": "ipv6_uuids", "off_value": "auto"},
+                     {"kind": "pin_cleanup", "uuid": "u", "property": "802-11-wireless.bssid",
+                      "list_key": "bssid_lock_uuids", "off_value": ""}])
+        def _apply_status_actions(self, status, pending, actions): self.seen = actions
+    it = IwdTag(); asyncio.run(it.get_status())
+    ok(not it.seen[0].get("iwd") and it.seen[1].get("iwd"),
+       "under iwd only the address and band cleanups bypass the enabled check")
+
+    # A failed generic switch leaves only the previous backend enabled.
+    class Rollback(m.Plugin):
+        def __init__(self): super().__init__(); self.cmds = []
+        def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+    _rc = m.GENERIC_BACKEND_CONF
+    try:
+        m.GENERIC_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "99-b.conf")
+        rb = Rollback(); rb._restore_generic_backend("wpa_supplicant")
+        ok(rb.cmds[0] == ["/usr/bin/systemctl", "disable", "--now", "iwd"]
+           and ["/usr/bin/systemctl", "start", "wpa_supplicant"] in rb.cmds,
+           "rolling back stops and disables the backend that did not take")
+    finally:
+        m.GENERIC_BACKEND_CONF = _rc
+
+    # Valve's helper drops the power save line; it is put back.
+    _rv = m.WIFI_BACKEND_CONF
+    try:
+        m.WIFI_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "99-valve.conf")
+        open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=3\n[device]\nwifi.backend=iwd\n")
+        class Legacy(m.Plugin):
+            def __init__(self): super().__init__(); self._ensure_backend_switch_state()
+            def _run_cmd(self, cmd, timeout=5):
+                if cmd[1:2] == ["write_config"]:
+                    open(m.WIFI_BACKEND_CONF, "w").write("[device]\nwifi.backend=wpa_supplicant\n")
+                return _ok()
+            def _get_wifi_interface(self): return "wlan0"
+            def _get_active_connection_uuid(self): return "u"
+            def _get_current_backend(self): return "wpa_supplicant"
+        asyncio.sleep = _no_sleep
+        try:
+            asyncio.run(Legacy()._backend_switch_worker("wpa_supplicant"))
+        finally:
+            asyncio.sleep = _real_sleep2
+        _t = open(m.WIFI_BACKEND_CONF).read()
+        ok("wifi.powersave=3" in _t and "wifi.backend=wpa_supplicant" in _t,
+           "a switch through Valve's helper keeps Steam's power save setting")
+    finally:
+        m.WIFI_BACKEND_CONF = _rv
+
+    # A long lock list does not crowd out the band candidates.
+    many = [f"dddddddd-0000-0000-0000-0000000001{i:02d}" for i in range(16)]
+    BU = "dddddddd-0000-0000-0000-0000000002aa"
+    cands = m.Plugin()._stranded_candidates({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+        "band_preference_enabled": True, "bssid_lock_uuids": many,
+        "band_preference_uuids": [BU]})
+    ok(BU in cands and "802-11-wireless.band" in cands[BU]
+       and len(cands) <= 2 * m.Plugin._STRANDED_CANDIDATES + 2,
+       "the release looks at recent profiles of each kind, bounded")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

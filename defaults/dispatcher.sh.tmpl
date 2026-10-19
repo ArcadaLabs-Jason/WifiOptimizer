@@ -26,6 +26,13 @@ if [ ! -d "$PLUGIN_DIR" ]; then
     exit 0
 fi
 
+# Without python3 the settings cannot be read at all, and the fallbacks below
+# would change power save whatever the user chose. Do nothing instead.
+if ! command -v python3 >/dev/null 2>&1; then
+    logger -t "$LOG_TAG" "python3 not found, settings unreadable, nothing applied"
+    exit 0
+fi
+
 # Read all settings in a single Python call for speed (<50ms).
 #
 # This script runs as root, and the settings file lives in a directory the
@@ -128,29 +135,10 @@ fi
 
 # Record enforcement timestamp.
 #
-# This script runs as root and the settings directory belongs to the desktop
-# user, so this name can be replaced with a link to a root-owned file that `>`
-# would truncate. Checking the file first and then writing is three separate
-# operations, and the user owning the directory can keep replacing it until a
-# write lands between them.
-#
-# Write somewhere fresh and rename over the target instead. rename replaces
-# whatever is at the destination rather than following it, so a link planted
-# at any moment is simply overwritten, and the same holds for a hard link.
-ENFORCED_FILE="$SETTINGS_DIR/last_enforced"
-ENFORCED_TMP=$(mktemp "$SETTINGS_DIR/.last_enforced.XXXXXX" 2>/dev/null)
-if [ -n "$ENFORCED_TMP" ]; then
-    # mktemp creates 0600; this file has always been world readable and the
-    # mode should not change as a side effect of how it is written.
-    chmod 644 "$ENFORCED_TMP" 2>/dev/null
-    if date +%s 2>/dev/null > "$ENFORCED_TMP"; then
-        # -T so a directory planted at the destination is not moved INTO;
-        # that would silently stop the timestamp updating and leave a temp
-        # file behind on every connect.
-        mv -fT "$ENFORCED_TMP" "$ENFORCED_FILE" 2>/dev/null || rm -f "$ENFORCED_TMP"
-    else
-        rm -f "$ENFORCED_TMP"
-    fi
-fi
+# In /run, which only root can write, not in the settings directory. That one
+# belongs to the desktop user, and any file root creates there can have a
+# symlink swapped in between creating it and writing it, however it is done.
+mkdir -p -m 0755 /run/wifi-optimizer 2>/dev/null
+date +%s > /run/wifi-optimizer/last_enforced 2>/dev/null
 
 exit 0
