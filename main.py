@@ -12,7 +12,6 @@ import os
 import re
 import copy
 import pwd
-import shlex
 import json
 import tempfile
 import time
@@ -234,6 +233,43 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _child_env() -> dict:
+    """Environment for every command we run.
+
+    Decky is a PyInstaller build, and it points LD_LIBRARY_PATH at the
+    libraries it bundles. A child that inherits that loads Decky's copies of
+    libssl, readline, zstd and the rest instead of the system's, and fails
+    with symbol-lookup errors that have nothing to do with what it was asked
+    to do. Which commands that hits depends on what a given Decky release
+    happens to bundle (3.3.0 added readline, tinfo and zstd), so it cannot be
+    handled per command. PyInstaller keeps any original value in
+    LD_LIBRARY_PATH_ORIG; restore that if present, otherwise drop it.
+    """
+    env = dict(os.environ)
+    original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original:
+        env["LD_LIBRARY_PATH"] = original
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+_SH_UNSAFE = re.compile(r"[^\w@%+=:,./-]", re.ASCII)
+
+
+def _sh_quote(value: str) -> str:
+    """Quote a string for the shell, the same way shlex.quote does.
+
+    Not shlex itself: plugins can only import what Decky's own build
+    bundles, and Decky 3.3.0 stopped bundling shlex.
+    """
+    if not value:
+        return "''"
+    if _SH_UNSAFE.search(value) is None:
+        return value
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
 def _write_no_follow(path: str, data: str) -> bool:
     """Write a file without following a symlink at the final component.
 
@@ -369,20 +405,17 @@ class Plugin:
 
     # ---- Helpers ----
 
-    def _run_cmd(self, cmd: list[str], timeout: int = 5, clean_env: bool = False) -> dict:
+    def _run_cmd(self, cmd: list[str], timeout: int = 5) -> dict:
         """Run a subprocess and return a result dict.
 
-        clean_env strips LD_LIBRARY_PATH so children use system libraries
-        instead of Decky's PyInstaller-bundled ones. Required for curl
-        (OpenSSL mismatch) and bash (readline symbol mismatch); without it,
-        those binaries fail with cryptic symbol-lookup errors.
+        Every child gets _child_env(), so it loads the system's libraries
+        rather than the ones bundled inside Decky. See _child_env for why
+        this cannot be left to the commands that happen to need it.
         """
         try:
-            env = None
-            if clean_env:
-                env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout, env=env
+                cmd, capture_output=True, text=True, timeout=timeout,
+                env=_child_env(),
             )
             return {
                 "success": result.returncode == 0,
@@ -479,7 +512,7 @@ class Plugin:
         cmd = self._session_bus_cmd([STEAMOSCTL, "get-wifi-backend"])
         if not cmd:
             return None
-        result = self._run_cmd(cmd, timeout=5, clean_env=True)
+        result = self._run_cmd(cmd, timeout=5)
         if not result["success"]:
             return None
         # Currently "Wi-Fi backend: wpa_supplicant", but match on the value
@@ -900,9 +933,9 @@ class Plugin:
             # Quote both, rather than trusting that neither path will ever
             # contain a character the shell reads as syntax. They come from
             # Decky's environment, not from us.
-            script = script.replace("__SETTINGS_PATH__", shlex.quote(SETTINGS_FILE))
+            script = script.replace("__SETTINGS_PATH__", _sh_quote(SETTINGS_FILE))
             script = script.replace(
-                "__PLUGIN_DIR__", shlex.quote(decky.DECKY_PLUGIN_DIR)
+                "__PLUGIN_DIR__", _sh_quote(decky.DECKY_PLUGIN_DIR)
             )
             with open(DISPATCHER_PATH, "w") as f:
                 f.write(script)
@@ -4439,7 +4472,6 @@ class Plugin:
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/contents/package.json?ref=beta",
                     ],
                     15,
-                    True,
                 )
             else:
                 result = await asyncio.to_thread(
@@ -4450,7 +4482,6 @@ class Plugin:
                         "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest",
                     ],
                     15,
-                    True,
                 )
 
             if not result["success"] or not result["stdout"]:
@@ -4642,14 +4673,13 @@ systemctl restart plugin_loader 2>/dev/null || true
             with os.fdopen(fd, "w") as f:
                 f.write(script)
 
-            clean_env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
             subprocess.Popen(
                 ["/bin/bash", script_path, script_dir, plugin_dir,
                  download_url, src_dir, label],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=clean_env,
+                env=_child_env(),
             )
 
             decky.logger.info(f"Update to {label} initiated (channel={channel})")
@@ -4674,16 +4704,13 @@ systemctl restart plugin_loader 2>/dev/null || true
             other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
 
             # Phase: switching - write config then restart services.
-            # clean_env=True clears LD_LIBRARY_PATH so bash doesn't hit a symbol
-            # lookup error against Decky's bundled readline (same class of bug
-            # as the curl/OpenSSL conflict).
             self._backend_switch["phase"] = "switching"
             decky.logger.info(
                 f"backend switch: calling helper write_config target={target} "
                 f"(euid={os.geteuid()}, helper={BACKEND_HELPER})"
             )
             write_result = await asyncio.to_thread(
-                self._run_cmd, [BACKEND_HELPER, "write_config", target], 5, True
+                self._run_cmd, [BACKEND_HELPER, "write_config", target], 5
             )
             decky.logger.info(
                 f"backend switch: write_config result rc={write_result.get('returncode')} "
@@ -4706,7 +4733,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                 return
 
             restart_result = await asyncio.to_thread(
-                self._run_cmd, [BACKEND_HELPER, "restart_units", other], 45, True
+                self._run_cmd, [BACKEND_HELPER, "restart_units", other], 45
             )
             rs_stdout = restart_result.get("stdout", "")
             rs_stderr = restart_result.get("stderr", "")
@@ -4898,7 +4925,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                 decky.logger.info(f"Recreated wlan0 on {phy}")
                 self._run_cmd(
                     ["/usr/bin/systemctl", "restart", "NetworkManager"],
-                    timeout=30, clean_env=True,
+                    timeout=30,
                 )
                 return True
             decky.logger.error(
@@ -4931,7 +4958,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                 }
                 return
 
-            result = await asyncio.to_thread(self._run_cmd, cmd, 45, True)
+            result = await asyncio.to_thread(self._run_cmd, cmd, 45)
             if not result["success"]:
                 detail = (result.get("stderr") or result.get("stdout") or "")[:200]
                 self._backend_switch["phase"] = "failed"
@@ -5071,13 +5098,12 @@ systemctl restart plugin_loader 2>/dev/null || true
                 ["/usr/bin/systemctl", "enable", target],
                 ["/usr/bin/systemctl", "start", target],
             ]:
-                await asyncio.to_thread(self._run_cmd, cmd, 10, True)
+                await asyncio.to_thread(self._run_cmd, cmd, 10)
 
             restart = await asyncio.to_thread(
                 self._run_cmd,
                 ["/usr/bin/systemctl", "restart", "NetworkManager"],
                 15,
-                True,
             )
             if not restart["success"]:
                 detail = restart.get("stderr", "")[:200]

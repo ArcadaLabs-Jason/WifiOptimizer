@@ -46,6 +46,62 @@ open(victim,"w").write("PRECIOUS"); os.symlink(victim, target)
 ok(m._write_no_follow(target, "x") is True, "write succeeds")
 ok(open(victim).read() == "PRECIOUS", "victim not truncated")
 
+section("runtime: what Decky's own build lets the backend do")
+import ast, shlex
+_tree = ast.parse(open("main.py").read())
+# The backend runs inside Decky's PyInstaller build, which carries only the
+# standard library modules Decky itself imports. A module missing from it
+# fails the import and the whole backend with it. Decky 3.3.0 dropped shlex,
+# which broke every beta from 0.12.1 on. Each name here was checked against
+# the module list of the 3.3.0 and 3.2.10 PluginLoader binaries; check any
+# addition the same way before relying on it (os, re, time and pwd live in
+# base_library.zip or are built in, so they do not show in that list).
+BUNDLED = {"os", "re", "copy", "pwd", "json", "tempfile", "time",
+           "asyncio", "subprocess", "decky"}
+_imported = set()
+for node in ast.walk(_tree):
+    if isinstance(node, ast.Import):
+        _imported.update(a.name.split(".")[0] for a in node.names)
+    elif isinstance(node, ast.ImportFrom) and node.level == 0:
+        _imported.add(node.module.split(".")[0])
+ok(_imported <= BUNDLED,
+   f"main.py imports only modules Decky bundles (extra: {sorted(_imported - BUNDLED)})")
+
+for v in ["", "/home/deck/homebrew/settings/WiFi Optimizer/settings.json",
+          "plain", "it's", "$(id)", "a\"b", "back`tick", "new\nline", "tab\t",
+          "--opt=val", "@%+=:,./-", "naïve", "*?[]"]:
+    ok(m._sh_quote(v) == shlex.quote(v), f"_sh_quote matches shlex.quote for {v!r}")
+
+_saved = dict(os.environ)
+try:
+    os.environ["LD_LIBRARY_PATH"] = "/tmp/_MEIabc"
+    os.environ.pop("LD_LIBRARY_PATH_ORIG", None)
+    ok("LD_LIBRARY_PATH" not in m._child_env(),
+       "a child does not inherit the path to Decky's bundled libraries")
+    os.environ["LD_LIBRARY_PATH_ORIG"] = "/usr/lib/custom"
+    env = m._child_env()
+    ok(env.get("LD_LIBRARY_PATH") == "/usr/lib/custom" and "LD_LIBRARY_PATH_ORIG" not in env,
+       "a path the system had before Decky started is given back instead")
+    ok(os.environ["LD_LIBRARY_PATH"] == "/tmp/_MEIabc",
+       "and building the child's environment leaves the plugin's own alone")
+finally:
+    os.environ.clear(); os.environ.update(_saved)
+
+# Which commands Decky's libraries break depends on what each Decky release
+# bundles, so no call may opt out: every process we start gets _child_env().
+_spawns = [n for n in ast.walk(_tree) if isinstance(n, ast.Call)
+           and isinstance(n.func, ast.Attribute)
+           and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"
+           and n.func.attr in ("run", "Popen", "call", "check_call", "check_output")]
+ok(len(_spawns) >= 2, f"the process-start calls are found at all ({len(_spawns)})")
+_bare = [n.lineno for n in _spawns
+         if not any(k.arg == "env" and isinstance(k.value, ast.Call)
+                    and getattr(k.value.func, "id", "") == "_child_env" for k in n.keywords)]
+ok(not _bare, f"every process start passes env=_child_env() (missing at lines {_bare})")
+ok(not any(isinstance(n, ast.Attribute) and n.attr in ("system", "popen")
+           and getattr(n.value, "id", "") == "os" for n in ast.walk(_tree)),
+   "and nothing starts a process around it with os.system or os.popen")
+
 section("security: version validation")
 for v, good in [("0.12.0",True),("0.12.0-beta",True),("1.2.3.4",True),
                 ("0.12.0; rm -rf /",False),("$(id)",False),("`id`",False),("v1.0",False)]:
@@ -82,7 +138,7 @@ calls=[]
 class P(m.Plugin):
     def _nmcli_modify(self,u,k,v,timeout=5):
         calls.append((k,v)); return {"success":True,"stdout":"","stderr":"","returncode":0}
-    def _run_cmd(self,cmd,timeout=5,clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         calls.append((cmd[0],)); return {"success":True,"stdout":"","stderr":"","returncode":0}
 q = P()
 act = [{"kind":"bssid_repoint","uuid":"u1","value":"AA:BB:CC:DD:EE:01"}]
@@ -177,7 +233,7 @@ REAL = {
  ("tc","qdisc","show","dev","wlan0"): "qdisc cake 8002: root",
 }
 class Connected(m.Plugin):
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         key = tuple(c.split("/")[-1] if c.startswith("/usr") else c for c in cmd)
         out = REAL.get(key); j = " ".join(cmd)
         if out is None:
@@ -224,7 +280,7 @@ class LateAssoc(m.Plugin):
     def _hard_reconnect(self, uuid): return True
     def _nmcli_modify(self, u, k, v, timeout=5):
         return {"success":True,"stdout":"","stderr":"","returncode":0}
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if "link" in cmd:
             self.polls += 1
             if self.fail:
@@ -288,7 +344,7 @@ class Pinned(Connected):
         super().__init__()
         self.pin_band, self.pin_bssid = band, bssid
         self.mods = []
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         j = " ".join(cmd)
         if "802-11-wireless.band" in j and "con" in cmd:
             return {"success":True,"stdout":f"802-11-wireless.band:{self.pin_band}",
@@ -296,7 +352,7 @@ class Pinned(Connected):
         if "802-11-wireless.bssid" in j and "con" in cmd:
             return {"success":True,"stdout":f"802-11-wireless.bssid:{self.pin_bssid}",
                     "stderr":"","returncode":0}
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
     def _nmcli_modify(self, u, k, v, timeout=5):
         self.mods.append((u, k, v))
         return {"success":True,"stdout":"","stderr":"","returncode":0}
@@ -426,7 +482,7 @@ class Mesh(m.Plugin):
         allowed.sort(key=lambda ap: ap[1], reverse=True)
         self.on = allowed[0][0].lower() if allowed else ""
         return True
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if "wifi" in cmd and "list" in cmd:
             self.scans += 1
             # Answer the columns actually asked for. _band_is_reachable wants
@@ -580,11 +636,11 @@ class V6(Connected):
     def __init__(self, live="disabled"):
         super().__init__()
         self.live, self.mods = live, []
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if "ipv6.method" in " ".join(cmd) and "con" in cmd:
             return {"success":True,"stdout":f"ipv6.method:{self.live}",
                     "stderr":"","returncode":0}
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
     def _nmcli_modify(self, u, k, v, timeout=5):
         self.mods.append((u, k, v))
         return {"success":True,"stdout":"","stderr":"","returncode":0}
@@ -651,7 +707,7 @@ for cand, than, want, label in cases:
 # installed, offered as though it were an upgrade.
 class Chan(m.Plugin):
     def __init__(self, latest): super().__init__(); self.latest = latest
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         return {"success":True,"stdout":json.dumps({"version":self.latest}),
                 "stderr":"","returncode":0}
 # The installed version comes from decky at runtime; without setting it the
@@ -676,12 +732,12 @@ class Noisy(Mesh):
     def __init__(self, rounds, on):
         super().__init__(rounds[0], on)
         self.rounds, self.round_at, self.rescans = rounds, 0, 0
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if "wifi" in cmd and "list" in cmd:
             if "--rescan" in cmd: self.rescans += 1
             self.scan = self.rounds[min(self.round_at, len(self.rounds) - 1)]
             self.round_at += 1
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
 
 LOW  = "Net:02\\:00\\:00\\:00\\:00\\:52:40:5220 MHz:WPA2 WPA3\nNet:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3"
 HIGH = "Net:02\\:00\\:00\\:00\\:00\\:52:90:5220 MHz:WPA2 WPA3\nNet:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3"
@@ -761,7 +817,7 @@ class Dup(Connected):
         super().__init__()
         self.rivals = rivals   # {uuid: (name, ssid, key_mgmt)}
         self.listings = 0
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         j = " ".join(cmd)
         if "UUID,NAME,TYPE" in j:
             self.listings += 1
@@ -781,7 +837,7 @@ class Dup(Connected):
                     "stdout":f"802-11-wireless.ssid:{v[1]}","stderr":"","returncode":0}
             return {"success":True,"stdout":"802-11-wireless.ssid:Net",
                     "stderr":"","returncode":0}
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
     def _nmcli_modify(self, *a, **k):
         return {"success":True,"stdout":"","stderr":"","returncode":0}
 
@@ -825,7 +881,7 @@ class RivalPins(Dup):
         super().__init__(rivals)
         self.pins = {u: dict(v) for u, v in pins.items()}
         self.modifies = []
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         j = " ".join(cmd)
         if "802-11-wireless.band,802-11-wireless.bssid" in j:
             for u, props in self.pins.items():
@@ -834,7 +890,7 @@ class RivalPins(Dup):
                             "stdout":"\n".join(f"{k}:{v}" for k, v in props.items()),
                             "stderr":"","returncode":0}
             return {"success":True,"stdout":"","stderr":"","returncode":0}
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.modifies.append((uuid, key, value))
         return {"success":True,"stdout":"","stderr":"","returncode":0}
@@ -909,12 +965,12 @@ class Offline(Connected):
         self.modifies = []
     def _get_active_connection_uuid(self):
         return None
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if "802-11-wireless.band,802-11-wireless.bssid" in " ".join(cmd):
             return {"success":True,
                     "stdout":"\n".join(f"{k}:{v}" for k,v in self.pins.items()),
                     "stderr":"","returncode":0}
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.modifies.append((uuid, key, value))
         return {"success":True,"stdout":"","stderr":"","returncode":0}
@@ -1010,7 +1066,7 @@ class Prio(Dup):
         super().__init__(rivals)
         self.priorities = dict(priorities)
         self.modifies = []
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         j = " ".join(cmd)
         if "connection.autoconnect-priority" in j and "show" in j:
             for u, v in self.priorities.items():
@@ -1020,7 +1076,7 @@ class Prio(Dup):
                             "stderr":"","returncode":0}
             return {"success":True,"stdout":"connection.autoconnect-priority:0",
                     "stderr":"","returncode":0}
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.modifies.append((uuid, key, value))
         return {"success":True,"stdout":"","stderr":"","returncode":0}
@@ -1125,7 +1181,7 @@ class Reg(m.Plugin):
         self.reg_text = reg_text
         self.ok_set = ok_set
         self.sets = []
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if cmd[:3] == ["/usr/bin/iw", "reg", "get"]:
             return {"success":True,"stdout":self.reg_text,"stderr":"","returncode":0}
         if cmd[:3] == ["/usr/bin/iw", "reg", "set"]:
@@ -1188,7 +1244,7 @@ class Scan(m.Plugin):
         self.rows = rows
         self.ssid = ssid
         self.scan_ok = scan_ok
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         j = " ".join(cmd)
         if "SSID,FREQ" in j:
             return {"success": self.scan_ok, "stdout": "\n".join(self.rows),
@@ -1251,7 +1307,7 @@ class Unlock(m.Plugin):
     def _get_wifi_interface(self): return "wlan0"
     def _get_active_connection_uuid(self): return LIVE_U
     def _hard_reconnect(self, uuid=None): return True
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         return {"success":True,"stdout":"","stderr":"","returncode":0}
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.modifies.append((uuid, key, value))
@@ -1338,7 +1394,7 @@ class Cake(m.Plugin):
         super().__init__()
         self.tc_ok = tc_ok
         self.ran = []
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         self.ran.append(list(cmd))
         if "qdisc" in cmd and "replace" in cmd:
             return {"success":self.tc_ok,"stdout":"","stderr":"no such qdisc",
@@ -1448,7 +1504,7 @@ class Field(m.Plugin):
         super().__init__()
         self.out = out
         self.asked = []
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         self.asked.append(list(cmd))
         return {"success":True,"stdout":self.out,"stderr":"","returncode":0}
 
@@ -1472,12 +1528,12 @@ ok(Field("ipv6.method:  auto  ")._read_profile_field("u","ipv6.method") == "auto
 # The collector publishes the unescaped address, which is what the panel shows
 # and what every comparison against a live BSSID is made against.
 class EscapedPin(Connected):
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if "802-11-wireless.bssid" in " ".join(cmd) and "con" in cmd:
             return {"success":True,
                     "stdout":"802-11-wireless.bssid:02\\:00\\:00\\:00\\:00\\:11",
                     "stderr":"","returncode":0}
-        return super()._run_cmd(cmd, timeout, clean_env)
+        return super()._run_cmd(cmd, timeout)
 
 m._save_settings(dict(base_ap))
 st, _p, _a = EscapedPin()._collect_status()
@@ -1645,7 +1701,7 @@ class Band(m.Plugin):
         # middle of the change and writes the old address back
         self.depth_seen.append(getattr(self, "_profile_change_depth", 0))
         return self.reconnect
-    def _run_cmd(self, cmd, timeout=5, clean_env=False):
+    def _run_cmd(self, cmd, timeout=5):
         if cmd[:2] == ["/usr/bin/iw", "dev"] and "link" in cmd:
             return {"success":True,"stdout":self.link,"stderr":"","returncode":0}
         return {"success":True,"stdout":"","stderr":"","returncode":0}
@@ -1973,7 +2029,7 @@ try:
     # poll re-points it - but it must not pass silently, or the lock reads as
     # enabled in settings while being absent from the profile.
     class DeadLink(Band):
-        def _run_cmd(self, cmd, timeout=5, clean_env=False):
+        def _run_cmd(self, cmd, timeout=5):
             if cmd[:2] == ["/usr/bin/iw", "dev"] and "link" in cmd:
                 return {"success":False,"stdout":"","stderr":"No such device",
                         "returncode":237}
