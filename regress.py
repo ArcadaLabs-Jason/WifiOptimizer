@@ -177,6 +177,59 @@ for product, family in [("Claw A1M", "msi_claw"), ("AYANEO 2S", "ayaneo"),
                m.DMI_DEVICES.get(product, {}).get("family"))
     ok(hit == family, f"product name {product!r} is recognised as {family}")
 
+section("timestamps: re-applying is not a change")
+m.ENFORCED_FILE = os.path.join(tempfile.mkdtemp(), "last_enforced")
+class Volatile(m.Plugin):
+    """The three volatile setters, each stamping as the real ones do."""
+    def __init__(self):
+        super().__init__(); self.calls = []
+    async def _stamp(self, name):
+        self.calls.append(name)
+        m._save_settings_with_timestamp(m._load_settings())
+        return {"success": True}
+    async def set_power_save(self, disabled): return await self._stamp("power_save")
+    async def set_buffer_tuning(self, enabled): return await self._stamp("buffer")
+    async def set_cake(self, enabled): return await self._stamp("cake")
+
+m._save_settings({"power_save_disabled": True, "buffer_tuning_enabled": True,
+                  "cake_enabled": True, "last_applied": 1700000000})
+if os.path.exists(m.ENFORCED_FILE): os.remove(m.ENFORCED_FILE)
+v = Volatile()
+res = asyncio.run(v.reapply_volatile())
+ok(res.get("applied") == 3 and v.calls == ["power_save", "buffer", "cake"],
+   "a game-launch reapply runs all three volatile setters")
+ok(m._load_settings().get("last_applied") == 1700000000,
+   "and leaves Last changed where the user's own change put it")
+ok(os.path.exists(m.ENFORCED_FILE)
+   and abs(int(open(m.ENFORCED_FILE).read()) - time.time()) < 60,
+   "recording itself as Auto-applied instead")
+
+m._save_settings({"power_save_disabled": False, "buffer_tuning_enabled": False,
+                  "cake_enabled": False, "last_applied": 1700000000})
+os.remove(m.ENFORCED_FILE)
+asyncio.run(Volatile().reapply_volatile())
+ok(not os.path.exists(m.ENFORCED_FILE),
+   "nothing enabled means nothing re-applied and nothing recorded")
+
+class RealSetter(m.Plugin):
+    def _run_cmd(self, cmd, timeout=5):
+        return {"success": True, "stdout": "", "stderr": "", "returncode": 0}
+    def _get_wifi_interface(self): return "wlan0"
+_real_nm_conf = m.NM_CONF_PATH
+m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+try:
+    m._save_settings({"last_applied": 1700000000})
+    res = asyncio.run(RealSetter().set_power_save(True))
+    ok(res.get("success") and m._load_settings().get("last_applied") != 1700000000,
+       "a toggle the user flips still moves Last changed")
+finally:
+    m.NM_CONF_PATH = _real_nm_conf
+
+_main_src = open("main.py").read()
+_main_body2 = _main_src[_main_src.index("    async def _main(self):"):_main_src.index("    async def _unload(self):")]
+ok("self._record_reapplied(" in _main_body2,
+   "the startup re-application records itself the same way")
+
 section("reach: a stronger access point the saved security cannot use")
 WU = "aa0fd3f5-5fba-4291-8cf0-3b38838338d3"
 JASONS_ROOM = [  # measured on a Deck: the office radio is WPA2 only

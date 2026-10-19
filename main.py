@@ -1098,6 +1098,10 @@ class Plugin:
                         await self.set_power_save(True)
                     except Exception as e:
                         decky.logger.error(f"Startup power save failed: {e}")
+                if any(settings.get(k) for k in (
+                    "buffer_tuning_enabled", "cake_enabled", "power_save_disabled"
+                )):
+                    self._record_reapplied(settings.get("last_applied", 0))
 
             # Sanity check: does the conf-declared backend match what's actually
             # running? Divergence would indicate a previous switch got interrupted
@@ -4419,6 +4423,21 @@ class Plugin:
             decky.logger.error(f"optimize_safe error: {e}")
             return self._unexpected_response(e)
 
+    def _record_reapplied(self, last_changed: int):
+        """Put back "Last changed" after a re-application, and stamp it as one.
+
+        Re-applying reuses the setters, and every setter stamps the time of
+        the user's last change. So each boot and each game launch read in the
+        panel as a change made just now. Re-applying is what the dispatcher
+        does after a reconnect, and the panel already shows that separately as
+        "Auto-applied", from the file the dispatcher writes. Use that.
+        """
+        settings = _load_settings()
+        if settings.get("last_applied", 0) != last_changed:
+            settings["last_applied"] = last_changed
+            _save_settings(settings)
+        _write_no_follow(ENFORCED_FILE, str(int(time.time())))
+
     async def reapply_volatile(self) -> dict:
         """Reapply volatile (non-reconnecting) settings. Safe to call mid-stream."""
         try:
@@ -4446,6 +4465,7 @@ class Plugin:
 
             if total > 0:
                 decky.logger.info(f"reapply_volatile: {applied}/{total} applied")
+                self._record_reapplied(settings.get("last_applied", 0))
 
             return {"success": True, "applied": applied, "total": total}
         except Exception as e:
