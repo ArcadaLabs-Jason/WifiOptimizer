@@ -1159,13 +1159,15 @@ class Plugin:
             )
         except Exception as e:
             decky.logger.error(f"WiFi Optimizer _main error: {e}")
+        self._stranded_task = asyncio.create_task(self._stranded_watch())
 
     async def _unload(self):
         try:
             decky.logger.info("WiFi Optimizer unloading")
-            task = getattr(self, "_backend_switch_task", None)
-            if task and not task.done():
-                task.cancel()
+            for name in ("_backend_switch_task", "_stranded_task"):
+                task = getattr(self, name, None)
+                if task and not task.done():
+                    task.cancel()
         except Exception as e:
             decky.logger.error(f"_unload error: {e}")
 
@@ -1844,6 +1846,10 @@ class Plugin:
                 # still be explaining this once WiFi returns, which is
                 # the only time the user is there to read it.
                 self._pin_released_at = time.time()
+                # The setting is still on and should land on whichever access
+                # point works once we are back. With the panel closed only the
+                # background watch can make that happen, so tell it to.
+                self._repoll_after_release = True
                 # And say so on THIS poll. The collector reads the
                 # timestamp before the actions run, so leaving it to
                 # the next poll would make the release silent at the
@@ -2013,6 +2019,58 @@ class Plugin:
     # this the notice would clear the instant WiFi returned, which is exactly
     # when the user is there to read it.
     _RELEASE_NOTICE_SECONDS = 600
+
+    # How often the background watch looks at the connection while one of our
+    # pins is on. One nmcli call each time; nothing more runs unless offline.
+    _STRANDED_WATCH_SECONDS = 20
+
+    async def _stranded_watch(self):
+        """Run the stranded-pin check whether or not the panel is open.
+
+        The release above only happened inside a status poll, and the panel
+        is the only thing that polls. The device it exists for is one that
+        woke up unable to reach the pinned access point, where SteamOS asks
+        for the password and nobody thinks to open a WiFi plugin. So it
+        never ran for the people it was written for.
+        """
+        while True:
+            await asyncio.sleep(self._STRANDED_WATCH_SECONDS)
+            try:
+                await self._stranded_watch_once()
+            except Exception as e:
+                decky.logger.error(f"stranded watch error: {e}")
+
+    async def _stranded_watch_once(self):
+        settings = _load_settings()
+        if not any(
+            settings.get(enabled_key)
+            for enabled_key, _lk, prop, _off in self._PIN_PROPERTIES
+            if prop in self._ELIMINATION_PINS
+        ):
+            return
+        result = await asyncio.to_thread(
+            self._run_cmd, ["/usr/bin/nmcli", "-t", "-f", "STATE", "general"], 5
+        )
+        if not result["success"]:
+            return
+        state = result.get("stdout", "").strip()
+        # Online in any form means no pin of ours is keeping it off. So does
+        # asleep: that is the system's doing, and the offline clock must not
+        # carry a stretch of it into the next real outage. Resetting here
+        # matters, because nothing else does while the panel is closed.
+        if state.startswith("connected") or state == "asleep":
+            self._offline_since = None
+            # Back online after we released a pin: one poll, so the setting
+            # that is still on settles on the access point that works now.
+            if state.startswith("connected") and getattr(
+                self, "_repoll_after_release", False
+            ):
+                self._repoll_after_release = False
+                await self.get_status()
+            return
+        # A full poll, exactly as the panel would make, so the release goes
+        # through the same proposal, the same guards and the same notice.
+        await self.get_status()
 
     def _propose_pin_cleanup(self, settings: dict) -> list[dict]:
         """One cleanup per property per poll for anything we could not unpin.

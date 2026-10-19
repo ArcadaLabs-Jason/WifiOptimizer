@@ -1081,6 +1081,8 @@ ok(rel(d, "802-11-wireless.bssid"),
    "a pin we wrote is released once it is the likely reason we are offline")
 ok(st.get("external", {}).get("pin_released") is True,
    "and the panel is told, so the change is not silent")
+ok(getattr(d, "_repoll_after_release", False) is True,
+   "and the background watch is asked to re-settle the lock once back online")
 
 # A band preference strands a device the same way.
 m._save_settings(off_settings(band_preference_enabled=True, band_preference="a",
@@ -1127,6 +1129,82 @@ d._offline_since = time.monotonic() - 999
 out = d._propose_stranded_pin_release(m._load_settings(), True)
 ok(out == [] and getattr(d, "_offline_since", "unset") is None,
    "reconnecting resets the offline clock")
+
+section("stranded pins: released with the panel closed")
+
+# The release lived only inside a status poll, and only the panel polls. The
+# device it is for is one that woke unable to reach its pinned access point,
+# where nobody opens the panel. The watch makes the same poll on its own.
+class Watched(m.Plugin):
+    def __init__(self, state, ok_=True):
+        super().__init__(); self.state = state; self.ok_ = ok_
+        self.nm_calls = 0; self.polls = 0
+    def _run_cmd(self, cmd, timeout=5):
+        if cmd == ["/usr/bin/nmcli", "-t", "-f", "STATE", "general"]:
+            self.nm_calls += 1
+            return {"success": self.ok_, "stdout": self.state, "stderr": "", "returncode": 0}
+        return {"success": False, "stdout": "", "stderr": "", "returncode": 1}
+    async def get_status(self):
+        self.polls += 1
+        return {}
+
+m._save_settings(off_settings(bssid_lock_enabled=False, band_preference_enabled=False))
+w = Watched("disconnected")
+asyncio.run(w._stranded_watch_once())
+ok(w.nm_calls == 0 and w.polls == 0,
+   "with no pin feature on, the watch costs nothing at all")
+
+for flag in ("bssid_lock_enabled", "band_preference_enabled"):
+    m._save_settings(off_settings(**{"bssid_lock_enabled": False,
+                                     "band_preference_enabled": False, flag: True}))
+    w = Watched("disconnected")
+    asyncio.run(w._stranded_watch_once())
+    ok(w.polls == 1, f"offline with {flag} on runs the same poll the panel would")
+
+m._save_settings(off_settings(ipv6_disabled=True, bssid_lock_enabled=False,
+                               band_preference_enabled=False))
+w = Watched("disconnected")
+asyncio.run(w._stranded_watch_once())
+ok(w.polls == 0, "IPv6 alone does not wake the watch, since it is never released")
+
+m._save_settings(off_settings())
+for state in ("connected", "connected (site only)", "connected (local only)", "asleep"):
+    w = Watched(state)
+    w._offline_since = time.monotonic() - 999
+    asyncio.run(w._stranded_watch_once())
+    ok(w.polls == 0 and w._offline_since is None,
+       f"{state!r} resets the offline clock and polls nothing")
+
+for state in ("connecting", "disconnecting"):
+    w = Watched(state)
+    asyncio.run(w._stranded_watch_once())
+    ok(w.polls == 1, f"{state!r} counts as offline, so a pin failing auth in a loop is caught")
+
+w = Watched("connected")
+w._repoll_after_release = True
+asyncio.run(w._stranded_watch_once())
+asyncio.run(w._stranded_watch_once())
+ok(w.polls == 1 and not w._repoll_after_release,
+   "back online after a release, one poll lets the lock settle on what works")
+w = Watched("asleep")
+w._repoll_after_release = True
+asyncio.run(w._stranded_watch_once())
+ok(w.polls == 0 and w._repoll_after_release,
+   "but not while asleep, which is not back online")
+
+w = Watched("", ok_=False)
+w._offline_since = 123.0
+asyncio.run(w._stranded_watch_once())
+ok(w.polls == 0 and w._offline_since == 123.0,
+   "an nmcli that cannot answer changes nothing either way")
+
+# Wired to the plugin's life: started by _main, cancelled by _unload.
+_src = open("main.py").read()
+_main_body = _src[_src.index("    async def _main(self):"):_src.index("    async def _unload(self):")]
+_unload_body = _src[_src.index("    async def _unload(self):"):_src.index("    async def _uninstall(self):")]
+ok("self._stranded_task = asyncio.create_task(self._stranded_watch())" in _main_body,
+   "_main starts the watch")
+ok('"_stranded_task"' in _unload_body, "and _unload cancels it")
 
 section("one network saved twice: making NetworkManager's choice deterministic")
 
