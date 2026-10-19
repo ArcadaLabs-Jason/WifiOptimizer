@@ -6,6 +6,8 @@ A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause 
 
 **Supported devices:** Steam Deck (LCD and OLED), Legion Go, ROG Ally, and other PC handhelds. Works on SteamOS, Bazzite, and CachyOS.
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/fanciestpeanut)
+
 ## The problem
 
 The OS resets WiFi settings after every system update and sleep/wake cycle. Power management gets re-enabled and network buffers reset to defaults. The result: latency spikes, connection drops, and degraded streaming quality - and the only fix is a trip to Desktop Mode.
@@ -70,6 +72,7 @@ Want to go further? The remaining optimizations are available as individual togg
 | Steam Deck OLED | WiFi 6E (QCA206X) | ath11k_pci | Full support |
 | Legion Go (all models) | WiFi 6E (MT7922) | mt7921e | Full support |
 | ROG Ally (all models) | WiFi 6E (MT7922) | mt7921e | Full support |
+| MSI Claw, AYANEO, GPD | WiFi 6 (RTL8852) or WiFi 7 (WCN7850) | rtw89, ath12k | Recognized; untested on hardware, reports welcome |
 | Other PC handhelds | Varies | iwlwifi, etc. | Detected automatically; driver-specific fixes applied when available |
 
 The plugin detects your WiFi hardware at startup and applies the right optimizations for your chip. Devices with unrecognized hardware still get universal optimizations (power save, buffer tuning, BSSID lock, etc.).
@@ -113,6 +116,11 @@ pnpm run build
 ```
 
 To deploy to your Deck, copy `.vscode/defsettings.json` to `.vscode/settings.json`, fill in your Deck's IP and password, then use the VS Code **builddeploy** task (Terminal > Run Task).
+
+## Support
+
+WiFi Optimizer is free and stays free. If you want to support it:
+[ko-fi.com/fanciestpeanut](https://ko-fi.com/fanciestpeanut).
 
 ## Contact
 
