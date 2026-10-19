@@ -2982,6 +2982,60 @@ class Plugin:
         ).get("stdout", "")
         return live
 
+    # NetworkManager reports a clash both ways, and on the night this was
+    # measured one of two clashes appeared only as the DHCP form.
+    def _report_network_problems(self, status: dict, uuid: str, iface: str,
+                                 ssid: str):
+        """Problems with the network itself, not with any setting of ours.
+
+        Each is checked on its own throttle and only reported; nothing here
+        writes or drifts.
+        """
+        live = status["live"]
+        self._recheck_address_conflict(live.get("ip_address", ""))
+        if getattr(self, "_address_conflict", None):
+            status["address_conflict"] = dict(self._address_conflict)
+        self._recheck_security_reach(uuid, iface, ssid, live.get("connected_bssid", ""))
+        if getattr(self, "_wpa2_blocked", None):
+            status["wpa2_only_stronger"] = dict(self._wpa2_blocked)
+
+    _CONFLICT_RE = re.compile(
+        r"conflict detected for IP address (\S+) with host ([0-9A-Fa-f:]{17})"
+        r"|new lease, address=([^,\s]+), acd conflict"
+    )
+    _CONFLICT_CHECK_SECONDS = 60
+
+    def _recheck_address_conflict(self, ip: str):
+        """Whether NetworkManager saw another device holding our address.
+
+        When a router hands out an address that is already in use, the Deck
+        shows WiFi as connected and nothing works, and a WiFi plugin is the
+        obvious thing to blame. Measured on a Deck: every boot one evening
+        logged "conflict detected for IP address 192.168.1.9 with host ...",
+        it kept happening with the plugin uninstalled, and it was the router.
+        NetworkManager only logs it, so read the log, for the address we hold
+        now, over the last ten minutes. Throttled, since it is a journal read.
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_conflict_checked_at", 0.0) < self._CONFLICT_CHECK_SECONDS \
+                and getattr(self, "_conflict_checked_ip", None) == ip:
+            return
+        self._conflict_checked_at = now
+        self._conflict_checked_ip = ip
+        self._address_conflict = None
+        if not ip:
+            return
+        log = self._run_cmd(
+            ["/usr/bin/journalctl", "-u", "NetworkManager", "--since", "-10min",
+             "-o", "cat", "--no-pager"],
+            timeout=5,
+        )
+        for found in self._CONFLICT_RE.finditer(log.get("stdout", "")):
+            if ip in (found.group(1), found.group(3)):
+                other = (found.group(2) or "").upper()
+                known = (self._address_conflict or {}).get("other", "")
+                self._address_conflict = {"ip": ip, "other": other or known}
+
     def _classify_ipv6(self, settings: dict, uuid: str, live_ipv6: str,
                        status: dict, actions: list):
         """Decide whether the profile's IPv6 state is ours or someone else's.
@@ -3457,12 +3511,7 @@ class Plugin:
             self._recheck_rival_profiles(settings, uuid, active_ssid, actions)
             if getattr(self, "_dup_conflict", False):
                 status["external"]["duplicate_profiles"] = True
-            self._recheck_security_reach(
-                uuid, iface, active_ssid() or "",
-                status["live"].get("connected_bssid", ""),
-            )
-            if getattr(self, "_wpa2_blocked", None):
-                status["wpa2_only_stronger"] = dict(self._wpa2_blocked)
+            self._report_network_problems(status, uuid, iface, active_ssid() or "")
             actions.extend(
                 self._propose_active_pin_cleanup(
                     settings, uuid, "band_preference_uuids", live_band

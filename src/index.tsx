@@ -659,6 +659,17 @@ function Content() {
         </Banner>
       )}
 
+      {/* The router handed out an address another device already holds. WiFi
+          reads as connected while nothing works, and without this the plugin
+          is the obvious suspect. */}
+      {status?.address_conflict && (
+        <Banner variant="warning" icon="⚠">
+          Another device on your network is using the same address as the Deck
+          ({status.address_conflict.ip}), so the connection may not work. That's
+          the router, not a WiFi setting. Restarting the router usually fixes it.
+        </Banner>
+      )}
+
       {/* The saved security is shutting the device out of a stronger access
           point on the same network. Without this the only symptom is the
           Deck preferring a distant access point for no visible reason. */}

@@ -230,6 +230,49 @@ _main_body2 = _main_src[_main_src.index("    async def _main(self):"):_main_src.
 ok("self._record_reapplied(" in _main_body2,
    "the startup re-application records itself the same way")
 
+section("address conflict: the router's fault, said plainly")
+# Verbatim from a Deck's journal the night a router handed out in-use addresses.
+NM_LOG = (
+    "dhcp4 (wlan0): state changed new lease, address=192.168.1.9, acd conflict\n"
+    "device (wlan0): conflict detected for IP address 192.168.1.9 with host 24:E8:53:90:64:8A\n"
+    "manager: NetworkManager state is now CONNECTED_GLOBAL\n"
+)
+class Journal(m.Plugin):
+    def __init__(self, log, ok_=True):
+        super().__init__(); self.log = log; self.ok_ = ok_; self.reads = 0
+    def _run_cmd(self, cmd, timeout=5):
+        if cmd[0] == "/usr/bin/journalctl":
+            self.reads += 1
+            return {"success": self.ok_, "stdout": self.log, "stderr": "", "returncode": 0}
+        return {"success": False, "stdout": "", "stderr": "", "returncode": 1}
+
+j = Journal(NM_LOG)
+j._recheck_address_conflict("192.168.1.9")
+ok(j._address_conflict == {"ip": "192.168.1.9", "other": "24:E8:53:90:64:8A"},
+   "a conflict logged for the address we hold is reported, with the other device")
+j = Journal(NM_LOG)
+j._recheck_address_conflict("192.168.1.36")
+ok(j._address_conflict is None, "a conflict over an address we no longer hold is not")
+j = Journal("dhcp4 (wlan0): state changed new lease, address=192.168.1.11, acd conflict\n")
+j._recheck_address_conflict("192.168.1.11")
+ok(j._address_conflict == {"ip": "192.168.1.11", "other": ""},
+   "the DHCP form alone counts, which is how one clash that night was logged")
+j = Journal("device (wlan0): conflict detected for IP address 192.168.1.90 with host 24:E8:53:90:64:8A\n"
+            "dhcp4 (wlan0): state changed new lease, address=192.168.1.90, acd conflict\n")
+j._recheck_address_conflict("192.168.1.9")
+ok(j._address_conflict is None, "an address that merely starts the same is not ours")
+j = Journal("", ok_=False)
+j._recheck_address_conflict("192.168.1.9")
+ok(j._address_conflict is None, "an unreadable journal reports nothing")
+j = Journal(NM_LOG)
+j._recheck_address_conflict("")
+ok(j._address_conflict is None and j.reads == 0, "no address, no journal read")
+j = Journal(NM_LOG)
+j._recheck_address_conflict("192.168.1.9"); j._recheck_address_conflict("192.168.1.9")
+ok(j.reads == 1, "throttled: one journal read per minute for the same address")
+j._recheck_address_conflict("192.168.1.11")
+ok(j.reads == 2, "but a new address is looked at straight away")
+
 section("reach: a stronger access point the saved security cannot use")
 WU = "aa0fd3f5-5fba-4291-8cf0-3b38838338d3"
 JASONS_ROOM = [  # measured on a Deck: the office radio is WPA2 only

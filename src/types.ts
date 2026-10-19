@@ -63,6 +63,8 @@ export interface PluginStatus {
   // A stronger access point of this network that only offers WPA2, while the
   // profile is saved as WPA3-only and so cannot use it. Signals are 0-100.
   wpa2_only_stronger?: { signal: number; current_signal: number };
+  // NetworkManager saw another device on the network holding our address.
+  address_conflict?: { ip: string; other: string };
   last_applied?: number;
   error?: string;
   message?: string;
