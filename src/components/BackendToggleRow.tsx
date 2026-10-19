@@ -17,7 +17,8 @@ const PHASE_TEXT: Record<BackendSwitchPhase, string> = {
 };
 
 const EXPLANATION =
-  "Your system defaults to iwd for WiFi management. Some devices see " +
+  "Linux handhelds use one of two WiFi backends, and which one your " +
+  "system is on varies by device and OS version. Some devices see " +
   "disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors " +
   "with iwd. Switching to wpa_supplicant trades slightly slower reconnect " +
   "(about 5s vs 1-2s) for broader compatibility and better stability on " +
@@ -43,7 +44,10 @@ export function BackendToggleRow({
   isBusy,
   onToggle,
 }: BackendToggleRowProps) {
-  const currentBackend = status.live?.wifi_backend || "iwd";
+  // The backend is genuinely unknown when no config declares one and neither
+  // service reports active. Defaulting the label to iwd states something we
+  // have not established, on a machine that may well be on wpa_supplicant.
+  const currentBackend = status.live?.wifi_backend || "";
   const isWpa = currentBackend === "wpa_supplicant";
   const switching = backendSwitch?.in_progress ?? false;
 
@@ -64,7 +68,9 @@ export function BackendToggleRow({
       ? { badge: "unknown", text: "…" }
       : isWpa
         ? { badge: "active", text: "wpa_supplicant" }
-        : { badge: "off", text: "iwd" };
+        : currentBackend === "iwd"
+          ? { badge: "off", text: "iwd" }
+          : { badge: "unknown", text: "unknown" };
 
   // Inline result shown right under the toggle so it's visible where the
   // user clicked - the top-of-panel banner is often off-screen when the
@@ -88,7 +94,11 @@ export function BackendToggleRow({
     >
       {lastResult?.success && (() => {
         const timedOut = lastResult.reconnect_timed_out;
-        const parts: string[] = [`Switched to ${lastResult.backend}`];
+        const parts: string[] = [
+          lastResult.backend
+            ? `Switched to ${lastResult.backend}`
+            : `Switched to ${lastResult.target}`,
+        ];
         if (lastResult.recovery_performed) parts.push("wlan0 interface recreated");
         if (timedOut) parts.push("WiFi didn't reconnect");
         return (

@@ -1,10 +1,14 @@
 import { PanelSection, PanelSectionRow, ButtonItem } from "@decky/ui";
+import { theme } from "../theme";
 
 interface ActionsSectionProps {
   connected: boolean;
   isBusy: boolean;
   onForceReapply: () => void;
   onReset: () => void;
+  // Reset's outcome when it failed. Force Reapply reports through the
+  // result banner at the top of the panel, like Optimize Safe.
+  resetError?: string | null;
 }
 
 export function ActionsSection({
@@ -12,6 +16,7 @@ export function ActionsSection({
   isBusy,
   onForceReapply,
   onReset,
+  resetError,
 }: ActionsSectionProps) {
   return (
     <PanelSection title="Actions">
@@ -29,6 +34,13 @@ export function ActionsSection({
           Reset Settings
         </ButtonItem>
       </PanelSectionRow>
+      {resetError && (
+        <PanelSectionRow>
+          <div style={{ fontSize: theme.fontSize.tiny, color: theme.error.text }}>
+            {resetError}
+          </div>
+        </PanelSectionRow>
+      )}
     </PanelSection>
   );
 }

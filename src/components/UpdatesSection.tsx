@@ -11,6 +11,9 @@ interface UpdatesSectionProps {
   onChannelChange: (channel: string) => void;
   onApply: () => void;
   onCheck: () => void;
+  // Another operation is running. Starting an update then would restart
+  // Decky in the middle of it.
+  busy?: boolean;
 }
 
 const CHANNEL_OPTIONS = [
@@ -31,6 +34,7 @@ export function UpdatesSection({
   onChannelChange,
   onApply,
   onCheck,
+  busy = false,
 }: UpdatesSectionProps) {
   return (
     <PanelSection title="Updates">
@@ -58,13 +62,22 @@ export function UpdatesSection({
       ) : updateInfo?.update_available ? (
         <>
           <PanelSectionRow>
-            <div style={{ fontSize: theme.fontSize.body, color: theme.success.text }}>
-              v{updateInfo.latest_version} available (you have v{updateInfo.current_version})
+            <div
+              style={{
+                fontSize: theme.fontSize.body,
+                color: updateInfo.is_downgrade ? theme.info.text : theme.success.text,
+              }}
+            >
+              {updateInfo.is_downgrade
+                ? `v${updateInfo.latest_version} is what the beta channel currently offers, which is older than your v${updateInfo.current_version}`
+                : `v${updateInfo.latest_version} available (you have v${updateInfo.current_version})`}
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
-            <ButtonItem layout="below" onClick={onApply}>
-              Update Now
+            <ButtonItem layout="below" disabled={busy} onClick={onApply}>
+              {updateInfo.is_downgrade
+                ? `Go back to v${updateInfo.latest_version}`
+                : "Update Now"}
             </ButtonItem>
           </PanelSectionRow>
         </>

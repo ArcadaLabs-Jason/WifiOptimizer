@@ -1,7 +1,9 @@
-import { PanelSection, PanelSectionRow, ButtonItem } from "@decky/ui";
+import { PanelSection, PanelSectionRow, ButtonItem, Navigation } from "@decky/ui";
 import { theme } from "../theme";
 import * as backend from "../backend";
 import { useState } from "react";
+
+const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
 
 interface PanelFooterProps {
   version: string;
@@ -25,8 +27,10 @@ export function PanelFooter({ version }: PanelFooterProps) {
         await navigator.clipboard.writeText(text);
         setDiagState("done");
       } catch {
-        await backend.saveDiagnosticInfo();
-        setDiagState("saved");
+        // A resolved failure is still a failure: saying "Saved" here sent
+        // people looking for a file that was never written.
+        const saved = await backend.saveDiagnosticInfo();
+        setDiagState(saved?.success === false ? "error" : "saved");
       }
       setTimeout(() => setDiagState("idle"), 5000);
     } catch {
@@ -65,6 +69,17 @@ export function PanelFooter({ version }: PanelFooterProps) {
           onClick={handleCopyDiagnostics}
         >
           {label}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          onClick={() => {
+            Navigation.CloseSideMenus();
+            Navigation.NavigateToExternalWeb(KOFI_URL);
+          }}
+        >
+          Support on Ko-fi
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>

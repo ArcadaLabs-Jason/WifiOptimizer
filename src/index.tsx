@@ -26,6 +26,7 @@ import type {
   UpdateCheckResult,
   BadgeStatus,
   BackendSwitchStatus,
+  RegdomainInfo,
 } from "./types";
 import { ERROR_MESSAGES } from "./types";
 import { InfoRow } from "./components/InfoRow";
@@ -43,7 +44,14 @@ const RECONNECT_DELAY = 4000;
 const BACKEND_POLL_INTERVAL = 750;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
 const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
-const UPDATE_TIMEOUT_MS = 60 * 1000;
+// The update script allows the download up to five minutes on a slow link,
+// so the panel waits a little longer than that before calling it failed.
+const UPDATE_TIMEOUT_MS = 6 * 60 * 1000;
+const BACKEND_SWITCH_MAX_S = 240;
+// Shown on the lock and band toggles while the iwd backend is in use.
+const IWD_PIN_NOTICE =
+  "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
+const BACKEND_POLL_MAX_FAILURES = 5;
 
 function getBadge(
   driftKey: string | undefined,
@@ -57,6 +65,35 @@ function getBadge(
   if (driftKey && status?.drift?.[driftKey]) return { badge: "drifted", text: "drifted" };
   return null;
 }
+
+// Regions the selector offers. A regulatory domain is a legal constraint on
+// transmit power and which channels may be used, so this is a deliberate
+// short list of ISO country codes rather than free text.
+const REGION_OPTIONS = [
+  { data: "00", label: "World (00) - most restrictive" },
+  { data: "US", label: "United States (US)" },
+  { data: "CA", label: "Canada (CA)" },
+  { data: "GB", label: "United Kingdom (GB)" },
+  { data: "IE", label: "Ireland (IE)" },
+  { data: "DE", label: "Germany (DE)" },
+  { data: "FR", label: "France (FR)" },
+  { data: "ES", label: "Spain (ES)" },
+  { data: "IT", label: "Italy (IT)" },
+  { data: "NL", label: "Netherlands (NL)" },
+  { data: "SE", label: "Sweden (SE)" },
+  { data: "NO", label: "Norway (NO)" },
+  { data: "DK", label: "Denmark (DK)" },
+  { data: "FI", label: "Finland (FI)" },
+  { data: "PL", label: "Poland (PL)" },
+  { data: "PT", label: "Portugal (PT)" },
+  { data: "AU", label: "Australia (AU)" },
+  { data: "NZ", label: "New Zealand (NZ)" },
+  { data: "JP", label: "Japan (JP)" },
+  { data: "KR", label: "South Korea (KR)" },
+  { data: "BR", label: "Brazil (BR)" },
+  { data: "MX", label: "Mexico (MX)" },
+  { data: "IN", label: "India (IN)" },
+];
 
 const DNS_OPTIONS = [
   { data: "cloudflare", label: "Cloudflare (1.1.1.1)" },
@@ -85,12 +122,23 @@ class ErrorBoundary extends Component<
 
   render() {
     if (this.state.err) {
+      // A retry rather than "close and reopen": the Quick Access Menu keeps
+      // the panel mounted across close and open, so reopening alone would
+      // show this same message again.
       return (
-        <Banner variant="error">
-          WiFi Optimizer hit an unexpected error. Close and reopen the panel to
-          recover. If it keeps happening, please report at
-          github.com/ArcadaLabs-Jason/WifiOptimizer.
-        </Banner>
+        <>
+          <Banner variant="error">
+            WiFi Optimizer hit an unexpected error. If it keeps happening,
+            please report at github.com/ArcadaLabs-Jason/WifiOptimizer.
+          </Banner>
+          <PanelSection>
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => this.setState({ err: null })}>
+                Try again
+              </ButtonItem>
+            </PanelSectionRow>
+          </PanelSection>
+        </>
       );
     }
     return this.props.children;
@@ -111,10 +159,33 @@ function Content() {
   // --- General status and toggle state ---
   const [status, setStatus] = useState<PluginStatus | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [notices, setNotices] = useState<Record<string, string>>({});
   const [isBusy, setIsBusy] = useState(false);
   const [applyingAll, setApplyingAll] = useState(false);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeSafeResult | null>(null);
+  const [regdomain, setRegdomainInfo] = useState<RegdomainInfo | null>(null);
+
+  // The wireless region is a device-level fact that does not change on its
+  // own, so it is read once rather than added to the status poll.
+  const refreshRegdomain = useCallback(() => {
+    backend
+      .getRegdomain()
+      .then((info) => setRegdomainInfo(info))
+      .catch(() => setRegdomainInfo(null));
+  }, []);
+
+  useEffect(() => {
+    refreshRegdomain();
+  }, [refreshRegdomain]);
   const [customDnsInput, setCustomDnsInput] = useState("");
+  // Custom DNS is edited as a draft and applied with a button. Choosing
+  // Custom used to send the empty field straight to the backend, which
+  // refused it, so the field it gates never appeared and nobody starting
+  // from the defaults could ever enter servers. The dirty flag stops the
+  // status poll replacing what is being typed, which on the on-screen
+  // keyboard takes longer than one poll.
+  const [dnsCustomOpen, setDnsCustomOpen] = useState(false);
+  const dnsDirtyRef = useRef(false);
 
   // --- Update flow state ---
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
@@ -132,6 +203,7 @@ function Content() {
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
   const lastUpdateCheckAtRef = useRef<number>(0);
+  const statusSeqRef = useRef(0);
 
   const setBusy = useCallback((val: boolean) => {
     busyRef.current = val;
@@ -155,12 +227,30 @@ function Content() {
     // handler-driven refreshes (at the end of an op) force through so the UI
     // catches up immediately instead of waiting for the next interval tick.
     if (!force && busyRef.current) return;
+    // Status collection runs off the event loop on the backend, so a slow
+    // call can still be in flight when the next tick fires. Without a
+    // sequence check the older reply lands last and overwrites the newer
+    // one, which shows up as toggles and stats flicking back to stale
+    // values a second after they settled.
+    const seq = ++statusSeqRef.current;
     try {
       const s = await backend.getStatus();
+      if (seq !== statusSeqRef.current) return;
       setStatus(s);
       if (s.settings) {
-        if (s.settings.dns_provider === "custom") {
-          setCustomDnsInput(s.settings.dns_servers || "");
+        // Only adopt a stored value that exists. Turning DNS off clears
+        // dns_servers while leaving the provider on "custom", and copying
+        // that empty string back over the field every few seconds made the
+        // setting impossible to re-enable: the servers field is only
+        // rendered while DNS is on, and turning it on with an empty custom
+        // list is rejected. The backend also resets the provider when it
+        // clears the servers, so the pair cannot get stuck together.
+        if (
+          !dnsDirtyRef.current &&
+          s.settings.dns_provider === "custom" &&
+          s.settings.dns_servers
+        ) {
+          setCustomDnsInput(s.settings.dns_servers);
         }
       }
     } catch (e) {
@@ -177,10 +267,31 @@ function Content() {
 
   const beginBackendPoll = useCallback(() => {
     stopBackendPoll();
+    // One request at a time: an interval callback that outlasts the interval
+    // would otherwise stack, and a late one could clear busy in the middle
+    // of whatever the user started next.
+    let inFlight = false;
+    let failures = 0;
+    const giveUp = async (message: string) => {
+      stopBackendPoll();
+      setBackendSwitch(null);
+      setErrors((prev) => ({ ...prev, wifi_backend: message }));
+      await refreshStatus(true);
+      setBusy(false);
+    };
     backendPollRef.current = setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const s = await backend.getBackendSwitchStatus();
+        failures = 0;
         if (s.in_progress) {
+          // A worker stuck on a wedged driver never reports back. Release
+          // the panel rather than keep every control disabled forever.
+          if (s.started_at && Date.now() / 1000 - s.started_at > BACKEND_SWITCH_MAX_S) {
+            await giveUp("The backend switch is taking too long. Restart the Deck if WiFi does not come back.");
+            return;
+          }
           // Mid-switch: update so the subtitle can show the current phase.
           setBackendSwitch(s);
           return;
@@ -202,9 +313,15 @@ function Content() {
         setBackendSwitch(s);
         setBusy(false);
       } catch (e) {
-        stopBackendPoll();
-        setBusy(false);
         console.error("backend switch poll error", e);
+        // One failed call is not the switch failing; the worker carries on
+        // regardless. Only after several in a row is it lost.
+        failures += 1;
+        if (failures >= BACKEND_POLL_MAX_FAILURES) {
+          await giveUp("Lost track of the backend switch. Check WiFi, then try again.");
+        }
+      } finally {
+        inFlight = false;
       }
     }, BACKEND_POLL_INTERVAL);
   }, [refreshStatus, setBusy]);
@@ -276,13 +393,13 @@ function Content() {
   }, [status?.connected, runUpdateCheck]);
 
   // Safety timeout: if an update was initiated but plugin_loader hasn't killed
-  // us within 60s, the detached update script probably failed (network drop,
-  // tarball corruption, etc.). Revert the UI so the user isn't stuck staring
+  // us within the time the script allows itself, it probably failed (network
+  // drop, tarball corruption, etc.). Revert the UI so the user isn't stuck staring
   // at "Updating..." forever, and surface a message they can act on.
   useEffect(() => {
     if (!updating) return;
     const id = setTimeout(() => {
-      console.error("WiFi Optimizer: update didn't complete within 60s");
+      console.error("WiFi Optimizer: update didn't complete in time");
       setUpdating(false);
       setUpdateError(
         "Update didn't complete. Try again, or reinstall manually from Konsole."
@@ -327,20 +444,37 @@ function Content() {
   // ---- User action handlers ----
   //
   // Generic toggle handler used by every setter toggle (power_save, BSSID,
-  // auto_fix, buffer_tuning, band_preference, DNS, IPv6) and by the Force
-  // Reapply All button. Takes a key for error tracking and a backend fn.
-  const handleToggle = async (key: string, fn: () => Promise<MethodResult>) => {
-    if (busyRef.current) return;
+  // auto_fix, buffer_tuning, band_preference, DNS, IPv6). Takes a key for
+  // error tracking and a backend fn, and hands back the result.
+  const handleToggle = async (
+    key: string,
+    fn: () => Promise<MethodResult>,
+  ): Promise<MethodResult | undefined> => {
+    if (busyRef.current) return undefined;
     setBusy(true);
     setErrors((prev) => {
       const next = { ...prev };
       delete next[key];
       return next;
     });
+    setNotices((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
     setOptimizeResult(null);
 
+    let outcome: MethodResult | undefined;
     try {
       const result = await fn();
+      outcome = result;
+      // A setter can succeed and still have done something other than what
+      // was asked - locking to the access point you were already on because
+      // the stronger one would not take, say. Saying nothing there leaves the
+      // user with a toggle that flipped and no idea why the outcome differs.
+      if (result.success && result.message) {
+        setNotices((prev) => ({ ...prev, [key]: result.message as string }));
+      }
       if (!result.success) {
         const detail = result.detail ? ` (${result.detail})` : "";
         const msg = (result.message ?? ERROR_MESSAGES[result.error ?? ""] ?? "Unknown error") + detail;
@@ -350,6 +484,13 @@ function Content() {
       if (result.reconnected) {
         await new Promise((r) => setTimeout(r, RECONNECT_DELAY));
       }
+    } catch (e) {
+      // A call that throws (Decky restarting, the backend gone) used to
+      // surface as an unhandled rejection with the toggle silently unchanged.
+      setErrors((prev) => ({
+        ...prev,
+        [key]: `Couldn't reach the plugin's backend (${String(e)})`,
+      }));
     } finally {
       // Refresh before clearing busy so toggles/badges don't briefly flip to
       // stale pre-operation values in the interim render. Refresh runs even on
@@ -357,16 +498,22 @@ function Content() {
       await refreshStatus(true);
       setBusy(false);
     }
+    return outcome;
   };
 
-  const handleOptimize = async () => {
+  // Optimize Safe, the drift banner's Fix now and Force Reapply all run
+  // several setters and report per setting. Force Reapply used to go through
+  // the single-toggle handler, which dropped every per-setting failure and
+  // put its own errors under a key nothing displayed.
+  const runBatch = async (fn: () => Promise<OptimizeSafeResult>) => {
     if (busyRef.current) return;
     setBusy(true);
     setApplyingAll(true);
     setErrors({});
+    setNotices({});
     setOptimizeResult(null);
     try {
-      const result = await backend.optimizeSafe();
+      const result = await fn();
       setOptimizeResult(result);
       if (result.results) {
         const newErrors: Record<string, string> = {};
@@ -384,6 +531,10 @@ function Content() {
       }
     } catch (e) {
       console.error("optimize error", e);
+      setOptimizeResult({
+        success: false, total: 0, applied: 0, results: {},
+        message: "Something went wrong. Check the Decky log for details.",
+      });
     } finally {
       // Refresh before clearing applyingAll so button doesn't briefly flip to
       // "All good" from stale status. Refresh runs on errors too.
@@ -393,16 +544,28 @@ function Content() {
     }
   };
 
-  const handleForceReapply = () =>
-    handleToggle("reapply", () => backend.reapplyAll());
+  const handleOptimize = () => runBatch(() => backend.optimizeSafe());
+  const handleRepairDrift = () => runBatch(() => backend.repairDrifted());
+  const handleForceReapply = () => runBatch(() => backend.reapplyAll());
+
+  const handleAllowWpa2 = () =>
+    handleToggle("allow_wpa2", () => backend.allowWpa2());
 
   const handleResetSettings = async () => {
     if (busyRef.current) return;
     setBusy(true);
     setOptimizeResult(null);
     setErrors({});
+    setNotices({});
+    resetDnsDraft();
     try {
-      await backend.resetSettings();
+      const result = await backend.resetSettings();
+      if (!result.success) {
+        setErrors({ reset: result.message ?? "Couldn't reset settings." });
+      }
+    } catch (e) {
+      console.error("reset error", e);
+      setErrors({ reset: "Couldn't reset settings." });
     } finally {
       await refreshStatus(true);
       setBusy(false);
@@ -462,7 +625,13 @@ function Content() {
     setUpdateError(null);
     setUpdating(true);
     try {
-      await backend.applyUpdate();
+      const result = await backend.applyUpdate();
+      // Refused outright (no update after all, a backend switch running):
+      // say why now instead of showing "Updating..." for a minute.
+      if (!result.success) {
+        setUpdating(false);
+        setUpdateError(result.message ?? "Couldn't start the update.");
+      }
     } catch {
       // plugin_loader restart killed the connection; expected
     }
@@ -482,13 +651,45 @@ function Content() {
   };
 
   const handleChannelChange = async (nextChannel: string) => {
-    await backend.setUpdateChannel(nextChannel);
-    setUpdateInfo(null);
+    try {
+      const result = await backend.setUpdateChannel(nextChannel);
+      if (!result.success) {
+        setUpdateError(result.message ?? "Couldn't change the update channel.");
+        return;
+      }
+      setUpdateError(null);
+      setUpdateInfo(null);
+    } catch (e) {
+      console.error("set channel error", e);
+      setUpdateError("Couldn't change the update channel.");
+      return;
+    }
     await refreshStatus();
   };
 
-  // Don't render content until first status arrives (prevents disconnect flash)
-  if (!status) {
+  // Custom DNS draft handling
+  const resetDnsDraft = () => {
+    dnsDirtyRef.current = false;
+    setDnsCustomOpen(false);
+    setCustomDnsInput(
+      status?.settings?.dns_provider === "custom" ? status.settings.dns_servers : ""
+    );
+  };
+
+  const applyCustomDns = async () => {
+    const result = await handleToggle("dns", () =>
+      backend.setDns(true, "custom", customDnsInput.trim())
+    );
+    if (result?.success) {
+      dnsDirtyRef.current = false;
+      setDnsCustomOpen(false);
+    }
+  };
+
+  // Don't render content until first status arrives (prevents disconnect flash).
+  // A status marked initializing is the backend saying a collection is still
+  // running and it has nothing to report yet, which is the same situation.
+  if (!status || status.initializing) {
     return <PanelSection title="WiFi Optimizer" />;
   }
 
@@ -506,6 +707,10 @@ function Content() {
     !status?.drift?.power_save &&
     s?.bssid_lock_enabled &&
     !status?.drift?.bssid_lock &&
+    // The lock can be enabled but belong to a different network, in which
+    // case nothing has drifted and it is also doing nothing here. Without
+    // this, the panel reports all clear while one of the four is inert.
+    !status?.live?.bssid_lock_other_network &&
     status?.live?.dispatcher_installed &&
     status?.live?.buffer_tuning_applied &&
     !status?.drift?.buffer_tuning;
@@ -535,8 +740,10 @@ function Content() {
       {updateInfo?.update_available && !updating && (
         <PanelSection>
           <PanelSectionRow>
-            <ButtonItem layout="below" onClick={handleApplyUpdate}>
-              Update to v{updateInfo.latest_version}
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleApplyUpdate}>
+              {updateInfo.is_downgrade
+                ? `Go back to v${updateInfo.latest_version}`
+                : `Update to v${updateInfo.latest_version}`}
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
@@ -560,21 +767,96 @@ function Content() {
         </Banner>
       )}
 
+      {/* Several saved copies of this network, disagreeing about security.
+          The old wording here told people to forget the network and rejoin.
+          That throws away their settings and gambles on which security the
+          new copy gets, when the actual problem is only that the copies rank
+          equally. Say what was done instead, and how to choose the other. */}
+      {status?.external?.duplicate_profiles && (
+        <Banner variant="warning" icon="⚠">
+          This network is saved more than once with different security
+          settings. Which copy is used decides which access points can be
+          reached, so the connection can look inconsistent. The copy in use
+          has been given priority, so the choice stays the same from now on.
+          To use the other one instead, connect with it once and it takes
+          priority.
+        </Banner>
+      )}
+
+      {/* The router handed out an address another device already holds. WiFi
+          reads as connected while nothing works, and without this the plugin
+          is the obvious suspect. */}
+      {status?.address_conflict && (
+        <Banner variant="warning" icon="⚠">
+          Another device on your network is using the same address as the Deck
+          ({status.address_conflict.ip}), so the connection may not work. That's
+          the router, not a WiFi setting. Restarting the router usually fixes it.
+        </Banner>
+      )}
+
+      {/* The saved security is shutting the device out of a stronger access
+          point on the same network. Without this the only symptom is the
+          Deck preferring a distant access point for no visible reason. */}
+      {status?.wpa2_only_stronger && (
+        <Banner variant="info">
+          A stronger access point on this network (signal{" "}
+          {status.wpa2_only_stronger.signal} vs{" "}
+          {status.wpa2_only_stronger.current_signal}) only offers WPA2, and this
+          network is saved as WPA3-only, so the Deck can't use it. Access points
+          that offer WPA3 keep using it. Only allow this if that access point
+          is yours: anyone nearby can broadcast your network's name.
+          {errors.allow_wpa2 && (
+            <div style={{ color: theme.error.text }}>{errors.allow_wpa2}</div>
+          )}
+        </Banner>
+      )}
+      {/* A real button, so it can be reached with the D-pad. */}
+      {status?.wpa2_only_stronger && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleAllowWpa2}>
+              Allow WPA2 here
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+
+      {/* A setting we wrote was the likely reason the device could not
+          connect, so it was released. Worth stating plainly: nothing the user
+          did caused it, and the preference is not lost. */}
+      {status?.external?.pin_released && (
+        <Banner variant="warning" icon="⚠">
+          WiFi could not connect for a while, so the locked access point or
+          band preference was released to let it reconnect. The setting is
+          still on and applies again to whichever access point works.
+        </Banner>
+      )}
+
       {/* Drift alert */}
       {connected && !!s?.last_applied && driftCount > 0 && (
         <Banner variant="warning" icon="⚠">
-          {driftCount} setting{driftCount > 1 ? "s" : ""} drifted after wake.{" "}
-          <span
-            style={{ textDecoration: "underline", cursor: "pointer" }}
-            onClick={handleOptimize}
-          >
-            Fix now
-          </span>
+          {driftCount} setting{driftCount > 1 ? "s" : ""} drifted after wake.
+        </Banner>
+      )}
+      {connected && !!s?.last_applied && driftCount > 0 && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleRepairDrift}>
+              Fix now
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+
+      {/* Status read failed - say so rather than claiming disconnection */}
+      {status?.success === false && (
+        <Banner variant="error" icon="⚠">
+          {status?.message ?? "Couldn't read WiFi status."}
         </Banner>
       )}
 
       {/* Disconnected banner */}
-      {!connected && (
+      {status?.success !== false && !connected && (
         <Banner variant="error" icon="✕">
           Not connected to WiFi. Connect first, then optimize.
         </Banner>
@@ -605,17 +887,32 @@ function Content() {
       })()}
 
       {/* Optimize result banner */}
-      {optimizeResult && (
-        <Banner
-          variant={
-            optimizeResult.applied === optimizeResult.total ? "success" : "warning"
-          }
-        >
-          {optimizeResult.applied === optimizeResult.total
-            ? "All applied"
-            : `${optimizeResult.applied}/${optimizeResult.total} applied`}
-        </Banner>
-      )}
+      {optimizeResult && (() => {
+        // A failure has no counts at all, and undefined === undefined made
+        // it read as "All applied".
+        if (optimizeResult.success === false) {
+          return (
+            <Banner variant="error" icon="⚠">
+              {optimizeResult.message ?? "Something went wrong."}
+            </Banner>
+          );
+        }
+        if (!optimizeResult.total) {
+          return (
+            <Banner variant="info">
+              {optimizeResult.message ?? "Nothing to apply."}
+            </Banner>
+          );
+        }
+        const all = optimizeResult.applied === optimizeResult.total;
+        return (
+          <Banner variant={all ? "success" : "warning"}>
+            {all
+              ? "All applied"
+              : `${optimizeResult.applied}/${optimizeResult.total} applied`}
+          </Banner>
+        );
+      })()}
 
       {/* Optimize button */}
       <PanelSection>
@@ -642,7 +939,7 @@ function Content() {
           explanation="The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
           {...getBadge("power_save", status, errors.power_save ?? null)}
           checked={s?.power_save_disabled ?? false}
-          disabled={isBusy}
+          disabled={isBusy || updating}
           error={errors.power_save}
           onChange={(val: boolean) =>
             handleToggle("power_save", () => backend.setPowerSave(val))
@@ -652,10 +949,20 @@ function Content() {
           label="Stop background scanning"
           subtitle="Locks to current AP - disable to switch networks or roam"
           explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
-          {...getBadge("bssid_lock", status, errors.bssid_lock ?? null)}
+          {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
+            ? { badge: "unknown" as const, text: "other network" }
+            : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
           checked={s?.bssid_lock_enabled ?? false}
-          disabled={isBusy || (!connected && !s?.bssid_lock_enabled)}
+          disabled={isBusy || updating || (!connected && !s?.bssid_lock_enabled)}
           error={errors.bssid_lock}
+          notice={
+            notices.bssid_lock ??
+            (status?.live?.pins_inactive_iwd && s?.bssid_lock_enabled
+              ? IWD_PIN_NOTICE
+              : status?.external?.bssid_lock
+              ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
+              : undefined)
+          }
           onChange={(val: boolean) =>
             handleToggle("bssid_lock", () => backend.setBssidLock(val))
           }
@@ -666,7 +973,7 @@ function Content() {
           explanation="The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
           {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
-          disabled={isBusy}
+          disabled={isBusy || updating}
           error={errors.auto_fix}
           onChange={(val: boolean) =>
             handleToggle("auto_fix", () => backend.setAutoFix(val))
@@ -678,7 +985,7 @@ function Content() {
           explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
           {...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null)}
           checked={s?.buffer_tuning_enabled ?? false}
-          disabled={isBusy}
+          disabled={isBusy || updating}
           error={errors.buffer_tuning}
           onChange={(val: boolean) =>
             handleToggle("buffer_tuning", () => backend.setBufferTuning(val))
@@ -688,18 +995,69 @@ function Content() {
 
       {/* Advanced */}
       <PanelSection title="Advanced">
+        {/* A radio that carries its own regulatory domain ignores this
+            setting entirely. Offering a control that cannot do anything is
+            worse than offering none, so the two cases render differently:
+            a selector where it works, an explanation where it does not. */}
+        {regdomain?.readable && regdomain.changeable && (
+          <PanelSectionRow>
+            <DropdownItem
+              label="WiFi region"
+              description="Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely."
+              rgOptions={REGION_OPTIONS}
+              selectedOption={regdomain.setting || regdomain.governing || "00"}
+              disabled={isBusy || updating}
+              onChange={(option: { data: string }) => {
+                void handleToggle("regdomain", () =>
+                  backend.setRegdomain(option.data)
+                ).then(refreshRegdomain);
+              }}
+            />
+          </PanelSectionRow>
+        )}
+        {(errors.regdomain || notices.regdomain) && (
+          <PanelSectionRow>
+            <div
+              style={{
+                fontSize: theme.fontSize.tiny,
+                color: errors.regdomain ? theme.error.text : theme.text.tertiary,
+              }}
+            >
+              {errors.regdomain ?? notices.regdomain}
+            </div>
+          </PanelSectionRow>
+        )}
+        {regdomain?.readable && !regdomain.changeable && (
+          <PanelSectionRow>
+            <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
+              WiFi region: {regdomain.governing || "unknown"}. This device's
+              WiFi card sets its own region, so it cannot be changed here. That
+              is normal on the Steam Deck and does not mean a band is missing.
+            </div>
+          </PanelSectionRow>
+        )}
         <InfoRow
-          label={supports6GHz ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band"}
+          label="Force 5 GHz band"
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz${
-            supports6GHz ? " or 6 GHz" : ""
-          } for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`}
+          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.${
+            supports6GHz
+              ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
+              : ""
+          }`}
           {...getBadge("band_preference", status, errors.band_preference ?? null)}
           checked={s?.band_preference_enabled ?? false}
-          disabled={isBusy || (!connected && !s?.band_preference_enabled)}
+          disabled={isBusy || updating || (!connected && !s?.band_preference_enabled)}
           error={errors.band_preference}
+          notice={
+            notices.band_preference ??
+            (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
+              ? IWD_PIN_NOTICE
+              : status?.external?.band
+              ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
+              : undefined)
+          }
           onChange={(val: boolean) =>
             handleToggle("band_preference", () =>
               backend.setBandPreference(val, s?.band_preference ?? "a")
@@ -712,13 +1070,14 @@ function Content() {
           explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
           {...getBadge(undefined, status, errors.dns ?? null)}
           checked={s?.dns_enabled ?? false}
-          disabled={isBusy || (!connected && !s?.dns_enabled)}
+          disabled={isBusy || updating || (!connected && !s?.dns_enabled)}
           error={errors.dns}
-          onChange={(val: boolean) =>
+          onChange={(val: boolean) => {
+            if (!val) resetDnsDraft();
             handleToggle("dns", () =>
               backend.setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput)
-            )
-          }
+            );
+          }}
         >
           {s?.dns_enabled && (
             <>
@@ -726,32 +1085,59 @@ function Content() {
                 <DropdownItem
                   label="DNS Provider"
                   rgOptions={DNS_OPTIONS}
-                  selectedOption={s?.dns_provider ?? "cloudflare"}
+                  selectedOption={dnsCustomOpen ? "custom" : s?.dns_provider ?? "cloudflare"}
+                  disabled={isBusy || updating}
                   onChange={(option: { data: string }) => {
-                    const custom = option.data === "custom" ? customDnsInput : "";
+                    if (option.data === "custom") {
+                      // Open the editor; nothing is sent until Apply.
+                      setDnsCustomOpen(true);
+                      return;
+                    }
+                    resetDnsDraft();
                     handleToggle("dns", () =>
-                      backend.setDns(true, option.data, custom)
+                      backend.setDns(true, option.data, "")
                     );
                   }}
                 />
               </PanelSectionRow>
-              {s?.dns_provider === "custom" && (
-                <PanelSectionRow>
-                  <TextField
-                    label="DNS servers (space-separated)"
-                    value={customDnsInput}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                      setCustomDnsInput(e.target.value)
-                    }
-                    onBlur={() => {
-                      if (customDnsInput) {
-                        handleToggle("dns", () =>
-                          backend.setDns(true, "custom", customDnsInput)
-                        );
-                      }
-                    }}
-                  />
-                </PanelSectionRow>
+              {(dnsCustomOpen || s?.dns_provider === "custom") && (
+                <>
+                  {/* No submit on blur: moving focus with the D-pad blurs
+                      the field, and each submit reconnects WiFi. */}
+                  <PanelSectionRow>
+                    <TextField
+                      label="DNS servers (space-separated)"
+                      value={customDnsInput}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                        dnsDirtyRef.current = true;
+                        setCustomDnsInput(e.target.value);
+                      }}
+                    />
+                  </PanelSectionRow>
+                  {(dnsCustomOpen ||
+                    customDnsInput.trim() !== (s?.dns_servers ?? "")) && (
+                    <>
+                      <PanelSectionRow>
+                        <ButtonItem
+                          layout="below"
+                          disabled={isBusy || updating || !customDnsInput.trim()}
+                          onClick={applyCustomDns}
+                        >
+                          Apply DNS servers
+                        </ButtonItem>
+                      </PanelSectionRow>
+                      <PanelSectionRow>
+                        <ButtonItem
+                          layout="below"
+                          disabled={isBusy || updating}
+                          onClick={resetDnsDraft}
+                        >
+                          Cancel
+                        </ButtonItem>
+                      </PanelSectionRow>
+                    </>
+                  )}
+                </>
               )}
             </>
           )}
@@ -761,8 +1147,16 @@ function Content() {
           subtitle="Use IPv4 only on this network"
           explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine."
           {...getBadge("ipv6", status, errors.ipv6 ?? null)}
+          notice={
+            notices.ipv6 ??
+            (status?.external?.ipv6
+              ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
+              : status?.live?.ipv6_other_network
+                ? "On for the network it was turned on for, not this one."
+                : undefined)
+          }
           checked={s?.ipv6_disabled ?? false}
-          disabled={isBusy || (!connected && !s?.ipv6_disabled)}
+          disabled={isBusy || updating || (!connected && !s?.ipv6_disabled)}
           error={errors.ipv6}
           onChange={(val: boolean) =>
             handleToggle("ipv6", () => backend.setIpv6(val))
@@ -771,10 +1165,10 @@ function Content() {
         <InfoRow
           label="Traffic shaping (CAKE)"
           subtitle="Fair queuing and bufferbloat prevention"
-          explanation="Replaces the default network queue with CAKE, which isolates traffic flows so a background download or another device can't starve your game stream. Also filters redundant TCP acknowledgments and prioritizes latency-sensitive packets. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
+          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
           {...getBadge("cake", status, errors.cake ?? null)}
           checked={s?.cake_enabled ?? false}
-          disabled={isBusy || (!connected && !s?.cake_enabled)}
+          disabled={isBusy || updating || (!connected && !s?.cake_enabled)}
           error={errors.cake}
           onChange={(val: boolean) =>
             handleToggle("cake", () => backend.setCake(val))
@@ -785,7 +1179,7 @@ function Content() {
             status={status}
             backendSwitch={backendSwitch}
             error={errors.wifi_backend}
-            isBusy={isBusy}
+            isBusy={isBusy || updating}
             onToggle={handleBackendToggle}
           />
         )}
@@ -810,6 +1204,7 @@ function Content() {
         isBusy={isBusy}
         onForceReapply={handleForceReapply}
         onReset={handleResetSettings}
+        resetError={errors.reset}
       />
 
       <UpdatesSection
@@ -821,6 +1216,7 @@ function Content() {
         onChannelChange={handleChannelChange}
         onApply={handleApplyUpdate}
         onCheck={handleCheckForUpdate}
+        busy={isBusy}
       />
 
       <PanelFooter version={status?.version ?? "?"} />
@@ -830,14 +1226,20 @@ function Content() {
 
 export default definePlugin(() => {
   let gameLifetimeUnsub: { unregister(): void } | null = null;
+  // A launch just before the plugin is unloaded still had its delayed
+  // reapply pending, which then called into a backend being torn down.
+  let disposed = false;
+  const timers = new Set<ReturnType<typeof setTimeout>>();
 
   try {
     gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications(
       (notification: { bRunning: boolean }) => {
-        if (notification.bRunning) {
-          setTimeout(() => {
-            backend.reapplyVolatile().catch(() => {});
+        if (notification.bRunning && !disposed) {
+          const id = setTimeout(() => {
+            timers.delete(id);
+            if (!disposed) backend.reapplyVolatile().catch(() => {});
           }, 3000);
+          timers.add(id);
         }
       },
     );
@@ -855,6 +1257,9 @@ export default definePlugin(() => {
     ),
     icon: <FaWifi />,
     onDismount() {
+      disposed = true;
+      timers.forEach((id) => clearTimeout(id));
+      timers.clear();
       gameLifetimeUnsub?.unregister();
     },
   };

@@ -1,6 +1,6 @@
 {
   "name": "wifi-optimizer",
-  "version": "0.11.7",
+  "version": "0.18.5-beta",
   "description": "WiFi optimizer for game streaming on Steam Deck and PC handhelds",
   "type": "module",
   "scripts": {
@@ -25,6 +25,10 @@
   "pnpm": {
     "peerDependencyRules": {
       "ignoreMissing": ["react", "react-dom"]
+    },
+    "overrides": {
+      "brace-expansion@^1": "^1.1.21",
+      "brace-expansion@^2": "^2.1.7"
     }
   }
 }

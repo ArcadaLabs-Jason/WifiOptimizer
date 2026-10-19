@@ -6,6 +6,7 @@ import type {
   UpdateCheckResult,
   BackendSwitchStartResult,
   BackendSwitchStatus,
+  RegdomainInfo,
 } from "./types";
 
 export const getStatus = callable<[], PluginStatus>("get_status");
@@ -19,12 +20,16 @@ export const setBufferTuning = callable<[enabled: boolean], MethodResult>("set_b
 export const setCake = callable<[enabled: boolean], MethodResult>("set_cake");
 export const optimizeSafe = callable<[], OptimizeSafeResult>("optimize_safe");
 export const reapplyAll = callable<[], OptimizeSafeResult>("reapply_all");
+export const repairDrifted = callable<[], OptimizeSafeResult>("repair_drifted");
 export const reapplyVolatile = callable<[], MethodResult>("reapply_volatile");
+export const allowWpa2 = callable<[], MethodResult>("allow_wpa2");
 export const resetSettings = callable<[], MethodResult>("reset_settings");
 export const setUpdateChannel = callable<[channel: string], MethodResult>("set_update_channel");
 export const checkForUpdate = callable<[], UpdateCheckResult>("check_for_update");
 export const applyUpdate = callable<[], MethodResult>("apply_update");
 export const startBackendSwitch = callable<[backend: string], BackendSwitchStartResult>("start_backend_switch");
 export const getBackendSwitchStatus = callable<[], BackendSwitchStatus>("get_backend_switch_status");
+export const getRegdomain = callable<[], RegdomainInfo>("get_regdomain");
+export const setRegdomain = callable<[country: string], MethodResult>("set_regdomain");
 export const getDiagnosticInfo = callable<[], Record<string, unknown>>("get_diagnostic_info");
 export const saveDiagnosticInfo = callable<[], Record<string, unknown>>("save_diagnostic_info");

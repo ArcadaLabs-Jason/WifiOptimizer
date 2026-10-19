@@ -13,6 +13,9 @@ interface InfoRowProps {
   checked: boolean;
   disabled?: boolean;
   error?: string | null;
+  // Something worth saying that is not a failure - a setter that did
+  // something other than exactly what was asked, and succeeded.
+  notice?: string | null;
   onChange: (val: boolean) => void;
   children?: React.ReactNode;
 }
@@ -26,6 +29,7 @@ export function InfoRow({
   checked,
   disabled = false,
   error,
+  notice,
   onChange,
   children,
 }: InfoRowProps) {
@@ -78,6 +82,10 @@ export function InfoRow({
               )}
               {error ? (
                 <span style={{ color: theme.error.text }}>{error}</span>
+              ) : notice ? (
+                <span style={{ color: theme.info.text, fontSize: theme.fontSize.small }}>
+                  {notice}
+                </span>
               ) : (
                 <span style={{ color: theme.text.subtitle, fontSize: theme.fontSize.small }}>
                   {subtitle}

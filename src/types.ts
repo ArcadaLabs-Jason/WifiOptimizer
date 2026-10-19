@@ -34,6 +34,9 @@ export interface LiveStatus {
   channel?: string;
   connected_bssid?: string;
   bssid_lock?: string;
+  bssid_lock_other_network?: boolean;
+  /** IPv6 is turned off for a different network, not this one. */
+  ipv6_other_network?: boolean;
   ip_address?: string;
   dns?: string;
   ipv6_method?: string;
@@ -43,17 +46,28 @@ export interface LiveStatus {
   dispatcher_installed?: boolean;
   last_enforced?: number;
   wifi_backend?: string;
+  pins_inactive_iwd?: boolean;
   backend_tool_available?: boolean;
 }
 
 export interface PluginStatus {
   success: boolean;
   connected: boolean;
+  /** First collection has not finished; connected is not yet meaningful. */
+  initializing?: boolean;
   support_tier: number;
   version?: string;
   settings: PluginSettings;
   live: LiveStatus;
   drift: Record<string, boolean>;
+  // Settings this plugin did not make, found on the connection. Distinct
+  // from drift, which is our own setting no longer holding.
+  external?: Record<string, boolean>;
+  // A stronger access point of this network that only offers WPA2, while the
+  // profile is saved as WPA3-only and so cannot use it. Signals are 0-100.
+  wpa2_only_stronger?: { signal: number; current_signal: number };
+  // NetworkManager saw another device on the network holding our address.
+  address_conflict?: { ip: string; other: string };
   last_applied?: number;
   error?: string;
   message?: string;
@@ -116,6 +130,7 @@ export interface UpdateCheckResult {
   current_version?: string;
   latest_version?: string;
   update_available?: boolean;
+  is_downgrade?: boolean;
   channel?: string;
   release_url?: string;
   error?: string;
@@ -133,3 +148,22 @@ export const ERROR_MESSAGES: Record<string, string> = {
   parse_error: "Settings were reset to defaults.",
   unexpected: "Something went wrong. Check the Decky log for details.",
 };
+
+export interface RegdomainPhy {
+  phy: string;
+  self_managed: boolean;
+  country: string;
+}
+
+export interface RegdomainInfo extends MethodResult {
+  readable: boolean;
+  // False when the radio carries its own regulatory domain, in which case
+  // changing this setting is cosmetic and the panel must say so rather than
+  // offering a control that does nothing.
+  changeable: boolean;
+  self_managed: boolean;
+  global: string;
+  governing: string;
+  phys: RegdomainPhy[];
+  setting: string;
+}

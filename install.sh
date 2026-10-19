@@ -32,7 +32,12 @@ fi
 
 # Fetch latest release tag from GitHub
 echo "Checking for latest release..."
-LATEST_TAG=$(curl -sL "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+LATEST_TAG=$(curl -sL --proto '=https' --connect-timeout 15 --max-time 60 "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+# Only a plain version tag goes into the download URL and the folder name.
+case "$LATEST_TAG" in
+    v[0-9]*) case "$LATEST_TAG" in *[!A-Za-z0-9.-]*) LATEST_TAG="" ;; esac ;;
+    *) LATEST_TAG="" ;;
+esac
 
 if [ -z "$LATEST_TAG" ]; then
     echo "Warning: Couldn't fetch latest release, falling back to main branch"
@@ -45,9 +50,14 @@ else
 fi
 
 TMP_DIR=$(mktemp -d)
+# Staging and the previous copy live beside the plugins folder, not in it:
+# Decky loads every folder there that has a plugin.json. Same filesystem, so
+# each move below is a rename rather than a copy.
+STAGE_DIR="$USER_HOME/homebrew/.wifi-optimizer-stage"
+OLD_DIR="$USER_HOME/homebrew/.wifi-optimizer-previous"
 
 cleanup() {
-    rm -rf "$TMP_DIR"
+    rm -rf "$TMP_DIR" "$STAGE_DIR"
 }
 trap cleanup EXIT
 
@@ -55,38 +65,53 @@ echo "Installing $PLUGIN_NAME..."
 
 # Download and extract
 echo "Downloading..."
-curl -sL "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz"
+curl -sSL --fail --proto '=https' --connect-timeout 15 --max-time 300 "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz"
 tar xzf "$TMP_DIR/plugin.tar.gz" -C "$TMP_DIR"
 
 SRC="$TMP_DIR/$DIR_NAME"
-if [ ! -f "$SRC/plugin.json" ]; then
-    echo "Error: Download failed or repo structure changed."
-    exit 1
-fi
+for f in plugin.json package.json main.py decky.pyi dist/index.js defaults/dispatcher.sh.tmpl; do
+    if [ ! -f "$SRC/$f" ]; then
+        echo "Error: Download failed or repo structure changed (missing $f)."
+        exit 1
+    fi
+done
+
+# Build the new copy completely before touching the installed one, so a
+# failure part way (a full disk, a closed terminal) leaves it working.
+rm -rf "$STAGE_DIR"
+mkdir -p "$STAGE_DIR/dist" "$STAGE_DIR/defaults" "$STAGE_DIR/py_modules"
+cp "$SRC/plugin.json" "$SRC/package.json" "$SRC/main.py" "$SRC/decky.pyi" "$STAGE_DIR/"
+cp "$SRC/dist/index.js" "$STAGE_DIR/dist/"
+cp "$SRC/dist/index.js.map" "$STAGE_DIR/dist/" 2>/dev/null || true
+cp "$SRC/defaults/dispatcher.sh.tmpl" "$STAGE_DIR/defaults/"
+touch "$STAGE_DIR/py_modules/.keep"
 
 # Install
 if [ -d "$PLUGIN_DIR" ]; then
     echo "Upgrading existing installation..."
     UPGRADING=true
+    rm -rf "$OLD_DIR"
+    mv "$PLUGIN_DIR" "$OLD_DIR"
 else
     echo "Installing to $PLUGIN_DIR..."
     UPGRADING=false
 fi
-rm -rf "$PLUGIN_DIR"
-mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults" "$PLUGIN_DIR/py_modules"
-
-cp "$SRC/plugin.json" "$PLUGIN_DIR/"
-cp "$SRC/package.json" "$PLUGIN_DIR/"
-cp "$SRC/main.py" "$PLUGIN_DIR/"
-cp "$SRC/decky.pyi" "$PLUGIN_DIR/"
-cp "$SRC/dist/index.js" "$PLUGIN_DIR/dist/"
-cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
-cp "$SRC/defaults/dispatcher.sh.tmpl" "$PLUGIN_DIR/defaults/"
-touch "$PLUGIN_DIR/py_modules/.keep"
+if ! mv "$STAGE_DIR" "$PLUGIN_DIR"; then
+    echo "Error: Couldn't move the new version into place."
+    if [ "$UPGRADING" = true ]; then
+        mv "$OLD_DIR" "$PLUGIN_DIR" && echo "The previous version was put back."
+    fi
+    exit 1
+fi
+rm -rf "$OLD_DIR"
 
 # Restart Decky
 echo "Restarting Decky Loader..."
-systemctl restart plugin_loader 2>/dev/null || true
+if ! systemctl restart plugin_loader; then
+    echo ""
+    echo "Installed, but Decky Loader did not restart. Restart the Deck to load it."
+    exit 1
+fi
 
 echo ""
 if [ "$UPGRADING" = true ]; then
