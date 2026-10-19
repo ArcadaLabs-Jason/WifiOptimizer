@@ -202,18 +202,17 @@ class Plugin:
 
     # ---- Helpers ----
 
-    def _run_cmd(self, cmd: list[str], timeout: int = 5, clean_env: bool = False) -> dict:
+    def _run_cmd(self, cmd: list[str], timeout: int = 5, clean_env: bool = True) -> dict:
         """Run a subprocess and return a result dict.
 
-        clean_env strips LD_LIBRARY_PATH so children use system libraries
-        instead of Decky's PyInstaller-bundled ones. Required for curl
-        (OpenSSL mismatch) and bash (readline symbol mismatch); without it,
-        those binaries fail with cryptic symbol-lookup errors.
+        Every child gets LD_LIBRARY_PATH stripped so it uses the system's
+        libraries instead of the ones bundled inside Decky. This used to be
+        opt-in for curl and bash, but Decky 3.3.0 bundles a libtinfo that
+        needs a newer glibc than SteamOS ships, which breaks nmcli and with it
+        nearly everything here. clean_env is kept so callers need no change.
         """
         try:
-            env = None
-            if clean_env:
-                env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+            env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout, env=env
             )
