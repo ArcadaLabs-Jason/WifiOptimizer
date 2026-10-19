@@ -177,6 +177,93 @@ for product, family in [("Claw A1M", "msi_claw"), ("AYANEO 2S", "ayaneo"),
                m.DMI_DEVICES.get(product, {}).get("family"))
     ok(hit == family, f"product name {product!r} is recognised as {family}")
 
+section("reach: a stronger access point the saved security cannot use")
+WU = "aa0fd3f5-5fba-4291-8cf0-3b38838338d3"
+JASONS_ROOM = [  # measured on a Deck: the office radio is WPA2 only
+    ("D8:07:B6:90:C7:D1", 100, 5180, "WPA2"),
+    ("D8:07:B6:90:C7:D0", 100, 2462, "WPA2"),
+    ("62:E9:31:0D:23:5F", 62, 5220, "WPA2 WPA3"),
+    ("62:E9:31:0D:1F:E7", 52, 5745, "WPA2 WPA3"),
+]
+class Reach(m.Plugin):
+    def __init__(self, km, aps):
+        super().__init__(); self.km = km; self.aps = aps
+    def _profile_key_mgmt(self, uuid): return self.km
+    def _visible_access_points(self, iface, ssid, rescan=False): return list(self.aps)
+
+r = Reach("sae", JASONS_ROOM)
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+ok(r._wpa2_blocked == {"signal": 100, "current_signal": 52},
+   "WPA3-only profile, WPA2-only radio far stronger: reported with both signals")
+r = Reach("wpa-psk", JASONS_ROOM)
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+ok(r._wpa2_blocked is None, "a profile that already allows WPA2 has nothing to report")
+r = Reach("sae", [("D8:07:B6:90:C7:D1", 60, 5180, "WPA2"),
+                  ("62:E9:31:0D:1F:E7", 52, 5745, "WPA2 WPA3")])
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+ok(r._wpa2_blocked is None, "inside the lock's margin, a WPA2-only radio is not worth a notice")
+r = Reach("sae", [("62:E9:31:0D:1F:E7", 52, 5745, "WPA2 WPA3"),
+                  ("AA:AA:AA:AA:AA:AA", 100, 5180, "WPA3")])
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+ok(r._wpa2_blocked is None, "a stronger radio the profile CAN join is the lock's business, not this")
+r = Reach("sae", [("AA:AA:AA:AA:AA:AA", 100, 5180, "")])
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+ok(r._wpa2_blocked is None, "an open radio of the same name is never suggested")
+r = Reach("sae", JASONS_ROOM)
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+r.aps = []
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+ok(r._wpa2_blocked is not None, "throttled: a second poll within the window reuses the finding")
+r._reach_checked_at = 0.0
+r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
+ok(r._wpa2_blocked is None, "and past it the finding is re-read, so it clears when the radio goes")
+
+class Allow(m.Plugin):
+    """Profile security as NetworkManager holds it, and whether a reconnect takes."""
+    def __init__(self, km="sae", connects=True, lock=False):
+        super().__init__(); self.km = km; self.connects = connects
+        self.writes = []; self.lock_calls = 0
+        m._save_settings({"bssid_lock_enabled": lock})
+    def _resolve_uuid(self, msg=None): return WU, None
+    def _profile_key_mgmt(self, uuid): return self.km
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.writes.append((key, value)); self.km = value
+        return {"success": True, "stdout": "", "stderr": "", "returncode": 0}
+    def _hard_reconnect(self, uuid=None): return True
+    def _get_active_connection_uuid(self):
+        return WU if (self.connects or self.km == "sae") else None
+    async def set_bssid_lock(self, enabled):
+        self.lock_calls += 1; return {"success": True}
+
+_real_sleep = asyncio.sleep
+async def _no_sleep(*_a, **_k): return None
+asyncio.sleep = _no_sleep
+try:
+    a = Allow()
+    res = asyncio.run(a.allow_wpa2())
+    ok(res.get("success") and a.writes == [("802-11-wireless-security.key-mgmt", "wpa-psk")],
+       "allowing WPA2 writes wpa-psk, which NetworkManager offers as WPA2 and WPA3")
+    ok(a.lock_calls == 0, "with the lock off, nothing else is touched")
+    ok(getattr(a, "_profile_change_depth", 0) == 0, "and the in-flight count is released")
+
+    a = Allow(lock=True)
+    asyncio.run(a.allow_wpa2())
+    ok(a.lock_calls == 1, "with the lock on, it chooses again now the stronger radio is eligible")
+
+    a = Allow(connects=False)
+    res = asyncio.run(a.allow_wpa2())
+    ok(not res.get("success") and a.km == "sae",
+       "if the profile will not come back, it is put back to WPA3 only")
+    ok(a.writes[-1] == ("802-11-wireless-security.key-mgmt", "sae"),
+       "by writing sae back, not by leaving it half-changed")
+
+    a = Allow(km="wpa-psk")
+    res = asyncio.run(a.allow_wpa2())
+    ok(not res.get("success") and res.get("error") == "not_needed" and not a.writes,
+       "a profile that already allows WPA2 is not rewritten")
+finally:
+    asyncio.sleep = _real_sleep
+
 section("security: version validation")
 for v, good in [("0.12.0",True),("0.12.0-beta",True),("1.2.3.4",True),
                 ("0.12.0; rm -rf /",False),("$(id)",False),("`id`",False),("v1.0",False)]:

@@ -60,6 +60,9 @@ export interface PluginStatus {
   // Settings this plugin did not make, found on the connection. Distinct
   // from drift, which is our own setting no longer holding.
   external?: Record<string, boolean>;
+  // A stronger access point of this network that only offers WPA2, while the
+  // profile is saved as WPA3-only and so cannot use it. Signals are 0-100.
+  wpa2_only_stronger?: { signal: number; current_signal: number };
   last_applied?: number;
   error?: string;
   message?: string;

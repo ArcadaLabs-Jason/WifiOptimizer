@@ -3008,6 +3008,110 @@ class Plugin:
         ):
             status["external"]["ipv6"] = True
 
+    def _recheck_security_reach(self, uuid: str, iface: str, ssid: str,
+                                current_bssid: str):
+        """Notice a stronger access point the saved security cannot use.
+
+        A profile saved as WPA3-only cannot join an access point of the same
+        network that only offers WPA2, however close it is. That is common
+        when an older router or an extender sits alongside a newer mesh, and
+        it looks to the user like the Deck preferring the far access point
+        for no reason. Measured on a Deck: the office radio at -33 dBm, WPA2
+        only, never chosen; the mesh node across the house at -74 always.
+
+        Reported only past the same margin the lock uses to move, so a
+        roughly equal access point is not worth a notice. Reads nmcli's
+        cached scan on the duplicate check's throttle, so it adds no scans.
+        """
+        now = time.monotonic()
+        if (
+            now - getattr(self, "_reach_checked_at", 0.0)
+            <= self._DUPLICATE_CHECK_SECONDS
+            and getattr(self, "_reach_checked_for", None) == uuid
+        ):
+            return
+        self._reach_checked_at = now
+        self._reach_checked_for = uuid
+        self._wpa2_blocked = None
+        if self._profile_key_mgmt(uuid) != "sae" or not ssid:
+            return
+        aps = self._visible_access_points(iface, ssid)
+        blocked = [
+            ap for ap in aps
+            if not self._ap_accepts(ap[3], "sae")
+            and self._ap_accepts(ap[3], "wpa-psk")
+        ]
+        usable = [ap for ap in aps if self._ap_accepts(ap[3], "sae")]
+        here = next(
+            (ap[1] for ap in usable if ap[0] == current_bssid.upper()),
+            usable[0][1] if usable else None,
+        )
+        if not blocked or here is None:
+            return
+        if blocked[0][1] - here >= self._AP_UPGRADE_MARGIN:
+            self._wpa2_blocked = {"signal": blocked[0][1], "current_signal": here}
+
+    async def allow_wpa2(self) -> dict:
+        """Let a WPA3-only profile use the WPA2-only access points of its network.
+
+        NetworkManager's wpa-psk key management offers WPA2 and WPA3 alike,
+        and the supplicant still chooses WPA3 wherever an access point offers
+        it, so this only widens what can be joined. If the profile cannot
+        connect afterwards it is put back as it was.
+        """
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
+        try:
+            uuid, err = self._resolve_uuid("Connect to WiFi first")
+            if err:
+                return err
+            if self._profile_key_mgmt(uuid) != "sae":
+                return {"success": False, "error": "not_needed",
+                        "message": "This network already allows WPA2."}
+            done = self._nmcli_modify(
+                uuid, "802-11-wireless-security.key-mgmt", "wpa-psk"
+            )
+            if not done["success"]:
+                return {"success": False, "error": "nmcli_failed",
+                        "message": "Couldn't change the network's security",
+                        "detail": done["stderr"]}
+            if not await self._reconnected_to(uuid):
+                self._nmcli_modify(uuid, "802-11-wireless-security.key-mgmt", "sae")
+                await self._reconnected_to(uuid)
+                decky.logger.error(
+                    f"Allowing WPA2 on {uuid} did not reconnect; put back to WPA3 only"
+                )
+                return {"success": False, "error": "reconnect_failed",
+                        "message": "Couldn't reconnect, so the network was left as it was."}
+            decky.logger.info(f"Allowed WPA2 alongside WPA3 on {uuid}")
+            self._wpa2_blocked = None
+            self._reach_checked_at = 0.0
+            # The lock picks its access point from those the profile can join,
+            # so with the stronger one now eligible, let it choose again.
+            if _load_settings().get("bssid_lock_enabled"):
+                await self.set_bssid_lock(True)
+            return {"success": True, "reconnected": True}
+        except Exception as e:
+            decky.logger.error(f"allow_wpa2 error: {e}")
+            return self._unexpected_response(e)
+        finally:
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
+            )
+
+    # How long a setter waits for its profile to come back after a reconnect.
+    # `nmcli con up` can outlast its own call's timeout while the activation
+    # carries on, so the answer is read from NetworkManager, not from it.
+    _RECONNECT_WAIT_SECONDS = 30
+
+    async def _reconnected_to(self, uuid: str) -> bool:
+        if not self._hard_reconnect(uuid):
+            return False
+        for _ in range(self._RECONNECT_WAIT_SECONDS):
+            if await asyncio.to_thread(self._get_active_connection_uuid) == uuid:
+                return True
+            await asyncio.sleep(1)
+        return False
+
     def _recheck_rival_profiles(self, settings: dict, uuid: str,
                                 active_ssid, actions: list):
         """Look again at the other saved copies of the network in use.
@@ -3349,6 +3453,12 @@ class Plugin:
             self._recheck_rival_profiles(settings, uuid, active_ssid, actions)
             if getattr(self, "_dup_conflict", False):
                 status["external"]["duplicate_profiles"] = True
+            self._recheck_security_reach(
+                uuid, iface, active_ssid() or "",
+                status["live"].get("connected_bssid", ""),
+            )
+            if getattr(self, "_wpa2_blocked", None):
+                status["wpa2_only_stronger"] = dict(self._wpa2_blocked)
             actions.extend(
                 self._propose_active_pin_cleanup(
                     settings, uuid, "band_preference_uuids", live_band

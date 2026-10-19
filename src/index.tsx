@@ -468,6 +468,9 @@ function Content() {
   const handleForceReapply = () =>
     handleToggle("reapply", () => backend.reapplyAll());
 
+  const handleAllowWpa2 = () =>
+    handleToggle("allow_wpa2", () => backend.allowWpa2());
+
   const handleResetSettings = async () => {
     if (busyRef.current) return;
     setBusy(true);
@@ -653,6 +656,28 @@ function Content() {
           has been given priority, so the choice stays the same from now on.
           To use the other one instead, connect with it once and it takes
           priority.
+        </Banner>
+      )}
+
+      {/* The saved security is shutting the device out of a stronger access
+          point on the same network. Without this the only symptom is the
+          Deck preferring a distant access point for no visible reason. */}
+      {status?.wpa2_only_stronger && (
+        <Banner variant="info">
+          A stronger access point on this network (signal{" "}
+          {status.wpa2_only_stronger.signal} vs{" "}
+          {status.wpa2_only_stronger.current_signal}) only offers WPA2, and this
+          network is saved as WPA3-only, so the Deck can't use it. Access points
+          that offer WPA3 keep using it.{" "}
+          <span
+            style={{ textDecoration: "underline", cursor: "pointer" }}
+            onClick={handleAllowWpa2}
+          >
+            Allow WPA2 here
+          </span>
+          {errors.allow_wpa2 && (
+            <div style={{ color: theme.error.text }}>{errors.allow_wpa2}</div>
+          )}
         </Banner>
       )}
 
