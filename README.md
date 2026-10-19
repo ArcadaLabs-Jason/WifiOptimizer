@@ -1,10 +1,12 @@
-# WiFi Optimizer v0.11.6
+# WiFi Optimizer v0.11.7
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
 A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. Benefits any streaming over WiFi - Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki, and more.
 
 **Supported devices:** Steam Deck (LCD and OLED), Legion Go, ROG Ally, and other PC handhelds. Works on SteamOS, Bazzite, and CachyOS.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/fanciestpeanut)
 
 ## The problem
 
@@ -110,6 +112,11 @@ pnpm run build
 ```
 
 To deploy to your Deck, copy `.vscode/defsettings.json` to `.vscode/settings.json`, fill in your Deck's IP and password, then use the VS Code **builddeploy** task (Terminal > Run Task).
+
+## Support
+
+WiFi Optimizer is free and stays free. If you want to support it:
+[ko-fi.com/fanciestpeanut](https://ko-fi.com/fanciestpeanut).
 
 ## Contact
 
