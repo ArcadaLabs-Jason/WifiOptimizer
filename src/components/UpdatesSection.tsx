@@ -11,6 +11,9 @@ interface UpdatesSectionProps {
   onChannelChange: (channel: string) => void;
   onApply: () => void;
   onCheck: () => void;
+  // Another operation is running. Starting an update then would restart
+  // Decky in the middle of it.
+  busy?: boolean;
 }
 
 const CHANNEL_OPTIONS = [
@@ -31,6 +34,7 @@ export function UpdatesSection({
   onChannelChange,
   onApply,
   onCheck,
+  busy = false,
 }: UpdatesSectionProps) {
   return (
     <PanelSection title="Updates">
@@ -70,7 +74,7 @@ export function UpdatesSection({
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
-            <ButtonItem layout="below" onClick={onApply}>
+            <ButtonItem layout="below" disabled={busy} onClick={onApply}>
               {updateInfo.is_downgrade
                 ? `Go back to v${updateInfo.latest_version}`
                 : "Update Now"}

@@ -160,6 +160,14 @@ function Content() {
     refreshRegdomain();
   }, [refreshRegdomain]);
   const [customDnsInput, setCustomDnsInput] = useState("");
+  // Custom DNS is edited as a draft and applied with a button. Choosing
+  // Custom used to send the empty field straight to the backend, which
+  // refused it, so the field it gates never appeared and nobody starting
+  // from the defaults could ever enter servers. The dirty flag stops the
+  // status poll replacing what is being typed, which on the on-screen
+  // keyboard takes longer than one poll.
+  const [dnsCustomOpen, setDnsCustomOpen] = useState(false);
+  const dnsDirtyRef = useRef(false);
 
   // --- Update flow state ---
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
@@ -219,7 +227,11 @@ function Content() {
         // rendered while DNS is on, and turning it on with an empty custom
         // list is rejected. The backend also resets the provider when it
         // clears the servers, so the pair cannot get stuck together.
-        if (s.settings.dns_provider === "custom" && s.settings.dns_servers) {
+        if (
+          !dnsDirtyRef.current &&
+          s.settings.dns_provider === "custom" &&
+          s.settings.dns_servers
+        ) {
           setCustomDnsInput(s.settings.dns_servers);
         }
       }
@@ -262,7 +274,15 @@ function Content() {
         setBackendSwitch(s);
         setBusy(false);
       } catch (e) {
+        // Without clearing the switch, its toggle stayed disabled on
+        // "Switching..." with no way out but reloading Decky.
         stopBackendPoll();
+        setBackendSwitch(null);
+        setErrors((prev) => ({
+          ...prev,
+          wifi_backend: "Lost track of the backend switch. Check WiFi, then try again.",
+        }));
+        await refreshStatus(true);
         setBusy(false);
         console.error("backend switch poll error", e);
       }
@@ -387,10 +407,13 @@ function Content() {
   // ---- User action handlers ----
   //
   // Generic toggle handler used by every setter toggle (power_save, BSSID,
-  // auto_fix, buffer_tuning, band_preference, DNS, IPv6) and by the Force
-  // Reapply All button. Takes a key for error tracking and a backend fn.
-  const handleToggle = async (key: string, fn: () => Promise<MethodResult>) => {
-    if (busyRef.current) return;
+  // auto_fix, buffer_tuning, band_preference, DNS, IPv6). Takes a key for
+  // error tracking and a backend fn, and hands back the result.
+  const handleToggle = async (
+    key: string,
+    fn: () => Promise<MethodResult>,
+  ): Promise<MethodResult | undefined> => {
+    if (busyRef.current) return undefined;
     setBusy(true);
     setErrors((prev) => {
       const next = { ...prev };
@@ -404,8 +427,10 @@ function Content() {
     });
     setOptimizeResult(null);
 
+    let outcome: MethodResult | undefined;
     try {
       const result = await fn();
+      outcome = result;
       // A setter can succeed and still have done something other than what
       // was asked - locking to the access point you were already on because
       // the stronger one would not take, say. Saying nothing there leaves the
@@ -429,16 +454,21 @@ function Content() {
       await refreshStatus(true);
       setBusy(false);
     }
+    return outcome;
   };
 
-  const handleOptimize = async () => {
+  // Optimize Safe, the drift banner's Fix now and Force Reapply all run
+  // several setters and report per setting. Force Reapply used to go through
+  // the single-toggle handler, which dropped every per-setting failure and
+  // put its own errors under a key nothing displayed.
+  const runBatch = async (fn: () => Promise<OptimizeSafeResult>) => {
     if (busyRef.current) return;
     setBusy(true);
     setApplyingAll(true);
     setErrors({});
     setOptimizeResult(null);
     try {
-      const result = await backend.optimizeSafe();
+      const result = await fn();
       setOptimizeResult(result);
       if (result.results) {
         const newErrors: Record<string, string> = {};
@@ -456,6 +486,10 @@ function Content() {
       }
     } catch (e) {
       console.error("optimize error", e);
+      setOptimizeResult({
+        success: false, total: 0, applied: 0, results: {},
+        message: "Something went wrong. Check the Decky log for details.",
+      });
     } finally {
       // Refresh before clearing applyingAll so button doesn't briefly flip to
       // "All good" from stale status. Refresh runs on errors too.
@@ -465,8 +499,9 @@ function Content() {
     }
   };
 
-  const handleForceReapply = () =>
-    handleToggle("reapply", () => backend.reapplyAll());
+  const handleOptimize = () => runBatch(() => backend.optimizeSafe());
+  const handleRepairDrift = () => runBatch(() => backend.repairDrifted());
+  const handleForceReapply = () => runBatch(() => backend.reapplyAll());
 
   const handleAllowWpa2 = () =>
     handleToggle("allow_wpa2", () => backend.allowWpa2());
@@ -477,7 +512,13 @@ function Content() {
     setOptimizeResult(null);
     setErrors({});
     try {
-      await backend.resetSettings();
+      const result = await backend.resetSettings();
+      if (!result.success) {
+        setErrors({ reset: result.message ?? "Couldn't reset settings." });
+      }
+    } catch (e) {
+      console.error("reset error", e);
+      setErrors({ reset: "Couldn't reset settings." });
     } finally {
       await refreshStatus(true);
       setBusy(false);
@@ -537,7 +578,13 @@ function Content() {
     setUpdateError(null);
     setUpdating(true);
     try {
-      await backend.applyUpdate();
+      const result = await backend.applyUpdate();
+      // Refused outright (no update after all, a backend switch running):
+      // say why now instead of showing "Updating..." for a minute.
+      if (!result.success) {
+        setUpdating(false);
+        setUpdateError(result.message ?? "Couldn't start the update.");
+      }
     } catch {
       // plugin_loader restart killed the connection; expected
     }
@@ -557,9 +604,39 @@ function Content() {
   };
 
   const handleChannelChange = async (nextChannel: string) => {
-    await backend.setUpdateChannel(nextChannel);
-    setUpdateInfo(null);
+    try {
+      const result = await backend.setUpdateChannel(nextChannel);
+      if (!result.success) {
+        setUpdateError(result.message ?? "Couldn't change the update channel.");
+        return;
+      }
+      setUpdateError(null);
+      setUpdateInfo(null);
+    } catch (e) {
+      console.error("set channel error", e);
+      setUpdateError("Couldn't change the update channel.");
+      return;
+    }
     await refreshStatus();
+  };
+
+  // Custom DNS draft handling
+  const resetDnsDraft = () => {
+    dnsDirtyRef.current = false;
+    setDnsCustomOpen(false);
+    setCustomDnsInput(
+      status?.settings?.dns_provider === "custom" ? status.settings.dns_servers : ""
+    );
+  };
+
+  const applyCustomDns = async () => {
+    const result = await handleToggle("dns", () =>
+      backend.setDns(true, "custom", customDnsInput.trim())
+    );
+    if (result?.success) {
+      dnsDirtyRef.current = false;
+      setDnsCustomOpen(false);
+    }
   };
 
   // Don't render content until first status arrives (prevents disconnect flash).
@@ -616,7 +693,7 @@ function Content() {
       {updateInfo?.update_available && !updating && (
         <PanelSection>
           <PanelSectionRow>
-            <ButtonItem layout="below" onClick={handleApplyUpdate}>
+            <ButtonItem layout="below" disabled={isBusy} onClick={handleApplyUpdate}>
               {updateInfo.is_downgrade
                 ? `Go back to v${updateInfo.latest_version}`
                 : `Update to v${updateInfo.latest_version}`}
@@ -709,7 +786,7 @@ function Content() {
           {driftCount} setting{driftCount > 1 ? "s" : ""} drifted after wake.{" "}
           <span
             style={{ textDecoration: "underline", cursor: "pointer" }}
-            onClick={handleOptimize}
+            onClick={handleRepairDrift}
           >
             Fix now
           </span>
@@ -755,17 +832,32 @@ function Content() {
       })()}
 
       {/* Optimize result banner */}
-      {optimizeResult && (
-        <Banner
-          variant={
-            optimizeResult.applied === optimizeResult.total ? "success" : "warning"
-          }
-        >
-          {optimizeResult.applied === optimizeResult.total
-            ? "All applied"
-            : `${optimizeResult.applied}/${optimizeResult.total} applied`}
-        </Banner>
-      )}
+      {optimizeResult && (() => {
+        // A failure has no counts at all, and undefined === undefined made
+        // it read as "All applied".
+        if (optimizeResult.success === false) {
+          return (
+            <Banner variant="error" icon="⚠">
+              {optimizeResult.message ?? "Something went wrong."}
+            </Banner>
+          );
+        }
+        if (!optimizeResult.total) {
+          return (
+            <Banner variant="info">
+              {optimizeResult.message ?? "Nothing to apply."}
+            </Banner>
+          );
+        }
+        const all = optimizeResult.applied === optimizeResult.total;
+        return (
+          <Banner variant={all ? "success" : "warning"}>
+            {all
+              ? "All applied"
+              : `${optimizeResult.applied}/${optimizeResult.total} applied`}
+          </Banner>
+        );
+      })()}
 
       {/* Optimize button */}
       <PanelSection>
@@ -861,6 +953,18 @@ function Content() {
             />
           </PanelSectionRow>
         )}
+        {(errors.regdomain || notices.regdomain) && (
+          <PanelSectionRow>
+            <div
+              style={{
+                fontSize: theme.fontSize.tiny,
+                color: errors.regdomain ? theme.error.text : theme.text.tertiary,
+              }}
+            >
+              {errors.regdomain ?? notices.regdomain}
+            </div>
+          </PanelSectionRow>
+        )}
         {regdomain?.readable && !regdomain.changeable && (
           <PanelSectionRow>
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
@@ -871,13 +975,15 @@ function Content() {
           </PanelSectionRow>
         )}
         <InfoRow
-          label={supports6GHz ? "Force 5 GHz / 6 GHz" : "Force 5 GHz band"}
+          label="Force 5 GHz band"
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz${
-            supports6GHz ? " or 6 GHz" : ""
-          } for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.`}
+          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.${
+            supports6GHz
+              ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
+              : ""
+          }`}
           {...getBadge("band_preference", status, errors.band_preference ?? null)}
           checked={s?.band_preference_enabled ?? false}
           disabled={isBusy || (!connected && !s?.band_preference_enabled)}
@@ -896,11 +1002,12 @@ function Content() {
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || (!connected && !s?.dns_enabled)}
           error={errors.dns}
-          onChange={(val: boolean) =>
+          onChange={(val: boolean) => {
+            if (!val) resetDnsDraft();
             handleToggle("dns", () =>
               backend.setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput)
-            )
-          }
+            );
+          }}
         >
           {s?.dns_enabled && (
             <>
@@ -908,32 +1015,59 @@ function Content() {
                 <DropdownItem
                   label="DNS Provider"
                   rgOptions={DNS_OPTIONS}
-                  selectedOption={s?.dns_provider ?? "cloudflare"}
+                  selectedOption={dnsCustomOpen ? "custom" : s?.dns_provider ?? "cloudflare"}
+                  disabled={isBusy}
                   onChange={(option: { data: string }) => {
-                    const custom = option.data === "custom" ? customDnsInput : "";
+                    if (option.data === "custom") {
+                      // Open the editor; nothing is sent until Apply.
+                      setDnsCustomOpen(true);
+                      return;
+                    }
+                    resetDnsDraft();
                     handleToggle("dns", () =>
-                      backend.setDns(true, option.data, custom)
+                      backend.setDns(true, option.data, "")
                     );
                   }}
                 />
               </PanelSectionRow>
-              {s?.dns_provider === "custom" && (
-                <PanelSectionRow>
-                  <TextField
-                    label="DNS servers (space-separated)"
-                    value={customDnsInput}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                      setCustomDnsInput(e.target.value)
-                    }
-                    onBlur={() => {
-                      if (customDnsInput) {
-                        handleToggle("dns", () =>
-                          backend.setDns(true, "custom", customDnsInput)
-                        );
-                      }
-                    }}
-                  />
-                </PanelSectionRow>
+              {(dnsCustomOpen || s?.dns_provider === "custom") && (
+                <>
+                  {/* No submit on blur: moving focus with the D-pad blurs
+                      the field, and each submit reconnects WiFi. */}
+                  <PanelSectionRow>
+                    <TextField
+                      label="DNS servers (space-separated)"
+                      value={customDnsInput}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                        dnsDirtyRef.current = true;
+                        setCustomDnsInput(e.target.value);
+                      }}
+                    />
+                  </PanelSectionRow>
+                  {(dnsCustomOpen ||
+                    customDnsInput.trim() !== (s?.dns_servers ?? "")) && (
+                    <>
+                      <PanelSectionRow>
+                        <ButtonItem
+                          layout="below"
+                          disabled={isBusy || !customDnsInput.trim()}
+                          onClick={applyCustomDns}
+                        >
+                          Apply DNS servers
+                        </ButtonItem>
+                      </PanelSectionRow>
+                      <PanelSectionRow>
+                        <ButtonItem
+                          layout="below"
+                          disabled={isBusy}
+                          onClick={resetDnsDraft}
+                        >
+                          Cancel
+                        </ButtonItem>
+                      </PanelSectionRow>
+                    </>
+                  )}
+                </>
               )}
             </>
           )}
@@ -947,7 +1081,9 @@ function Content() {
             notices.ipv6 ??
             (status?.external?.ipv6
               ? "IPv6 is off on this connection, but not because of this plugin."
-              : undefined)
+              : status?.live?.ipv6_other_network
+                ? "On for the network it was turned on for. This network is unchanged."
+                : undefined)
           }
           checked={s?.ipv6_disabled ?? false}
           disabled={isBusy || (!connected && !s?.ipv6_disabled)}
@@ -959,7 +1095,7 @@ function Content() {
         <InfoRow
           label="Traffic shaping (CAKE)"
           subtitle="Fair queuing and bufferbloat prevention"
-          explanation="Replaces the default network queue with CAKE, which isolates traffic flows so a background download or another device can't starve your game stream. Also filters redundant TCP acknowledgments and prioritizes latency-sensitive packets. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
+          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
           {...getBadge("cake", status, errors.cake ?? null)}
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || (!connected && !s?.cake_enabled)}
@@ -973,7 +1109,7 @@ function Content() {
             status={status}
             backendSwitch={backendSwitch}
             error={errors.wifi_backend}
-            isBusy={isBusy}
+            isBusy={isBusy || updating}
             onToggle={handleBackendToggle}
           />
         )}
@@ -998,6 +1134,7 @@ function Content() {
         isBusy={isBusy}
         onForceReapply={handleForceReapply}
         onReset={handleResetSettings}
+        resetError={errors.reset}
       />
 
       <UpdatesSection
@@ -1009,6 +1146,7 @@ function Content() {
         onChannelChange={handleChannelChange}
         onApply={handleApplyUpdate}
         onCheck={handleCheckForUpdate}
+        busy={isBusy}
       />
 
       <PanelFooter version={status?.version ?? "?"} />
@@ -1018,14 +1156,20 @@ function Content() {
 
 export default definePlugin(() => {
   let gameLifetimeUnsub: { unregister(): void } | null = null;
+  // A launch just before the plugin is unloaded still had its delayed
+  // reapply pending, which then called into a backend being torn down.
+  let disposed = false;
+  const timers = new Set<ReturnType<typeof setTimeout>>();
 
   try {
     gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications(
       (notification: { bRunning: boolean }) => {
-        if (notification.bRunning) {
-          setTimeout(() => {
-            backend.reapplyVolatile().catch(() => {});
+        if (notification.bRunning && !disposed) {
+          const id = setTimeout(() => {
+            timers.delete(id);
+            if (!disposed) backend.reapplyVolatile().catch(() => {});
           }, 3000);
+          timers.add(id);
         }
       },
     );
@@ -1043,6 +1187,9 @@ export default definePlugin(() => {
     ),
     icon: <FaWifi />,
     onDismount() {
+      disposed = true;
+      timers.forEach((id) => clearTimeout(id));
+      timers.clear();
       gameLifetimeUnsub?.unregister();
     },
   };

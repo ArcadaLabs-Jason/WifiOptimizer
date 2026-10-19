@@ -1448,6 +1448,13 @@ d = Prio({}, {U: 100})
 asyncio.run(d.get_status())
 ok(prio_writes(d) == [], "and is not rewritten once it already has it")
 
+for mine in (-10, 500):
+    m._save_settings({**base_ap, "priority_set": False})
+    d = Prio({}, {U: mine})
+    asyncio.run(d.get_status())
+    ok(prio_writes(d) == [],
+       f"a single copy whose priority was set deliberately ({mine}) is left alone")
+
 # Every existing install is already marked done, ties and all, so the one-shot
 # flag must not be allowed to freeze the tie in place forever.
 # last_connection_uuid must match, or the collector resets the flag and the
@@ -2037,9 +2044,15 @@ class Band(m.Plugin):
         # middle of the change and writes the old address back
         self.depth_seen.append(getattr(self, "_profile_change_depth", 0))
         return self.reconnect
+    # The network is visible on both bands unless a check says otherwise, so
+    # the reachability check before the write passes.
+    bands_in_range = (5180, 2462)
     def _run_cmd(self, cmd, timeout=5):
         if cmd[:2] == ["/usr/bin/iw", "dev"] and "link" in cmd:
             return {"success":True,"stdout":self.link,"stderr":"","returncode":0}
+        if "wifi" in cmd and "list" in cmd:
+            rows = "\n".join(f"{self.ssid}:{f} MHz" for f in self.bands_in_range)
+            return {"success":True,"stdout":rows,"stderr":"","returncode":0}
         return {"success":True,"stdout":"","stderr":"","returncode":0}
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.mods.append((uuid, key, value))
@@ -2369,7 +2382,7 @@ try:
             if cmd[:2] == ["/usr/bin/iw", "dev"] and "link" in cmd:
                 return {"success":False,"stdout":"","stderr":"No such device",
                         "returncode":237}
-            return {"success":True,"stdout":"","stderr":"","returncode":0}
+            return super()._run_cmd(cmd, timeout)
     m._save_settings(band_settings(bssid_lock_enabled=True,
                                    bssid_lock_connection_uuid=BU))
     d = DeadLink()
@@ -2394,6 +2407,392 @@ try:
        "but a re-lock that failed is not recorded as the pin in force")
 finally:
     asyncio.sleep = _real_sleep
+
+
+section("buffer tuning: putting back what the system had")
+
+class Sysctl(m.Plugin):
+    """sysctl with a live table, so a restore can be read back."""
+    def __init__(self, live, cake=False):
+        super().__init__(); self.live = dict(live); self.cmds = []; self.cake = cake
+    def _get_wifi_interface(self): return "wlan0"
+    def _run_cmd(self, cmd, timeout=5):
+        self.cmds.append(cmd)
+        if cmd[:2] == ["/usr/bin/sysctl", "-n"]:
+            return _ok(self.live.get(cmd[2], ""))
+        if cmd[:2] == ["/usr/bin/sysctl", "-w"]:
+            k, v = cmd[2].split("=", 1); self.live[k] = v
+            return _ok()
+        if cmd[:3] == ["/usr/bin/tc", "qdisc", "show"]:
+            return _ok("qdisc cake 8001: root" if self.cake else "qdisc noqueue 0: root")
+        return _ok()
+
+STOCK_618 = {**m.SYSCTL_DEFAULTS, "net.core.rmem_max": "4194304",
+             "net.core.wmem_max": "4194304"}
+_real_release = getattr(m, "_kernel_release", None)
+try:
+    m._kernel_release = lambda: "6.18.50-valve2-1-neptune-618"
+    ok(m._stock_sysctl_defaults("6.18.50")["net.core.rmem_max"] == "4194304",
+       "kernel 6.18 and later default rmem_max to 4 MiB")
+    ok(m._stock_sysctl_defaults("6.17.9")["net.core.rmem_max"] == "212992",
+       "older kernels keep 212992")
+    ok(m._stock_sysctl_defaults("7.0.1")["net.core.wmem_max"] == "4194304",
+       "a major version past 6 counts as newer")
+
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    k = Sysctl({**STOCK_618, "net.core.netdev_max_backlog": "4096"})
+    asyncio.run(k.set_buffer_tuning(True))
+    ok(k.live["net.core.rmem_max"] == m.TUNED_RMEM_MAX, "turning tuning on applies it")
+    asyncio.run(k.set_buffer_tuning(False))
+    ok(k.live["net.core.rmem_max"] == "4194304",
+       "turning it off puts back 4 MiB on 6.18, not the older 212992")
+    ok(k.live["net.core.netdev_max_backlog"] == "4096",
+       "and a distro's own value comes back rather than the kernel default")
+
+    # Tuning already on when this version arrives: the live values are ours,
+    # so nothing is recorded and the kernel's default is used.
+    m._save_settings({**m.DEFAULT_SETTINGS, "buffer_tuning_enabled": True})
+    k = Sysctl(m.SYSCTL_PARAMS)
+    asyncio.run(k.set_buffer_tuning(True))
+    ok(m._load_settings().get("sysctl_baseline") == {},
+       "values we set ourselves are never recorded as the system's")
+    asyncio.run(k.set_buffer_tuning(False))
+    ok(k.live == STOCK_618, "so turning it off falls back to this kernel's defaults")
+
+    # A baseline from another kernel is stale after an OS update.
+    m._save_settings({**m.DEFAULT_SETTINGS, "buffer_tuning_enabled": True,
+                      "sysctl_baseline": {"kernel": "6.16.1", "values":
+                                          {"net.core.rmem_max": "212992"}}})
+    k = Sysctl(m.SYSCTL_PARAMS)
+    asyncio.run(k.set_buffer_tuning(False))
+    ok(k.live["net.core.rmem_max"] == "4194304",
+       "a baseline recorded on another kernel is not put back")
+
+    # The baseline reaches sysctl -w as root from a user-editable file.
+    m._save_settings({**m.DEFAULT_SETTINGS, "sysctl_baseline": {
+        "kernel": "6.18.50-valve2-1-neptune-618",
+        "values": {"net.core.rmem_max": "1; reboot", "kernel.panic": "1",
+                   "net.core.wmem_max": "\u00b2", "net.core.rmem_default": "300000"}}})
+    ok(m._load_settings().get("sysctl_baseline").get("values") == {"net.core.rmem_default": "300000"},
+       "only known keys with plain numbers survive a load")
+
+    # Reset and uninstall leave the system alone when tuning was never on.
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    k = Sysctl(STOCK_618)
+    asyncio.run(k.reset_settings())
+    ok(not any(c[:2] == ["/usr/bin/sysctl", "-w"] for c in k.cmds),
+       "reset writes no sysctl when tuning was never applied")
+    ok(not any(c[:3] == ["/usr/bin/tc", "qdisc", "del"] for c in k.cmds),
+       "and deletes no queueing discipline that is not ours")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    k = Sysctl(m.SYSCTL_PARAMS, cake=True)
+    asyncio.run(k._uninstall())
+    ok(k.live == STOCK_618, "uninstall restores tuning that is live even with the setting off")
+    ok(any(c[:3] == ["/usr/bin/tc", "qdisc", "del"] for c in k.cmds),
+       "and removes CAKE that is still attached")
+
+    # A partial apply is said out loud.
+    class Partial(Sysctl):
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[:2] == ["/usr/bin/sysctl", "-w"] and "netdev_budget=" in cmd[2]:
+                return {"success": False, "stdout": "", "stderr": "nope", "returncode": 1}
+            return super()._run_cmd(cmd, timeout)
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    r = asyncio.run(Partial(STOCK_618).set_buffer_tuning(True))
+    ok(r.get("success") is True and "netdev_budget" in (r.get("message") or ""),
+       "a partly applied tuning names what did not take")
+except Exception as e:
+    ok(False, f"buffer tuning checks raised {e!r}")
+finally:
+    m._kernel_release = _real_release
+
+
+section("PCIe power states: each one written and read back")
+
+def pcie_device(files, power="auto", odd=()):
+    """A fake WiFi PCI device. Names in `odd` are directories, which no
+    write can succeed on and which raise something other than the two
+    errors the old loop caught."""
+    root = tempfile.mkdtemp()
+    dev = os.path.join(root, "dev"); os.makedirs(os.path.join(dev, "link"))
+    os.makedirs(os.path.join(dev, "power"))
+    for name in files:
+        path = os.path.join(dev, "link", name)
+        if name in odd: os.makedirs(path)
+        else: open(path, "w").write("1")
+    open(os.path.join(dev, "power", "control"), "w").write(power)
+    net = os.path.join(root, "net"); os.makedirs(os.path.join(net, "wlan0"))
+    os.symlink(dev, os.path.join(net, "wlan0", "device"))
+    return net, dev
+
+class Pcie(m.Plugin):
+    def _get_wifi_interface(self): return "wlan0"
+
+_real_sysfs = m.SYSFS_NET
+try:
+    OLED = ["l1_aspm", "l1_1_aspm", "l1_2_aspm", "l1_1_pcipm", "l1_2_pcipm"]
+    m.SYSFS_NET, dev = pcie_device(OLED)
+    ok(Pcie()._apply_pcie_aspm_fix(True) == [],
+       "every state the device has is disabled, and a missing one is not a failure")
+    ok(all(open(os.path.join(dev, "link", f)).read() == "0" for f in OLED)
+       and open(os.path.join(dev, "power", "control")).read() == "on",
+       "and each was actually written")
+
+    m.SYSFS_NET, dev = pcie_device(OLED, odd=("l1_aspm",))
+    missed = Pcie()._apply_pcie_aspm_fix(True)
+    ok(missed == ["l1_aspm"], "a state that would not take is named")
+    ok(open(os.path.join(dev, "link", "l1_2_pcipm")).read() == "0"
+       and open(os.path.join(dev, "power", "control")).read() == "on",
+       "and an odd error on one file no longer stops the rest")
+    ok(Pcie()._apply_pcie_aspm_fix(False) == [],
+       "restoring is not judged by what firmware chooses to keep off")
+finally:
+    m.SYSFS_NET = _real_sysfs
+
+
+section("IPv6: only on the networks it was turned off for")
+
+A6 = "aaaaaaaa-0000-0000-0000-0000000000a6"
+B6 = "bbbbbbbb-0000-0000-0000-0000000000b6"
+def classify(settings, uuid, live):
+    st = {"drift": {}, "external": {}, "live": {}}; acts = []
+    m.Plugin()._classify_ipv6(settings, uuid, live, st, acts)
+    return st, acts
+
+st, acts = classify({"ipv6_disabled": True, "ipv6_uuids": [A6]}, B6, "auto")
+ok(acts == [] and not st["drift"], "another network is not written to by a status poll")
+ok(st["live"].get("ipv6_other_network") is True, "and the panel is told it belongs elsewhere")
+st, acts = classify({"ipv6_disabled": True, "ipv6_uuids": [A6]}, A6, "auto")
+ok(st["drift"].get("ipv6") and acts and acts[0]["kind"] == "ipv6",
+   "the network it was set on is still held")
+st, acts = classify({"ipv6_disabled": True, "ipv6_uuids": []}, A6, "disabled")
+ok(acts == [{"kind": "ipv6_adopt", "uuid": A6}],
+   "a setting from before tracking adopts the profile where it already holds")
+st, acts = classify({"ipv6_disabled": True, "ipv6_uuids": []}, B6, "auto")
+ok(acts == [] and st["live"].get("ipv6_other_network"),
+   "and does not spread to a profile where it does not")
+
+section("custom DNS: every network it was set on is undone")
+
+class Dns(m.Plugin):
+    def __init__(self, active, missing=()):
+        super().__init__(); self.active = active; self.mods = []; self.missing = set(missing)
+    def _resolve_uuid(self, msg=None): return self.active, None
+    def _read_profile_field(self, uuid, field, timeout=5): return "192.168.1.1"
+    def _hard_reconnect(self, uuid=None): return True
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.mods.append((uuid, key, value))
+        if uuid in self.missing:
+            return {"success": False, "stdout": "", "returncode": 10,
+                    "stderr": f"Error: unknown connection '{uuid}'."}
+        return _ok()
+
+m._save_settings(dict(m.DEFAULT_SETTINGS))
+d = Dns(A6)
+asyncio.run(d.set_dns(True, "cloudflare", ""))
+ok(m._load_settings().get("dns_uuids") == [A6], "where DNS is set is recorded")
+d = Dns(B6)
+asyncio.run(d.set_dns(False))
+ok((A6, "ipv4.ignore-auto-dns", "no") in d.mods and (A6, "ipv4.dns", "") in d.mods,
+   "turning it off on another network still gives the first one its own DNS back")
+ok(m._load_settings().get("dns_uuids") == [], "and nothing is left tracked")
+
+m._save_settings({**m.DEFAULT_SETTINGS, "dns_enabled": True, "dns_uuids": [A6, B6]})
+d = Dns(A6, missing=(B6,))
+asyncio.run(d.set_dns(False))
+ok(m._load_settings().get("dns_uuids") == [], "a profile that no longer exists is let go")
+
+m._save_settings({**m.DEFAULT_SETTINGS, "dns_enabled": True, "dns_uuids": [A6]})
+d = Dns(B6)
+d._clear_profile_pins()
+ok((A6, "ipv4.dns", "") in d.mods, "reset and uninstall clear DNS too")
+
+class HalfDns(Dns):
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self.mods.append((uuid, key, value))
+        if key == "ipv4.ignore-auto-dns":
+            return {"success": False, "stdout": "", "stderr": "no", "returncode": 1}
+        return _ok()
+m._save_settings(dict(m.DEFAULT_SETTINGS))
+d = HalfDns(A6)
+r = asyncio.run(d.set_dns(True, "google", ""))
+ok(r.get("success") is False and d.mods[-1] == (A6, "ipv4.dns", "192.168.1.1"),
+   "a half-applied DNS change puts the profile's servers back")
+
+section("force 5 GHz: refused where it would disconnect")
+m._save_settings(band_settings())
+b = Band(); b.bands_in_range = (2462,)
+r = asyncio.run(b.set_band_preference(True, "a"))
+ok(r.get("success") is False and r.get("error") == "band_unavailable",
+   "no 5 GHz access point in range means no write and no reconnect")
+ok(not b.mods and b.reconnects == 0, "and nothing was touched")
+
+class SlowScan(Band):
+    def __init__(self):
+        super().__init__(); self.timeouts = []
+    def _run_cmd(self, cmd, timeout=5):
+        if "wifi" in cmd and "list" in cmd:
+            self.timeouts.append(timeout)
+            return {"success":False,"stdout":"","stderr":"Command timed out","returncode":-1}
+        return super()._run_cmd(cmd, timeout)
+m._save_settings(band_settings())
+b = SlowScan()
+r = asyncio.run(b.set_band_preference(True, "a"))
+ok(r.get("error") != "band_unavailable",
+   "a scan that could not be read is not taken as nothing in range")
+ok(b.timeouts and min(b.timeouts) >= 15,
+   "and the scan gets the same budget as the access point list (a cold scan is slow)")
+
+section("Fix now: repairs only what drifted")
+
+class Drifted(m.Plugin):
+    def __init__(self, drift):
+        super().__init__(); self.drift = drift; self.calls = []
+    async def get_status(self): return {"success": True, "drift": dict(self.drift)}
+    async def _call(self, name):
+        self.calls.append(name); return {"success": True}
+    async def set_power_save(self, v): return await self._call("power_save")
+    async def set_buffer_tuning(self, v): return await self._call("buffer_tuning")
+    async def set_cake(self, v): return await self._call("cake")
+    async def set_bssid_lock(self, v): return await self._call("bssid_lock")
+    async def set_band_preference(self, v, b="a"): return await self._call("band")
+    async def set_ipv6(self, v): return await self._call("ipv6")
+    async def set_auto_fix(self, v): return await self._call("auto_fix")
+
+m._save_settings({**m.DEFAULT_SETTINGS, "power_save_disabled": True,
+                  "cake_enabled": True, "bssid_lock_enabled": False})
+if not hasattr(m.Plugin, "repair_drifted"):
+    ok(False, "there is a repair that touches only what drifted")
+else:
+    d = Drifted({"cake": True, "power_save": True})
+    r = asyncio.run(d.repair_drifted())
+    ok(d.calls == ["cake", "power_save"], "only the drifted settings are re-run")
+    ok("bssid_lock" not in d.calls and "auto_fix" not in d.calls,
+       "and nothing the user left off is turned on")
+    ok(r.get("total") == 2 and r.get("applied") == 2, "with per-setting counts")
+    d = Drifted({})
+    r = asyncio.run(d.repair_drifted())
+    ok(r.get("total") == 0 and r.get("message"), "no drift reports that rather than all applied")
+
+section("backend switch: one at a time, and never during an update")
+
+class Switch(m.Plugin):
+    def _has_backend_tool(self): return True
+    def _get_current_backend(self): return "iwd"
+    def _get_backend_method(self): return "steamos"
+    async def _backend_switch_worker(self, target): await asyncio.sleep(0)
+
+async def two_at_once():
+    sw = Switch()
+    return await asyncio.gather(sw.start_backend_switch("wpa_supplicant"),
+                                sw.start_backend_switch("wpa_supplicant")), sw
+(first, second), sw = asyncio.run(two_at_once())
+ok([first.get("accepted"), second.get("accepted")].count(True) == 1,
+   "two overlapping requests start one switch")
+
+sw = Switch()
+r = asyncio.run(sw.start_backend_switch("iwd"))
+ok(r.get("reason") == "already_set" and sw._backend_switch["in_progress"] is False,
+   "a refused request gives the reservation back")
+
+sw = Switch(); sw._update_dir = tempfile.mkdtemp()
+r = asyncio.run(sw.start_backend_switch("wpa_supplicant"))
+ok(r.get("accepted") is False and r.get("reason") == "update_in_progress",
+   "no switch while an update is being installed")
+
+class Updating(m.Plugin):
+    async def check_for_update(self):
+        raise AssertionError("should not get this far")
+u = Updating(); u._ensure_backend_switch_state(); u._backend_switch["in_progress"] = True
+r = asyncio.run(u.apply_update())
+ok(r.get("success") is False, "and no update while a switch is running")
+
+class TwoUpdates(m.Plugin):
+    def __init__(self):
+        super().__init__(); self.checks = 0
+    async def check_for_update(self):
+        self.checks += 1
+        await asyncio.sleep(0)
+        return {"update_available": False}
+async def two_updates():
+    u = TwoUpdates()
+    return await asyncio.gather(u.apply_update(), u.apply_update()), u
+(r1, r2), u = asyncio.run(two_updates())
+ok(u.checks == 1, "two overlapping update requests run one update")
+class HeldUpdate(TwoUpdates):
+    async def check_for_update(self):
+        self.checks += 1
+        await asyncio.sleep(0.05)
+        return {"update_available": False}
+async def refused_mid_check():
+    u = HeldUpdate()
+    first = asyncio.ensure_future(u.apply_update())
+    await asyncio.sleep(0.01)
+    await u.apply_update()
+    held = u._update_running()
+    await first
+    return held
+ok(asyncio.run(refused_mid_check()) is True,
+   "a refused request does not release the claim of the one still running")
+ok(u._update_running() is False, "and the claim is released when it ends")
+
+class GenericStartFails(m.Plugin):
+    def __init__(self):
+        super().__init__(); self.cmds = []
+        self._ensure_backend_switch_state()
+    def _run_cmd(self, cmd, timeout=5):
+        self.cmds.append(cmd)
+        if cmd[:3] == ["/usr/bin/systemctl", "start", "iwd"]:
+            return {"success": False, "stdout": "", "stderr": "failed", "returncode": 1}
+        return _ok()
+_real_conf = m.GENERIC_BACKEND_CONF
+try:
+    m.GENERIC_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "conf.d", "99-backend.conf")
+    g = GenericStartFails()
+    asyncio.run(g._generic_backend_switch_worker("iwd"))
+    res = g._backend_switch["result"]
+    ok(res and res["success"] is False, "a backend that will not start fails the switch")
+    ok(["/usr/bin/systemctl", "start", "wpa_supplicant"] in g.cmds
+       and "wifi.backend=wpa_supplicant" in open(m.GENERIC_BACKEND_CONF).read(),
+       "and the previous backend is put back")
+finally:
+    m.GENERIC_BACKEND_CONF = _real_conf
+
+section("auto-fix and CAKE: off only once actually off")
+
+class StuckDispatcher(m.Plugin):
+    def _remove_dispatcher(self): return False
+m._save_settings({**m.DEFAULT_SETTINGS, "auto_fix_on_wake": True})
+r = asyncio.run(StuckDispatcher().set_auto_fix(False))
+ok(r.get("success") is False and m._load_settings()["auto_fix_on_wake"] is True,
+   "a script that could not be removed keeps the toggle on")
+
+class StuckCake(m.Plugin):
+    def _get_wifi_interface(self): return "wlan0"
+    def _run_cmd(self, cmd, timeout=5):
+        if cmd[:3] == ["/usr/bin/tc", "qdisc", "del"]:
+            return {"success": False, "stdout": "", "stderr": "busy", "returncode": 2}
+        if cmd[:3] == ["/usr/bin/tc", "qdisc", "show"]:
+            return _ok("qdisc cake 8001: root")
+        return _ok()
+m._save_settings({**m.DEFAULT_SETTINGS, "cake_enabled": True})
+r = asyncio.run(StuckCake().set_cake(False))
+ok(r.get("success") is False and m._load_settings()["cake_enabled"] is True,
+   "CAKE that is still attached is not reported as removed")
+
+section("update script: staged, versioned, one at a time")
+_src = open("main.py").read()
+_i = _src.index('script = """#!/bin/bash'); _j = _src.index('"""', _i + 20)
+_script = _src[_i + 10:_j]
+ok("flock -n" in _script, "a second update exits instead of running alongside")
+ok("--max-time" in _script and "--fail" in _script, "the download is bounded and fails on HTTP errors")
+ok(_script.index("wifiopt-new\" ||") < _script.index("mv -f"),
+   "everything is copied beside the live files before anything is replaced")
+ok(_script.rindex("package.json") > _script.index('FILES="') and
+   _script[_script.index('FILES="'):].split("\n")[0].rstrip('"').endswith("package.json"),
+   "package.json, which carries the version, is moved into place last")
+ok('"$GOT" != "$EXPECTED"' in _script, "a payload of the wrong version is refused")
+ok("if systemctl restart plugin_loader" in _script, "a failed restart is not reported as success")
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

@@ -40,7 +40,7 @@ Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > 
    - Tunes network buffers (handles streaming traffic bursts)
 3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
 
-Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5/6 GHz, custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
+Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5 GHz, custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
 
 ## All optimizations
 
@@ -57,7 +57,7 @@ Want to go further? The remaining optimizations are available as individual togg
 
 | Optimization | What it does | Why it's manual |
 |---|---|---|
-| Force 5 GHz / 6 GHz | Locks WiFi to the higher-frequency band to avoid Bluetooth interference | Won't connect if your network is 2.4 GHz only |
+| Force 5 GHz band | Locks WiFi to 5 GHz to avoid Bluetooth interference on 2.4 GHz | Won't connect if your network is 2.4 GHz only, and keeps a 6 GHz capable device off 6 GHz. Refused when no 5 GHz access point for your network is in range. |
 | Traffic shaping (CAKE) | Replaces the default network queue with CAKE for fair queuing, bufferbloat prevention, and ACK filtering. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
@@ -91,7 +91,7 @@ volatile settings shortly after a game launches.
 
 ## Uninstall
 
-**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This reverts the runtime optimizations (power save, buffer tuning, PCIe ASPM, CAKE) and deletes the plugin's own config files. The BSSID lock, the band preference and the IPv6 setting are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. Custom DNS stays on your saved WiFi network - to remove it, forget and rejoin the network from Steam's WiFi settings. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
+**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. Power save then follows the plugin's defaults until you uninstall. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
 
 Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
 

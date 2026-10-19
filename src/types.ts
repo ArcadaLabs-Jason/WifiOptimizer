@@ -35,6 +35,8 @@ export interface LiveStatus {
   connected_bssid?: string;
   bssid_lock?: string;
   bssid_lock_other_network?: boolean;
+  /** IPv6 is turned off for a different network, not this one. */
+  ipv6_other_network?: boolean;
   ip_address?: string;
   dns?: string;
   ipv6_method?: string;

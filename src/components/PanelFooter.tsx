@@ -27,8 +27,10 @@ export function PanelFooter({ version }: PanelFooterProps) {
         await navigator.clipboard.writeText(text);
         setDiagState("done");
       } catch {
-        await backend.saveDiagnosticInfo();
-        setDiagState("saved");
+        // A resolved failure is still a failure: saying "Saved" here sent
+        // people looking for a file that was never written.
+        const saved = await backend.saveDiagnosticInfo();
+        setDiagState(saved?.success === false ? "error" : "saved");
       }
       setTimeout(() => setDiagState("idle"), 5000);
     } catch {

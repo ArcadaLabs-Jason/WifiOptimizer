@@ -193,7 +193,11 @@ SYSCTL_PARAMS = {
 # the tuning above cannot leave the drift check comparing to the old number.
 TUNED_RMEM_MAX = SYSCTL_PARAMS["net.core.rmem_max"]
 
-# Kernel defaults, restored when buffer tuning is disabled.
+# Kernel defaults, the fallback when buffer tuning is turned off and no value
+# from before our first change was recorded. Linux 6.18 raised rmem_max and
+# wmem_max to 4 MiB (SteamOS 3.8.28 ships 6.18), so those two are adjusted by
+# _stock_sysctl_defaults rather than read from here directly. Restoring the
+# older 212992 there cut the stock buffers to a twentieth.
 SYSCTL_DEFAULTS = {
     "net.core.rmem_max": "212992",
     "net.core.wmem_max": "212992",
@@ -235,11 +239,20 @@ DEFAULT_SETTINGS = {
     "dns_provider": "cloudflare",
     "dns_servers": "1.1.1.1 1.0.0.1",
     "dns_enabled": False,
+    # Every profile we have written DNS servers to. Turning DNS off used to
+    # reach only the profile in use, so the network it was set on kept
+    # public DNS (and ignored the router's) with the panel showing it off.
+    "dns_uuids": [],
     "ipv6_disabled": False,
     "ipv6_uuids": [],
     # Access points that accepted a scan but refused an association, and when.
     "ap_move_failures": {},
     "buffer_tuning_enabled": False,
+    # What the buffer sysctls were before our first change, and the kernel
+    # they were read on, so turning tuning off puts back what the system had.
+    # A distro can ship its own values (CachyOS raises the backlog) and the
+    # kernel's own defaults move between versions.
+    "sysctl_baseline": {},
     "cake_enabled": False,
     "last_connection_uuid": "",
     "priority_set": False,
@@ -333,6 +346,41 @@ def _first_existing(paths: list[str]) -> str | None:
     return None
 
 
+def _kernel_release() -> str:
+    try:
+        return os.uname().release
+    except Exception:
+        return ""
+
+
+def _stock_sysctl_defaults(release: str) -> dict:
+    """The kernel's own buffer defaults for this kernel version."""
+    values = dict(SYSCTL_DEFAULTS)
+    found = re.match(r"(\d+)\.(\d+)", release or "")
+    if found and (int(found.group(1)), int(found.group(2))) >= (6, 18):
+        values["net.core.rmem_max"] = "4194304"
+        values["net.core.wmem_max"] = "4194304"
+    return values
+
+
+def _clean_sysctl_baseline(value) -> dict:
+    """Keep only a well-formed baseline. These values reach `sysctl -w` as
+    root and come from a file the desktop user can edit, so anything that is
+    not a known key with a plain number is dropped."""
+    if not isinstance(value, dict):
+        return {}
+    kernel = value.get("kernel", "")
+    values = value.get("values", {})
+    if not isinstance(kernel, str) or len(kernel) > 128 or not isinstance(values, dict):
+        return {}
+    kept = {
+        k: v for k, v in values.items()
+        if k in SYSCTL_PARAMS and isinstance(v, str)
+        and re.fullmatch(r"[0-9]{1,12}", v, re.ASCII)
+    }
+    return {"kernel": kernel, "values": kept} if kernel and kept else {}
+
+
 def _load_settings() -> dict:
     try:
         # Bounded read. This file belongs to the desktop user and root parses
@@ -369,7 +417,8 @@ def _load_settings() -> dict:
         # handed to nmcli on exactly the same path, and leaving it out meant
         # the one list whose entries were never checked was also the one the
         # cleanup refuses to act on without a record.
-        for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids"):
+        for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids",
+                    "dns_uuids"):
             merged[key] = [
                 u for u in merged.get(key, [])
                 if isinstance(u, str) and UUID_RE.match(u)
@@ -381,6 +430,9 @@ def _load_settings() -> dict:
             value = merged.get(key, "")
             if value and not REGDOMAIN_RE.match(value):
                 merged[key] = ""
+        merged["sysctl_baseline"] = _clean_sysctl_baseline(
+            merged.get("sysctl_baseline")
+        )
         return merged
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -815,6 +867,21 @@ class Plugin:
         # not at all. Bounded to profiles we recorded writing to.
         for uuid in {u for u in settings.get("ipv6_uuids", []) if u}:
             self._nmcli_modify(uuid, "ipv6.method", "auto", timeout=2)
+        # And DNS, which no reset or uninstall used to touch at all: the
+        # profile kept public servers and ignored the router's afterwards.
+        for uuid in {u for u in settings.get("dns_uuids", []) if u}:
+            self._clear_dns(uuid)
+
+    def _clear_dns(self, uuid: str) -> bool:
+        """Give a profile back its automatic DNS. True when done, or when the
+        profile no longer exists and there is nothing left to undo."""
+        results = [
+            self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no", timeout=2),
+            self._nmcli_modify(uuid, "ipv4.dns", "", timeout=2),
+        ]
+        gone = any("unknown connection" in (r.get("stderr") or "").lower()
+                   for r in results)
+        return gone or all(r["success"] for r in results)
 
     _RADIO_OFF_RESULT = {
         "success": False,
@@ -923,46 +990,72 @@ class Plugin:
             except FileNotFoundError:
                 pass
 
-    def _apply_pcie_aspm_fix(self, enable: bool):
+    def _apply_pcie_aspm_fix(self, enable: bool) -> list[str]:
         """Disable or restore PCIe ASPM for the WiFi device.
         Prevents throughput degradation during sustained streaming.
-        Works on all PCIe-attached WiFi adapters."""
+        Works on all PCIe-attached WiFi adapters.
+
+        Returns the names of the files that did not end up disabled, so the
+        caller can say so. Each file is written and read back on its own:
+        catching only two error types used to let any other one abort the
+        loop part way, and nothing checked whether a write took. A file the
+        device does not have is skipped (the OLED has no l0s_aspm). Restoring
+        is not verified, because firmware can keep a state off that we ask
+        for, which is not a failure of ours.
+        """
+        not_applied = []
         try:
             # Discover WiFi PCI device path dynamically
             iface = self._get_wifi_interface()
             if not iface or not IFACE_RE.match(iface):
-                return
+                return not_applied
             device_link = os.path.realpath(os.path.join(SYSFS_NET, iface, "device"))
             if not os.path.isdir(device_link):
-                return
+                return not_applied
 
-            # Disable/restore PCIe ASPM L-states
+            targets = []
             link_dir = os.path.join(device_link, "link")
             if os.path.isdir(link_dir):
                 val = "0" if enable else "1"
                 for aspm_file in ["l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
                                    "l1_1_pcipm", "l1_2_pcipm"]:
-                    path = os.path.join(link_dir, aspm_file)
-                    try:
-                        with open(path, "w") as f:
-                            f.write(val)
-                    except (FileNotFoundError, PermissionError):
-                        pass
+                    targets.append((os.path.join(link_dir, aspm_file), val))
+            # PCI runtime power management
+            targets.append((
+                os.path.join(device_link, "power", "control"),
+                "on" if enable else "auto",
+            ))
 
-            # Disable/restore PCI runtime power management
-            power_control = os.path.join(device_link, "power", "control")
-            try:
-                with open(power_control, "w") as f:
-                    f.write("on" if enable else "auto")
-            except (FileNotFoundError, PermissionError):
-                pass
+            for path, val in targets:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, "w") as f:
+                        f.write(val)
+                except OSError as e:
+                    decky.logger.info(f"PCIe power write {path}={val}: {e}")
+                if not enable:
+                    continue
+                try:
+                    with open(path, "r") as f:
+                        current = f.read().strip()
+                except OSError:
+                    current = None
+                if current != val:
+                    not_applied.append(os.path.basename(path))
 
-            if enable:
+            if not_applied:
+                decky.logger.error(
+                    f"PCIe power states still enabled on {device_link}: "
+                    f"{', '.join(not_applied)}"
+                )
+            elif enable:
                 decky.logger.info(f"PCIe ASPM disabled for {device_link}")
             else:
                 decky.logger.info(f"PCIe ASPM restored for {device_link}")
         except Exception as e:
             decky.logger.error(f"PCIe ASPM fix error: {e}")
+        return not_applied
 
     def _install_dispatcher(self) -> bool:
         try:
@@ -1182,12 +1275,7 @@ class Plugin:
             self._remove_dispatcher()
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
-            for key, value in SYSCTL_DEFAULTS.items():
-                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
-            iface = self._get_wifi_interface()
-            if iface:
-                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
-                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+            self._revert_queue_tuning(_load_settings())
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
                          SETTINGS_FILE, ENFORCED_FILE]:
                 try:
@@ -1652,6 +1740,9 @@ class Plugin:
                 self._apply_priority(action, settings, status, pending)
             elif kind == "ipv6":
                 self._apply_ipv6(action, settings, status, pending)
+            elif kind == "ipv6_adopt":
+                if settings.get("ipv6_disabled") and not settings.get("ipv6_uuids"):
+                    pending["ipv6_uuids"] = [action["uuid"]]
             elif kind == "band":
                 self._apply_band(action, settings, status, pending)
             elif kind == "cake":
@@ -2586,7 +2677,8 @@ class Plugin:
         can behave differently from one hour to the next.
 
         Only ever raises OUR profile; a rival is read but never written, so
-        this cannot disturb a value somebody else set deliberately. It also
+        this cannot disturb a value somebody else set deliberately. With no
+        rivals it only moves a profile off the default of 0. It also
         converges: once this profile outranks the others NetworkManager stops
         switching, so nothing bumps again.
         """
@@ -2595,7 +2687,11 @@ class Plugin:
             ssid = self._get_profile_ssid(uuid)
             rivals = self._rival_profiles(uuid, ssid) if ssid else []
         if not rivals:
-            return None if mine == self._PRIORITY_BASE else self._PRIORITY_BASE
+            # Only a profile still on NetworkManager's default of 0. Writing
+            # the base over any other value lowered a priority someone had
+            # raised on purpose, or raised one they had lowered (a metered
+            # hotspot set below home), just from opening the panel there.
+            return self._PRIORITY_BASE if mine == 0 else None
         highest = max(self._profile_priority(other) for other, _km in rivals)
         if mine > highest:
             return None
@@ -2774,6 +2870,31 @@ class Plugin:
             return None
         return best
 
+    def _band_unreachable(self, uuid: str, band: str) -> dict | None:
+        """The refusal to return when this network has nothing on the band.
+
+        The lock checks this before it cycles the radio and the band setter
+        did not, so turning it on where the network has nothing on that band
+        disconnected the device until the stranded-pin release gave up on it
+        a minute later.
+        """
+        iface = self._get_wifi_interface()
+        # Only a scan that answered and found nothing is a reason to refuse.
+        # One that could not be read says nothing either way, and refusing on
+        # it would block the setting for no reason the user could act on.
+        if not iface or self._band_presence(iface, uuid, band) is not False:
+            return None
+        name = "5 GHz" if band == "a" else "2.4 GHz"
+        decky.logger.info(
+            f"Refusing band {band!r}: no {name} access point for "
+            f"{self._get_profile_ssid(uuid)!r} in the scan of {iface}"
+        )
+        return {
+            "success": False,
+            "error": "band_unavailable",
+            "message": f"No {name} access point for this network is in range, so this would disconnect you.",
+        }
+
     def _band_is_reachable(self, iface: str, uuid: str, want: str) -> bool:
         """Whether this network has a visible AP on the wanted band.
 
@@ -2781,16 +2902,30 @@ class Plugin:
         back leaves the user disconnected - worse than the state the cycle
         was meant to improve.
         """
+        return self._band_presence(iface, uuid, want) is True
+
+    def _band_presence(self, iface: str, uuid: str, want: str) -> bool | None:
+        """True or False from a scan that answered, None when none did.
+
+        The same scan budget as the access point list. A cold list makes
+        nmcli rescan, which takes several seconds; at five seconds it timed
+        out inside Decky and read as "nothing on that band" on a Deck that
+        was connected on it at the time.
+        """
         ssid = self._get_profile_ssid(uuid)
         if not ssid:
-            return False
+            return None
         scan = self._run_cmd(
             ["/usr/bin/nmcli", "-t", "-f", "SSID,FREQ", "dev", "wifi", "list",
              "ifname", iface],
-            timeout=5,
+            timeout=self._SCAN_SECONDS,
         )
         if not scan["success"]:
-            return False
+            decky.logger.error(
+                f"Could not list access points on {iface}: "
+                f"{(scan.get('stderr', '') or 'timed out')[:160]}"
+            )
+            return None
         for line in scan.get("stdout", "").split("\n"):
             name, _, freq = line.rpartition(":")
             # Unescape BOTH sides. _get_profile_ssid returns nmcli's terse
@@ -3055,7 +3190,18 @@ class Plugin:
         plugin for a state it did not create and cannot explain.
         """
         if settings.get("ipv6_disabled"):
-            if live_ipv6 != "disabled":
+            tracked = settings.get("ipv6_uuids", [])
+            # Only the networks it was turned off on. Reasserting on whatever
+            # profile is active wrote "disabled" into every network the panel
+            # was opened on, without recording it, so nothing could undo it
+            # and the panel later blamed something else. A profile already
+            # off with nothing recorded is a setting from before tracking
+            # existed: adopt it so the toggle can undo it.
+            if uuid and not tracked and live_ipv6 == "disabled":
+                actions.append({"kind": "ipv6_adopt", "uuid": uuid})
+            elif uuid and uuid not in tracked:
+                status["live"]["ipv6_other_network"] = True
+            elif live_ipv6 != "disabled":
                 status["drift"]["ipv6"] = True
                 actions.append({
                     "kind": "ipv6", "uuid": uuid, "observed": live_ipv6,
@@ -3569,14 +3715,23 @@ class Plugin:
                     pass
 
             self._apply_driver_fixes(disabled)
-            self._apply_pcie_aspm_fix(disabled)
+            not_applied = self._apply_pcie_aspm_fix(disabled)
 
             # Save settings only after success
             settings = _load_settings()
             settings["power_save_disabled"] = disabled
             _save_settings_with_timestamp(settings)
 
-            return {"success": True, "power_save_off": disabled}
+            result = {"success": True, "power_save_off": disabled}
+            if not_applied:
+                # WiFi power save itself is off, which is most of the benefit,
+                # but the toggle also promises the PCIe power states and some
+                # did not take. Say which rather than claim all of it.
+                result["message"] = (
+                    "WiFi power save is off, but some PCIe power states could "
+                    f"not be disabled: {', '.join(not_applied)}."
+                )
+            return result
         except Exception as e:
             decky.logger.error(f"set_power_save error: {e}")
             return self._unexpected_response(e)
@@ -3596,7 +3751,10 @@ class Plugin:
             # Only record the setting as on once the script is actually in
             # place. Saving first left the toggle showing on, and the header
             # claiming a recent change, while nothing had been installed.
-            settings["auto_fix_on_wake"] = enabled and installed
+            # And as off only once it is gone: a script that could not be
+            # removed still runs on every connect, so the toggle should keep
+            # saying so and let the user try again.
+            settings["auto_fix_on_wake"] = installed if enabled else not removed
             _save_settings_with_timestamp(settings)
             if not enabled and not removed:
                 # The toggle would otherwise read off while the script stays
@@ -4021,6 +4179,9 @@ class Plugin:
                         "error": "nmcli_failed",
                         "message": "Couldn't identify this network. Try again in a moment.",
                     }
+                refused = self._band_unreachable(uuid, band)
+                if refused:
+                    return refused
 
             value = band if enabled else ""
             unresolved_bands: list[str] = []
@@ -4214,6 +4375,7 @@ class Plugin:
                         "message": f"Unknown DNS provider '{provider}'",
                     }
 
+                previous = self._read_profile_field(uuid, "ipv4.dns")
                 result = self._nmcli_modify(uuid, "ipv4.dns", servers)
                 if not result["success"]:
                     return {
@@ -4225,6 +4387,10 @@ class Plugin:
 
                 result2 = self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "yes")
                 if not result2["success"]:
+                    # Half applied: our servers merged in beside the router's.
+                    # Put the profile back the way it was rather than leave a
+                    # change the settings do not record.
+                    self._nmcli_modify(uuid, "ipv4.dns", previous.replace(",", " "))
                     return {
                         "success": False,
                         "error": "nmcli_failed",
@@ -4263,6 +4429,14 @@ class Plugin:
                 servers = ""
 
             settings = _load_settings()
+            known = [u for u in settings.get("dns_uuids", []) if u != uuid]
+            if enabled:
+                known.append(uuid)
+            else:
+                # Every other profile we wrote to, not just the one in use.
+                # One we cannot reach stays listed for the next attempt.
+                known = [u for u in known if not self._clear_dns(u)]
+            settings["dns_uuids"] = known[-self._MAX_TRACKED_LOCK_UUIDS:]
             settings["dns_enabled"] = enabled
             settings["dns_provider"] = provider
             settings["dns_servers"] = servers
@@ -4316,41 +4490,115 @@ class Plugin:
             decky.logger.error(f"set_ipv6 error: {e}")
             return self._unexpected_response(e)
 
+    def _capture_sysctl_baseline(self, settings: dict):
+        """Record what the buffer sysctls are before we change them.
+
+        Only values that differ from ours are taken, so a value we set
+        ourselves (the dispatcher reapplies tuning on connect, before the
+        plugin loads) is never mistaken for the system's own. A baseline read
+        on another kernel is discarded: a reboot into a newer kernel brings
+        new defaults, and the old ones would then be the wrong thing to put
+        back.
+        """
+        release = _kernel_release()
+        baseline = settings.get("sysctl_baseline") or {}
+        values = dict(baseline.get("values", {})) if baseline.get("kernel") == release else {}
+        # Tuning already in place (every game launch reapplies it) means there
+        # is nothing of the system's left to read. One call instead of eight.
+        live = (self._run_cmd(["/usr/bin/sysctl", "-n", "net.core.rmem_max"]).get("stdout") or "").strip()
+        if live == TUNED_RMEM_MAX:
+            return
+        for key, tuned in SYSCTL_PARAMS.items():
+            if key in values:
+                continue
+            current = (self._run_cmd(["/usr/bin/sysctl", "-n", key]).get("stdout") or "").strip()
+            if re.fullmatch(r"[0-9]{1,12}", current, re.ASCII) and current != tuned:
+                values[key] = current
+        settings["sysctl_baseline"] = _clean_sysctl_baseline(
+            {"kernel": release, "values": values}
+        )
+
+    def _sysctl_restore_values(self, settings: dict) -> dict:
+        """What to put back: the recorded baseline where we have one for this
+        kernel, the kernel's own default otherwise."""
+        release = _kernel_release()
+        values = _stock_sysctl_defaults(release)
+        baseline = settings.get("sysctl_baseline") or {}
+        if baseline.get("kernel") == release:
+            values.update(baseline.get("values", {}))
+        return values
+
+    def _restore_buffer_sysctls(self, settings: dict) -> int:
+        """Put the buffer sysctls back. Returns how many writes failed."""
+        failed = 0
+        for key, value in self._sysctl_restore_values(settings).items():
+            result = self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
+            if not result["success"]:
+                failed += 1
+                decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
+        return failed
+
+    def _buffer_tuning_in_place(self, settings: dict) -> bool:
+        """Whether reset or uninstall has anything of ours to undo. Writing the
+        restore values unconditionally replaced whatever the system had even
+        for people who never turned tuning on."""
+        if settings.get("buffer_tuning_enabled"):
+            return True
+        live = self._run_cmd(["/usr/bin/sysctl", "-n", "net.core.rmem_max"])
+        return (live.get("stdout") or "").strip() == TUNED_RMEM_MAX
+
+    def _revert_queue_tuning(self, settings: dict):
+        """Undo buffer tuning and CAKE for reset and uninstall, and only what
+        we actually changed: the system's own values are left alone for
+        someone who never turned either on."""
+        tuned = self._buffer_tuning_in_place(settings)
+        if tuned:
+            self._restore_buffer_sysctls(settings)
+        iface = self._get_wifi_interface()
+        if iface:
+            cake = settings.get("cake_enabled") or self._get_cake_status(iface)
+            if tuned or cake:
+                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
+            if cake:
+                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+
     async def set_buffer_tuning(self, enabled: bool) -> dict:
         try:
-
-            params = SYSCTL_PARAMS if enabled else SYSCTL_DEFAULTS
-            failed = 0
-            for key, value in params.items():
-                result = self._run_cmd(
-                    ["/usr/bin/sysctl", "-w", f"{key}={value}"]
-                )
-                if not result["success"]:
-                    failed += 1
-                    decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
-
-            if failed == len(params) and not enabled:
-                decky.logger.error(
-                    "Could not restore any kernel buffer defaults; recording "
-                    "the setting as off anyway so the toggle is not stuck"
-                )
-            if enabled and failed == len(params):
-                # Reporting success here recorded the setting as on, which then
-                # showed as drift on every poll with no control able to clear
-                # it: Optimize Safe just calls back into here and fails again.
-                # Only on the enable path. Refusing to disable would leave
-                # the setting recorded as on with a toggle that will not move,
-                # which is worse than recording the user's intent and logging
-                # that the restore did not take.
-                return {
-                    "success": False,
-                    "error": "unexpected",
-                    "message": "Couldn't apply network buffer settings.",
-                }
+            settings = _load_settings()
+            if enabled:
+                self._capture_sysctl_baseline(settings)
+                failed_keys = []
+                for key, value in SYSCTL_PARAMS.items():
+                    result = self._run_cmd(
+                        ["/usr/bin/sysctl", "-w", f"{key}={value}"]
+                    )
+                    if not result["success"]:
+                        failed_keys.append(key)
+                        decky.logger.error(f"sysctl {key}={value} failed: {result['stderr']}")
+                if len(failed_keys) == len(SYSCTL_PARAMS):
+                    # Reporting success here recorded the setting as on, which
+                    # then showed as drift on every poll with no control able
+                    # to clear it: Optimize Safe just calls back into here and
+                    # fails again.
+                    return {
+                        "success": False,
+                        "error": "unexpected",
+                        "message": "Couldn't apply network buffer settings.",
+                    }
+            else:
+                # Refusing to disable would leave the setting recorded as on
+                # with a toggle that will not move, which is worse than
+                # recording the user's intent and logging that the restore
+                # did not take.
+                if self._restore_buffer_sysctls(settings) == len(SYSCTL_PARAMS):
+                    decky.logger.error(
+                        "Could not restore any kernel buffer defaults; recording "
+                        "the setting as off anyway so the toggle is not stuck"
+                    )
+                failed_keys = []
 
             # TX queue length (CAKE needs 256; defer to it if active)
             iface = self._get_wifi_interface()
-            settings = _load_settings()
             if iface:
                 if settings.get("cake_enabled"):
                     txq = "256"
@@ -4362,7 +4610,14 @@ class Plugin:
 
             settings["buffer_tuning_enabled"] = enabled
             _save_settings_with_timestamp(settings)
-            return {"success": True, "buffer_tuning": enabled}
+            result = {"success": True, "buffer_tuning": enabled}
+            if failed_keys:
+                # Some took and some did not. The status poll only checks one
+                # of them, so without saying so here a partial apply looks
+                # exactly like a full one.
+                names = ", ".join(k.rsplit(".", 1)[-1] for k in failed_keys)
+                result["message"] = f"Applied, except: {names}."
+            return result
         except Exception as e:
             decky.logger.error(f"set_buffer_tuning error: {e}")
             return self._unexpected_response(e)
@@ -4411,6 +4666,13 @@ class Plugin:
                     decky.logger.info(
                         f"tc qdisc del on {iface}: {removal.get('stderr', '')[:120]}"
                     )
+                    if self._get_cake_status(iface):
+                        return {
+                            "success": False,
+                            "error": "unexpected",
+                            "message": "Couldn't remove CAKE.",
+                            "detail": removal.get("stderr", ""),
+                        }
                 # Restore txqueuelen based on whether buffer tuning is active
                 settings = _load_settings()
                 txq = "2000" if settings.get("buffer_tuning_enabled") else "1000"
@@ -4591,7 +4853,20 @@ class Plugin:
                         applied += 1
                     did_reconnect = True
 
-            if settings.get("dns_enabled"):
+            # DNS and IPv6 belong to the networks they were set on, the same
+            # as the band: reapplying them here would spread them onto
+            # whichever network happens to be active. An empty list is a
+            # setting from before tracking existed; applying it once records
+            # where it lives.
+            active_uuid = self._get_active_connection_uuid() or ""
+
+            def elsewhere(list_key: str) -> bool:
+                tracked = settings.get(list_key, [])
+                return bool(tracked) and active_uuid not in tracked
+
+            if settings.get("dns_enabled") and elsewhere("dns_uuids"):
+                decky.logger.info("Skipping DNS: it was set on another network")
+            elif settings.get("dns_enabled"):
                 total += 1
                 r = await self.set_dns(
                     True,
@@ -4603,7 +4878,9 @@ class Plugin:
                     applied += 1
                 did_reconnect = True
 
-            if settings.get("ipv6_disabled"):
+            if settings.get("ipv6_disabled") and elsewhere("ipv6_uuids"):
+                decky.logger.info("Skipping IPv6: it was turned off on another network")
+            elif settings.get("ipv6_disabled"):
                 total += 1
                 r = await self.set_ipv6(True)
                 results["ipv6"] = r
@@ -4641,6 +4918,59 @@ class Plugin:
             decky.logger.error(f"reapply_all error: {e}")
             return self._unexpected_response(e)
 
+    async def repair_drifted(self) -> dict:
+        """Put back only the settings that are on and have stopped holding.
+
+        What the drift banner's "Fix now" runs. It used to run Optimize Safe,
+        which turned on the access point lock, buffer tuning and auto-fix for
+        someone who had deliberately left them off, and did nothing for drift
+        in CAKE, IPv6 or the band, while reporting everything applied.
+        """
+        try:
+            status = await self.get_status()
+            drift = dict(status.get("drift") or {})
+            settings = _load_settings()
+            # Non-reconnecting first and power save last, as in reapply_all,
+            # so a reconnect cannot undo what was just put back.
+            steps = (
+                ("buffer_tuning", "buffer_tuning_enabled",
+                 lambda: self.set_buffer_tuning(True)),
+                ("cake", "cake_enabled", lambda: self.set_cake(True)),
+                ("bssid_lock", "bssid_lock_enabled",
+                 lambda: self.set_bssid_lock(True)),
+                ("band_preference", "band_preference_enabled",
+                 lambda: self.set_band_preference(
+                     True, settings.get("band_preference", "a"))),
+                ("ipv6", "ipv6_disabled", lambda: self.set_ipv6(True)),
+                ("power_save", "power_save_disabled",
+                 lambda: self.set_power_save(True)),
+            )
+            results = {}
+            applied = 0
+            reconnected = False
+            for key, enabled_key, run in steps:
+                if not drift.get(key) or not settings.get(enabled_key):
+                    continue
+                r = await run()
+                results[key] = r
+                if r.get("success"):
+                    applied += 1
+                reconnected = reconnected or bool(r.get("reconnected"))
+            result = {
+                "success": True,
+                "total": len(results),
+                "applied": applied,
+                "results": results,
+            }
+            if not results:
+                result["message"] = "Nothing needed fixing."
+            if reconnected:
+                result["reconnected"] = True
+            return result
+        except Exception as e:
+            decky.logger.error(f"repair_drifted error: {e}")
+            return self._unexpected_response(e)
+
     async def reset_settings(self) -> dict:
         """Delete settings and revert to defaults."""
         try:
@@ -4649,12 +4979,7 @@ class Plugin:
             # Revert runtime state
             self._apply_driver_fixes(False)
             self._apply_pcie_aspm_fix(False)
-            for key, value in SYSCTL_DEFAULTS.items():
-                self._run_cmd(["/usr/bin/sysctl", "-w", f"{key}={value}"])
-            iface = self._get_wifi_interface()
-            if iface:
-                self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "1000"])
-                self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
+            self._revert_queue_tuning(_load_settings())
             try:
                 os.remove(NM_CONF_PATH)
             except FileNotFoundError:
@@ -4864,7 +5189,19 @@ class Plugin:
 
     async def apply_update(self) -> dict:
         """Download and install update from the selected channel, then restart Decky."""
+        claimed = False
         try:
+            self._ensure_backend_switch_state()
+            if self._backend_switch.get("in_progress"):
+                # The update restarts Decky, which would lose the switch's
+                # progress and result part way through.
+                return {"success": False, "message": "Wait for the WiFi backend switch to finish."}
+            if self._update_running():
+                return {"success": False, "message": "An update is already being installed."}
+            # Claimed before the first await, or two requests both pass the
+            # check above while the version lookup runs.
+            self._update_starting = True
+            claimed = True
             info = await self.check_for_update()
             if not info.get("update_available"):
                 return {"success": False, "message": "No update available."}
@@ -4897,14 +5234,34 @@ PLUGIN_DIR="$2"
 DOWNLOAD_URL="$3"
 SRC_NAME="$4"
 LABEL="$5"
+EXPECTED="$6"
+
+TMP=$(mktemp -d) || exit 1
+OWN_LOCK=0
+cleanup() {
+    rm -rf "$TMP"
+    # Only the update holding the lock may clear staged files; another one
+    # exiting early must not delete what the running one is about to move.
+    if [ "$OWN_LOCK" = 1 ]; then
+        rm -f "$PLUGIN_DIR"/*.wifiopt-new "$PLUGIN_DIR"/*/*.wifiopt-new
+    fi
+    rm -rf "$SELF_DIR"
+}
+trap cleanup EXIT
+
+# One update at a time. A retry after the panel gave up waiting used to
+# start a second copy alongside the first, and both restarted Decky.
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/wifi-optimizer-update.lock || exit 1
+    flock -n 9 || { logger -t wifi-optimizer "Update already running"; exit 0; }
+fi
+OWN_LOCK=1
 
 sleep 2
 
-TMP=$(mktemp -d) || exit 1
-cleanup() { rm -rf "$TMP"; rm -rf "$SELF_DIR"; }
-trap cleanup EXIT
-
-curl -sL --proto '=https' --tlsv1.2 "$DOWNLOAD_URL" -o "$TMP/update.tar.gz" || {
+# Bounded, so a stalled download ends instead of outliving the panel's wait.
+OPTS="--connect-timeout 15 --speed-limit 1024 --speed-time 30 --max-time 300"
+curl -sSL --fail --proto '=https' --tlsv1.2 $OPTS "$DOWNLOAD_URL" -o "$TMP/update.tar.gz" || {
     logger -t wifi-optimizer "Update failed: download error"
     exit 1
 }
@@ -4919,22 +5276,48 @@ tar xzf "$TMP/update.tar.gz" -C "$TMP" --no-same-owner --no-same-permissions || 
 }
 SRC="$TMP/$SRC_NAME"
 
-if [ ! -f "$SRC/plugin.json" ] || [ ! -f "$SRC/main.py" ] || [ ! -f "$SRC/dist/index.js" ]; then
-    logger -t wifi-optimizer "Update failed: payload incomplete"
+FILES="plugin.json main.py decky.pyi dist/index.js defaults/dispatcher.sh.tmpl package.json"
+for f in $FILES; do
+    if [ ! -f "$SRC/$f" ]; then
+        logger -t wifi-optimizer "Update failed: payload incomplete ($f)"
+        exit 1
+    fi
+done
+GOT=$(grep -o '"version": *"[^"]*"' "$SRC/package.json" | head -n 1 | cut -d'"' -f4)
+if [ "$GOT" != "$EXPECTED" ]; then
+    logger -t wifi-optimizer "Update failed: payload is version $GOT, expected $EXPECTED"
     exit 1
 fi
 
-cp "$SRC/plugin.json" "$PLUGIN_DIR/"
-cp "$SRC/package.json" "$PLUGIN_DIR/"
-cp "$SRC/main.py" "$PLUGIN_DIR/"
-cp "$SRC/decky.pyi" "$PLUGIN_DIR/"
-mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults"
-cp "$SRC/dist/index.js" "$PLUGIN_DIR/dist/"
+# Copy everything beside the live files first, and only then move each into
+# place. A copy that fails part way (a full disk) leaves the installed
+# version whole. package.json goes last because it carries the version: if
+# anything before it fails, the installed version is unchanged and the same
+# update is offered again.
+mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults" || {
+    logger -t wifi-optimizer "Update failed: could not create directories"
+    exit 1
+}
+for f in $FILES; do
+    cp "$SRC/$f" "$PLUGIN_DIR/$f.wifiopt-new" || {
+        logger -t wifi-optimizer "Update failed: could not copy $f"
+        exit 1
+    }
+done
+for f in $FILES; do
+    mv -f "$PLUGIN_DIR/$f.wifiopt-new" "$PLUGIN_DIR/$f" || {
+        logger -t wifi-optimizer "Update failed: could not replace $f"
+        exit 1
+    }
+done
 cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
-cp "$SRC/defaults/dispatcher.sh.tmpl" "$PLUGIN_DIR/defaults/"
 
-logger -t wifi-optimizer "Updated to $LABEL, restarting plugin_loader"
-systemctl restart plugin_loader 2>/dev/null || true
+if systemctl restart plugin_loader; then
+    logger -t wifi-optimizer "Updated to $LABEL, restarted plugin_loader"
+else
+    logger -t wifi-optimizer "Updated to $LABEL, but Decky did not restart. Restart the Deck to load it."
+    exit 1
+fi
 """
             # Not a fixed path under /tmp. That directory is world writable, so
             # any local user could pre-create the file we are about to write,
@@ -4950,10 +5333,13 @@ systemctl restart plugin_loader 2>/dev/null || true
             )
             with os.fdopen(fd, "w") as f:
                 f.write(script)
+            # The script removes its own directory when it exits, so while
+            # the directory exists an update is running.
+            self._update_dir = script_dir
 
             subprocess.Popen(
                 ["/bin/bash", script_path, script_dir, plugin_dir,
-                 download_url, src_dir, label],
+                 download_url, src_dir, label, latest],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -4965,6 +5351,17 @@ systemctl restart plugin_loader 2>/dev/null || true
         except Exception as e:
             decky.logger.error(f"apply_update error: {e}")
             return self._unexpected_response(e)
+        finally:
+            # Only the request that made the claim may drop it; a refused one
+            # passing through here must not release another's.
+            if claimed:
+                self._update_starting = False
+
+    def _update_running(self) -> bool:
+        if getattr(self, "_update_starting", False):
+            return True
+        directory = getattr(self, "_update_dir", None)
+        return bool(directory) and os.path.isdir(directory)
 
     # ---- WiFi backend switch (iwd / wpa_supplicant) ----
 
@@ -5352,6 +5749,47 @@ systemctl restart plugin_loader 2>/dev/null || true
         finally:
             self._backend_switch["in_progress"] = False
 
+    def _merged_nm_backend(self) -> str | None:
+        """The backend NetworkManager's merged configuration names, from NM
+        itself, so the order conf.d files are read in is NM's own."""
+        for binary in ("/usr/bin/NetworkManager", "/usr/sbin/NetworkManager"):
+            if not os.path.isfile(binary):
+                continue
+            result = self._run_cmd([binary, "--print-config"], timeout=5)
+            if not result["success"]:
+                return None
+            for line in result.get("stdout", "").split("\n"):
+                key, sep, val = line.strip().partition("=")
+                if sep and key.strip() == "wifi.backend":
+                    val = val.strip()
+                    return val if val in ("iwd", "wpa_supplicant") else None
+            return None
+        return None
+
+    def _effective_generic_backend(self) -> str | None:
+        """The backend actually in force on a generic system: the one NM is
+        configured for, and only if its service is running."""
+        configured = self._merged_nm_backend() or self._get_current_backend()
+        if not configured:
+            return None
+        active = self._run_cmd(["/usr/bin/systemctl", "is-active", configured], timeout=3)
+        return configured if active.get("stdout", "").strip() == "active" else None
+
+    def _restore_generic_backend(self, backend: str):
+        """Point NM back at a backend and start it, after a failed switch."""
+        try:
+            with open(GENERIC_BACKEND_CONF, "w") as f:
+                if backend == "iwd":
+                    f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
+                else:
+                    f.write("[device]\nwifi.backend=wpa_supplicant\n")
+        except OSError as e:
+            decky.logger.error(f"restoring backend conf: {e}")
+        for cmd in (["/usr/bin/systemctl", "enable", backend],
+                    ["/usr/bin/systemctl", "start", backend],
+                    ["/usr/bin/systemctl", "restart", "NetworkManager"]):
+            self._run_cmd(cmd, timeout=15)
+
     async def _generic_backend_switch_worker(self, target: str):
         """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
         Writes NM config directly and manages systemd services."""
@@ -5374,9 +5812,25 @@ systemctl restart plugin_loader 2>/dev/null || true
                 ["/usr/bin/systemctl", "stop", other],
                 ["/usr/bin/systemctl", "disable", other],
                 ["/usr/bin/systemctl", "enable", target],
-                ["/usr/bin/systemctl", "start", target],
             ]:
                 await asyncio.to_thread(self._run_cmd, cmd, 10)
+            started = await asyncio.to_thread(
+                self._run_cmd, ["/usr/bin/systemctl", "start", target], 10
+            )
+            if not started["success"]:
+                # Going on would leave NetworkManager pointed at a backend
+                # that is not running and the other one stopped: no WiFi.
+                # Put the previous one back first.
+                await asyncio.to_thread(self._restore_generic_backend, other)
+                detail = started.get("stderr", "")[:200]
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": f"{target} would not start, so {other} was kept.",
+                    "detail": detail,
+                }
+                return
 
             restart = await asyncio.to_thread(
                 self._run_cmd,
@@ -5406,7 +5860,17 @@ systemctl restart plugin_loader 2>/dev/null || true
                         reconnect_timed_out = False
                         break
 
-            final_backend = await asyncio.to_thread(self._get_current_backend)
+            # Judged from what is running, not from the file just written:
+            # reading that back always agreed with itself. Another file in
+            # conf.d can still win (Bazzite's iwd.conf sorts after ours), and
+            # the service can fail after starting. Allow a few seconds for a
+            # service that is still coming up.
+            final_backend = None
+            for _ in range(5):
+                final_backend = await asyncio.to_thread(self._effective_generic_backend)
+                if final_backend == target:
+                    break
+                await asyncio.sleep(1)
 
             if final_backend == target:
                 self._backend_switch["phase"] = "done"
@@ -5458,6 +5922,9 @@ systemctl restart plugin_loader 2>/dev/null || true
 
     async def start_backend_switch(self, backend: str) -> dict:
         """Kick off a backend switch. Returns immediately; poll get_backend_switch_status for progress."""
+        reserved = False
+        launched = False
+        previous = None
         try:
             self._ensure_backend_switch_state()
             if backend not in ("iwd", "wpa_supplicant"):
@@ -5466,19 +5933,43 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "reason": "invalid_backend",
                     "message": "Backend must be 'iwd' or 'wpa_supplicant'.",
                 }
-            if not await asyncio.to_thread(self._has_backend_tool):
-                return {
-                    "accepted": False,
-                    "reason": "tool_missing",
-                    "message": "WiFi backend switch tool not found on this system.",
-                }
             if self._backend_switch.get("in_progress"):
                 return {
                     "accepted": False,
                     "reason": "in_progress",
                     "message": "Backend switch already in progress.",
                 }
+            if self._update_running():
+                return {
+                    "accepted": False,
+                    "reason": "update_in_progress",
+                    "message": "An update is being installed. Try again once it finishes.",
+                }
+            # Reserve before the first await. Checking and then awaiting let
+            # two requests both pass the check and both start a worker.
+            previous = dict(self._backend_switch)
+            self._backend_switch.update({
+                "in_progress": True,
+                "phase": "switching",
+                "target": backend,
+                "started_at": int(time.time()),
+                "result": None,
+            })
+            reserved = True
+            if not await asyncio.to_thread(self._has_backend_tool):
+                return {
+                    "accepted": False,
+                    "reason": "tool_missing",
+                    "message": "WiFi backend switch tool not found on this system.",
+                }
             current = await asyncio.to_thread(self._get_current_backend)
+            method = await asyncio.to_thread(self._get_backend_method)
+            if current == backend and method not in ("steamos_manager", "steamos"):
+                # Configured is not the same as working. If the named backend
+                # is not actually running, switching to it again is the repair.
+                effective = await asyncio.to_thread(self._effective_generic_backend)
+                if effective != backend:
+                    current = effective
             if current == backend:
                 return {
                     "accepted": False,
@@ -5487,15 +5978,7 @@ systemctl restart plugin_loader 2>/dev/null || true
                     "backend": current,
                 }
 
-            self._backend_switch.update({
-                "in_progress": True,
-                "phase": "switching",
-                "target": backend,
-                "started_at": int(time.time()),
-                "result": None,
-            })
             # Route to the appropriate worker based on backend method
-            method = await asyncio.to_thread(self._get_backend_method)
             if method == "steamos_manager":
                 worker = self._steamos_manager_backend_switch_worker(backend)
             elif method == "steamos":
@@ -5503,6 +5986,7 @@ systemctl restart plugin_loader 2>/dev/null || true
             else:
                 worker = self._generic_backend_switch_worker(backend)
             self._backend_switch_task = asyncio.create_task(worker)
+            launched = True
             decky.logger.info(f"backend switch started: {current} -> {backend}")
             return {
                 "accepted": True,
@@ -5516,6 +6000,12 @@ systemctl restart plugin_loader 2>/dev/null || true
                 "reason": "unexpected",
                 "message": str(e),
             }
+        finally:
+            # Anything that returned without starting a worker gives the
+            # reservation back, or every later switch reads "in progress".
+            if reserved and not launched and previous is not None:
+                self._backend_switch.clear()
+                self._backend_switch.update(previous)
 
     async def get_backend_switch_status(self) -> dict:
         """Return current phase and, when terminal, the final result."""

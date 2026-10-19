@@ -20,6 +20,7 @@ export const setBufferTuning = callable<[enabled: boolean], MethodResult>("set_b
 export const setCake = callable<[enabled: boolean], MethodResult>("set_cake");
 export const optimizeSafe = callable<[], OptimizeSafeResult>("optimize_safe");
 export const reapplyAll = callable<[], OptimizeSafeResult>("reapply_all");
+export const repairDrifted = callable<[], OptimizeSafeResult>("repair_drifted");
 export const reapplyVolatile = callable<[], MethodResult>("reapply_volatile");
 export const allowWpa2 = callable<[], MethodResult>("allow_wpa2");
 export const resetSettings = callable<[], MethodResult>("reset_settings");
