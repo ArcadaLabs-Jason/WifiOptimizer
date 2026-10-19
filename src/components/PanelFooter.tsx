@@ -1,7 +1,9 @@
-import { PanelSection, PanelSectionRow, ButtonItem } from "@decky/ui";
+import { PanelSection, PanelSectionRow, ButtonItem, Navigation } from "@decky/ui";
 import { theme } from "../theme";
 import * as backend from "../backend";
 import { useState } from "react";
+
+const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
 
 interface PanelFooterProps {
   version: string;
@@ -65,6 +67,17 @@ export function PanelFooter({ version }: PanelFooterProps) {
           onClick={handleCopyDiagnostics}
         >
           {label}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          onClick={() => {
+            Navigation.CloseSideMenus();
+            Navigation.NavigateToExternalWeb(KOFI_URL);
+          }}
+        >
+          Support on Ko-fi
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>
