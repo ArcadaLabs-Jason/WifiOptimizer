@@ -19,6 +19,9 @@ import importlib.util, asyncio, os, re, tempfile, time, json, sys
 spec = importlib.util.spec_from_file_location("wifiopt", "main.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+# Never read the host's own network devices: a Linux machine running this
+# would otherwise answer from its real sysfs and skip every nmcli stub.
+m.SYSFS_NET = os.path.join(tempfile.mkdtemp(), "no-sysfs")
 FAILS = []
 def ok(c, l):
     print(("PASS  " if c else "FAIL  ")+l)
@@ -101,6 +104,78 @@ ok(not _bare, f"every process start passes env=_child_env() (missing at lines {_
 ok(not any(isinstance(n, ast.Attribute) and n.attr in ("system", "popen")
            and getattr(n.value, "id", "") == "os" for n in ast.walk(_tree)),
    "and nothing starts a process around it with os.system or os.popen")
+
+section("detection: which interface and which driver")
+class NmcliSays(m.Plugin):
+    def __init__(self, devs):
+        super().__init__(); self.devs = devs; self.nmcli_calls = 0
+    def _run_cmd(self, cmd, timeout=5):
+        if cmd[:2] == ["/usr/bin/nmcli", "-t"] and cmd[-2:] == ["dev", "status"]:
+            self.nmcli_calls += 1
+            return {"success": True, "stdout": self.devs, "stderr": "", "returncode": 0}
+        return {"success": False, "stdout": "", "stderr": "", "returncode": 1}
+
+def fake_sysfs(ifaces):
+    """ifaces: name -> (has phy80211, has device link, driver module or None)"""
+    root = tempfile.mkdtemp()
+    for name, (phy, dev, module) in ifaces.items():
+        os.makedirs(os.path.join(root, name))
+        if phy:
+            os.makedirs(os.path.join(root, name, "phy80211"))
+        if dev:
+            devdir = os.path.join(root, f".dev-{name}")
+            os.makedirs(devdir)
+            if module:
+                os.makedirs(os.path.join(root, ".mods", module), exist_ok=True)
+                os.makedirs(os.path.join(devdir, "driver"))
+                os.symlink(os.path.join(root, ".mods", module),
+                           os.path.join(devdir, "driver", "module"))
+            os.symlink(devdir, os.path.join(root, name, "device"))
+    return root
+
+_real_sysfs = m.SYSFS_NET
+try:
+    m.SYSFS_NET = fake_sysfs({"lo": (False, False, None),
+                              "wlan0": (True, True, "ath11k_pci")})
+    d = NmcliSays("wlan0:wifi")
+    ok(d._get_wifi_interface() == "wlan0" and d.nmcli_calls == 0,
+       "one physical wireless netdev is read from sysfs without asking nmcli")
+    ok(d._detect_wifi_driver() == "ath11k_pci", "and its driver is read from the module link")
+
+    m.SYSFS_NET = fake_sysfs({"wlan0": (True, True, "x"), "wlan1": (True, True, "y")})
+    d = NmcliSays("wlan1:wifi\nwlan0:wifi")
+    ok(d._get_wifi_interface() == "wlan1" and d.nmcli_calls == 1,
+       "two candidates are not decided by directory order: NetworkManager picks")
+
+    m.SYSFS_NET = fake_sysfs({"wlan0": (True, False, None)})
+    d = NmcliSays("p2p-dev-wlan0:wifi-p2p\nwlan0:wifi")
+    ok(d._get_wifi_interface() == "wlan0" and d.nmcli_calls == 1,
+       "a wireless netdev with no device behind it is not taken as the radio")
+
+    m.SYSFS_NET = fake_sysfs({"lo": (False, False, None)})
+    d = NmcliSays("")
+    ok(d._get_wifi_interface() is None,
+       "no radio anywhere is None, which is what wlan0 recovery waits on")
+
+    for module, key in [("rtw89_8852be", "rtw89"), ("rtw89_8852ce", "rtw89"),
+                        ("ath12k", "ath12k"), ("rtw88_8822ce", "rtw88"),
+                        ("mt7921e", "mt7921e"), ("brcmfmac", "brcmfmac")]:
+        m.SYSFS_NET = fake_sysfs({"wlan0": (True, True, module)})
+        ok(NmcliSays("")._detect_wifi_driver() == key,
+           f"driver module {module} resolves to profile {key}")
+finally:
+    m.SYSFS_NET = _real_sysfs
+
+for name in ("rtw89", "ath12k"):
+    prof = m.DRIVER_PROFILES[name]
+    ok(p._safe_modprobe_options(name, prof) == prof["modprobe_options"]
+       and p._safe_sysfs_fixes(prof) == prof["sysfs_power_fixes"],
+       f"the {name} profile passes the same validation as the shipped ones")
+for product, family in [("Claw A1M", "msi_claw"), ("AYANEO 2S", "ayaneo"),
+                        ("G1618-04", "gpd_win"), ("Galileo", "deck_oled")]:
+    hit = next((i["family"] for pre, i in m.DMI_SUBSTRING_DEVICES if product.startswith(pre)),
+               m.DMI_DEVICES.get(product, {}).get("family"))
+    ok(hit == family, f"product name {product!r} is recognised as {family}")
 
 section("security: version validation")
 for v, good in [("0.12.0",True),("0.12.0-beta",True),("1.2.3.4",True),

@@ -35,6 +35,7 @@ except ImportError:
             def error(msg): print(f"[ERROR] {msg}")
 
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
+SYSFS_NET = "/sys/class/net"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
 BACKEND_HELPER = "/usr/bin/steamos-polkit-helpers/steamos-wifi-set-backend-privileged"
@@ -468,11 +469,22 @@ class Plugin:
             }
 
     def _get_wifi_interface(self) -> str | None:
+        # Reading sysfs saves an nmcli call on most polls, but only when the
+        # answer is unambiguous. With two wireless netdevs, listdir order would
+        # decide which one we tune, and picking the wrong one is silent: every
+        # sysfs path built from it resolves to nothing and the setters report
+        # success while applying nothing. So one physical candidate or ask
+        # NetworkManager, which knows which device it is managing.
         try:
-            for iface in os.listdir("/sys/class/net"):
-                if os.path.exists(f"/sys/class/net/{iface}/phy80211") or os.path.exists(f"/sys/class/net/{iface}/wireless"):
-                    return iface
-        except Exception:
+            candidates = [
+                iface for iface in sorted(os.listdir(SYSFS_NET))
+                if IFACE_RE.match(iface)
+                and os.path.exists(os.path.join(SYSFS_NET, iface, "phy80211"))
+                and os.path.exists(os.path.join(SYSFS_NET, iface, "device"))
+            ]
+            if len(candidates) == 1:
+                return candidates[0]
+        except OSError:
             pass
 
         result = self._run_cmd(
@@ -920,7 +932,7 @@ class Plugin:
             iface = self._get_wifi_interface()
             if not iface or not IFACE_RE.match(iface):
                 return
-            device_link = os.path.realpath(f"/sys/class/net/{iface}/device")
+            device_link = os.path.realpath(os.path.join(SYSFS_NET, iface, "device"))
             if not os.path.isdir(device_link):
                 return
 
@@ -1210,7 +1222,7 @@ class Plugin:
         if not iface or not IFACE_RE.match(iface):
             return "unknown"
         try:
-            driver_path = os.path.realpath(f"/sys/class/net/{iface}/device/driver/module")
+            driver_path = os.path.realpath(os.path.join(SYSFS_NET, iface, "device", "driver", "module"))
             module = os.path.basename(driver_path)
             if module in DRIVER_PROFILES:
                 return module
