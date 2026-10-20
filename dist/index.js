@@ -621,8 +621,10 @@ function stop() {
     }
 }
 function askDeckyToReload(version) {
-    // Once per version across every copy of the module, so two copies
-    // following the same update cannot reload the plugin twice.
+    // Once per update across every copy of the module, so two copies
+    // following the same update cannot reload the plugin twice. Cleared when
+    // the user starts an update: installing the same version again later in
+    // the same Steam session skipped the reload, and Steam restarted.
     if (shared().reloadAsked === version)
         return;
     shared().reloadAsked = version;
@@ -673,7 +675,11 @@ async function poll() {
     }
 }
 // Called once apply_update has started the script for this version.
-function watchUpdate(version) {
+// fresh: a new update the user just started, rather than a copy of the
+// module picking up one already running.
+function watchUpdate(version, fresh = false) {
+    if (fresh)
+        shared().reloadAsked = undefined;
     stop();
     target = version;
     startedAt = Date.now();
@@ -1327,7 +1333,7 @@ function Content() {
             }
             const version = result.version ?? updateInfo?.latest_version;
             if (version)
-                watchUpdate(version);
+                watchUpdate(version, true);
         }
         catch {
             // The script runs on its own; the safety timeout covers a lost reply.

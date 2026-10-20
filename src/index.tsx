@@ -687,7 +687,7 @@ function Content() {
         return;
       }
       const version = result.version ?? updateInfo?.latest_version;
-      if (version) watchUpdate(version);
+      if (version) watchUpdate(version, true);
     } catch {
       // The script runs on its own; the safety timeout covers a lost reply.
     }

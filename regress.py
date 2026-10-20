@@ -3089,7 +3089,8 @@ try:
     _done = _idx[_idx.index('progress?.phase === "done"'):]
     ok(_done.index("setUpdateInfo(null)") < _done.index("runUpdateCheck(true)") < _done.index("} else if (progress)"),
        "a panel left open across the update stops offering the version it just installed")
-    ok("watchUpdate(version)" in _idx, "the panel follows an update it started")
+    ok("watchUpdate(version, true)" in _idx and "if (fresh) shared().reloadAsked = undefined" in _watch,
+       "the panel follows an update it started, and asks for the reload again even for a version installed earlier")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
