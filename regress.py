@@ -319,7 +319,9 @@ r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
 r.aps = []
 r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
 ok(r._wpa2_blocked is not None, "throttled: a second poll within the window reuses the finding")
-r._reach_checked_at = 0.0
+# Relative to now, not zero: the monotonic clock starts at boot, so on a
+# machine that has just started, zero is still inside the window.
+r._reach_checked_at = time.monotonic() - (m.Plugin._DUPLICATE_CHECK_SECONDS + 1)
 r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
 ok(r._wpa2_blocked is None, "and past it the finding is re-read, so it clears when the radio goes")
 
