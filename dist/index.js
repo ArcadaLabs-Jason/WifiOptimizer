@@ -103,6 +103,9 @@ const moveBssidLock = callable("move_bssid_lock");
 const resetSettings = callable("reset_settings");
 const acknowledgeSettingsRecovered = callable("acknowledge_settings_recovered");
 const setUpdateChannel = callable("set_update_channel");
+const setUpdateNotify = callable("set_update_notify");
+const updateNotice = callable("update_notice");
+const markUpdateNotified = callable("mark_update_notified");
 const checkForUpdate = callable("check_for_update");
 const applyUpdate = callable("apply_update");
 const getUpdateProgress = callable("get_update_progress");
@@ -406,8 +409,8 @@ const CHANNEL_OPTIONS = [
 // stuck / failed update, and a button that context-switches between
 // "Updating...", "Update Now", "Up to date", and "Check for Updates"
 // depending on state.
-function UpdatesSection({ channel, updating, updatingText, checkingUpdate, updateInfo, updateError, onChannelChange, onApply, onCheck, busy = false, }) {
-    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Updates", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Update channel", rgOptions: CHANNEL_OPTIONS, selectedOption: channel, onChange: (option) => onChannelChange(option.data) }) }), updateError && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text }, children: ["\u26A0 ", updateError] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+function UpdatesSection({ channel, updating, updatingText, checkingUpdate, updateInfo, updateError, onChannelChange, notify, onNotifyChange, onApply, onCheck, busy = false, }) {
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Updates", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Update channel", rgOptions: CHANNEL_OPTIONS, selectedOption: channel, onChange: (option) => onChannelChange(option.data) }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Tell me about updates", description: "Shows a notification when a new version is out, never during a game. Nothing installs until you choose to.", checked: notify, onChange: onNotifyChange }) }), updateError && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text }, children: ["\u26A0 ", updateError] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.body,
                                 color: updateInfo.is_downgrade ? theme.info.text : theme.success.text,
                             }, children: updateInfo.is_downgrade
@@ -723,6 +726,83 @@ async function checkUpdateOnLoad() {
     catch {
         // Nothing to pick up or announce.
     }
+}
+// Telling people an update is out. The panel only checks while it is open,
+// and Decky does not announce updates for a plugin installed outside its
+// store, so without this an install nobody reopens never hears of one.
+// Runs for as long as the plugin is loaded: a first check a couple of
+// minutes after load, then twice a day. Each version is announced once,
+// remembered by the backend across reboots, and never while a game or a
+// stream is running, since a toast there is exactly the interruption this
+// plugin exists to avoid. Nothing is installed: the toast opens the panel.
+const NOTICE_FIRST_MS = 2 * 60 * 1000;
+const NOTICE_EVERY_MS = 12 * 60 * 60 * 1000;
+const NOTICE_RETRY_MS = 60 * 60 * 1000;
+const NOTICE_BUSY_MS = 10 * 60 * 1000;
+function gameRunning() {
+    try {
+        return !!DFL.Router.MainRunningApp;
+    }
+    catch {
+        return false;
+    }
+}
+function openPanel() {
+    try {
+        DFL.Navigation.OpenQuickAccessMenu(DFL.QuickAccessTab.Decky);
+        // Decky's internal state, not part of @decky/api: without it the menu
+        // still opens, on whichever plugin was last shown.
+        const loader = window.DeckyPluginLoader;
+        loader?.deckyState?.setActivePlugin?.(PLUGIN_NAME);
+    }
+    catch (e) {
+        console.error("WiFi Optimizer: could not open the panel", e);
+    }
+}
+// Returns the delay before the next check.
+async function noticeOnce() {
+    try {
+        const notice = await updateNotice();
+        if (notice.retry)
+            return NOTICE_RETRY_MS;
+        if (!notice.notify || !notice.version)
+            return NOTICE_EVERY_MS;
+        if (notice.busy || gameRunning())
+            return NOTICE_BUSY_MS;
+        // A second copy of the module (Decky issue #611) must not toast too.
+        if (shared().noticeShown === notice.version)
+            return NOTICE_EVERY_MS;
+        shared().noticeShown = notice.version;
+        toaster.toast({
+            title: PLUGIN_NAME,
+            body: `v${notice.version} is available. Open the plugin to update.`,
+            onClick: openPanel,
+        });
+        await markUpdateNotified(notice.version);
+        return NOTICE_EVERY_MS;
+    }
+    catch {
+        return NOTICE_RETRY_MS;
+    }
+}
+// Starts the checks for this copy of the module; returns how to stop them.
+function startUpdateNotices() {
+    let stopped = false;
+    let next = null;
+    const schedule = (ms) => {
+        next = setTimeout(async () => {
+            next = null;
+            const delay = await noticeOnce();
+            if (!stopped)
+                schedule(delay);
+        }, ms);
+    };
+    schedule(NOTICE_FIRST_MS);
+    return () => {
+        stopped = true;
+        if (next)
+            clearTimeout(next);
+    };
 }
 // When Decky dismounts this copy. Nothing is stopped: a watch in progress
 // stops by itself (see the top of this file), and a panel still on screen
@@ -1381,6 +1461,21 @@ function Content() {
         }
         setCheckingUpdate(false);
     };
+    const handleNotifyChange = async (enabled) => {
+        try {
+            const result = await setUpdateNotify(enabled);
+            if (!result.success) {
+                setUpdateError(result.message ?? "Couldn't change the update notice setting.");
+                return;
+            }
+            setUpdateError(null);
+        }
+        catch (e) {
+            console.error("set update notify error", e);
+            setUpdateError("Couldn't change the update notice setting.");
+        }
+        await refreshStatus(true);
+    };
     const handleChannelChange = async (nextChannel) => {
         try {
             const result = await setUpdateChannel(nextChannel);
@@ -1535,7 +1630,7 @@ function Content() {
                                 ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
                                 : status?.live?.ipv6_other_network
                                     ? "On for the network it was turned on for, not this one."
-                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...gatedBadge("cake", s?.cake_enabled), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsx(StreamingSection, { settings: s, live: status?.live, disabled: isBusy || updating, error: errors.streaming, notice: notices.streaming, onToggle: handleToggle }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
+                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...gatedBadge("cake", s?.cake_enabled), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsx(StreamingSection, { settings: s, live: status?.live, disabled: isBusy || updating, error: errors.streaming, notice: notices.streaming, onToggle: handleToggle }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, notify: s?.update_notify ?? true, onNotifyChange: handleNotifyChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
 }
 var index = definePlugin(() => {
     let gameLifetimeUnsub = null;
@@ -1549,6 +1644,7 @@ var index = definePlugin(() => {
             checkUpdateOnLoad();
     }, ANNOUNCE_DELAY_MS);
     timers.add(announce);
+    const stopUpdateNotices = startUpdateNotices();
     try {
         const later = (ms, fn) => {
             const id = setTimeout(() => {
@@ -1584,6 +1680,7 @@ var index = definePlugin(() => {
             timers.forEach((id) => clearTimeout(id));
             timers.clear();
             gameLifetimeUnsub?.unregister();
+            stopUpdateNotices();
             disposeUpdateWatch();
         },
     };

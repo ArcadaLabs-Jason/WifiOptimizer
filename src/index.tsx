@@ -46,6 +46,7 @@ import {
   subscribeUpdate,
   checkUpdateOnLoad,
   disposeUpdateWatch,
+  startUpdateNotices,
 } from "./updateWatch";
 import { theme } from "./theme";
 
@@ -746,6 +747,21 @@ function Content() {
     setCheckingUpdate(false);
   };
 
+  const handleNotifyChange = async (enabled: boolean) => {
+    try {
+      const result = await backend.setUpdateNotify(enabled);
+      if (!result.success) {
+        setUpdateError(result.message ?? "Couldn't change the update notice setting.");
+        return;
+      }
+      setUpdateError(null);
+    } catch (e) {
+      console.error("set update notify error", e);
+      setUpdateError("Couldn't change the update notice setting.");
+    }
+    await refreshStatus(true);
+  };
+
   const handleChannelChange = async (nextChannel: string) => {
     try {
       const result = await backend.setUpdateChannel(nextChannel);
@@ -1401,6 +1417,8 @@ function Content() {
         updateInfo={updateInfo}
         updateError={updateError}
         onChannelChange={handleChannelChange}
+        notify={s?.update_notify ?? true}
+        onNotifyChange={handleNotifyChange}
         onApply={handleApplyUpdate}
         onCheck={handleCheckForUpdate}
         busy={isBusy}
@@ -1423,6 +1441,7 @@ export default definePlugin(() => {
     if (!disposed) checkUpdateOnLoad();
   }, ANNOUNCE_DELAY_MS);
   timers.add(announce);
+  const stopUpdateNotices = startUpdateNotices();
 
   try {
     const later = (ms: number, fn: () => void) => {
@@ -1463,6 +1482,7 @@ export default definePlugin(() => {
       timers.forEach((id) => clearTimeout(id));
       timers.clear();
       gameLifetimeUnsub?.unregister();
+      stopUpdateNotices();
       disposeUpdateWatch();
     },
   };

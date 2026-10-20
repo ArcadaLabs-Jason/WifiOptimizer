@@ -5444,6 +5444,77 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("updates: telling people one is out, from a check that runs with the panel closed")
+try:
+    class Notice(m.Plugin):
+        """check_for_update answering as given, and a stream running or not."""
+        def __init__(self, info, stream=False):
+            super().__init__(); self.info = info; self.stream = stream; self.checks = 0
+        async def check_for_update(self):
+            self.checks += 1
+            return dict(self.info)
+        def _stream_running(self, settings): return self.stream
+
+    _new = {"success": True, "update_available": True, "is_downgrade": False,
+            "latest_version": "0.24.0", "current_version": "0.23.0", "channel": "stable"}
+    ok(m.DEFAULT_SETTINGS.get("update_notify") is True and m.DEFAULT_SETTINGS.get("update_notified_version") == "",
+       "on by default, with nothing announced yet")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _n = Notice(_new)
+    _r = asyncio.run(_n.update_notice())
+    ok(_r == {"notify": True, "version": "0.24.0", "busy": False}, f"a newer release is announced ({_r})")
+    ok(asyncio.run(_n.mark_update_notified("0.24.0")).get("success") is True
+       and m._load_settings().get("update_notified_version") == "0.24.0",
+       "and once shown it is recorded")
+    _r = asyncio.run(_n.update_notice())
+    ok(_r.get("notify") is False, "so the same version is not announced again, after a reload or a reboot")
+    _r = asyncio.run(Notice({**_new, "latest_version": "0.25.0"}).update_notice())
+    ok(_r.get("notify") is True and _r.get("version") == "0.25.0", "but the next release is")
+    for _what, _info in [
+        ("nothing newer", {**_new, "update_available": False}),
+        ("a beta channel offering to go back", {**_new, "is_downgrade": True, "latest_version": "0.22.0"}),
+    ]:
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        _r = asyncio.run(Notice(_info).update_notice())
+        ok(_r.get("notify") is False and not _r.get("retry"), f"{_what}: nothing to announce")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _r = asyncio.run(Notice({"success": False, "update_available": False}).update_notice())
+    ok(_r == {"notify": False, "retry": True}, "a failed check is retried sooner, without a notice")
+    _r = asyncio.run(Notice(_new, stream=True).update_notice())
+    ok(_r.get("notify") is True and _r.get("busy") is True, "during a stream it says so, so the toast waits")
+    m._save_settings({**m.DEFAULT_SETTINGS, "update_notify": False})
+    _n = Notice(_new)
+    _r = asyncio.run(_n.update_notice())
+    ok(_r == {"notify": False} and _n.checks == 0, "turned off, GitHub is not even asked")
+    ok(asyncio.run(_n.set_update_notify(True)).get("success") is True
+       and m._load_settings().get("update_notify") is True, "and the toggle turns it back on")
+    for _bad in ["", "0.24.0;rm", "1." * 40 + "1", 24, None]:
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        _r = asyncio.run(Notice(_new).mark_update_notified(_bad))
+        ok(_r.get("success") is False and m._load_settings().get("update_notified_version") == "",
+           f"{_bad!r} is not recorded as a version")
+    ok(m._clean_settings({"update_notified_version": "0.24.0-beta"})["update_notified_version"] == "0.24.0-beta"
+       and m._clean_settings({"update_notified_version": "v0.24;x"})["update_notified_version"] == ""
+       and m._clean_settings({"update_notify": "yes"})["update_notify"] is True,
+       "the settings file keeps a real version and a real on/off, and nothing else")
+
+    _uw = open("src/updateWatch.ts").read(); _ix = open("src/index.tsx").read(); _dist = open("dist/index.js").read()
+    _once = _uw[_uw.index("async function noticeOnce"):_uw.index("export function startUpdateNotices")]
+    ok(_once.index("notice.busy || gameRunning()") < _once.index("toaster.toast(")
+       < _once.index("backend.markUpdateNotified(notice.version)"),
+       "the toast waits for a game or stream to end, and the version is recorded only once it is shown")
+    ok("shared().noticeShown === notice.version" in _once and "onClick: openPanel" in _once,
+       "a second copy of the module does not toast twice, and tapping it opens the panel")
+    ok("NOTICE_EVERY_MS = 12 * 60 * 60 * 1000" in _uw and "NOTICE_FIRST_MS = 2 * 60 * 1000" in _uw,
+       "checked a couple of minutes after load, then twice a day")
+    ok("const stopUpdateNotices = startUpdateNotices();" in _ix and "stopUpdateNotices();" in _ix,
+       "started with the plugin, not the panel, and stopped when Decky unloads it")
+    ok("is available. Open the plugin to update." in _dist and "Tell me about updates" in _dist,
+       "the built bundle has the notice and the toggle")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("update script: the payload must match its signed checksum, run for real")
 try:
     import io, tarfile, subprocess as _sp, shutil

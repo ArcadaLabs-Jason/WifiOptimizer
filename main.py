@@ -355,6 +355,11 @@ DEFAULT_SETTINGS = {
     "distro_id": "unknown",
     "distro_name": "Unknown",
     "update_channel": "stable",
+    # A toast when an update is available, from a check that runs whether or
+    # not the panel is open, and the version it was last shown for, so each
+    # release is announced once.
+    "update_notify": True,
+    "update_notified_version": "",
     # Streaming auto mode: off means the fixes apply all the time, as always.
     "streaming_mode_enabled": False,
     # App id -> watched. An app missing from this is watched.
@@ -701,6 +706,10 @@ def _clean_settings(data: dict) -> dict:
     # a band with no control able to clear it.
     if merged.get("band_preference") not in BAND_NAMES:
         merged["band_preference"] = "a"
+    # Compared against GitHub's answer and shown in a toast.
+    notified = merged.get("update_notified_version", "")
+    if notified and (len(notified) > 64 or not VERSION_RE.match(notified)):
+        merged["update_notified_version"] = ""
     # These lists are handed to nmcli as root. argv rather than a shell,
     # so junk is not dangerous, but a list of it turns a reset into a
     # long series of doomed calls on the event loop.
@@ -7311,6 +7320,61 @@ class Plugin:
             return {"success": True, "channel": channel}
         except Exception as e:
             decky.logger.error(f"set_update_channel error: {e}")
+            return self._unexpected_response(e)
+
+    async def set_update_notify(self, enabled: bool) -> dict:
+        """Turn the available-update toast on or off."""
+        try:
+            settings = _load_settings()
+            settings["update_notify"] = bool(enabled)
+            _save_settings(settings)
+            decky.logger.info(f"Update notices {'on' if enabled else 'off'}")
+            return {"success": True, "enabled": bool(enabled)}
+        except Exception as e:
+            decky.logger.error(f"set_update_notify error: {e}")
+            return self._unexpected_response(e)
+
+    async def update_notice(self) -> dict:
+        """Whether the background check should announce an update now.
+
+        Called by the plugin whether or not the panel is open. notify is set
+        for a newer release on the user's channel that has not been announced
+        yet; a "go back to" offer on the beta channel is not announced. busy
+        says a stream looks to be running, so the toast waits. retry says the
+        check itself failed and is worth trying again sooner. Nothing here
+        installs anything.
+        """
+        try:
+            settings = _load_settings()
+            if not settings.get("update_notify", True):
+                return {"notify": False}
+            info = await self.check_for_update()
+            if not info.get("success"):
+                return {"notify": False, "retry": True}
+            latest = info.get("latest_version", "")
+            notify = bool(
+                info.get("update_available") and not info.get("is_downgrade")
+                and latest and latest != settings.get("update_notified_version", "")
+            )
+            busy = notify and await asyncio.to_thread(self._stream_running, settings)
+            return {"notify": notify, "version": latest, "busy": bool(busy)}
+        except Exception as e:
+            decky.logger.error(f"update_notice error: {e}")
+            return {"notify": False, "retry": True}
+
+    async def mark_update_notified(self, version: str) -> dict:
+        """Record that the update to version has been announced, so it is not
+        announced again after a reload or a reboot."""
+        try:
+            if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
+                return {"success": False, "message": "Not a version."}
+            settings = _load_settings()
+            settings["update_notified_version"] = version
+            _save_settings(settings)
+            decky.logger.info(f"Announced the update to v{version}")
+            return {"success": True}
+        except Exception as e:
+            decky.logger.error(f"mark_update_notified error: {e}")
             return self._unexpected_response(e)
 
     @staticmethod

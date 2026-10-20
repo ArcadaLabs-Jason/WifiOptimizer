@@ -1,4 +1,5 @@
 import { toaster } from "@decky/api";
+import { Navigation, QuickAccessTab, Router } from "@decky/ui";
 import * as backend from "./backend";
 import type { UpdateProgress } from "./types";
 
@@ -28,7 +29,7 @@ const JUST_UPDATED_S = 120;
 type Listener = (progress: UpdateProgress | null) => void;
 
 // Shared by every copy of this module on the page.
-type Shared = { reloadAsked?: string; announced?: string };
+type Shared = { reloadAsked?: string; announced?: string; noticeShown?: string };
 const shared = (): Shared => {
   const w = window as unknown as { __wifiOptimizerUpdate?: Shared };
   w.__wifiOptimizerUpdate = w.__wifiOptimizerUpdate ?? {};
@@ -159,6 +160,81 @@ export async function checkUpdateOnLoad() {
   } catch {
     // Nothing to pick up or announce.
   }
+}
+
+// Telling people an update is out. The panel only checks while it is open,
+// and Decky does not announce updates for a plugin installed outside its
+// store, so without this an install nobody reopens never hears of one.
+// Runs for as long as the plugin is loaded: a first check a couple of
+// minutes after load, then twice a day. Each version is announced once,
+// remembered by the backend across reboots, and never while a game or a
+// stream is running, since a toast there is exactly the interruption this
+// plugin exists to avoid. Nothing is installed: the toast opens the panel.
+const NOTICE_FIRST_MS = 2 * 60 * 1000;
+const NOTICE_EVERY_MS = 12 * 60 * 60 * 1000;
+const NOTICE_RETRY_MS = 60 * 60 * 1000;
+const NOTICE_BUSY_MS = 10 * 60 * 1000;
+
+function gameRunning(): boolean {
+  try {
+    return !!Router.MainRunningApp;
+  } catch {
+    return false;
+  }
+}
+
+function openPanel() {
+  try {
+    Navigation.OpenQuickAccessMenu(QuickAccessTab.Decky);
+    // Decky's internal state, not part of @decky/api: without it the menu
+    // still opens, on whichever plugin was last shown.
+    const loader = (window as unknown as {
+      DeckyPluginLoader?: { deckyState?: { setActivePlugin?: (name: string) => void } };
+    }).DeckyPluginLoader;
+    loader?.deckyState?.setActivePlugin?.(PLUGIN_NAME);
+  } catch (e) {
+    console.error("WiFi Optimizer: could not open the panel", e);
+  }
+}
+
+// Returns the delay before the next check.
+async function noticeOnce(): Promise<number> {
+  try {
+    const notice = await backend.updateNotice();
+    if (notice.retry) return NOTICE_RETRY_MS;
+    if (!notice.notify || !notice.version) return NOTICE_EVERY_MS;
+    if (notice.busy || gameRunning()) return NOTICE_BUSY_MS;
+    // A second copy of the module (Decky issue #611) must not toast too.
+    if (shared().noticeShown === notice.version) return NOTICE_EVERY_MS;
+    shared().noticeShown = notice.version;
+    toaster.toast({
+      title: PLUGIN_NAME,
+      body: `v${notice.version} is available. Open the plugin to update.`,
+      onClick: openPanel,
+    });
+    await backend.markUpdateNotified(notice.version);
+    return NOTICE_EVERY_MS;
+  } catch {
+    return NOTICE_RETRY_MS;
+  }
+}
+
+// Starts the checks for this copy of the module; returns how to stop them.
+export function startUpdateNotices(): () => void {
+  let stopped = false;
+  let next: ReturnType<typeof setTimeout> | null = null;
+  const schedule = (ms: number) => {
+    next = setTimeout(async () => {
+      next = null;
+      const delay = await noticeOnce();
+      if (!stopped) schedule(delay);
+    }, ms);
+  };
+  schedule(NOTICE_FIRST_MS);
+  return () => {
+    stopped = true;
+    if (next) clearTimeout(next);
+  };
 }
 
 // When Decky dismounts this copy. Nothing is stopped: a watch in progress

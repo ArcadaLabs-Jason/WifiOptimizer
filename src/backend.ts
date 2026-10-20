@@ -5,6 +5,7 @@ import type {
   OptimizeSafeResult,
   UpdateCheckResult,
   UpdateProgress,
+  UpdateNotice,
   BackendSwitchStartResult,
   BackendSwitchStatus,
   RegdomainInfo,
@@ -29,6 +30,9 @@ export const moveBssidLock = callable<[], MethodResult>("move_bssid_lock");
 export const resetSettings = callable<[], MethodResult>("reset_settings");
 export const acknowledgeSettingsRecovered = callable<[], MethodResult>("acknowledge_settings_recovered");
 export const setUpdateChannel = callable<[channel: string], MethodResult>("set_update_channel");
+export const setUpdateNotify = callable<[enabled: boolean], MethodResult>("set_update_notify");
+export const updateNotice = callable<[], UpdateNotice>("update_notice");
+export const markUpdateNotified = callable<[version: string], MethodResult>("mark_update_notified");
 export const checkForUpdate = callable<[], UpdateCheckResult>("check_for_update");
 export const applyUpdate = callable<[version: string], MethodResult>("apply_update");
 export const getUpdateProgress = callable<[], UpdateProgress>("get_update_progress");

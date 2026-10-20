@@ -1,4 +1,4 @@
-import { PanelSection, PanelSectionRow, ButtonItem, DropdownItem } from "@decky/ui";
+import { PanelSection, PanelSectionRow, ButtonItem, DropdownItem, ToggleField } from "@decky/ui";
 import type { UpdateCheckResult } from "../types";
 import { theme } from "../theme";
 
@@ -11,6 +11,10 @@ interface UpdatesSectionProps {
   updateInfo: UpdateCheckResult | null;
   updateError: string | null;
   onChannelChange: (channel: string) => void;
+  // The toast when an update comes out, from the check that runs with the
+  // panel closed.
+  notify: boolean;
+  onNotifyChange: (enabled: boolean) => void;
   onApply: () => void;
   onCheck: () => void;
   // Another operation is running. Starting an update then would restart
@@ -35,6 +39,8 @@ export function UpdatesSection({
   updateInfo,
   updateError,
   onChannelChange,
+  notify,
+  onNotifyChange,
   onApply,
   onCheck,
   busy = false,
@@ -47,6 +53,14 @@ export function UpdatesSection({
           rgOptions={CHANNEL_OPTIONS}
           selectedOption={channel}
           onChange={(option: { data: string }) => onChannelChange(option.data)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Tell me about updates"
+          description="Shows a notification when a new version is out, never during a game. Nothing installs until you choose to."
+          checked={notify}
+          onChange={onNotifyChange}
         />
       </PanelSectionRow>
       {updateError && !updating && (

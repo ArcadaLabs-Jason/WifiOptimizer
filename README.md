@@ -26,7 +26,7 @@ This requires a user password - set one with `passwd` in Konsole if you haven't 
 
 Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
 
-**Updating:** The plugin checks for updates automatically when you open it. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. You can also update manually by running the install command above again.
+**Updating:** The plugin checks for updates automatically when you open it, and from v0.24.0 on also twice a day in the background: when a new version comes out you get one notification (never during a game or a stream), and tapping it opens the plugin. You can turn that off with **Tell me about updates** in the Updates section. Nothing installs on its own. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. You can also update manually by running the install command above again.
 
 Releases are signed. From v0.21.0-beta on, before installing an update, the plugin checks the release's signature against the keys built into it and the download against the signed checksum, and installs nothing that doesn't match. Earlier versions install what they download. The install command doesn't check signatures: it downloads the release over HTTPS from GitHub. [SECURITY.md](SECURITY.md) lists the keys and how to check a release yourself. The beta channel installs the newest release of either kind, beta or stable.
 

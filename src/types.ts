@@ -23,6 +23,8 @@ export interface PluginSettings {
   last_connection_uuid: string;
   priority_set: boolean;
   update_channel: string;
+  update_notify: boolean;
+  update_notified_version: string;
   streaming_mode_enabled: boolean;
   streaming_apps: Record<string, boolean>;
   streaming_custom_patterns: string;
@@ -180,6 +182,16 @@ export type UpdatePhase =
   | "restarting"
   | "done"
   | "failed";
+
+// The background check's answer: whether to announce an update now.
+export interface UpdateNotice {
+  notify: boolean;
+  version?: string;
+  // A stream looks to be running, so the toast waits.
+  busy?: boolean;
+  // The check itself failed; try again sooner than usual.
+  retry?: boolean;
+}
 
 export interface UpdateProgress {
   success: boolean;
