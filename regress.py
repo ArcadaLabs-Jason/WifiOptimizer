@@ -3086,6 +3086,9 @@ try:
        and "shared().reloadAsked === version" in _watch,
        "the reload is asked for once per version, and only while the old version still answers")
     ok("checkUpdateOnLoad()" in _idx, "a copy that loads mid-update picks the watch up")
+    _done = _idx[_idx.index('progress?.phase === "done"'):]
+    ok(_done.index("setUpdateInfo(null)") < _done.index("runUpdateCheck(true)") < _done.index("} else if (progress)"),
+       "a panel left open across the update stops offering the version it just installed")
     ok("watchUpdate(version)" in _idx, "the panel follows an update it started")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

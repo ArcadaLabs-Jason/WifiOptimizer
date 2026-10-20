@@ -433,13 +433,16 @@ function Content() {
           setUpdateError("The update didn't finish. Try again, or check the plugin log.");
         } else if (progress?.phase === "done") {
           // Seen by a panel left open across the reload; the new copy of the
-          // plugin is the one running now.
+          // plugin is the one running now. Its offer to update is stale too,
+          // and kept showing "Update to" the version just installed.
           setUpdating(false);
+          setUpdateInfo(null);
+          runUpdateCheck(true);
         } else if (progress) {
           setUpdating(true);
         }
       }),
-    [],
+    [runUpdateCheck],
   );
 
   // Safety timeout: if an update was initiated but the plugin hasn't been
