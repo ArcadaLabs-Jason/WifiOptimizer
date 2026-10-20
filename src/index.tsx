@@ -610,6 +610,9 @@ function Content() {
   const handleAllowWpa2 = () =>
     handleToggle("allow_wpa2", () => backend.allowWpa2());
 
+  const handleMoveLock = () =>
+    handleToggle("move_bssid_lock", () => backend.moveBssidLock());
+
   // Reset asks first: see RESET_CONFIRM_TEXT.
   const handleResetSettings = () => {
     if (busyRef.current) return;
@@ -934,6 +937,37 @@ function Content() {
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleAllowWpa2}>
               Allow WPA2 here
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+
+      {/* The lock is holding the Deck on an access point it has been carried
+          away from, while a much stronger one of the same network is in
+          range. Moving reconnects, so it is offered rather than done. The
+          banner also stays up for a failed move's message, because a failed
+          move clears the finding and would otherwise take the reason away
+          with it. */}
+      {(status?.lock_weaker || errors.move_bssid_lock) && (
+        <Banner variant="warning" icon="⚠">
+          {status?.lock_weaker && (
+            <>
+              The access point lock is holding you on a weaker access point
+              (signal {status.lock_weaker.current_signal}). A stronger one is in
+              range (signal {status.lock_weaker.signal}).
+            </>
+          )}
+          {errors.move_bssid_lock && (
+            <div style={{ color: theme.error.text }}>{errors.move_bssid_lock}</div>
+          )}
+        </Banner>
+      )}
+      {/* A real button, so it can be reached with the D-pad. */}
+      {status?.lock_weaker && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleMoveLock}>
+              Move the lock
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>

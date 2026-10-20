@@ -3591,8 +3591,28 @@ class Plugin:
     # Erring small is the right direction here. The move happens once, when
     # the user asks for the lock, so a needless one costs a single reconnect;
     # refusing a real one costs a worse connection for as long as the lock
-    # stays on. There is no continuous re-evaluation to flap.
+    # stays on. Nothing moves the lock on its own afterwards, so there is
+    # nothing to flap: the most that happens later is a notice offering a
+    # move, which the user has to accept (see _LOCK_WEAKER_MARGIN).
     _AP_UPGRADE_MARGIN = 12
+
+    # How much stronger another access point must be, on nmcli's 0-100
+    # signal, before the panel says the lock is holding the device on a
+    # weaker one. Larger than _AP_UPGRADE_MARGIN on purpose. That margin is
+    # applied to an average of several fresh scans, once, at a moment the
+    # user chose. This one is applied to a single cached scan, over and over
+    # for as long as the lock is on, and a notice that comes and goes with
+    # scan-to-scan drift (about 26 points for one access point on a measured
+    # Deck) would nag about nothing. A miss here costs little: the lock still
+    # works, and turning it off and on again moves it on the smaller margin.
+    _LOCK_WEAKER_MARGIN = 20
+
+    # How often that is looked at, and how long the stronger access point has
+    # to stay ahead before it is mentioned. Both are about not reacting to
+    # one scan: a cached scan is cheap to read but only as fresh as the last
+    # time anything scanned, so the finding has to hold on two reads at
+    # least this far apart.
+    _LOCK_WEAKER_CHECK_SECONDS = 30
 
     def _visible_access_points(
         self, iface: str, ssid: str, rescan: bool = False, cached_only: bool = False
@@ -3982,11 +4002,40 @@ class Plugin:
         averaged.sort(key=lambda ap: (ap[1], ap[2] >= 5000), reverse=True)
         return averaged
 
-    def _preferred_access_point(
+    def _lock_candidates(
+        self, aps: list, ssid: str, settings: dict, key_mgmt: str
+    ) -> list[tuple[str, int, int, str]]:
+        """The access points of this network the lock could pin this profile to.
+
+        Shared by choosing where to lock and by noticing, later, that the
+        lock is holding the device somewhere much weaker. If the two used
+        different rules, the panel would offer a move the lock then declines,
+        or point at an access point it can never join.
+
+        An access point that cannot accept this profile's credentials is not
+        a candidate however strong it is. A band preference, when set, is a
+        constraint and not a suggestion: choosing an access point on the other
+        band would write a profile whose band and address contradict, which is
+        the one state that stops it associating at all. And an access point
+        that refused us recently is left alone until its cooldown runs out.
+        """
+        if key_mgmt:
+            aps = [ap for ap in aps if self._ap_accepts(ap[3], key_mgmt)]
+        if settings.get("band_preference_enabled") and settings.get(
+            "band_preference_ssid"
+        ) == ssid:
+            want = settings.get("band_preference")
+            aps = [ap for ap in aps if self._freq_band(ap[2]) == want]
+        refused = self._recent_ap_failures(settings)
+        if refused:
+            aps = [ap for ap in aps if ap[0] not in refused]
+        return aps
+
+    def _lock_target(
         self, iface: str, ssid: str, current: str, settings: dict,
         link: str = "", uuid: str = ""
-    ) -> tuple[str, int, int, str] | None:
-        """The AP worth moving to, or None to stay where we are.
+    ) -> tuple[tuple[str, int, int, str] | None, int | None]:
+        """The AP worth moving to (or None), and the signal of the one we are on.
 
         The lock pins whichever access point you happen to be on. On a mesh
         that is often not the one you want - a handheld carried between rooms
@@ -3994,46 +4043,39 @@ class Plugin:
         it turns a passing bad choice into a permanent one. So the lock looks
         first, and only moves when the difference is worth a reconnect.
 
-        A band preference, when set, is a constraint and not a suggestion:
-        choosing an access point on the other band would write a profile whose
-        band and address contradict, which is the one state that stops it
-        associating at all.
+        The current signal comes back alongside so a move can be logged with
+        both sides of the comparison it was made on. It is None when the scan
+        cannot see the access point we are on.
         """
         if self._link_is_strong(link):
-            return None
+            return None, None
         aps = self._sampled_access_points(iface, ssid)
+        key_mgmt = self._profile_key_mgmt(uuid) if uuid and aps else ""
+        aps = self._lock_candidates(aps, ssid, settings, key_mgmt)
         if not aps:
-            return None
-        # An access point that cannot accept this profile's credentials is not
-        # a candidate however strong it is.
-        key_mgmt = self._profile_key_mgmt(uuid) if uuid else ""
-        if key_mgmt:
-            aps = [ap for ap in aps if self._ap_accepts(ap[3], key_mgmt)]
-            if not aps:
-                return None
-        if settings.get("band_preference_enabled") and settings.get(
-            "band_preference_ssid"
-        ) == ssid:
-            want = settings.get("band_preference")
-            aps = [ap for ap in aps if self._freq_band(ap[2]) == want]
-            if not aps:
-                return None
-        refused = self._recent_ap_failures(settings)
-        if refused:
-            aps = [ap for ap in aps if ap[0] not in refused]
-            if not aps:
-                return None
+            return None, None
         best = aps[0]
-        if best[0] == current.upper():
-            return None
         here = next((ap for ap in aps if ap[0] == current.upper()), None)
         # Unknown current signal means the scan cannot see what we are on, so
         # there is nothing to compare and no case for moving.
         if here is None:
-            return None
+            return None, None
+        if best[0] == current.upper():
+            return None, here[1]
         if best[1] - here[1] < self._AP_UPGRADE_MARGIN:
-            return None
-        return best
+            return None, here[1]
+        return best, here[1]
+
+    def _preferred_access_point(
+        self, iface: str, ssid: str, current: str, settings: dict,
+        link: str = "", uuid: str = ""
+    ) -> tuple[str, int, int, str] | None:
+        """The AP worth moving to, or None to stay where we are.
+
+        _lock_target without the current signal, for a caller that only
+        needs to know where the lock would go.
+        """
+        return self._lock_target(iface, ssid, current, settings, link, uuid)[0]
 
     def _band_unreachable(self, uuid: str, band: str) -> dict | None:
         """The refusal to return when this network has nothing on the band.
@@ -4594,6 +4636,94 @@ class Plugin:
         if blocked[0][1] - here >= self._AP_UPGRADE_MARGIN:
             self._wpa2_blocked = {"signal": blocked[0][1], "current_signal": here}
 
+    def _report_lock_weaker(self, settings: dict, status: dict, uuid: str,
+                            iface: str, ssid: str, link: str):
+        """Say when the lock is holding the device on a much weaker access point.
+
+        Reported only. Moving would reconnect, possibly in the middle of a
+        game stream, and keeping the link from bouncing between access points
+        is the reason the lock exists, so the move is the user's to make.
+        """
+        self._recheck_lock_weaker(settings, status["live"], uuid, iface, ssid, link)
+        if getattr(self, "_lock_weaker", None):
+            status["lock_weaker"] = dict(self._lock_weaker)
+
+    def _forget_lock_weaker(self):
+        """Drop the finding and anything seen towards it, so it starts over."""
+        self._lock_weaker = None
+        self._lock_weaker_since = None
+        self._lock_weaker_checked_for = None
+
+    def _recheck_lock_weaker(self, settings: dict, live: dict, uuid: str,
+                             iface: str, ssid: str, link: str):
+        """Notice a much stronger access point than the one the lock pins.
+
+        The lock picks the best access point when it is turned on and then
+        holds it. A handheld carried through a house leaves that one behind,
+        and the only release, the stranded-pin safety net, needs the device
+        to be offline first. Reported by the owner: carried to another room,
+        the link went bad and he turned the lock off, suspecting it had held
+        him on the wrong access point, because nothing said whether it had.
+
+        Only while the lock is actually holding: on, written for the profile
+        in use, and pinning the access point we are on now. Candidates follow
+        the lock's own rules (_lock_candidates), so what is offered is what a
+        move would choose. Reads nmcli's cached scan on its own short
+        throttle, so a poll never waits on a rescan, and needs the finding to
+        hold on two reads before it is reported.
+        """
+        pinned = live.get("bssid_lock", "").upper()
+        # nmcli reports addresses upper-case and iw lower-case.
+        on = live.get("connected_bssid", "").upper()
+        switch = getattr(self, "_backend_switch", None) or {}
+        if (
+            # Under iwd the status pass hands this the lock as off.
+            not settings.get("bssid_lock_enabled")
+            or uuid != settings.get("bssid_lock_connection_uuid")
+            or not pinned or pinned != on or not ssid
+            # The lock would not move off a healthy link, so offering it
+            # would only produce a move that declines.
+            or self._link_is_strong(link)
+            or self._profile_change_in_flight()
+            or self._update_running()
+            or switch.get("in_progress")
+        ):
+            self._forget_lock_weaker()
+            return
+        now = time.monotonic()
+        key = (uuid, pinned)
+        if getattr(self, "_lock_weaker_checked_for", None) != key:
+            # A different profile or pin: nothing seen so far applies to it.
+            self._forget_lock_weaker()
+        elif now - getattr(self, "_lock_weaker_checked_at", 0.0) \
+                < self._LOCK_WEAKER_CHECK_SECONDS:
+            return
+        self._lock_weaker_checked_at = now
+        self._lock_weaker_checked_for = key
+        # The cached list: this runs inside the status poll, and letting nmcli
+        # decide to rescan there held the poll for seconds.
+        aps = self._visible_access_points(iface, ssid, cached_only=True)
+        here = next((ap[1] for ap in aps if ap[0] == pinned), None)
+        better = [
+            ap for ap in self._lock_candidates(
+                aps, ssid, settings, self._profile_key_mgmt(uuid) if aps else ""
+            )
+            if ap[0] != pinned
+        ]
+        if here is None or not better \
+                or better[0][1] - here < self._LOCK_WEAKER_MARGIN:
+            # Gone, recovered, or never there: start over.
+            self._lock_weaker = None
+            self._lock_weaker_since = None
+            return
+        since = getattr(self, "_lock_weaker_since", None)
+        if since is None:
+            # One read is not evidence. Remember it and wait for the next.
+            self._lock_weaker_since = now
+            return
+        if now - since >= self._LOCK_WEAKER_CHECK_SECONDS:
+            self._lock_weaker = {"signal": better[0][1], "current_signal": here}
+
     async def allow_wpa2(self) -> dict:
         """Let a WPA3-only profile use the WPA2-only access points of its network.
 
@@ -5030,6 +5160,8 @@ class Plugin:
             if getattr(self, "_dup_conflict", False):
                 status["external"]["duplicate_profiles"] = True
             self._report_network_problems(status, uuid, iface, active_ssid() or "")
+            self._report_lock_weaker(settings, status, uuid, iface,
+                                     active_ssid() or "", link_out)
             actions.extend(
                 self._propose_active_pin_cleanup(
                     settings, uuid, "band_preference_uuids", live_band
@@ -5349,10 +5481,6 @@ class Plugin:
                     ),
                 }, iface, bssid, link_out
 
-        # Look before pinning. Locking whichever access point we
-        # happen to be on is how a passing bad choice becomes a
-        # permanent one, and on a mesh that is the common case rather
-
         return None, iface, bssid, link_out
 
     async def set_bssid_lock(self, enabled: bool) -> dict:
@@ -5375,150 +5503,251 @@ class Plugin:
                 iface, uuid, err = self._require_wifi()
                 if err:
                     return err
+                return await self._lock_onto_best(iface, uuid, moving=False)
 
-                # Wait for an association rather than demanding one instantly.
-                # Turning the lock OFF ends with a radio cycle, so turning it
-                # straight back on arrives while the interface is still
-                # re-associating and there is no "Connected to" line yet - the
-                # user sees an error for a network they are plainly on.
-                #
-                # MEASURED on a Deck OLED against wpa_supplicant, from the
-                # NetworkManager journal: getting back to activated after a
-                # radio cycle took 13 s, 13 s and 24 s, and the window where
-                # NM already reports the connection active while iw still has
-                # no "Connected to" line ran about 20 s. A six-second budget
-                # was shorter than every one of those, so it still failed on
-                # the hardware it was written for. wpa_supplicant is the slow
-                # backend to reassociate and it is kept on purpose for
-                # streaming, so this has to cover it rather than avoid it.
-                #
-                # This awaits instead of blocking: half a minute of blocked
-                # event loop would freeze the whole panel. What kept the
-                # blocking version safe was that no status poll could run
-                # inside it; the reconciliation guard held across this call
-                # buys the same thing, by stopping a poll re-pointing the
-                # lock while the change is in flight.
-                assoc = await self._await_association(iface)
-                iface, bssid = assoc["iface"], assoc["bssid"]
-                link_out, read_error = assoc["link"], assoc["error"]
-
-                if not bssid:
-                    if read_error:
-                        decky.logger.error(
-                            f"BSSID lock: could not read the link on {iface} "
-                            f"- {read_error[:200]}"
-                        )
-                        return {
-                            "success": False,
-                            "error": "nmcli_failed",
-                            "message": "Couldn't read the WiFi link.",
-                            "detail": read_error,
-                        }
-                    decky.logger.info(
-                        f"BSSID lock: {iface} did not associate within "
-                        f"{self._ASSOCIATION_WAIT_SECONDS:.0f}s; not locking"
-                    )
-                    return {
-                        "success": False,
-                        "error": "no_wifi",
-                        "message": "WiFi hasn't finished reconnecting. Wait a moment and try again.",
-                    }
-
-                # Refuse rather than write a profile that cannot associate.
-                # This is reachable from the drift banner's Fix now, which
-                # runs Optimize Safe, and it reconnects immediately after -
-                # so getting it wrong strands the user then and there rather
-                # than at their next wake.
-                current = _load_settings()
-                active_ssid = self._get_profile_ssid(uuid)
-                err, iface, bssid, link_out = await asyncio.to_thread(
-                    self._settle_band_before_locking,
-                    current, iface, uuid, bssid, link_out, active_ssid,
-                )
-                if err:
-                    return err
-                # than the corner one.
-                # A scan can take seconds, so it runs off the event loop.
-                # The reconciliation guard is held across this whole setter,
-                # which is what makes awaiting here safe.
-                moved_to = await asyncio.to_thread(
-                    self._preferred_access_point,
-                    iface, active_ssid or "", bssid, _load_settings(), link_out,
-                    uuid,
-                )
-                chosen = moved_to[0] if moved_to else bssid
-                if moved_to:
-                    decky.logger.info(
-                        f"Locking to {chosen} (signal {moved_to[1]}) rather "
-                        f"than {bssid}, which this network also offers more "
-                        f"strongly elsewhere"
-                    )
-
-                result = self._nmcli_modify(uuid, "802-11-wireless.bssid", chosen)
-                if not result["success"]:
-                    return {
-                        "success": False,
-                        "error": "nmcli_failed",
-                        "message": "Couldn't lock BSSID",
-                        "detail": result["stderr"],
-                    }
-
-                settings = _load_settings()
-                settings["bssid_lock_enabled"] = True
-                settings["bssid_lock_value"] = chosen
-                settings["bssid_lock_connection_uuid"] = uuid
-                settings["pins_owned"] = _with_pin(settings, "802-11-wireless.bssid")
-                known = list(settings.get("bssid_lock_uuids", []))
-                if uuid not in known:
-                    known.append(uuid)
-                settings["bssid_lock_uuids"] = known[
-                    -self._MAX_TRACKED_LOCK_UUIDS:
-                ]
-                _save_settings_with_timestamp(settings)
-                if not self._hard_reconnect(uuid):
-                    return dict(self._RADIO_OFF_RESULT)
-
-                if moved_to:
-                    # Moving is the one path that can strand the user: the
-                    # access point we pinned was visible in a scan, which is
-                    # not the same as being associable. If it did not take,
-                    # put back the one they were demonstrably on rather than
-                    # leaving a profile pinned to somewhere unreachable.
-                    landed = await self._await_association(iface)
-                    iface = landed["iface"]
-                    if landed["bssid"].upper() != chosen.upper():
-                        decky.logger.error(
-                            f"Could not associate to {chosen} after moving "
-                            f"the lock; restoring {bssid} and leaving it "
-                            f"alone for a while"
-                        )
-                        self._record_ap_failure(chosen)
-                        self._nmcli_modify(uuid, "802-11-wireless.bssid", bssid)
-                        restored = _load_settings()
-                        restored["bssid_lock_value"] = bssid
-                        _save_settings_with_timestamp(restored)
-                        if not self._hard_reconnect(uuid):
-                            return dict(self._RADIO_OFF_RESULT)
-                        return {
-                            "success": True,
-                            "bssid_locked": True,
-                            "reconnected": True,
-                            "message": (
-                                "Locked to the access point you were already "
-                                "on. A stronger one is in range but could not "
-                                "be reached."
-                            ),
-                        }
-            else:
-                err = self._release_lock_from_all_profiles()
-                if err:
-                    return err
-
-            return {"success": True, "bssid_locked": enabled, "reconnected": True}
+            err = self._release_lock_from_all_profiles()
+            if err:
+                return err
+            # Said in the log because the panel only shows the toggle as it is
+            # now. After a bad stretch of WiFi the owner could not tell from
+            # the log whether he had turned the lock off or something else had.
+            decky.logger.info("BSSID lock turned off")
+            return {"success": True, "bssid_locked": False, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_bssid_lock error: {e}")
             return self._unexpected_response(e)
         finally:
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
+            )
+
+    async def _lock_onto_best(self, iface: str, uuid: str, moving: bool) -> dict:
+        """Pin the best access point of this network, and check it took.
+
+        Both turning the lock on and moving it come through here, so the two
+        cannot drift apart on which access point they choose or on how they
+        recover when it will not have us. The caller holds the reconciliation
+        guard across the whole of it.
+
+        Turning the lock on pins where we are when nothing is clearly better.
+        A move does not: the user asked for a stronger access point, and
+        cycling the radio only to land back on the same one is a reconnect
+        for nothing.
+        """
+        # Wait for an association rather than demanding one instantly.
+        # Turning the lock OFF ends with a radio cycle, so turning it
+        # straight back on arrives while the interface is still
+        # re-associating and there is no "Connected to" line yet - the
+        # user sees an error for a network they are plainly on.
+        #
+        # MEASURED on a Deck OLED against wpa_supplicant, from the
+        # NetworkManager journal: getting back to activated after a
+        # radio cycle took 13 s, 13 s and 24 s, and the window where
+        # NM already reports the connection active while iw still has
+        # no "Connected to" line ran about 20 s. A six-second budget
+        # was shorter than every one of those, so it still failed on
+        # the hardware it was written for. wpa_supplicant is the slow
+        # backend to reassociate and it is kept on purpose for
+        # streaming, so this has to cover it rather than avoid it.
+        #
+        # This awaits instead of blocking: half a minute of blocked
+        # event loop would freeze the whole panel. What kept the
+        # blocking version safe was that no status poll could run
+        # inside it; the reconciliation guard held across this call
+        # buys the same thing, by stopping a poll re-pointing the
+        # lock while the change is in flight.
+        assoc = await self._await_association(iface)
+        iface, bssid = assoc["iface"], assoc["bssid"]
+        link_out, read_error = assoc["link"], assoc["error"]
+
+        if not bssid:
+            if read_error:
+                decky.logger.error(
+                    f"BSSID lock: could not read the link on {iface} "
+                    f"- {read_error[:200]}"
+                )
+                return {
+                    "success": False,
+                    "error": "nmcli_failed",
+                    "message": "Couldn't read the WiFi link.",
+                    "detail": read_error,
+                }
+            decky.logger.info(
+                f"BSSID lock: {iface} did not associate within "
+                f"{self._ASSOCIATION_WAIT_SECONDS:.0f}s; not locking"
+            )
+            return {
+                "success": False,
+                "error": "no_wifi",
+                "message": "WiFi hasn't finished reconnecting. Wait a moment and try again.",
+            }
+
+        # Refuse rather than write a profile that cannot associate.
+        # This is reachable from the drift banner's Fix now, which
+        # runs Optimize Safe, and it reconnects immediately after -
+        # so getting it wrong strands the user then and there rather
+        # than at their next wake.
+        current = _load_settings()
+        active_ssid = self._get_profile_ssid(uuid)
+        err, iface, bssid, link_out = await asyncio.to_thread(
+            self._settle_band_before_locking,
+            current, iface, uuid, bssid, link_out, active_ssid,
+        )
+        if err:
+            return err
+        # Look before pinning. Locking whichever access point we happen to
+        # be on is how a passing bad choice becomes a permanent one, and on
+        # a mesh that is the common case rather than the corner one.
+        # A scan can take seconds, so it runs off the event loop.
+        # The reconciliation guard is held across this whole setter,
+        # which is what makes awaiting here safe.
+        moved_to, here_signal = await asyncio.to_thread(
+            self._lock_target,
+            iface, active_ssid or "", bssid, _load_settings(), link_out, uuid,
+        )
+        if moving and not moved_to:
+            decky.logger.info(
+                f"Not moving the BSSID lock: nothing clearly stronger than "
+                f"{bssid} (signal {here_signal}) on a fresh look"
+            )
+            return {
+                "success": False,
+                "error": "no_better_ap",
+                "message": (
+                    "Looked again and found no access point clearly stronger "
+                    "than this one, so the lock stayed where it is."
+                ),
+            }
+        chosen = moved_to[0] if moved_to else bssid
+        if moving:
+            decky.logger.info(
+                f"Moving the BSSID lock from {bssid} (signal {here_signal}) "
+                f"to {chosen} (signal {moved_to[1]})"
+            )
+        elif moved_to:
+            decky.logger.info(
+                f"Locking to {chosen} (signal {moved_to[1]}) rather "
+                f"than {bssid} (signal {here_signal}), which this network "
+                f"also offers more strongly elsewhere"
+            )
+
+        result = self._nmcli_modify(uuid, "802-11-wireless.bssid", chosen)
+        if not result["success"]:
+            return {
+                "success": False,
+                "error": "nmcli_failed",
+                "message": "Couldn't lock BSSID",
+                "detail": result["stderr"],
+            }
+
+        settings = _load_settings()
+        settings["bssid_lock_enabled"] = True
+        settings["bssid_lock_value"] = chosen
+        settings["bssid_lock_connection_uuid"] = uuid
+        settings["pins_owned"] = _with_pin(settings, "802-11-wireless.bssid")
+        known = list(settings.get("bssid_lock_uuids", []))
+        if uuid not in known:
+            known.append(uuid)
+        settings["bssid_lock_uuids"] = known[-self._MAX_TRACKED_LOCK_UUIDS:]
+        _save_settings_with_timestamp(settings)
+        if not self._hard_reconnect(uuid):
+            return dict(self._RADIO_OFF_RESULT)
+
+        if moved_to:
+            return await self._verify_lock_move(iface, uuid, bssid, chosen, moving)
+        return {"success": True, "bssid_locked": True, "reconnected": True}
+
+    async def _verify_lock_move(self, iface: str, uuid: str, previous: str,
+                                chosen: str, moving: bool) -> dict:
+        """Check a moved lock landed, and put the previous pin back if not.
+
+        Moving is the one path that can strand the user: the access point we
+        pinned was visible in a scan, which is not the same as being
+        associable. If it did not take, put back the one they were
+        demonstrably on rather than leaving a profile pinned to somewhere
+        unreachable, and remember the refusal so the next attempt does not
+        repeat it.
+        """
+        landed = await self._await_association(iface)
+        if landed["bssid"].upper() == chosen.upper():
+            return {"success": True, "bssid_locked": True, "reconnected": True}
+        decky.logger.error(
+            f"Could not associate to {chosen} after moving "
+            f"the lock; restoring {previous} and leaving it "
+            f"alone for a while"
+        )
+        self._record_ap_failure(chosen)
+        self._nmcli_modify(uuid, "802-11-wireless.bssid", previous)
+        restored = _load_settings()
+        restored["bssid_lock_value"] = previous
+        _save_settings_with_timestamp(restored)
+        if not self._hard_reconnect(uuid):
+            return dict(self._RADIO_OFF_RESULT)
+        if moving:
+            # A move the user asked for that did not happen is a failure to
+            # them, whatever state it left behind, so it is reported as one.
+            return {
+                "success": False,
+                "error": "move_failed",
+                "reconnected": True,
+                "message": (
+                    "The stronger access point would not accept the "
+                    "connection, so the lock went back to the one you "
+                    "were on."
+                ),
+            }
+        return {
+            "success": True,
+            "bssid_locked": True,
+            "reconnected": True,
+            "message": (
+                "Locked to the access point you were already "
+                "on. A stronger one is in range but could not "
+                "be reached."
+            ),
+        }
+
+    async def move_bssid_lock(self) -> dict:
+        """Move the lock to a stronger access point of the same network.
+
+        Only ever on request, from the panel's notice (see
+        _recheck_lock_weaker). It chooses again with the same rules as
+        turning the lock on, so it takes the best access point on a fresh
+        look rather than the one a cached scan pointed at, and it rolls back
+        the same way if that one will not have us.
+        """
+        if (
+            self._profile_change_in_flight()
+            or self._update_running()
+            or (getattr(self, "_backend_switch", None) or {}).get("in_progress")
+        ):
+            return dict(self._BUSY_RESULT)
+        self._profile_change_depth = getattr(
+            self, "_profile_change_depth", 0
+        ) + 1
+        try:
+            if await asyncio.to_thread(self._backend_is_iwd):
+                return {"success": False, "error": "needs_wpa_supplicant",
+                        "message": "The access point lock " + self._NEEDS_WPA_SUPPLICANT}
+            iface, uuid, err = self._require_wifi()
+            if err:
+                return err
+            settings = _load_settings()
+            # The lock on, and for this network. Moving it anywhere else would
+            # pin a network the user never locked.
+            if not settings.get("bssid_lock_enabled") or not self._lock_is_for_this_network(
+                settings, uuid, self._get_profile_ssid(uuid)
+            ):
+                return {"success": False, "error": "not_locked",
+                        "message": "The access point lock isn't on for this network."}
+            return await self._lock_onto_best(iface, uuid, moving=True)
+        except Exception as e:
+            decky.logger.error(f"move_bssid_lock error: {e}")
+            return self._unexpected_response(e)
+        finally:
+            # Whatever happened, the notice that led here no longer describes
+            # the link, so it starts over and must hold on two reads again.
+            self._forget_lock_weaker()
             self._profile_change_depth = max(
                 0, getattr(self, "_profile_change_depth", 1) - 1
             )

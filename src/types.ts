@@ -88,6 +88,11 @@ export interface PluginStatus {
   // A stronger access point of this network that only offers WPA2, while the
   // profile is saved as WPA3-only and so cannot use it. Signals are 0-100.
   wpa2_only_stronger?: { signal: number; current_signal: number };
+  // The access point lock is holding the device on an access point that a
+  // much stronger one of the same network, which the lock could use, has
+  // overtaken on two reads in a row. Signals are 0-100. Reported only: the
+  // move is the user's to make, through move_bssid_lock.
+  lock_weaker?: { signal: number; current_signal: number };
   // NetworkManager saw another device on the network holding our address.
   address_conflict?: { ip: string; other: string };
   // The settings file did not parse and was moved aside to

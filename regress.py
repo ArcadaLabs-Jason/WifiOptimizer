@@ -3524,7 +3524,9 @@ try:
         p = m.Plugin(); p._update_starting = True
         ok(asyncio.run(call(p)).get("error") == "busy", f"{name} refuses while an update installs")
     _lock_src = _src_all[_src_all.index("    async def set_bssid_lock"):_src_all.index("    async def set_band_preference")]
-    ok("await asyncio.to_thread(\n                    self._settle_band_before_locking" in _lock_src,
+    # The slice runs on to set_band_preference, so it takes in _lock_onto_best,
+    # where the enable path's settling now lives, shared with moving the lock.
+    ok("await asyncio.to_thread(\n            self._settle_band_before_locking" in _lock_src,
        "the lock's band settling (a scan and a radio cycle) runs off the event loop")
     _band_src = _src_all[_src_all.index("    async def set_band_preference"):]
     ok("await asyncio.to_thread(self._band_unreachable" in _band_src[:6000],
@@ -5237,6 +5239,322 @@ exec /bin/bash "$0" "$@"
         ok(_o["rc"] != 0 and not _o["curl"] and not _o["tar"] and _o["main"] == "# old\n"
            and "no signed checksum" in _o["log"],
            f"a 7th argument that is {_what} is refused before any download ({_o['rc']}, {_o['log'][-80:]!r})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("access point lock: saying when it holds you on a weaker access point")
+try:
+    # The owner carried the Deck through the house with the lock on. The link
+    # went bad, a much stronger node of the same network was right there, and
+    # nothing said so, so he turned the lock off suspecting it. The lock still
+    # never moves on its own (that would reconnect mid-stream); it says so,
+    # and offers a move.
+    LW = "eeeeeeee-0000-0000-0000-0000000000f1"
+    LW_WINDOW = getattr(m.Plugin, "_LOCK_WEAKER_CHECK_SECONDS", 30)
+    ok(LW_WINDOW >= 30, "the finding needs two reads at least 30 s apart")
+    ok(getattr(m.Plugin, "_LOCK_WEAKER_MARGIN", 0) > m.Plugin._AP_UPGRADE_MARGIN,
+       "and a margin larger than the one the lock moves on, since it nags while the lock is on")
+    PINNED = "02:00:00:00:00:11"
+    HALL = [  # pinned node far away, the router close by on both bands
+        ("02:00:00:00:00:51", 88, 5180, "WPA2 WPA3"),
+        ("02:00:00:00:00:24", 80, 2462, "WPA2 WPA3"),
+        ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3"),
+    ]
+    ONLY_ROUTER_5 = [("02:00:00:00:00:51", 88, 5180, "WPA2 WPA3"),
+                     ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")]
+
+    class LockReach(m.Plugin):
+        def __init__(self, aps, km="wpa-psk"):
+            super().__init__(); self.aps = aps; self.km = km; self.reads = 0
+            self.cached_only = None
+        def _profile_key_mgmt(self, uuid): return self.km
+        def _visible_access_points(self, iface, ssid, rescan=False, cached_only=False):
+            self.reads += 1; self.cached_only = cached_only; return list(self.aps)
+
+    def lw_settings(**extra):
+        return {**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                "bssid_lock_connection_uuid": LW, **extra}
+
+    def lw_live(pin=PINNED, on=PINNED):
+        # nmcli upper-case for the pin, iw lower-case for the link.
+        return {"bssid_lock": pin.upper(), "connected_bssid": on.lower()}
+
+    def lw_read(r, settings=None, live=None, uuid=LW, ssid="Net", link=""):
+        r._recheck_lock_weaker(settings or lw_settings(), live or lw_live(),
+                               uuid, "wlan0", ssid, link)
+        return getattr(r, "_lock_weaker", None)
+
+    def lw_later(r):
+        # Relative to now, never zero: the monotonic clock starts at boot, so
+        # on a runner that has just started, zero is still inside the window.
+        back = LW_WINDOW + 1
+        if getattr(r, "_lock_weaker_checked_at", None) is not None:
+            r._lock_weaker_checked_at = time.monotonic() - back
+        if getattr(r, "_lock_weaker_since", None) is not None:
+            r._lock_weaker_since = time.monotonic() - back
+
+    def lw_two_reads(r, **kw):
+        first = lw_read(r, **kw)
+        lw_later(r)
+        return first, lw_read(r, **kw)
+
+    r = LockReach(HALL)
+    first, second = lw_two_reads(r)
+    ok(first is None, "one read, however lopsided, is not enough to say anything")
+    ok(second == {"signal": 88, "current_signal": 31},
+       "the same finding on a second read 30 s later is reported, with both signals")
+    ok(r.cached_only is True, "and it only ever reads nmcli's cached scan")
+
+    r = LockReach(HALL)
+    lw_read(r)
+    reads = r.reads
+    lw_read(r)
+    ok(r._lock_weaker is None and r.reads == reads,
+       "a second poll inside the window neither reports nor scans")
+
+    r = LockReach([("02:00:00:00:00:51", 31 + 15, 5180, "WPA2 WPA3"),
+                   ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")])
+    ok(lw_two_reads(r)[1] is None,
+       "15 points stronger is past the lock's own margin but not this one, so no notice")
+    r = LockReach([("02:00:00:00:00:51", 31 + 20, 5180, "WPA2 WPA3"),
+                   ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")])
+    ok(lw_two_reads(r)[1] == {"signal": 51, "current_signal": 31},
+       "20 points stronger is reported")
+
+    r = LockReach(HALL)
+    ok(lw_two_reads(r, settings=lw_settings(bssid_lock_enabled=False))[1] is None,
+       "not with the lock off")
+    r = LockReach(HALL)
+    ok(lw_two_reads(r, uuid="eeeeeeee-0000-0000-0000-0000000000f2")[1] is None,
+       "not on a profile the lock was not written for")
+    r = LockReach(HALL)
+    ok(lw_two_reads(r, live=lw_live(on="02:00:00:00:00:24"))[1] is None,
+       "not when the device is not on the pinned access point")
+    r = LockReach(HALL)
+    ok(lw_two_reads(r, live=lw_live(pin=""))[1] is None,
+       "not when the profile carries no pin")
+    r = LockReach(HALL)
+    ok(lw_two_reads(r, link="Connected to 02:00:00:00:00:11\n\tsignal: -50 dBm\n")[1] is None,
+       "not on a link healthy enough that the lock would not move off it")
+
+    r = LockReach(ONLY_ROUTER_5)
+    ok(lw_two_reads(r, settings=lw_settings(
+        ap_move_failures={"02:00:00:00:00:51": int(time.time())}))[1] is None,
+       "not for an access point that refused us and is still in its cooldown")
+    r = LockReach([("02:00:00:00:00:51", 88, 5180, "WPA2"),
+                   ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")], km="sae")
+    ok(lw_two_reads(r)[1] is None,
+       "not for an access point this profile's security cannot join")
+    _band = lw_settings(band_preference_enabled=True, band_preference="a",
+                        band_preference_ssid="Net")
+    r = LockReach([("02:00:00:00:00:24", 88, 2462, "WPA2 WPA3"),
+                   ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")])
+    ok(lw_two_reads(r, settings=_band)[1] is None,
+       "not for an access point on the other band while a band preference is set")
+    r = LockReach([("02:00:00:00:00:24", 88, 2462, "WPA2 WPA3"),
+                   ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")])
+    ok(lw_two_reads(r, settings=lw_settings(band_preference_enabled=True,
+                                           band_preference="a",
+                                           band_preference_ssid="Elsewhere"))[1] is not None,
+       "while a preference set for another network does not constrain this one")
+
+    r = LockReach(HALL)
+    lw_two_reads(r)
+    r.aps = [("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")]
+    lw_later(r)
+    ok(lw_read(r) is None, "it clears when the stronger access point goes")
+    r = LockReach(HALL)
+    lw_two_reads(r)
+    r.aps = [("02:00:00:00:00:51", 88, 5180, "WPA2 WPA3"),
+             ("02:00:00:00:00:11", 80, 5745, "WPA2 WPA3")]
+    lw_later(r)
+    ok(lw_read(r) is None, "and when the pinned one recovers")
+    r = LockReach(HALL)
+    lw_two_reads(r)
+    ok(lw_read(r, settings=lw_settings(bssid_lock_enabled=False)) is None,
+       "and at once when the lock is turned off, without waiting out the window")
+    # Two weak nodes and the router: the finding for one pin must not carry
+    # over to the next, or a fresh pin is reported on a single read.
+    r = LockReach([("02:00:00:00:00:51", 88, 5180, "WPA2 WPA3"),
+                   ("02:00:00:00:00:22", 31, 5220, "WPA2 WPA3"),
+                   ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")])
+    ok(lw_two_reads(r)[1] is not None, "(the first pin's finding is reported)")
+    lw_later(r)
+    ok(lw_read(r, live=lw_live(pin="02:00:00:00:00:22", on="02:00:00:00:00:22")) is None,
+       "a different pin starts over rather than inheriting the old finding")
+
+    for what, setup in [
+        ("another profile change is mid-flight", lambda p: setattr(p, "_profile_change_depth", 1)),
+        ("an update is installing", lambda p: setattr(p, "_update_starting", True)),
+        ("a backend switch is running", lambda p: setattr(p, "_backend_switch", {"in_progress": True})),
+    ]:
+        r = LockReach(HALL)
+        lw_two_reads(r)
+        setup(r)
+        ok(lw_read(r) is None, f"nothing is reported while {what}")
+
+    r = LockReach(HALL)
+    _st = {"live": lw_live()}
+    r._report_lock_weaker(lw_settings(), _st, LW, "wlan0", "Net", "")
+    lw_later(r)
+    r._report_lock_weaker(lw_settings(), _st, LW, "wlan0", "Net", "")
+    ok(_st.get("lock_weaker") == {"signal": 88, "current_signal": 31},
+       "the status carries it as lock_weaker")
+    _coll = _src_all[_src_all.index("    def _collect_status"):]
+    _coll = _coll[:_coll.index("\n    def ", 10)]
+    ok("self._report_lock_weaker(" in _coll, "and the status poll is what runs it")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("access point lock: moving it when asked")
+try:
+    _logged = []
+    _real_info = m.decky.logger.info
+    m.decky.logger.info = staticmethod(lambda msg: _logged.append(msg))
+    try:
+        # A real UUID: settings validation drops anything else, and a lock
+        # recorded for no profile is a lock for no network.
+        MU = "eeeeeeee-0000-0000-0000-0000000000f3"
+        class LockedMesh(Mesh):
+            def _get_active_connection_uuid(self): return MU
+
+        def lock_on(**extra):
+            m._save_settings({**base_ap, "bssid_lock_enabled": True,
+                              "bssid_lock_value": "02:00:00:00:00:11",
+                              "bssid_lock_connection_uuid": MU,
+                              "bssid_lock_uuids": [MU], **extra})
+
+        def mesh_pinned(scan=MESH, **kw):
+            g = LockedMesh(scan, "02:00:00:00:00:11", **kw)
+            g.pinned = "02:00:00:00:00:11"
+            g._ASSOCIATION_WAIT_SECONDS = 1.0
+            g._lock_weaker = {"signal": 100, "current_signal": 45}
+            return g
+
+        lock_on(); _logged.clear()
+        g = mesh_pinned()
+        r = asyncio.run(g.move_bssid_lock())
+        _s = m._load_settings()
+        ok(r.get("success") is True and g.pinned.upper() == "02:00:00:00:00:51"
+           and g.on.upper() == "02:00:00:00:00:51",
+           "moving writes the stronger access point as the pin and lands on it")
+        ok(_s["bssid_lock_value"] == "02:00:00:00:00:51" and _s["bssid_lock_enabled"] is True
+           and _s["bssid_lock_connection_uuid"] == MU,
+           "and records it in settings the way turning the lock on does")
+        ok(any("Moving the BSSID lock from 02:00:00:00:00:11 (signal 45) to "
+               "02:00:00:00:00:51 (signal 100)" in l for l in _logged),
+           "the move is logged with both access points and both signals")
+        ok(g._lock_weaker is None and getattr(g, "_profile_change_depth", 0) == 0,
+           "the notice is cleared and the in-flight claim released")
+
+        lock_on()
+        g = mesh_pinned(reachable={"02:00:00:00:00:11"})
+        r = asyncio.run(g.move_bssid_lock())
+        _s = m._load_settings()
+        ok(g.pinned.upper() == "02:00:00:00:00:11" and _s["bssid_lock_value"].upper() == "02:00:00:00:00:11",
+           "an access point that will not have us is rolled back to the previous pin")
+        ok("02:00:00:00:00:51" in _s.get("ap_move_failures", {}),
+           "and remembered, so the notice does not offer it again during its cooldown")
+        ok(r.get("success") is False and r.get("error") == "move_failed"
+           and "went back" in r.get("message", "") and r.get("reconnected") is True,
+           "the user is told the move did not happen and why")
+        ok(g._lock_weaker is None and getattr(g, "_profile_change_depth", 0) == 0,
+           "with the notice cleared and the claim released")
+
+        lock_on()
+        g = mesh_pinned(scan=NEAR)
+        r = asyncio.run(g.move_bssid_lock())
+        ok(r.get("error") == "no_better_ap" and not any(k == "802-11-wireless.bssid" for k, _ in g.mods),
+           "nothing clearly stronger on a fresh look writes nothing and does not reconnect")
+        ok(g._lock_weaker is None and getattr(g, "_profile_change_depth", 0) == 0,
+           "and still clears the notice and releases the claim")
+
+        m._save_settings({**base_ap, "bssid_lock_enabled": False})
+        g = mesh_pinned()
+        r = asyncio.run(g.move_bssid_lock())
+        ok(r.get("error") == "not_locked" and not g.mods and g.scans == 0,
+           "with the lock off it refuses, touching nothing")
+
+        class Elsewhere(Mesh):
+            def _get_profile_ssid(self, uuid, timeout=5):
+                return {MU: "Net"}.get(uuid, "Cafe")
+            def _get_active_connection_uuid(self):
+                return "eeeeeeee-0000-0000-0000-0000000000f4"
+        lock_on()
+        g = Elsewhere(MESH, "02:00:00:00:00:11")
+        r = asyncio.run(g.move_bssid_lock())
+        ok(r.get("error") == "not_locked" and not g.mods,
+           "and it never pins a network the lock was not turned on for")
+
+        class IwdMesh(LockedMesh):
+            def _backend_is_iwd(self): return True
+        lock_on()
+        g = IwdMesh(MESH, "02:00:00:00:00:11")
+        r = asyncio.run(g.move_bssid_lock())
+        ok(r.get("error") == "needs_wpa_supplicant" and not g.mods
+           and getattr(g, "_profile_change_depth", 0) == 0,
+           "under iwd it refuses with the reason and releases the claim")
+
+        class Boom(LockedMesh):
+            def _require_wifi(self): raise RuntimeError("boom")
+        lock_on()
+        g = Boom(MESH, "02:00:00:00:00:11")
+        r = asyncio.run(g.move_bssid_lock())
+        ok(r.get("success") is False and getattr(g, "_profile_change_depth", 0) == 0,
+           "an unexpected error is reported and the claim is still released")
+
+        for what, setup in [
+            ("another profile change is mid-flight", lambda p: setattr(p, "_profile_change_depth", 1)),
+            ("an update is installing", lambda p: setattr(p, "_update_starting", True)),
+            ("a backend switch is running", lambda p: setattr(p, "_backend_switch", {"in_progress": True})),
+        ]:
+            lock_on()
+            g = mesh_pinned()
+            setup(g)
+            depth = getattr(g, "_profile_change_depth", 0)
+            r = asyncio.run(g.move_bssid_lock())
+            ok(r.get("error") == "busy" and not g.mods
+               and getattr(g, "_profile_change_depth", 0) == depth,
+               f"it refuses while {what}, leaving that claim alone")
+
+        # Turning the lock off said nothing in the log, and after a bad
+        # stretch the owner had to ask whether he had done it himself.
+        class Unlock(m.Plugin):
+            def __init__(self, err=None): super().__init__(); self.err = err
+            def _release_lock_from_all_profiles(self): return self.err
+        _logged.clear()
+        r = asyncio.run(Unlock().set_bssid_lock(False))
+        ok(r.get("success") is True and "BSSID lock turned off" in _logged,
+           "turning the lock off is logged")
+        _logged.clear()
+        asyncio.run(Unlock({"success": False, "error": "nmcli_failed", "message": "x"}).set_bssid_lock(False))
+        ok("BSSID lock turned off" not in _logged, "but not when it did not actually come off")
+    finally:
+        m.decky.logger.info = _real_info
+
+    _tsx = open("src/index.tsx").read()
+    _ban = _tsx[_tsx.index("{(status?.lock_weaker || errors.move_bssid_lock) && ("):]
+    _ban = _ban[:_ban.index("Move the lock") + 40]
+    ok("The access point lock is holding you on a weaker access point" in _ban
+       and "A stronger one is in" in _ban and "status.lock_weaker.current_signal" in _ban
+       and "status.lock_weaker.signal" in _ban,
+       "the panel shows a warning with both signals while lock_weaker is reported")
+    ok("onClick={handleMoveLock}" in _ban and "disabled={isBusy || updating}" in _ban,
+       "with a Move the lock button that is held while busy or updating")
+    ok("errors.move_bssid_lock" in _ban, "and a failed move's message is shown there")
+    ok('handleToggle("move_bssid_lock", () => backend.moveBssidLock())' in _tsx,
+       "the button calls the backend's move")
+    ok('callable<[], MethodResult>("move_bssid_lock")' in open("src/backend.ts").read()
+       and "lock_weaker?:" in open("src/types.ts").read(),
+       "the callable and the status field are declared")
+    ok(all(ord(ch) < 128 for ch in _ban.replace('icon="⚠"', "")),
+       "the wording is plain ASCII")
+    _dist = open("dist/index.js").read()
+    ok('"move_bssid_lock"' in _dist and "Move the lock" in _dist
+       and "The access point lock is holding you on a weaker access point" in _dist,
+       "and the built bundle carries the notice and the button")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
