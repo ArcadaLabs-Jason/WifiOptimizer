@@ -100,6 +100,7 @@ const repairDrifted = callable("repair_drifted");
 const reapplyVolatile = callable("reapply_volatile");
 const allowWpa2 = callable("allow_wpa2");
 const resetSettings = callable("reset_settings");
+const acknowledgeSettingsRecovered = callable("acknowledge_settings_recovered");
 const setUpdateChannel = callable("set_update_channel");
 const checkForUpdate = callable("check_for_update");
 const applyUpdate = callable("apply_update");
@@ -121,9 +122,9 @@ const ERROR_MESSAGES = {
     no_wifi: "Not connected to WiFi. Connect first, then optimize.",
     iw_failed: "Couldn't change WiFi setting. Try toggling WiFi off/on.",
     nmcli_failed: "Couldn't update connection. Forget and reconnect to this network.",
-    timeout: "Command timed out. The system may be busy. Try again.",
     write_failed: "Couldn't install auto-fix script. The filesystem may be locked.",
-    parse_error: "Settings were reset to defaults.",
+    // Shown while the backend reports settings_recovered.
+    parse_error: "The settings file could not be read, so settings were reset to defaults. The old file was kept as settings.json.corrupt.",
     unexpected: "Something went wrong. Check the Decky log for details.",
 };
 
@@ -194,8 +195,6 @@ const theme = {
 
 const BADGE_STYLES = {
     active: { background: theme.success.badgeBg, color: theme.success.text },
-    locked: { background: theme.success.badgeBg, color: theme.success.text },
-    set: { background: theme.success.badgeBg, color: theme.success.text },
     drifted: { background: theme.warning.badgeBg, color: theme.warning.text },
     off: { background: theme.surface.md, color: theme.text.muted },
     error: { background: theme.error.badgeBg, color: theme.error.text },
@@ -740,6 +739,9 @@ const BACKEND_SWITCH_MAX_S = 240;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE = "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
+// What Reset undoes, said before it happens. It reaches every network the
+// plugin touched, so one stray press of the button should not be enough.
+const RESET_CONFIRM_TEXT = "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the 5 GHz preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -1247,7 +1249,13 @@ function Content() {
     const handleRepairDrift = () => runBatch(() => repairDrifted());
     const handleForceReapply = () => runBatch(() => reapplyAll());
     const handleAllowWpa2 = () => handleToggle("allow_wpa2", () => allowWpa2());
-    const handleResetSettings = async () => {
+    // Reset asks first: see RESET_CONFIRM_TEXT.
+    const handleResetSettings = () => {
+        if (busyRef.current)
+            return;
+        DFL.showModal(SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Reset WiFi Optimizer?", strDescription: RESET_CONFIRM_TEXT, strOKButtonText: "Reset", strCancelButtonText: "Cancel", bDestructiveWarning: true, onOK: () => void runReset() }));
+    };
+    const runReset = async () => {
         if (busyRef.current)
             return;
         setBusy(true);
@@ -1269,6 +1277,17 @@ function Content() {
             await refreshStatus(true);
             setBusy(false);
         }
+    };
+    // The backend keeps reporting a settings file it had to set aside until
+    // told the user has seen it, so the notice survives the panel closing.
+    const handleDismissRecovered = async () => {
+        try {
+            await acknowledgeSettingsRecovered();
+        }
+        catch (e) {
+            console.error("acknowledge settings recovered error", e);
+        }
+        await refreshStatus(true);
     };
     const handleBackendToggle = async (on) => {
         // Re-entrancy guard: drop rapid clicks or clicks that land while another
@@ -1417,7 +1436,7 @@ function Content() {
                     ? `${s?.device_label} - ${s?.chip_label}`
                     : s?.chip_label && s.chip_label !== "unknown"
                         ? s.chip_label
-                        : undefined }), supportTier === 3 && (SP_JSX.jsx(Banner, { variant: "info", children: "Unknown WiFi hardware detected. Some optimizations may not apply." })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleApplyUpdate, children: updateInfo.is_downgrade
+                        : undefined }), supportTier === 3 && (SP_JSX.jsx(Banner, { variant: "info", children: "Unknown WiFi hardware detected. Some optimizations may not apply." })), status?.settings_recovered && (SP_JSX.jsx(Banner, { variant: "warning", children: ERROR_MESSAGES.parse_error })), status?.settings_recovered && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleDismissRecovered, children: "Dismiss" }) }) })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleApplyUpdate, children: updateInfo.is_downgrade
                             ? `Go back to v${updateInfo.latest_version}`
                             : `Update to v${updateInfo.latest_version}` }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText(updateProgress) }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), status?.external?.duplicate_profiles && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent. The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority." })), status?.address_conflict && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Another device on your network is using the same address as the Deck (", status.address_conflict.ip, "), so the connection may not work. That's the router, not a WiFi setting. Restarting the router usually fixes it."] })), status?.wpa2_only_stronger && (SP_JSX.jsxs(Banner, { variant: "info", children: ["A stronger access point on this network (signal", " ", status.wpa2_only_stronger.signal, " vs", " ", status.wpa2_only_stronger.current_signal, ") only offers WPA2, and this network is saved as WPA3-only, so the Deck can't use it. Access points that offer WPA3 keep using it. Only allow this if that access point is yours: anyone nearby can broadcast your network's name.", errors.allow_wpa2 && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.allow_wpa2 }))] })), status?.wpa2_only_stronger && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleAllowWpa2, children: "Allow WPA2 here" }) }) })), status?.external?.pin_released && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "WiFi could not connect for a while, so the locked access point or band preference was released to let it reconnect. The setting is still on and applies again to whichever access point works." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [driftCount, " setting", driftCount > 1 ? "s" : "", " drifted after wake."] })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleRepairDrift, children: "Fix now" }) }) })), status?.success === false && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u26A0", children: status?.message ?? "Couldn't read WiFi status." })), status?.success !== false && !connected && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "Not connected to WiFi. Connect first, then optimize." })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
                 const r = backendSwitch.result;
@@ -1476,7 +1495,7 @@ function Content() {
                                 ? IWD_PIN_NOTICE
                                 : status?.external?.band
                                     ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
-                                    : undefined), onChange: (val) => handleToggle("band_preference", () => setBandPreference(val, s?.band_preference ?? "a")) }), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge(undefined, status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
+                                    : undefined), onChange: (val) => handleToggle("band_preference", () => setBandPreference(val, s?.band_preference ?? "a")) }), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
                             if (!val)
                                 resetDnsDraft();
                             handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput));

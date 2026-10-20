@@ -26,6 +26,7 @@ export const repairDrifted = callable<[], OptimizeSafeResult>("repair_drifted");
 export const reapplyVolatile = callable<[], MethodResult>("reapply_volatile");
 export const allowWpa2 = callable<[], MethodResult>("allow_wpa2");
 export const resetSettings = callable<[], MethodResult>("reset_settings");
+export const acknowledgeSettingsRecovered = callable<[], MethodResult>("acknowledge_settings_recovered");
 export const setUpdateChannel = callable<[channel: string], MethodResult>("set_update_channel");
 export const checkForUpdate = callable<[], UpdateCheckResult>("check_for_update");
 export const applyUpdate = callable<[], MethodResult>("apply_update");

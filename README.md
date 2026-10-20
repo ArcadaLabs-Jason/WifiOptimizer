@@ -1,4 +1,4 @@
-# WiFi Optimizer v0.19.2-beta
+# WiFi Optimizer v0.20.0-beta
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
@@ -68,7 +68,7 @@ Want to go further? The remaining optimizations are available as individual togg
 
 Off by default. When it's on, Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) apply only while a streaming app is running, and come off when it exits, so the rest of the time your device saves battery as it normally would. Background scanning, Force 5 GHz, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.
 
-It watches for Moonlight, GeForce NOW, Chiaki, Steam Remote Play, Steam Link, Greenlight, Parsec and Xbox Cloud Gaming, each of which can be unticked, plus any process names you add. The top of the panel always says which state you're in. If a stream isn't picked up, turn on **Keep fixes on**, which holds the fixes on until you restart, or add the app's process name.
+It watches for Moonlight, GeForce NOW, Chiaki (PS Remote Play), Steam Remote Play, Steam Link, Greenlight (Xbox), Parsec and Xbox Cloud Gaming, each of which can be unticked, plus any process names you add. The top of the panel always says which state you're in. If a stream isn't picked up, turn on **Keep fixes on**, which holds the fixes on until you restart, or add the app's process name.
 
 Idea and first implementation by [bassobr](https://github.com/bassobr) ([#5](https://github.com/ArcadaLabs-Jason/WifiOptimizer/issues/5)).
 
@@ -138,3 +138,12 @@ Follow development on [Bluesky](https://bsky.app/profile/thefanciestpeanut.bsky.
 ## License
 
 BSD 3-Clause. See [LICENSE](LICENSE).
+
+### Third-party code
+
+The built frontend (`dist/index.js`) includes code from these libraries, under their own licenses:
+
+- [@decky/api](https://github.com/SteamDeckHomebrew/loader-api) - LGPL-2.1
+- [react-icons](https://github.com/react-icons/react-icons) - MIT
+
+The panel also uses [@decky/ui](https://github.com/SteamDeckHomebrew/decky-frontend-lib) (LGPL-2.1), which Decky Loader provides at runtime rather than this bundle, and [tslib](https://github.com/microsoft/tslib) (0BSD) is installed with the build tools, though none of it ends up in the bundle.

@@ -13,6 +13,8 @@ import {
   ButtonItem,
   DropdownItem,
   TextField,
+  ConfirmModal,
+  showModal,
   staticClasses,
 } from "@decky/ui";
 import { definePlugin } from "@decky/api";
@@ -60,6 +62,10 @@ const BACKEND_SWITCH_MAX_S = 240;
 const IWD_PIN_NOTICE =
   "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
+// What Reset undoes, said before it happens. It reaches every network the
+// plugin touched, so one stray press of the button should not be enough.
+const RESET_CONFIRM_TEXT =
+  "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the 5 GHz preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -604,7 +610,22 @@ function Content() {
   const handleAllowWpa2 = () =>
     handleToggle("allow_wpa2", () => backend.allowWpa2());
 
-  const handleResetSettings = async () => {
+  // Reset asks first: see RESET_CONFIRM_TEXT.
+  const handleResetSettings = () => {
+    if (busyRef.current) return;
+    showModal(
+      <ConfirmModal
+        strTitle="Reset WiFi Optimizer?"
+        strDescription={RESET_CONFIRM_TEXT}
+        strOKButtonText="Reset"
+        strCancelButtonText="Cancel"
+        bDestructiveWarning={true}
+        onOK={() => void runReset()}
+      />,
+    );
+  };
+
+  const runReset = async () => {
     if (busyRef.current) return;
     setBusy(true);
     setOptimizeResult(null);
@@ -623,6 +644,17 @@ function Content() {
       await refreshStatus(true);
       setBusy(false);
     }
+  };
+
+  // The backend keeps reporting a settings file it had to set aside until
+  // told the user has seen it, so the notice survives the panel closing.
+  const handleDismissRecovered = async () => {
+    try {
+      await backend.acknowledgeSettingsRecovered();
+    } catch (e) {
+      console.error("acknowledge settings recovered error", e);
+    }
+    await refreshStatus(true);
   };
 
   const handleBackendToggle = async (on: boolean) => {
@@ -799,6 +831,22 @@ function Content() {
         <Banner variant="info">
           Unknown WiFi hardware detected. Some optimizations may not apply.
         </Banner>
+      )}
+
+      {/* The settings file could not be read and was set aside. Every toggle
+          has just gone back to its default, and without this it looks as if
+          the plugin forgot them for no reason. */}
+      {status?.settings_recovered && (
+        <Banner variant="warning">{ERROR_MESSAGES.parse_error}</Banner>
+      )}
+      {status?.settings_recovered && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissRecovered}>
+              Dismiss
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
       )}
 
       {/* Update available */}
@@ -1133,7 +1181,7 @@ function Content() {
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
           explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
-          {...getBadge(undefined, status, errors.dns ?? null)}
+          {...getBadge("dns", status, errors.dns ?? null)}
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.dns_enabled)}
           error={errors.dns}

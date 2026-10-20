@@ -4179,5 +4179,326 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("settings: a file that does not parse is kept, not overwritten")
+try:
+    _real_settings = m.SETTINGS_FILE
+    try:
+        _d = tempfile.mkdtemp(); m.SETTINGS_FILE = os.path.join(_d, "settings.json")
+        _corrupt = m.SETTINGS_FILE + ".corrupt"
+        m._settings_recovered = False
+        _bad = '{"dns_uuids": ["aaaaaaaa-0000-0000-0000-0000000000a6"], "dns_enabled": tru'
+        open(m.SETTINGS_FILE, "w").write(_bad)
+        ok(m._load_settings() == m.DEFAULT_SETTINGS, "a settings file that does not parse loads as defaults")
+        ok(os.path.isfile(_corrupt) and open(_corrupt).read() == _bad,
+           "and is kept, unchanged, as settings.json.corrupt")
+        ok(not os.path.exists(m.SETTINGS_FILE),
+           "so saving the defaults afterwards cannot overwrite the user's data")
+        ok(getattr(m, "_settings_recovered", False) is True, "and the event is recorded for the panel")
+        m._save_settings(m._load_settings())
+        ok(open(_corrupt).read() == _bad, "a later load and save leave the kept copy alone")
+        open(m.SETTINGS_FILE, "w").write("[1, 2, 3]")
+        m._load_settings()
+        ok(open(_corrupt).read() == "[1, 2, 3]",
+           "valid JSON that is not an object is set aside too, replacing the older copy")
+        # Conditions that may pass, or were never the user's data: nothing moves.
+        os.remove(_corrupt)
+        m._load_settings()
+        ok(not os.path.exists(_corrupt), "a missing settings file sets nothing aside")
+        os.mkfifo(m.SETTINGS_FILE)
+        m._load_settings()
+        ok(os.path.exists(m.SETTINGS_FILE) and not os.path.exists(_corrupt),
+           "nor does a FIFO at the settings path")
+        os.remove(m.SETTINGS_FILE)
+        open(m.SETTINGS_FILE, "w").write('{"driver": "' + "x" * 70000 + '"}')
+        ok(m._load_settings() == m.DEFAULT_SETTINGS and os.path.exists(m.SETTINGS_FILE)
+           and not os.path.exists(_corrupt), "nor does an oversized one")
+        os.remove(m.SETTINGS_FILE)
+
+        class RecoveredStatus(m.Plugin):
+            def _collect_status(self):
+                return ({"success": True, "connected": False, "settings": {}, "live": {},
+                         "drift": {}, "external": {}}, {}, [])
+        m._settings_recovered = True
+        _rp = RecoveredStatus()
+        ok(asyncio.run(_rp.get_status()).get("settings_recovered") is True,
+           "the status tells the panel the settings were reset")
+        ok(asyncio.run(_rp.get_status()).get("settings_recovered") is True,
+           "on every poll, not once, so the plugin's own status reads cannot swallow it")
+        _ack = getattr(_rp, "acknowledge_settings_recovered", None)
+        ok(_ack is not None and asyncio.run(_ack()).get("success") is True
+           and "settings_recovered" not in asyncio.run(_rp.get_status()),
+           "until the panel says the user has seen it")
+    finally:
+        m.SETTINGS_FILE = _real_settings
+        m._settings_recovered = False
+    _ix = open("src/index.tsx").read()
+    ok("status?.settings_recovered" in _ix and "{ERROR_MESSAGES.parse_error}" in _ix
+       and "backend.acknowledgeSettingsRecovered()" in _ix,
+       "the panel shows the notice and can dismiss it")
+    ok("settings.json.corrupt" in open("src/types.ts").read(),
+       "and the notice says where the old file was kept")
+    ok('"acknowledge_settings_recovered"' in open("src/backend.ts").read(),
+       "the panel's call names the backend method")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("settings: the defaults are never handed out to be changed")
+_defaults_before = json.loads(json.dumps(m.DEFAULT_SETTINGS))
+try:
+    _real_settings = m.SETTINGS_FILE
+    try:
+        m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+        _s = m._load_settings()
+        _s["bssid_lock_uuids"].append(A6); _s["ap_move_failures"]["x"] = 1
+        _s["streaming_apps"]["moonlight"] = False
+        ok(m.DEFAULT_SETTINGS["bssid_lock_uuids"] == [] and m.DEFAULT_SETTINGS["ap_move_failures"] == {}
+           and m.DEFAULT_SETTINGS["streaming_apps"] == {},
+           "changing a list or dict in defaults loaded with no file leaves DEFAULT_SETTINGS alone")
+        m._save_settings({"driver": "rtw88"})
+        _s = m._load_settings()
+        _s["ap_move_failures"]["x"] = 1; _s["sysctl_baseline"]["kernel"] = "x"
+        ok(m.DEFAULT_SETTINGS["ap_move_failures"] == {} and m.DEFAULT_SETTINGS["sysctl_baseline"] == {},
+           "and so does one filled in for a key the saved file lacks")
+        m._save_settings({"ap_move_failures": "not a dict"})
+        _s = m._load_settings(); _s["ap_move_failures"]["x"] = 1
+        ok(m.DEFAULT_SETTINGS["ap_move_failures"] == {},
+           "and one put back in place of a value of the wrong type")
+    finally:
+        m.SETTINGS_FILE = _real_settings
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+finally:
+    m.DEFAULT_SETTINGS.clear(); m.DEFAULT_SETTINGS.update(_defaults_before)
+
+section("Reset: asks before undoing everything")
+try:
+    _ix = open("src/index.tsx").read()
+    _hr = _ix[_ix.index("const handleResetSettings"):]
+    _hr = _hr[:_hr.index("const runReset")]
+    ok("showModal(" in _hr and "<ConfirmModal" in _hr and "onOK={() => void runReset()}" in _hr,
+       "the Reset button opens a confirmation, and only its OK runs the reset")
+    ok('strOKButtonText="Reset"' in _hr and 'strCancelButtonText="Cancel"' in _hr,
+       "with buttons named Reset and Cancel")
+    ok("backend.resetSettings()" not in _hr and "onReset={handleResetSettings}" in _ix,
+       "and nothing resets on the first press")
+    _rct = _ix[_ix.index("const RESET_CONFIRM_TEXT"):]
+    _rct = _rct[:_rct.index(";")]
+    ok(all(w in _rct for w in ("Buffer tuning", "CAKE", "lock", "5 GHz", "IPv6", "DNS")),
+       "the confirmation says what a reset undoes")
+    ok("Reset WiFi Optimizer?" in open("dist/index.js").read(), "and the built bundle carries it")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("diagnostics: no network names or addresses")
+try:
+    _IW_DEV = ("phy#0\n\tInterface wlan0\n\t\tifindex 3\n\t\twdev 0x1\n"
+               "\t\taddr 3c:e9:f7:12:34:56\n\t\tssid Smith Family 5G\n\t\ttype managed\n"
+               "\t\tchannel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz\n"
+               "\t\ttxpower 22.00 dBm\n")
+    _IW_LINK = "Connected to 62:e9:31:0d:1f:e7 (on wlan0)\n\tSSID: Smith Family 5G\n"
+
+    class Diag(m.Plugin):
+        def _get_wifi_interface(self): return "wlan0"
+        async def get_device_info(self): return {"success": True, "driver": "rtw89"}
+        def _detect_distro(self): return {"id": "steamos", "name": "SteamOS"}
+        def _get_support_tier(self): return 1
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[-1:] == ["dev"]: return _ok(_IW_DEV + _IW_LINK + "addr 192.168.1.23 fe80::1c2b:3cff:fe4d:5e6f")
+            if cmd[-2:] == ["reg", "get"]: return _ok("global\ncountry US: DFS-FCC\n\t(2400 - 2472 @ 40), (N/A, 30), (N/A)\n")
+            if cmd[-1:] == ["-r"]: return _ok("6.11.11-valve24-2-neptune-611\n")
+            return _ok()
+    _info = asyncio.run(Diag().get_diagnostic_info())
+    _flat = json.dumps(_info)
+    ok(_info.get("success") is True and "Smith Family" not in _flat,
+       "the diagnostics do not carry the network's name, wherever it appears")
+    ok(not re.search(r"(?i)3c:e9:f7|62:e9:31", _flat),
+       "nor the device's or the access point's hardware address")
+    ok("192.168.1.23" not in _flat and "fe80::1c2b" not in _flat, "nor any IP address")
+    ok("ssid <ssid>" in _info.get("iw_dev", "") and "addr <mac>" in _info.get("iw_dev", ""),
+       "each is replaced by a placeholder, so the shape of the output still reads")
+    ok("channel 36 (5180 MHz), width: 80 MHz" in _info.get("iw_dev", "")
+       and "6.11.11-valve24-2-neptune-611" in _info.get("kernel", "")
+       and "country US" in _info.get("iw_reg", ""),
+       "while the channel, kernel and region stay readable")
+    _real_settings = m.SETTINGS_FILE
+    try:
+        m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+        _sv = asyncio.run(Diag().save_diagnostic_info())
+        _txt = open(_sv["path"]).read() if _sv.get("success") else ""
+        ok(_txt and "Smith Family" not in _txt and "3c:e9:f7" not in _txt,
+           "the saved diagnostics file is redacted the same way")
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        asyncio.run(Sysctl(STOCK_618).reset_settings())
+        ok(not os.path.exists(_sv["path"]), "Reset removes the diagnostics file")
+        asyncio.run(Diag().save_diagnostic_info())
+        asyncio.run(Sysctl(STOCK_618)._uninstall())
+        ok(not os.path.exists(_sv["path"]), "and so does uninstalling")
+    finally:
+        m.SETTINGS_FILE = _real_settings
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("dispatcher: the same tuning as the plugin, and valid once filled in")
+try:
+    _tmpl = open("defaults/dispatcher.sh.tmpl").read()
+    _src_all = open("main.py").read()
+    _buf = _tmpl[_tmpl.index("# Apply buffer tuning"):_tmpl.index("# Apply CAKE")]
+    _cake = _tmpl[_tmpl.index("# Apply CAKE"):_tmpl.index("# Record enforcement")]
+    _ps = _tmpl[_tmpl.index("# Apply power save"):_tmpl.index("# Apply buffer tuning")]
+    ok(dict(re.findall(r"sysctl -w ([\w.]+)=(\S+)", _buf)) == m.SYSCTL_PARAMS,
+       "the dispatcher's sysctl values are exactly SYSCTL_PARAMS")
+
+    class TxLog(Sysctl):
+        def txq(self):
+            return [c[-1] for c in self.cmds if c[:2] == ["/usr/bin/ip", "link"] and "txqueuelen" in c]
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _tx = TxLog(STOCK_618); asyncio.run(_tx.set_buffer_tuning(True))
+    ok(re.findall(r"txqueuelen (\d+)", _buf) == _tx.txq()[-1:],
+       f"the dispatcher's buffer tuning queue length matches the plugin's ({_tx.txq()[-1:]})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _tx = TxLog(STOCK_618); asyncio.run(_tx.set_cake(True))
+    _tc = [c for c in _tx.cmds if c[:3] == ["/usr/bin/tc", "qdisc", "replace"]]
+    _tmpl_tc = re.search(r"tc qdisc replace dev \"\$IFACE\" (root .*?) 2>/dev/null", _cake)
+    ok(bool(_tc) and _tmpl_tc is not None
+       and _tmpl_tc.group(1).split() == _tc[0][_tc[0].index("root"):],
+       "the dispatcher's CAKE arguments match the plugin's")
+    ok(re.findall(r"txqueuelen (\d+)", _cake) == _tx.txq()[-1:],
+       f"and so does the queue length that goes with CAKE ({_tx.txq()[-1:]})")
+    _drv = {}
+    for _name, _body in re.findall(r'"\$DRIVER" = "(\w+)" \]; then\n(.*?)(?=\n\s*(?:elif|fi)\b)', _ps, re.S):
+        _drv[_name] = re.findall(r"> (/sys/module/\S+)", _body)
+    ok(_drv == {n: p["sysfs_power_fixes"] for n, p in m.DRIVER_PROFILES.items() if p["sysfs_power_fixes"]},
+       "the dispatcher writes each driver's sysfs fixes from DRIVER_PROFILES, no more, no fewer")
+    _case = re.search(r'case "\$DRIVER" in ([\w|]+)\)', _tmpl)
+    ok(_case is not None and set(_case.group(1).split("|")) == set(m.DRIVER_PROFILES),
+       "and accepts exactly the drivers the plugin has profiles for")
+    _py_links = re.search(r"for aspm_file in \[(.*?)\]", _src_all, re.S)
+    _sh_links = re.search(r"for f in ([\w ]+); do", _ps)
+    ok(_py_links is not None and _sh_links is not None
+       and re.findall(r'"(\w+)"', _py_links.group(1)) == _sh_links.group(1).split(),
+       "the PCIe power state files are the same in both")
+
+    import subprocess as _sp
+    _filled = _tmpl.replace("__SETTINGS_PATH__",
+                            m._sh_quote("/home/deck/homebrew/settings/WiFi Optimizer/settings.json"))
+    _filled = _filled.replace("__PLUGIN_DIR__", m._sh_quote("/home/deck/homebrew/plugins/WiFi Optimizer"))
+    _sh = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer"); open(_sh, "w").write(_filled)
+    _syn = _sp.run(["/bin/bash", "-n", _sh], capture_output=True, text=True)
+    ok("__" not in _filled and _syn.returncode == 0,
+       f"the dispatcher, filled in with paths that contain a space, parses ({_syn.stderr.strip()[:120]})")
+    _assign = "\n".join(l for l in _filled.splitlines() if l.startswith(("SETTINGS_FILE=", "PLUGIN_DIR=")))
+    _vals = _sp.run(["/bin/bash", "-c", _assign + '\nprintf "%s|%s" "$SETTINGS_FILE" "$PLUGIN_DIR"'],
+                    capture_output=True, text=True).stdout
+    ok(_vals == "/home/deck/homebrew/settings/WiFi Optimizer/settings.json|"
+               "/home/deck/homebrew/plugins/WiFi Optimizer",
+       "and reads both paths back whole")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("custom DNS: drift on the network it was set for")
+try:
+    class DnsDrift(Connected):
+        def __init__(self, out, read_ok=True):
+            super().__init__(); self.out = out; self.read_ok = read_ok
+            self.modifies = []; self.reconnects = 0
+        def _run_cmd(self, cmd, timeout=5):
+            if "ipv4.dns,ipv4.ignore-auto-dns" in cmd:
+                return {"success": self.read_ok, "stdout": self.out if self.read_ok else "",
+                        "stderr": "", "returncode": 0 if self.read_ok else 1}
+            return super()._run_cmd(cmd, timeout)
+        def _nmcli_modify(self, *a, **k):
+            self.modifies.append(a); return _ok()
+        def _hard_reconnect(self, uuid=None):
+            self.reconnects += 1; return True
+    HOLDS = "ipv4.dns:1.1.1.1,1.0.0.1\nipv4.ignore-auto-dns:yes"
+    def dns_drift(out, read_ok=True, **extra):
+        m._save_settings({**m.DEFAULT_SETTINGS, "driver": "ath11k_pci", "distro_id": "steamos",
+                          "dns_enabled": True, "dns_provider": "cloudflare",
+                          "dns_servers": "1.1.1.1 1.0.0.1", "dns_uuids": [U], **extra})
+        dd = DnsDrift(out, read_ok)
+        return bool(asyncio.run(dd.get_status()).get("drift", {}).get("dns")), dd
+    ok(dns_drift(HOLDS)[0] is False, "custom DNS still in place is not drift")
+    ok(dns_drift("ipv4.dns:1.1.1.1 1.0.0.1\nipv4.ignore-auto-dns:yes")[0] is False,
+       "nor is it when nmcli lists the servers with spaces")
+    _hit, _dd = dns_drift("ipv4.dns:\nipv4.ignore-auto-dns:no")
+    ok(_hit is True, "the servers gone from the profile is drift")
+    ok(not [a for a in _dd.modifies if str(a[1]).startswith("ipv4.")] and _dd.reconnects == 0,
+       "reported only: the poll writes no DNS and does not reconnect")
+    ok(dns_drift("ipv4.dns:1.1.1.1,1.0.0.1\nipv4.ignore-auto-dns:no")[0] is True,
+       "the router's DNS let back in beside ours is drift too")
+    ok(dns_drift("ipv4.dns:9.9.9.9\nipv4.ignore-auto-dns:yes")[0] is True,
+       "and so are other servers in place of ours")
+    ok(dns_drift("ipv4.dns:\nipv4.ignore-auto-dns:no",
+                 dns_uuids=["dddddddd-0000-0000-0000-0000000000d5"])[0] is False,
+       "a network DNS was never set on is not drift")
+    ok(dns_drift("ipv4.dns:\nipv4.ignore-auto-dns:no", dns_uuids=[])[0] is True,
+       "a setting from before the list existed is checked on the network in use")
+    ok(dns_drift("", read_ok=False)[0] is False and dns_drift("ipv4.dns:1.1.1.1")[0] is False,
+       "a read that failed or came back incomplete is not drift")
+    ok(dns_drift("ipv4.dns:\nipv4.ignore-auto-dns:no", dns_enabled=False)[0] is False,
+       "nothing is drift with custom DNS off")
+
+    class DriftedDns(Drifted):
+        async def set_dns(self, enabled, provider="cloudflare", servers=""):
+            self.dns_args = (enabled, provider, servers); return await self._call("dns")
+    m._save_settings({**m.DEFAULT_SETTINGS, "dns_enabled": True, "dns_provider": "custom",
+                      "dns_servers": "9.9.9.9 1.1.1.1"})
+    _dr = DriftedDns({"dns": True}); _r = asyncio.run(_dr.repair_drifted())
+    ok(_dr.calls == ["dns"] and getattr(_dr, "dns_args", None) == (True, "custom", "9.9.9.9 1.1.1.1"),
+       "Fix now puts the saved DNS servers back")
+    _ix = open("src/index.tsx").read()
+    ok('getBadge("dns", status' in _ix, "and the DNS row shows the drift")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("frontend: no error text or badge that nothing uses")
+try:
+    _types = open("src/types.ts").read()
+    _em = _types[_types.index("export const ERROR_MESSAGES"):]
+    _em = _em[:_em.index("};")]
+    _keys = re.findall(r"^\s+(\w+):", _em, re.M)
+    _src_ts = "".join(open(os.path.join(dp, f)).read() for dp, _dn, fs in os.walk("src") for f in fs)
+    _unused = [k for k in _keys if f'"error": "{k}"' not in _src_all
+               and f"ERROR_MESSAGES.{k}" not in _src_ts]
+    ok(_keys and not _unused, f"every error message is one the backend can send or the panel shows (unused: {_unused})")
+    _bs = _types[_types.index("export type BadgeStatus"):]
+    _bs = _bs[:_bs.index(";")]
+    _members = re.findall(r'"(\w+)"', _bs)
+    _used_src = _src_ts.replace(_bs, "")
+    _unused_b = [b for b in _members if f'badge: "{b}"' not in _used_src]
+    ok(_members and not _unused_b, f"every badge kind is one the panel shows (unused: {_unused_b})")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("streaming apps: named the way people know them")
+try:
+    _labels = {i: l for i, l, _p in m.STREAMING_APPS}
+    ok(_labels.get("chiaki") == "Chiaki (PS Remote Play)" and _labels.get("greenlight") == "Greenlight (Xbox)",
+       "Chiaki and Greenlight say what they stream")
+    _rd = open("README.md").read()
+    ok("Chiaki (PS Remote Play)" in _rd and "Greenlight (Xbox)" in _rd, "and the README lists them the same way")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("repository: CI pinned, security policy present")
+try:
+    _wf = open(".github/workflows/ci.yml").read()
+    _uses = re.findall(r"uses:\s*(\S+)(.*)", _wf)
+    ok(_uses and all(re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", u) and re.search(r"#\s*v\d+\.\d+\.\d+", c)
+                     for u, c in _uses),
+       "every action in CI is pinned to a full commit, with its release noted")
+    ok("persist-credentials: false" in _wf and re.search(r"^permissions:\n\s+contents: read", _wf, re.M),
+       "CI keeps no credentials and can only read")
+    ok(os.path.isfile("SECURITY.md"), "there is a security policy")
+    for _f in ("SECURITY.md", ".github/workflows/ci.yml"):
+        _t = open(_f, encoding="utf-8").read()
+        ok(all(ord(ch) < 128 for ch in _t), f"{_f} is plain ASCII")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

@@ -90,6 +90,9 @@ export interface PluginStatus {
   wpa2_only_stronger?: { signal: number; current_signal: number };
   // NetworkManager saw another device on the network holding our address.
   address_conflict?: { ip: string; other: string };
+  // The settings file did not parse and was moved aside to
+  // settings.json.corrupt. Reported until the panel acknowledges it.
+  settings_recovered?: boolean;
   last_applied?: number;
   error?: string;
   message?: string;
@@ -183,8 +186,6 @@ export interface UpdateProgress {
 
 export type BadgeStatus =
   | "active"
-  | "locked"
-  | "set"
   | "drifted"
   | "off"
   | "error"
@@ -195,9 +196,10 @@ export const ERROR_MESSAGES: Record<string, string> = {
   no_wifi: "Not connected to WiFi. Connect first, then optimize.",
   iw_failed: "Couldn't change WiFi setting. Try toggling WiFi off/on.",
   nmcli_failed: "Couldn't update connection. Forget and reconnect to this network.",
-  timeout: "Command timed out. The system may be busy. Try again.",
   write_failed: "Couldn't install auto-fix script. The filesystem may be locked.",
-  parse_error: "Settings were reset to defaults.",
+  // Shown while the backend reports settings_recovered.
+  parse_error:
+    "The settings file could not be read, so settings were reset to defaults. The old file was kept as settings.json.corrupt.",
   unexpected: "Something went wrong. Check the Decky log for details.",
 };
 

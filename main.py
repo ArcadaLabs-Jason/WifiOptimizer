@@ -174,10 +174,10 @@ UPDATE_STATE_MAX_AGE = 900
 STREAMING_APPS = (
     ("moonlight", "Moonlight", ("moonlight",)),
     ("geforce_now", "GeForce NOW", ("com.nvidia.geforcenow", "play.geforcenow.com")),
-    ("chiaki", "Chiaki", ("chiaki",)),
+    ("chiaki", "Chiaki (PS Remote Play)", ("chiaki",)),
     ("steam_remote_play", "Steam Remote Play", ("/streaming_client",)),
     ("steam_link", "Steam Link", ("steamlink",)),
-    ("greenlight", "Greenlight", ("greenlight",)),
+    ("greenlight", "Greenlight (Xbox)", ("greenlight",)),
     ("parsec", "Parsec", ("parsecd",)),
     ("xbox_cloud", "Xbox Cloud Gaming", ("xbox.com/play",)),
 )
@@ -586,6 +586,39 @@ def _clean_sysctl_baseline(value) -> dict:
 _VALVE_POWERSAVE_VALUES = ("0", "1", "2", "3")
 
 
+# Set when a settings file that could not be parsed was moved aside, and
+# cleared once the panel has told the user. Module level, like the loader
+# that sets it, so every caller of _load_settings is covered.
+_settings_recovered = False
+
+
+def _set_aside_corrupt_settings(read_stat: os.stat_result, reason: Exception):
+    """Move a settings file that does not parse to settings.json.corrupt.
+
+    The loader falls back to defaults and _main saves them straight away,
+    which used to overwrite the only copy of the tracked profile lists and
+    the recorded baselines. Moved rather than copied, so the next load finds
+    no file and takes the ordinary missing-file path instead of setting it
+    aside again, and a previous .corrupt file is replaced: one is enough to
+    recover from, and they cannot pile up.
+    """
+    global _settings_recovered
+    try:
+        # Only the file that was read. A save that landed since then put a
+        # good file at this name, and moving that aside would lose it.
+        now = os.stat(SETTINGS_FILE, follow_symlinks=False)
+        if (now.st_dev, now.st_ino) != (read_stat.st_dev, read_stat.st_ino):
+            return
+        os.replace(SETTINGS_FILE, SETTINGS_FILE + ".corrupt")
+        _settings_recovered = True
+        decky.logger.error(
+            f"Settings file could not be read ({type(reason).__name__}); "
+            "kept it as settings.json.corrupt and started from defaults"
+        )
+    except OSError as e:
+        decky.logger.error(f"Settings file could not be read or set aside: {e}")
+
+
 def _load_settings() -> dict:
     try:
         # Bounded read. This file belongs to the desktop user and root parses
@@ -596,74 +629,100 @@ def _load_settings() -> dict:
         # plugin on its first read; and only ever a regular file.
         fd = os.open(SETTINGS_FILE, os.O_RDONLY | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as f:
-            if not _is_regular(os.fstat(f.fileno()).st_mode):
+            read_stat = os.fstat(f.fileno())
+            if not _is_regular(read_stat.st_mode):
                 raise ValueError("settings file is not a regular file")
             raw = f.read(65536)
             if f.read(1):
                 raise ValueError("settings file too large")
-        data = json.loads(raw)
-        # Merge with defaults (adds new keys), then strip stale keys
-        merged = {**DEFAULT_SETTINGS, **data}
-        merged = {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
-        # This file lives in a directory the desktop user owns, so its types
-        # are not guaranteed. A driver of the wrong type makes the profile
-        # lookup raise on an unhashable key and silently kills the feature.
-        for key, default in DEFAULT_SETTINGS.items():
-            if not isinstance(merged.get(key), type(default)):
-                merged[key] = default
-        # An out-of-range band would be rejected by the setter, including on
-        # the path that turns the preference OFF - leaving a profile pinned to
-        # a band with no control able to clear it.
-        if merged.get("band_preference") not in ("a", "bg"):
-            merged["band_preference"] = "a"
-        # These lists are handed to nmcli as root. argv rather than a shell,
-        # so junk is not dangerous, but a list of it turns a reset into a
-        # long series of doomed calls on the event loop.
-        for key in ("last_connection_uuid", "bssid_lock_connection_uuid"):
-            value = merged.get(key, "")
-            if value and not UUID_RE.match(value):
-                merged[key] = ""
-        # ipv6_uuids belongs here too: it is the third tracked list, it is
-        # handed to nmcli on exactly the same path, and leaving it out meant
-        # the one list whose entries were never checked was also the one the
-        # cleanup refuses to act on without a record.
-        for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids",
-                    "dns_uuids"):
-            merged[key] = [
-                u for u in merged.get(key, [])
-                if isinstance(u, str) and UUID_RE.match(u)
-            ]
-        # The region reaches `iw reg set`. Both the setter and the startup
-        # reapply check it, but a value that cannot be valid has no business
-        # surviving a load either.
-        for key in ("regdomain", "regdomain_previous"):
-            value = merged.get(key, "")
-            if value and not REGDOMAIN_RE.match(value):
-                merged[key] = ""
-        merged["sysctl_baseline"] = _clean_sysctl_baseline(
-            merged.get("sysctl_baseline")
-        )
-        # Older versions saved DNS off as provider "custom" with no servers,
-        # and turning it on from there is refused with no field to fill in.
-        if (not merged.get("dns_enabled") and merged.get("dns_provider") == "custom"
-                and not str(merged.get("dns_servers", "")).strip()):
-            merged["dns_provider"] = "cloudflare"
-        merged["pins_owned"] = [
-            p for p in merged.get("pins_owned", [])
-            if p in ("802-11-wireless.band", "802-11-wireless.bssid")
-        ]
-        # Written back into a NetworkManager file as root, so nothing but the
-        # values NetworkManager defines may come through.
-        if merged.get("valve_powersave_before") not in _VALVE_POWERSAVE_VALUES + ("", "?"):
-            merged["valve_powersave_before"] = "?"
-        merged["streaming_apps"] = {
-            k: v for k, v in merged.get("streaming_apps", {}).items()
-            if k in STREAMING_APP_IDS and isinstance(v, bool)
-        }
-        merged["streaming_custom_patterns"] = merged.get("streaming_custom_patterns", "")[:512]
-        return merged
     except Exception:
-        return dict(DEFAULT_SETTINGS)
+        # Missing, not a regular file, too large or unreadable. Nothing was
+        # parsed, so there is nothing to keep: defaults stand in as always,
+        # and whatever sits at the path is left where it is.
+        return copy.deepcopy(DEFAULT_SETTINGS)
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("settings file does not hold a JSON object")
+    except (ValueError, RecursionError) as e:
+        _set_aside_corrupt_settings(read_stat, e)
+        return copy.deepcopy(DEFAULT_SETTINGS)
+    try:
+        return _clean_settings(data)
+    except Exception:
+        return copy.deepcopy(DEFAULT_SETTINGS)
+
+
+def _clean_settings(data: dict) -> dict:
+    """Parsed settings merged over the defaults, with every value checked."""
+    # Merge with defaults (adds new keys), then strip stale keys. The
+    # defaults are copied: their lists and dicts are shared otherwise,
+    # and a caller appending to one would change DEFAULT_SETTINGS itself.
+    merged = {**copy.deepcopy(DEFAULT_SETTINGS), **data}
+    merged = {k: v for k, v in merged.items() if k in DEFAULT_SETTINGS}
+    # This file lives in a directory the desktop user owns, so its types
+    # are not guaranteed. A driver of the wrong type makes the profile
+    # lookup raise on an unhashable key and silently kills the feature.
+    for key, default in DEFAULT_SETTINGS.items():
+        if not isinstance(merged.get(key), type(default)):
+            merged[key] = copy.deepcopy(default)
+    # An out-of-range band would be rejected by the setter, including on
+    # the path that turns the preference OFF - leaving a profile pinned to
+    # a band with no control able to clear it.
+    if merged.get("band_preference") not in ("a", "bg"):
+        merged["band_preference"] = "a"
+    # These lists are handed to nmcli as root. argv rather than a shell,
+    # so junk is not dangerous, but a list of it turns a reset into a
+    # long series of doomed calls on the event loop.
+    for key in ("last_connection_uuid", "bssid_lock_connection_uuid"):
+        value = merged.get(key, "")
+        if value and not UUID_RE.match(value):
+            merged[key] = ""
+    # ipv6_uuids belongs here too: it is the third tracked list, it is
+    # handed to nmcli on exactly the same path, and leaving it out meant
+    # the one list whose entries were never checked was also the one the
+    # cleanup refuses to act on without a record.
+    for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids",
+                "dns_uuids"):
+        merged[key] = [
+            u for u in merged.get(key, [])
+            if isinstance(u, str) and UUID_RE.match(u)
+        ]
+    # The region reaches `iw reg set`. Both the setter and the startup
+    # reapply check it, but a value that cannot be valid has no business
+    # surviving a load either.
+    for key in ("regdomain", "regdomain_previous"):
+        value = merged.get(key, "")
+        if value and not REGDOMAIN_RE.match(value):
+            merged[key] = ""
+    merged["sysctl_baseline"] = _clean_sysctl_baseline(
+        merged.get("sysctl_baseline")
+    )
+    # Older versions saved DNS off as provider "custom" with no servers,
+    # and turning it on from there is refused with no field to fill in.
+    if (not merged.get("dns_enabled") and merged.get("dns_provider") == "custom"
+            and not str(merged.get("dns_servers", "")).strip()):
+        merged["dns_provider"] = "cloudflare"
+    merged["pins_owned"] = [
+        p for p in merged.get("pins_owned", [])
+        if p in ("802-11-wireless.band", "802-11-wireless.bssid")
+    ]
+    # Written back into a NetworkManager file as root, so nothing but the
+    # values NetworkManager defines may come through.
+    if merged.get("valve_powersave_before") not in _VALVE_POWERSAVE_VALUES + ("", "?"):
+        merged["valve_powersave_before"] = "?"
+    merged["streaming_apps"] = {
+        k: v for k, v in merged.get("streaming_apps", {}).items()
+        if k in STREAMING_APP_IDS and isinstance(v, bool)
+    }
+    merged["streaming_custom_patterns"] = merged.get("streaming_custom_patterns", "")[:512]
+    return merged
+
+
+def _diagnostics_path() -> str:
+    """Where Save diagnostics writes, beside the settings. Worked out when
+    called rather than fixed at import, as SETTINGS_FILE can be moved."""
+    return os.path.join(os.path.dirname(SETTINGS_FILE), "diagnostics.json")
 
 
 def _save_settings(data: dict):
@@ -1756,13 +1815,20 @@ class Plugin:
             self._apply_pcie_aspm_fix(False)
             self._revert_queue_tuning(_load_settings())
             self._release_valve_powersave(_load_settings())
+            # The diagnostics file and a settings file set aside as unreadable
+            # are ours too, and nothing else would ever remove them.
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
-                         SETTINGS_FILE, ENFORCED_FILE, LEGACY_ENFORCED_FILE,
+                         SETTINGS_FILE, SETTINGS_FILE + ".corrupt",
+                         _diagnostics_path(), ENFORCED_FILE, LEGACY_ENFORCED_FILE,
                          STREAM_FLAG_FILE, STREAM_HOLD_FILE]:
+                # One that cannot go (the settings directory is the user's,
+                # so anything can sit at these names) does not stop the rest.
                 try:
                     os.remove(path)
                 except FileNotFoundError:
                     pass
+                except OSError as e:
+                    decky.logger.error(f"_uninstall could not remove {path}: {e}")
         except Exception as e:
             decky.logger.error(f"_uninstall error: {e}")
 
@@ -2019,8 +2085,60 @@ class Plugin:
             decky.logger.error(f"set_regdomain error: {e}")
             return self._unexpected_response(e)
 
+    # What identifies a network or a device in the diagnostics. People paste
+    # these into public issues, and an SSID next to an access point's address
+    # is enough to place someone on a map through the public WiFi databases.
+    _DIAG_SSID_LINE_RE = re.compile(r"^([ \t]*ssid ).*$", re.MULTILINE)
+    _DIAG_MAC_RE = re.compile(
+        r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:-])"
+    )
+    _DIAG_IPV4_RE = re.compile(
+        r"(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
+        r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])"
+    )
+    # Either the full eight groups or a form shortened with "::". Requiring
+    # one of the two keeps times and channel lists, which also have colons,
+    # out of it.
+    _DIAG_IPV6_RE = re.compile(
+        r"(?<![0-9A-Fa-f:])(?:"
+        r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
+        r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::"
+        r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?"
+        r")(?![0-9A-Fa-f:])"
+    )
+
+    @classmethod
+    def _redact_diagnostics(cls, value, ssids: tuple = ()):
+        """The diagnostics with network names and addresses replaced.
+
+        Placeholders rather than removal, so the shape of the output still
+        says what was there: an interface with an SSID is associated, and
+        one without is not. Applied to every string, keys included, because
+        anything added to the diagnostics later should be covered without
+        someone having to remember this.
+        """
+        if isinstance(value, dict):
+            return {cls._redact_diagnostics(k, ssids): cls._redact_diagnostics(v, ssids)
+                    for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._redact_diagnostics(v, ssids) for v in value]
+        if not isinstance(value, str):
+            return value
+        text = cls._DIAG_SSID_LINE_RE.sub(r"\1<ssid>", value)
+        # The name can also turn up away from the line that labels it. Very
+        # short ones are left, since replacing every "ab" would wreck the rest.
+        for ssid in ssids:
+            if len(ssid) >= 4:
+                text = text.replace(ssid, "<ssid>")
+        text = cls._DIAG_MAC_RE.sub("<mac>", text)
+        text = cls._DIAG_IPV6_RE.sub(
+            lambda m: m.group(0) if m.group(0) == "::" else "<ip>", text
+        )
+        return cls._DIAG_IPV4_RE.sub("<ip>", text)
+
     async def get_diagnostic_info(self) -> dict:
-        """Collect system info for remote debugging. Sanitized (no passwords)."""
+        """Collect system info for remote debugging. Sanitized: no passwords,
+        and no network names or addresses (see _redact_diagnostics)."""
         try:
             info = await self.get_device_info()
             iface = self._get_wifi_interface() or "none"
@@ -2034,7 +2152,11 @@ class Plugin:
             except Exception:
                 pass
             distro = self._detect_distro()
-            return {
+            ssids = tuple(
+                found.group(0).split("ssid ", 1)[1]
+                for found in self._DIAG_SSID_LINE_RE.finditer(iw_dev.get("stdout", ""))
+            )
+            return self._redact_diagnostics({
                 "success": True,
                 "device_info": info,
                 "wifi_interface": iface,
@@ -2050,7 +2172,7 @@ class Plugin:
                 "distro_id": distro["id"],
                 "distro_name": distro["name"],
                 "support_tier": self._get_support_tier(),
-            }
+            }, ssids)
         except Exception as e:
             decky.logger.error(f"get_diagnostic_info error: {e}")
             return {"success": False, "error": str(e)}
@@ -2060,9 +2182,7 @@ class Plugin:
         fallback when clipboard is unavailable."""
         try:
             info = await self.get_diagnostic_info()
-            diag_path = os.path.join(
-                os.path.dirname(SETTINGS_FILE), "diagnostics.json"
-            )
+            diag_path = _diagnostics_path()
             if not _write_no_follow(diag_path, json.dumps(info, indent=2)):
                 return {
                     "success": False,
@@ -2133,6 +2253,7 @@ class Plugin:
                     cached["settings"] = _load_settings()
                 except Exception:
                     pass
+                self._report_settings_recovery(cached)
                 return cached
             # No previous result to hand back. Falling through here is what
             # the guard exists to prevent: the first collection of a cold boot
@@ -2192,8 +2313,29 @@ class Plugin:
             except Exception as e:
                 decky.logger.error(f"settings refresh error: {e}")
 
+        self._report_settings_recovery(status)
         self._last_status = status
         return status
+
+    @staticmethod
+    def _report_settings_recovery(status: dict):
+        """Tell the panel the settings file was unreadable and set aside.
+
+        Reported on every poll until the panel acknowledges it, rather than
+        once: get_status is also called by the plugin itself (Fix now, the
+        stranded pin watch), and a one-shot flag those calls consumed would
+        never reach the user.
+        """
+        if _settings_recovered:
+            status["settings_recovered"] = True
+        else:
+            status.pop("settings_recovered", None)
+
+    async def acknowledge_settings_recovered(self) -> dict:
+        """The panel has shown the notice; stop reporting it."""
+        global _settings_recovered
+        _settings_recovered = False
+        return {"success": True}
 
     def _apply_status_actions(self, status: dict, pending: dict, actions: list):
         """Carry out what _collect_status proposed, on the event loop.
@@ -3985,6 +4127,47 @@ class Plugin:
         ):
             status["external"]["ipv6"] = True
 
+    def _check_dns_drift(self, settings: dict, uuid: str, status: dict,
+                         timeout: int = 5):
+        """Whether custom DNS still holds on the network it was set for.
+
+        Something else rewriting the profile (the network settings, a
+        reconnect through another tool) silently put the router's DNS back
+        with the toggle still reading on. Reported only: putting DNS back
+        means a reconnect, which a status poll must never cause, so it is
+        Fix now that repairs it, through set_dns. A read that fails or comes
+        back incomplete says nothing, rather than drift.
+        """
+        if not settings.get("dns_enabled") or not uuid:
+            return
+        # Only where it was set. An empty list is a setting from before the
+        # list existed, which applied to whichever network was in use.
+        tracked = settings.get("dns_uuids", [])
+        if tracked and uuid not in tracked:
+            return
+        want = str(settings.get("dns_servers", "")).replace(",", " ").split()
+        if not want:
+            return
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "ipv4.dns,ipv4.ignore-auto-dns",
+             "con", "show", "uuid", uuid],
+            timeout=timeout,
+        )
+        if not result.get("success"):
+            return
+        fields = {}
+        for line in result.get("stdout", "").splitlines():
+            key, sep, value = line.partition(":")
+            if sep:
+                fields[key.strip()] = value.strip()
+        if "ipv4.dns" not in fields or "ipv4.ignore-auto-dns" not in fields:
+            return
+        # Newer nmcli separates servers with commas, older with spaces, and
+        # terse output escapes any colon with a backslash.
+        have = fields["ipv4.dns"].replace("\\", "").replace(",", " ").split()
+        if not set(want) <= set(have) or fields["ipv4.ignore-auto-dns"] != "yes":
+            status["drift"]["dns"] = True
+
     def _recheck_security_reach(self, uuid: str, iface: str, ssid: str,
                                 current_bssid: str):
         """Notice a stronger access point the saved security cannot use.
@@ -4265,7 +4448,7 @@ class Plugin:
         try:
             settings = _load_settings()
         except Exception:
-            settings = dict(DEFAULT_SETTINGS)
+            settings = copy.deepcopy(DEFAULT_SETTINGS)
         return (
             {
                 "success": False,
@@ -4451,6 +4634,7 @@ class Plugin:
             live_ipv6 = self._read_profile_field(uuid, "ipv6.method", timeout=T)
             status["live"]["ipv6_method"] = live_ipv6
             self._classify_ipv6(settings, uuid, live_ipv6, status, actions)
+            self._check_dns_drift(settings, uuid, status, timeout=T)
 
             # Band preference
             live_band = self._read_profile_field(
@@ -5249,8 +5433,8 @@ class Plugin:
                 # Order matters and both results matter. Clearing the servers
                 # first and then failing to re-enable the automatic ones
                 # leaves a profile that ignores DHCP DNS and has none of its
-                # own, so it reconnects with no resolvers at all - and there
-                # is no drift key for DNS, so nothing would report it.
+                # own, so it reconnects with no resolvers at all - and with
+                # DNS recorded as off, the drift check would not report it.
                 restored = self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
                 if not restored["success"]:
                     return {
@@ -5821,6 +6005,11 @@ class Plugin:
                  lambda: self.set_band_preference(
                      True, settings.get("band_preference", "a"))),
                 ("ipv6", "ipv6_disabled", lambda: self.set_ipv6(True)),
+                # The servers saved with the setting, so a custom list is put
+                # back as it was rather than replaced by a provider's.
+                ("dns", "dns_enabled", lambda: self.set_dns(
+                    True, settings.get("dns_provider", "cloudflare"),
+                    settings.get("dns_servers", ""))),
                 ("power_save", "power_save_disabled",
                  lambda: self.set_power_save(True)),
             )
@@ -5878,6 +6067,15 @@ class Plugin:
                     os.remove(path)
                 except FileNotFoundError:
                     pass
+            # Diagnostics too: they describe the setup being reset. In the
+            # user's directory, so a directory planted at the name is logged
+            # rather than allowed to fail the whole reset.
+            try:
+                os.remove(_diagnostics_path())
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                decky.logger.error(f"reset_settings could not remove diagnostics: {e}")
             try:
                 os.remove(GENERIC_BACKEND_CONF)
             except FileNotFoundError:
@@ -5887,7 +6085,7 @@ class Plugin:
             # Unsupported device" until the next plugin reload. Mirrors the
             # hardware detection _main does on startup.
             info = await self.get_device_info()
-            fresh = dict(DEFAULT_SETTINGS)
+            fresh = copy.deepcopy(DEFAULT_SETTINGS)
             fresh["model"] = info.get("model", "unknown")
             fresh["driver"] = info.get("driver", "unknown")
             fresh["device_family"] = info.get("device_family", "unknown")
