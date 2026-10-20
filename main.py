@@ -415,36 +415,139 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def _open_dir_no_follow(path: str, create: bool = False) -> int:
+    """A descriptor for the directory at path, opened one component at a time.
+
+    The settings and log directories belong to the desktop user, who can swap
+    any of them for a link to somewhere else while root works in it. Opening
+    each component with O_NOFOLLOW, and then working relative to what was
+    opened, means a swap either fails the open or leaves the work in the
+    directory that was opened. A link is followed only while every directory
+    walked so far is root's and no one else can write it, so nobody but root
+    could have made the link or moved anything above it. Bazzite's /home, a
+    link to /var/home, is one. Past the first directory that is not, no link
+    is followed at all.
+
+    create makes missing components (mode 0755), as os.makedirs did. The
+    caller closes the descriptor.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parts = [p for p in os.path.abspath(path).split("/") if p]
+    links = 0
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    trusted = _root_only(os.fstat(fd))
+    try:
+        while parts:
+            name = parts.pop(0)
+            try:
+                nxt = os.open(name, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(name, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nxt = os.open(name, flags, dir_fd=fd)
+            except OSError:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if ((st.st_mode & 0o170000) != 0o120000 or st.st_uid != 0
+                        or not trusted or links >= 8):
+                    _log_refused_link(path, name, st)
+                    raise
+                links += 1
+                target = os.readlink(name, dir_fd=fd)
+                if target.startswith("/"):
+                    root = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+                    os.close(fd)
+                    fd = root
+                parts = [p for p in target.split("/") if p] + parts
+                continue
+            os.close(fd)
+            fd = nxt
+            trusted = trusted and _root_only(os.fstat(fd))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _root_only(st: os.stat_result) -> bool:
+    """Owned by root and writable by nobody else."""
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+# The paths _log_refused_link has already reported.
+_REFUSED_LINKS: set = set()
+
+
+def _log_refused_link(path: str, name: str, st: os.stat_result):
+    """Say once, per path, that a link was not followed.
+
+    A user who moved their homebrew folder behind a link of their own would
+    otherwise see settings fall back to defaults with no reason given.
+    """
+    if (st.st_mode & 0o170000) != 0o120000:
+        return
+    if path in _REFUSED_LINKS:
+        return
+    _REFUSED_LINKS.add(path)
+    try:
+        decky.logger.error(
+            f"Not following the link {name!r} on the way to {path}: the plugin "
+            "only follows links that nobody but root could have made, so it "
+            "will not read or write there"
+        )
+    except Exception:
+        pass
+
+
+def _remove_no_follow(path: str):
+    """os.remove for a file in a directory the desktop user owns.
+
+    Raises as os.remove does, FileNotFoundError included.
+    """
+    dfd = _open_dir_no_follow(os.path.dirname(path))
+    try:
+        os.unlink(os.path.basename(path), dir_fd=dfd)
+    finally:
+        os.close(dfd)
+
+
 def _write_no_follow(path: str, data: str) -> bool:
-    """Write a file without following a symlink at the final component.
+    """Write a file in a directory someone else may control, without links.
 
     The settings directory belongs to the desktop user, so anything we write
     there can be replaced with a link to a file we should not be touching.
     Plain open(path, "w") follows that link and truncates the target as root.
-    O_NOFOLLOW refuses instead, and O_EXCL means we only ever create.
-
-    This covers the FINAL path component only. The directory itself is equally
-    user-owned and could be swapped for a link, redirecting these writes
-    wholesale; closing that means holding the directory open with
-    O_DIRECTORY|O_NOFOLLOW and writing relative to it throughout. Left open
-    deliberately - said here rather than letting the next reader assume the
-    whole path is guarded.
+    O_NOFOLLOW refuses instead, and O_EXCL means we only ever create. The
+    directory itself is opened with _open_dir_no_follow and the file written
+    relative to it, so swapping the directory for a link does not redirect
+    the write either.
     """
     try:
+        dfd = _open_dir_no_follow(os.path.dirname(path))
+    except OSError:
+        return False
+    name = os.path.basename(path)
+    try:
         try:
-            os.unlink(path)
+            os.unlink(name, dir_fd=dfd)
         except FileNotFoundError:
             pass
         except OSError:
             return False
         fd = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
+            dir_fd=dfd,
         )
         with os.fdopen(fd, "w") as f:
             f.write(data)
         return True
     except Exception:
         return False
+    finally:
+        os.close(dfd)
 
 
 def _with_pin(settings: dict, prop: str) -> list:
@@ -623,12 +726,17 @@ def _set_aside_corrupt_settings(read_stat: os.stat_result, reason: Exception):
     recover from, and they cannot pile up.
     """
     try:
-        # Only the file that was read. A save that landed since then put a
-        # good file at this name, and moving that aside would lose it.
-        now = os.stat(SETTINGS_FILE, follow_symlinks=False)
-        if (now.st_dev, now.st_ino) != (read_stat.st_dev, read_stat.st_ino):
-            return
-        os.replace(SETTINGS_FILE, SETTINGS_FILE + ".corrupt")
+        dfd = _open_dir_no_follow(os.path.dirname(SETTINGS_FILE))
+        name = os.path.basename(SETTINGS_FILE)
+        try:
+            # Only the file that was read. A save that landed since then put
+            # a good file at this name, and moving that aside would lose it.
+            now = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != (read_stat.st_dev, read_stat.st_ino):
+                return
+            os.replace(name, name + ".corrupt", src_dir_fd=dfd, dst_dir_fd=dfd)
+        finally:
+            os.close(dfd)
         decky.logger.error(
             f"Settings file could not be read ({type(reason).__name__}); "
             "kept it as settings.json.corrupt and started from defaults"
@@ -662,8 +770,14 @@ def _load_settings() -> dict:
         # plugin allocate arbitrarily much, repeatedly. The dispatcher applies
         # the same cap.
         # Not blocking on a FIFO planted at this name, which would hang the
-        # plugin on its first read; and only ever a regular file.
-        fd = os.open(SETTINGS_FILE, os.O_RDONLY | os.O_NONBLOCK)
+        # plugin on its first read; only ever a regular file; and not through
+        # a link, at the name or anywhere in the user's directories above it.
+        dfd = _open_dir_no_follow(os.path.dirname(SETTINGS_FILE))
+        try:
+            fd = os.open(os.path.basename(SETTINGS_FILE),
+                         os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dfd)
+        finally:
+            os.close(dfd)
         with os.fdopen(fd, "rb") as f:
             read_stat = os.fstat(f.fileno())
             if not _is_regular(read_stat.st_mode):
@@ -773,32 +887,38 @@ def _diagnostics_path() -> str:
 
 
 def _save_settings(data: dict):
-    directory = os.path.dirname(SETTINGS_FILE)
-    os.makedirs(directory, exist_ok=True)
+    # The directory is the user's: everything below is relative to it as
+    # opened by _open_dir_no_follow, which also creates it if missing.
+    dfd = _open_dir_no_follow(os.path.dirname(SETTINGS_FILE), create=True)
     # Write to a temp file then rename, so a crash cannot leave a half-written
     # settings file. The temp name is unique per call rather than fixed: with a
     # shared name, two writers race and the loser's os.replace finds its own
     # file already renamed away. Every caller is on the event loop today, but
     # that is not something a future change should have to know.
-    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".settings-", suffix=".tmp")
+    tmp_name = f".settings-{os.urandom(6).hex()}.tmp"
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-            # mkstemp creates 0600 and os.replace preserves it, which would
-            # silently narrow this file from the 0644 it has always had and
-            # make it unreadable to the user whose settings it holds. Set on
-            # the open file, not by name: the directory is the user's, and a
-            # chmod by path follows whatever link was swapped in meanwhile.
-            os.fchmod(f.fileno(), 0o644)
-        os.replace(tmp_path, SETTINGS_FILE)
-    except Exception:
+        fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=dfd)
         try:
-            os.remove(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+                # Created 0600 and os.replace preserves it, which would
+                # silently narrow this file from the 0644 it has always had
+                # and make it unreadable to the user whose settings it holds.
+                # Set on the open file, not by name, which could be swapped.
+                os.fchmod(f.fileno(), 0o644)
+            os.replace(tmp_name, os.path.basename(SETTINGS_FILE),
+                       src_dir_fd=dfd, dst_dir_fd=dfd)
+        except Exception:
+            try:
+                os.unlink(tmp_name, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
 
 
 def _save_settings_with_timestamp(data: dict):
@@ -1982,32 +2102,51 @@ class Plugin:
         """
         try:
             log_dir = getattr(decky, "DECKY_PLUGIN_LOG_DIR", None)
-            # A linked log directory would point these deletions anywhere.
-            if not log_dir or os.path.islink(log_dir) or not os.path.isdir(log_dir):
+            if not log_dir:
                 return
-            files = [
-                os.path.join(log_dir, f)
-                for f in os.listdir(log_dir)
-                if f.endswith(".log")
-            ]
-            if len(files) <= keep:
+            # The log directory is the user's. Opened without following links
+            # anywhere along it, and worked in relative to that, so a link
+            # swapped in cannot point these deletions somewhere else.
+            try:
+                dfd = _open_dir_no_follow(log_dir)
+            except OSError:
                 return
-            files.sort(key=os.path.getmtime, reverse=True)
-            current_log = getattr(decky, "DECKY_PLUGIN_LOG", None)
-            removed = 0
-            for path in files[keep:]:
-                # Paranoia: never delete the file we're currently writing to.
-                if current_log and os.path.realpath(path) == os.path.realpath(current_log):
-                    continue
-                try:
-                    os.remove(path)
-                    removed += 1
-                except Exception:
-                    pass
-            if removed:
-                decky.logger.info(f"Rotated logs: removed {removed} old file(s), kept {keep} newest")
+            try:
+                self._prune_logs(dfd, log_dir, keep)
+            finally:
+                os.close(dfd)
         except Exception as e:
             decky.logger.error(f"Log rotation error: {e}")
+
+    def _prune_logs(self, dfd: int, log_dir: str, keep: int):
+        """_rotate_logs, inside the log directory as opened."""
+        files = []
+        for name in os.listdir(dfd):
+            if not name.endswith(".log"):
+                continue
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except OSError:
+                continue
+            if _is_regular(st.st_mode):
+                files.append((st.st_mtime, name))
+        if len(files) <= keep:
+            return
+        files.sort(reverse=True)
+        current_log = getattr(decky, "DECKY_PLUGIN_LOG", None)
+        removed = 0
+        for _mtime, name in files[keep:]:
+            # Paranoia: never delete the file we're currently writing to.
+            if current_log and os.path.realpath(os.path.join(log_dir, name)) \
+                    == os.path.realpath(current_log):
+                continue
+            try:
+                os.unlink(name, dir_fd=dfd)
+                removed += 1
+            except Exception:
+                pass
+        if removed:
+            decky.logger.info(f"Rotated logs: removed {removed} old file(s), kept {keep} newest")
 
     # ---- Lifecycle ----
 
@@ -2216,14 +2355,14 @@ class Plugin:
             self._release_valve_powersave(_load_settings())
             # The diagnostics file and a settings file set aside as unreadable
             # are ours too, and nothing else would ever remove them.
+            users = (SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
+                     LEGACY_ENFORCED_FILE)
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
-                         SETTINGS_FILE, SETTINGS_FILE + ".corrupt",
-                         _diagnostics_path(), ENFORCED_FILE, LEGACY_ENFORCED_FILE,
-                         STREAM_FLAG_FILE, STREAM_HOLD_FILE]:
+                         *users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE]:
                 # One that cannot go (the settings directory is the user's,
                 # so anything can sit at these names) does not stop the rest.
                 try:
-                    os.remove(path)
+                    (_remove_no_follow if path in users else os.remove)(path)
                 except FileNotFoundError:
                     pass
                 except OSError as e:
@@ -7067,12 +7206,14 @@ class Plugin:
                 os.remove(MODPROBE_CONF_PATH)
             except FileNotFoundError:
                 pass
-            try:
-                os.remove(SETTINGS_FILE)
-            except FileNotFoundError:
-                pass
-            for path in (ENFORCED_FILE, LEGACY_ENFORCED_FILE, STREAM_FLAG_FILE,
-                         STREAM_HOLD_FILE):
+            # In the user's directory: _remove_no_follow, which does not
+            # follow a link swapped in anywhere along the way.
+            for path in (SETTINGS_FILE, LEGACY_ENFORCED_FILE):
+                try:
+                    _remove_no_follow(path)
+                except FileNotFoundError:
+                    pass
+            for path in (ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE):
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -7081,7 +7222,7 @@ class Plugin:
             # user's directory, so a directory planted at the name is logged
             # rather than allowed to fail the whole reset.
             try:
-                os.remove(_diagnostics_path())
+                _remove_no_follow(_diagnostics_path())
             except FileNotFoundError:
                 pass
             except OSError as e:

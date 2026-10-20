@@ -57,6 +57,110 @@ open(victim,"w").write("PRECIOUS"); os.symlink(victim, target)
 ok(m._write_no_follow(target, "x") is True, "write succeeds")
 ok(open(victim).read() == "PRECIOUS", "victim not truncated")
 
+section("security: a directory of the user's swapped for a link")
+# The settings and log directories belong to the desktop user, who can swap
+# one for a link while root works in it. Every write, move and removal there
+# goes through _open_dir_no_follow, which refuses a link at any component.
+try:
+    _odnf = getattr(m, "_open_dir_no_follow", None)
+    _top = tempfile.mkdtemp(); _away = tempfile.mkdtemp()
+    os.mkdir(os.path.join(_away, "plugin"))
+    open(os.path.join(_away, "plugin", "settings.json"), "w").write("PRECIOUS")
+    open(os.path.join(_away, "plugin", "keep.log"), "w").write("PRECIOUS")
+    os.symlink(_away, os.path.join(_top, "settings"))            # a link mid-path
+    os.symlink(os.path.join(_away, "plugin"), os.path.join(_top, "flat"))  # and at the end
+    _real = os.path.join(_top, "real"); os.mkdir(_real)
+    for _via in ("settings/plugin", "flat"):
+        _p = os.path.join(_top, _via, "settings.json")
+        ok(m._write_no_follow(_p, "x") is False
+           and open(os.path.join(_away, "plugin", "settings.json")).read() == "PRECIOUS",
+           f"a write through a linked directory ({_via}) is refused")
+        try:
+            m._remove_no_follow(_p); _removed = True
+        except OSError:
+            _removed = False
+        ok(not _removed and os.path.exists(os.path.join(_away, "plugin", "settings.json")),
+           f"and so is a removal ({_via})")
+        _saved = m.SETTINGS_FILE
+        try:
+            m.SETTINGS_FILE = _p
+            try:
+                m._save_settings({"x": 1}); _wrote = True
+            except OSError:
+                _wrote = False
+            ok(not _wrote and open(os.path.join(_away, "plugin", "settings.json")).read() == "PRECIOUS",
+               f"and a settings save ({_via})")
+            open(os.path.join(_away, "plugin", "settings.json"), "w").write("{not json")
+            ok(m._load_settings() == m.DEFAULT_SETTINGS
+               and open(os.path.join(_away, "plugin", "settings.json")).read() == "{not json"
+               and not os.path.exists(os.path.join(_away, "plugin", "settings.json.corrupt")),
+               f"and the settings read neither follows it nor sets the file there aside ({_via})")
+            open(os.path.join(_away, "plugin", "settings.json"), "w").write("PRECIOUS")
+        finally:
+            m.SETTINGS_FILE = _saved
+    _errs = []
+    _real_err = m.decky.logger.error
+    m.decky.logger.error = staticmethod(lambda msg: _errs.append(msg))
+    try:
+        getattr(m, "_REFUSED_LINKS", set()).clear()
+        _lp = os.path.join(_top, "settings", "plugin", "x.json")
+        m._write_no_follow(_lp, "x"); m._write_no_follow(_lp, "x")
+    finally:
+        m.decky.logger.error = _real_err
+    ok(len([e for e in _errs if "'settings'" in e]) == 1,
+       f"a refused link is logged once, naming it, so a moved folder is not a silent reset ({_errs})")
+    _p = os.path.join(_real, "settings.json")
+    ok(m._write_no_follow(_p, "ok") is True and open(_p).read() == "ok",
+       "while a real directory is written as before")
+    _saved = m.SETTINGS_FILE
+    try:
+        m.SETTINGS_FILE = os.path.join(_real, "new", "settings.json")
+        m._save_settings({"bssid_lock_enabled": True})
+        ok(m._load_settings().get("bssid_lock_enabled") is True
+           and oct(os.stat(m.SETTINGS_FILE).st_mode & 0o777) == "0o644"
+           and not [f for f in os.listdir(os.path.dirname(m.SETTINGS_FILE)) if f.endswith(".tmp")],
+           "and a save creates a missing settings directory, leaves 0644 and no temp file")
+    finally:
+        m.SETTINGS_FILE = _saved
+    _host_tmp = tempfile.gettempdir()
+    if os.path.realpath(_host_tmp) != os.path.abspath(_host_tmp):
+        # macOS: /var is a link root made in /, which only root can write.
+        _fd = _odnf(_host_tmp); os.close(_fd)
+        ok(True, "a link only root could have made (here the host's /var) is followed")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("security: the dispatcher's settings read")
+try:
+    import subprocess as _sp
+    _tm = open("defaults/dispatcher.sh.tmpl").read()
+    _prog = _tm[_tm.index("python3 -I -c '") + len("python3 -I -c '"):]
+    _prog = _prog[:_prog.index("\n' ")]
+    def _disp(path):
+        return _sp.run([sys.executable, "-I", "-c", _prog, path], capture_output=True,
+                       text=True, timeout=10).stdout.split("\n")[:5]
+    _dd = tempfile.mkdtemp()
+    _sf = os.path.join(_dd, "settings.json")
+    open(_sf, "w").write(json.dumps({"power_save_disabled": False, "cake_enabled": True,
+                                     "driver": "ath11k_pci", "streaming_mode_enabled": True}))
+    ok(_disp(_sf) == ["False", "False", "ath11k_pci", "True", "True"],
+       "it reads the settings it applies")
+    _lk = os.path.join(_dd, "link.json"); os.symlink(_sf, _lk)
+    ok(_disp(_lk) == ["True", "False", "unknown", "False", "False"],
+       "a link at the name is not followed: safe defaults")
+    _ff = os.path.join(_dd, "fifo.json"); os.mkfifo(_ff)
+    try:
+        ok(_disp(_ff) == ["True", "False", "unknown", "False", "False"],
+           "and a FIFO neither blocks the connect nor reads as settings")
+    except _sp.TimeoutExpired:
+        ok(False, "and a FIFO neither blocks the connect nor reads as settings (it hung)")
+    ok("python3 -I -c" in _tm and "python3 -c" not in _tm,
+       "the dispatcher runs its Python isolated from the environment")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("runtime: what Decky's own build lets the backend do")
 import ast, shlex
 _tree = ast.parse(open("main.py").read())
@@ -3271,6 +3375,25 @@ try:
         m.decky.DECKY_PLUGIN_LOG_DIR = _logs
         LinkedLogs()._rotate_logs()
         ok(len(os.listdir(_victim)) == 15, "log rotation does not follow a linked log directory")
+        _above = tempfile.mkdtemp(); _vic2 = tempfile.mkdtemp()
+        os.mkdir(os.path.join(_vic2, "WiFi Optimizer"))
+        for i in range(15):
+            open(os.path.join(_vic2, "WiFi Optimizer", f"{i}.log"), "w").write("x")
+        os.symlink(_vic2, os.path.join(_above, "logs"))
+        m.decky.DECKY_PLUGIN_LOG_DIR = os.path.join(_above, "logs", "WiFi Optimizer")
+        LinkedLogs()._rotate_logs()
+        ok(len(os.listdir(os.path.join(_vic2, "WiFi Optimizer"))) == 15,
+           "nor a link further up the path")
+        _own = tempfile.mkdtemp()
+        for i in range(15):
+            _lf = os.path.join(_own, f"{i:02d}.log"); open(_lf, "w").write("x")
+            os.utime(_lf, (1700000000 + i, 1700000000 + i))
+        open(os.path.join(_own, "notes.txt"), "w").write("x")
+        m.decky.DECKY_PLUGIN_LOG_DIR = _own
+        LinkedLogs()._rotate_logs()
+        _left = sorted(os.listdir(_own))
+        ok(_left == [f"{i:02d}.log" for i in range(5, 15)] + ["notes.txt"],
+           f"a real log directory keeps the ten newest logs and nothing else is touched ({len(_left)} left)")
     finally:
         m.decky.DECKY_PLUGIN_LOG_DIR = _saved_dir
 

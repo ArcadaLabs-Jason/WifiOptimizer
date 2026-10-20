@@ -43,11 +43,17 @@ fi
 if [ -f "$SETTINGS_FILE" ] && [ -r "$SETTINGS_FILE" ]; then
     # The path is passed as an argument rather than pasted into the program
     # text, so a directory name containing a quote cannot alter what runs. The
-    # read is capped so a large file cannot stall every WiFi connect.
-    SETTINGS_RAW=$(python3 -c '
-import json, sys
+    # read is capped so a large file cannot stall every WiFi connect, does not
+    # follow a link or block on a FIFO planted at the name, and takes only a
+    # regular file. -I keeps Python from importing anything from the
+    # environment or the current directory.
+    SETTINGS_RAW=$(python3 -I -c '
+import json, os, sys
 try:
-    with open(sys.argv[1], "rb") as fh:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        if (os.fstat(fh.fileno()).st_mode & 0o170000) != 0o100000:
+            raise ValueError("not a regular file")
         raw = fh.read(65536)
     d = json.loads(raw)
     print("True" if d.get("power_save_disabled", True) else "False")
