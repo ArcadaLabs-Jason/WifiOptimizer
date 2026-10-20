@@ -106,6 +106,12 @@ const applyUpdate = callable("apply_update");
 const getUpdateProgress = callable("get_update_progress");
 const startBackendSwitch = callable("start_backend_switch");
 const getBackendSwitchStatus = callable("get_backend_switch_status");
+const setStreamingMode = callable("set_streaming_mode");
+const setStreamingHold = callable("set_streaming_hold");
+const setStreamingApp = callable("set_streaming_app");
+const setStreamingPatterns = callable("set_streaming_patterns");
+const listStreamingApps = callable("list_streaming_apps");
+const pokeDetection = callable("poke_detection");
 const getRegdomain = callable("get_regdomain");
 const setRegdomain = callable("set_regdomain");
 const getDiagnosticInfo = callable("get_diagnostic_info");
@@ -194,6 +200,7 @@ const BADGE_STYLES = {
     off: { background: theme.surface.md, color: theme.text.muted },
     error: { background: theme.error.badgeBg, color: theme.error.text },
     unknown: { background: theme.surface.md, color: theme.text.tertiary },
+    paused: { background: theme.info.accentBg, color: theme.info.text },
 };
 function StatusBadge({ badge, text }) {
     const style = BADGE_STYLES[badge];
@@ -430,7 +437,7 @@ function timeAgo(ts) {
     return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function PanelHeader({ driver, version, lastApplied, lastEnforced, deviceLabel, }) {
+function PanelHeader({ driver, version, lastApplied, lastEnforced, deviceLabel, streaming, }) {
     const modelLabel = deviceLabel && deviceLabel !== "unknown"
         ? deviceLabel
         : driver && driver !== "unknown"
@@ -446,7 +453,20 @@ function PanelHeader({ driver, version, lastApplied, lastEnforced, deviceLabel, 
                         padding: "2px 8px",
                         borderRadius: theme.radius.pill,
                         color: theme.text.tertiary,
-                    }, children: ["Device: ", modelLabel] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Version: ", version] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: rowStyle, children: "Tap (i) on any toggle for details" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Last changed: ", timeAgo(lastApplied), lastEnforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(lastEnforced)] })) : ("")] }) })] }));
+                    }, children: ["Device: ", modelLabel] }) }), streaming?.streaming_mode && (
+            // Always in view, so nobody has to find the section to know whether
+            // the fixes are on right now.
+            SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("span", { style: {
+                        fontSize: theme.fontSize.tiny,
+                        background: streaming.streaming_active ? theme.success.badgeBg : theme.info.accentBg,
+                        color: streaming.streaming_active ? theme.success.text : theme.info.text,
+                        padding: "2px 8px",
+                        borderRadius: theme.radius.pill,
+                    }, children: streaming.streaming_active
+                        ? streaming.streaming_app
+                            ? `Auto mode: streaming ${streaming.streaming_app}, fixes on`
+                            : "Auto mode: held on, fixes on"
+                        : "Auto mode: no stream, fixes paused" }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Version: ", version] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: rowStyle, children: "Tap (i) on any toggle for details" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Last changed: ", timeAgo(lastApplied), lastEnforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(lastEnforced)] })) : ("")] }) })] }));
 }
 
 const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
@@ -497,6 +517,67 @@ function ActionsSection({ connected, isBusy, onForceReapply, onReset, resetError
     return (SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || isBusy, onClick: onForceReapply, children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onReset, children: "Reset Settings" }) }), resetError && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.error.text }, children: resetError }) }))] }));
 }
 
+// Streaming auto mode: when the fixes apply, rather than another fix. Placed
+// after Advanced for that reason. Most of what is here is about making it
+// obvious which state you are in, because fixes that quietly stopped
+// applying are worse than fixes left on.
+function StreamingSection({ settings, live, disabled, error, notice, onToggle, }) {
+    const enabled = settings?.streaming_mode_enabled ?? false;
+    const [apps, setApps] = SP_REACT.useState([]);
+    const [patterns, setPatterns] = SP_REACT.useState(settings?.streaming_custom_patterns ?? "");
+    const [patternsDirty, setPatternsDirty] = SP_REACT.useState(false);
+    SP_REACT.useEffect(() => {
+        if (!enabled)
+            return;
+        listStreamingApps()
+            .then((r) => r.success && setApps(r.apps))
+            .catch(() => { });
+    }, [enabled]);
+    // Follow the saved value unless something is being typed.
+    SP_REACT.useEffect(() => {
+        if (!patternsDirty)
+            setPatterns(settings?.streaming_custom_patterns ?? "");
+    }, [settings?.streaming_custom_patterns, patternsDirty]);
+    const toggleApp = async (id, watched) => {
+        setApps((prev) => prev.map((a) => (a.id === id ? { ...a, watched } : a)));
+        const result = await onToggle("streaming", () => setStreamingApp(id, watched));
+        if (!result?.success) {
+            listStreamingApps().then((r) => r.success && setApps(r.apps)).catch(() => { });
+        }
+    };
+    const savePatterns = async () => {
+        const result = await onToggle("streaming", () => setStreamingPatterns(patterns));
+        if (result?.success) {
+            setPatternsDirty(false);
+            setPatterns(String(result.patterns ?? ""));
+        }
+    };
+    const active = live?.streaming_active ?? false;
+    const held = live?.streaming_held ?? false;
+    const app = live?.streaming_app ?? "";
+    const process = live?.streaming_process ?? "";
+    let stateText;
+    if (active && app) {
+        stateText = `Streaming: ${app} (${process}). Fixes are on.`;
+    }
+    else if (active && held) {
+        stateText = "Held on by you. Fixes are on until you turn this off or restart.";
+    }
+    else {
+        stateText =
+            "No streaming app running. Power save, buffer tuning and CAKE are paused until one starts.";
+    }
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Streaming auto mode", children: [SP_JSX.jsx(InfoRow, { label: "Only fix while streaming", subtitle: enabled
+                    ? "Fixes apply while a streaming app runs"
+                    : "Off: enabled fixes apply all the time", explanation: "Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream. If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.", checked: enabled, disabled: disabled, error: error, notice: notice, onChange: (val) => onToggle("streaming", () => setStreamingMode(val)) }), enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+                                fontSize: theme.fontSize.body,
+                                color: active ? theme.success.text : theme.info.text,
+                            }, children: [active ? "● " : "○ ", stateText] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Keep fixes on", description: "For a stream that is not detected. Lasts until you restart.", checked: held, disabled: disabled, onChange: (val) => onToggle("streaming", () => setStreamingHold(val)) }) }), apps.map((a) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: a.label, checked: a.watched, disabled: disabled, onChange: (val) => toggleApp(a.id, val) }) }, a.id))), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Other process names (space-separated)", value: patterns, onChange: (e) => {
+                                setPatternsDirty(true);
+                                setPatterns(e.target.value);
+                            } }) }), patternsDirty && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: savePatterns, children: "Save process names" }) }))] }))] }));
+}
+
 // Follows a running update and, once the new files are in place, asks Decky
 // to reload this plugin, which is what Decky's own store does after an
 // install. Restarting plugin_loader instead restarts all of Steam, so the
@@ -504,15 +585,28 @@ function ActionsSection({ connected, isBusy, onForceReapply, onReset, resetError
 //
 // This lives at module level, not in the panel, because closing the Quick
 // Access menu unmounts the panel and the reload must still be asked for.
+//
+// It also keeps going in a copy of this module that Decky has dismounted.
+// An open Quick Access menu can go on showing that copy's panel after a
+// reload (and Decky issue #611 can start two copies), so the copy the user
+// pressed Update in may well be one of those. Measured on a Deck: with the
+// watch tied to the module's lifetime, nothing asked for the reload and the
+// update ended in the Steam restart this exists to avoid.
 const PLUGIN_NAME = "WiFi Optimizer";
 const POLL_MS = 1000;
+// The script's own limit is 15 minutes; a watch never outlives that.
+const MAX_WATCH_MS = 15 * 60 * 1000;
 // A "done" this recent, for the version now running, is the update that
 // just loaded this copy of the plugin.
 const JUST_UPDATED_S = 120;
+const shared = () => {
+    const w = window;
+    w.__wifiOptimizerUpdate = w.__wifiOptimizerUpdate ?? {};
+    return w.__wifiOptimizerUpdate;
+};
 let timer = null;
+let startedAt = 0;
 let inFlight = false;
-let reloadAsked = false;
-let disposed = false;
 let target = "";
 let current = null;
 const listeners = new Set();
@@ -526,10 +620,12 @@ function stop() {
         timer = null;
     }
 }
-function askDeckyToReload() {
-    if (reloadAsked || disposed)
+function askDeckyToReload(version) {
+    // Once per version across every copy of the module, so two copies
+    // following the same update cannot reload the plugin twice.
+    if (shared().reloadAsked === version)
         return;
-    reloadAsked = true;
+    shared().reloadAsked = version;
     // Out of the poll's own call, since the reload tears this module down.
     // DeckyBackend is Decky's internal client, not part of @decky/api, so a
     // Decky without it is expected; the script restarts plugin_loader then.
@@ -543,20 +639,27 @@ function askDeckyToReload() {
     }, 0);
 }
 async function poll() {
-    if (inFlight || disposed)
+    if (inFlight)
         return;
+    if (Date.now() - startedAt > MAX_WATCH_MS) {
+        stop();
+        return;
+    }
     inFlight = true;
     try {
         const progress = await getUpdateProgress();
-        if (disposed || !progress.success)
+        if (!progress.success)
             return;
         // Until the script has written anything, the file is either absent or
         // removed by apply_update, so an empty phase is just "starting".
         if (progress.phase && progress.version !== target)
             return;
         publish(progress);
-        if (progress.phase === "swapped")
-            askDeckyToReload();
+        // Only while the old backend is still the one answering: once the new
+        // version answers, the reload has happened.
+        if (progress.phase === "swapped" && progress.running_version !== target) {
+            askDeckyToReload(target);
+        }
         if (progress.phase === "failed" || progress.phase === "done")
             stop();
     }
@@ -571,11 +674,9 @@ async function poll() {
 }
 // Called once apply_update has started the script for this version.
 function watchUpdate(version) {
-    if (disposed)
-        return;
     stop();
     target = version;
-    reloadAsked = false;
+    startedAt = Date.now();
     publish(null);
     timer = setInterval(poll, POLL_MS);
 }
@@ -586,31 +687,35 @@ function subscribeUpdate(fn) {
         listeners.delete(fn);
     };
 }
-// On load: say so if the update that just finished is what loaded us. Keyed
-// on the window, since a reload can start this module twice (Decky #611).
-async function announceIfJustUpdated() {
+// On load: pick up an update that is running (started from another copy of
+// the module, or before a reload), and say so if one just finished.
+async function checkUpdateOnLoad() {
     try {
         const progress = await getUpdateProgress();
-        const w = window;
-        if (!disposed &&
-            progress.success &&
-            (progress.phase === "loaded" || progress.phase === "done") &&
-            progress.version === progress.running_version &&
+        if (!progress.success || !progress.phase)
+            return;
+        const running = progress.running_version;
+        if (["downloading", "installing", "swapped"].includes(progress.phase) &&
+            progress.version !== running) {
+            if (!timer)
+                watchUpdate(progress.version);
+            return;
+        }
+        if ((progress.phase === "loaded" || progress.phase === "done") &&
+            progress.version === running &&
             progress.age < JUST_UPDATED_S &&
-            w.__wifiOptimizerAnnounced !== progress.version) {
-            w.__wifiOptimizerAnnounced = progress.version;
+            shared().announced !== progress.version) {
+            shared().announced = progress.version;
             toaster.toast({ title: PLUGIN_NAME, body: `Updated to v${progress.version}` });
         }
     }
     catch {
-        // Nothing to announce.
+        // Nothing to pick up or announce.
     }
 }
-// A reload can start this module twice (Decky issue #611), so everything it
-// started has to stop when Decky dismounts it.
+// When Decky dismounts this copy. The panel's subscriptions go; a watch in
+// progress does not (see the top of this file), and stops by itself.
 function disposeUpdateWatch() {
-    disposed = true;
-    stop();
     listeners.clear();
 }
 
@@ -626,7 +731,8 @@ const BACKEND_SWITCH_MAX_S = 240;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE = "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
-// Long enough for the reloaded backend to have answered the update script.
+// Long enough for the reloaded backend to have answered the update script,
+// so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
 // What the panel says while an update runs, from what the script reports.
 function updatingText(progress) {
@@ -1271,9 +1377,15 @@ function Content() {
     const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
     const supports6GHz = s?.supports_6ghz ?? false;
     const isDeckLcd = s?.device_family === "deck_lcd";
+    // Streaming auto mode with no stream running: power save, buffer tuning
+    // and CAKE are off on purpose. They read as paused, not as off or drifted.
+    const streamingIdle = !!status?.live?.streaming_mode && !status?.live?.streaming_active;
+    const gatedBadge = (key, on) => streamingIdle && on && !errors[key]
+        ? { badge: "paused", text: "paused" }
+        : getBadge(key, status, errors[key] ?? null);
     // Check if all safe optimizations are already active
     const allSafeActive = connected &&
-        status?.live?.power_save_off &&
+        (status?.live?.power_save_off || (streamingIdle && s?.power_save_disabled)) &&
         !status?.drift?.power_save &&
         s?.bssid_lock_enabled &&
         !status?.drift?.bssid_lock &&
@@ -1282,9 +1394,9 @@ function Content() {
         // this, the panel reports all clear while one of the four is inert.
         !status?.live?.bssid_lock_other_network &&
         status?.live?.dispatcher_installed &&
-        status?.live?.buffer_tuning_applied &&
+        (status?.live?.buffer_tuning_applied || (streamingIdle && s?.buffer_tuning_enabled)) &&
         !status?.drift?.buffer_tuning;
-    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(PanelHeader, { driver: s?.driver ?? "", version: status?.version ?? "?", lastApplied: s?.last_applied ?? 0, lastEnforced: status?.live?.last_enforced, deviceLabel: s?.device_label !== "Unknown Device"
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(PanelHeader, { driver: s?.driver ?? "", version: status?.version ?? "?", lastApplied: s?.last_applied ?? 0, lastEnforced: status?.live?.last_enforced, streaming: status?.live, deviceLabel: s?.device_label !== "Unknown Device"
                     ? `${s?.device_label} - ${s?.chip_label}`
                     : s?.chip_label && s.chip_label !== "unknown"
                         ? s.chip_label
@@ -1328,14 +1440,14 @@ function Content() {
                             ? "Applying..."
                             : allSafeActive
                                 ? "All good"
-                                : "Optimize Safe" }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Power & stability", children: [SP_JSX.jsx(InfoRow, { label: "Prevent lag spikes", subtitle: "Disables WiFi power save and PCIe power states", explanation: "The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal.", ...getBadge("power_save", status, errors.power_save ?? null), checked: s?.power_save_disabled ?? false, disabled: isBusy || updating, error: errors.power_save, onChange: (val) => handleToggle("power_save", () => setPowerSave(val)) }), SP_JSX.jsx(InfoRow, { label: "Stop background scanning", subtitle: "Locks to current AP - disable to switch networks or roam", explanation: "Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point.", ...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
+                                : "Optimize Safe" }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Power & stability", children: [SP_JSX.jsx(InfoRow, { label: "Prevent lag spikes", subtitle: "Disables WiFi power save and PCIe power states", explanation: "The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal.", ...gatedBadge("power_save", s?.power_save_disabled), checked: s?.power_save_disabled ?? false, disabled: isBusy || updating, error: errors.power_save, onChange: (val) => handleToggle("power_save", () => setPowerSave(val)) }), SP_JSX.jsx(InfoRow, { label: "Stop background scanning", subtitle: "Locks to current AP - disable to switch networks or roam", explanation: "Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point.", ...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
                             ? { badge: "unknown", text: "other network" }
                             : getBadge("bssid_lock", status, errors.bssid_lock ?? null)), checked: s?.bssid_lock_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.bssid_lock_enabled), error: errors.bssid_lock, notice: notices.bssid_lock ??
                             (status?.live?.pins_inactive_iwd && s?.bssid_lock_enabled
                                 ? IWD_PIN_NOTICE
                                 : status?.external?.bssid_lock
                                     ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
-                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: REGION_OPTIONS, selectedOption: regdomain.setting || regdomain.governing || "00", disabled: isBusy || updating, onChange: (option) => {
+                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: REGION_OPTIONS, selectedOption: regdomain.setting || regdomain.governing || "00", disabled: isBusy || updating, onChange: (option) => {
                                 void handleToggle("regdomain", () => setRegdomain(option.data)).then(refreshRegdomain);
                             } }) })), (errors.regdomain || notices.regdomain) && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.tiny,
@@ -1368,7 +1480,7 @@ function Content() {
                                 ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
                                 : status?.live?.ipv6_other_network
                                     ? "On for the network it was turned on for, not this one."
-                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...getBadge("cake", status, errors.cake ?? null), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
+                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...gatedBadge("cake", s?.cake_enabled), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsx(StreamingSection, { settings: s, live: status?.live, disabled: isBusy || updating, error: errors.streaming, notice: notices.streaming, onToggle: handleToggle }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
 }
 var index = definePlugin(() => {
     let gameLifetimeUnsub = null;
@@ -1379,18 +1491,28 @@ var index = definePlugin(() => {
     const announce = setTimeout(() => {
         timers.delete(announce);
         if (!disposed)
-            announceIfJustUpdated();
+            checkUpdateOnLoad();
     }, ANNOUNCE_DELAY_MS);
     timers.add(announce);
     try {
+        const later = (ms, fn) => {
+            const id = setTimeout(() => {
+                timers.delete(id);
+                if (!disposed)
+                    fn();
+            }, ms);
+            timers.add(id);
+        };
         gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications((notification) => {
-            if (notification.bRunning && !disposed) {
-                const id = setTimeout(() => {
-                    timers.delete(id);
-                    if (!disposed)
-                        reapplyVolatile().catch(() => { });
-                }, 3000);
-                timers.add(id);
+            if (disposed)
+                return;
+            // Streaming auto mode looks now and again once the app has had time
+            // to start or exit, instead of waiting for its next pass. A no-op
+            // with auto mode off.
+            pokeDetection().catch(() => { });
+            later(3000, () => pokeDetection().catch(() => { }));
+            if (notification.bRunning) {
+                later(3000, () => reapplyVolatile().catch(() => { }));
             }
         });
     }

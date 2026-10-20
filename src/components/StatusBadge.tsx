@@ -9,6 +9,7 @@ const BADGE_STYLES: Record<BadgeStatus, { background: string; color: string }> =
   off: { background: theme.surface.md, color: theme.text.muted },
   error: { background: theme.error.badgeBg, color: theme.error.text },
   unknown: { background: theme.surface.md, color: theme.text.tertiary },
+  paused: { background: theme.info.accentBg, color: theme.info.text },
 };
 
 interface StatusBadgeProps {

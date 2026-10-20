@@ -24,6 +24,12 @@ m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
 m.SYSFS_NET = os.path.join(tempfile.mkdtemp(), "no-sysfs")
 # Nor the host's /run, where the update script reports its progress.
 m.UPDATE_STATE_FILE = os.path.join(tempfile.mkdtemp(), "update-state")
+# Nor where streaming auto mode keeps its state, or the host's processes.
+_run_dir = tempfile.mkdtemp()
+m.STREAM_FLAG_FILE = os.path.join(_run_dir, "streaming")
+m.STREAM_HOLD_FILE = os.path.join(_run_dir, "streaming-hold")
+m.PCIE_BASELINE_FILE = os.path.join(_run_dir, "pcie-baseline")
+m.PROC_DIR = os.path.join(tempfile.mkdtemp(), "no-proc")
 FAILS = []
 def ok(c, l):
     print(("PASS  " if c else "FAIL  ")+l)
@@ -3072,7 +3078,14 @@ try:
        "and copes with a Decky that has no such call, leaving the restart to the script")
     _idx = open("src/index.tsx").read()
     ok("disposeUpdateWatch()" in _idx[_idx.index("onDismount()"):],
-       "the watch stops when Decky dismounts the plugin, which a reload can do twice")
+       "the panel's subscriptions go when Decky dismounts the plugin")
+    _dispose = _watch[_watch.index("export function disposeUpdateWatch"):]
+    ok("stop()" not in _dispose and "disposed" not in _watch,
+       "but a watch in progress carries on: the panel left on screen after a reload may be the one the user pressed")
+    ok('progress.phase === "swapped" && progress.running_version !== target' in _watch
+       and "shared().reloadAsked === version" in _watch,
+       "the reload is asked for once per version, and only while the old version still answers")
+    ok("checkUpdateOnLoad()" in _idx, "a copy that loads mid-update picks the watch up")
     ok("watchUpdate(version)" in _idx, "the panel follows an update it started")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -3405,8 +3418,8 @@ try:
             m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
             class PS(m.Plugin):
                 def _get_wifi_interface(self): return None
-                def _apply_driver_fixes(self, d): pass
-                def _apply_pcie_aspm_fix(self, d): return []
+                def _apply_driver_fixes(self, d, persist=True): pass
+                def _apply_pcie_aspm_fix(self, d, record_all=False): return []
             open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=3\n[device]\nwifi.backend=wpa_supplicant\n")
             m._save_settings(dict(m.DEFAULT_SETTINGS))
             asyncio.run(PS().set_power_save(True))
@@ -3795,6 +3808,298 @@ try:
        and len(cands) <= 2 * m.Plugin._STRANDED_CANDIDATES + 2,
        "the release looks at recent profiles of each kind, bounded")
 except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("streaming auto mode: the fixes follow the stream")
+try:
+    def _flags(flag=False, hold=False):
+        for path, on in ((m.STREAM_FLAG_FILE, flag), (m.STREAM_HOLD_FILE, hold)):
+            if on: open(path, "w").write("1\n")
+            elif os.path.exists(path): os.remove(path)
+
+    _flags()
+    pl = m.Plugin()
+    ok(pl._volatile_gate_open({**m.DEFAULT_SETTINGS}) is True, "with auto mode off the fixes apply, as always")
+    ok(m.DEFAULT_SETTINGS["streaming_mode_enabled"] is False, "and auto mode starts off")
+    ok(pl._volatile_gate_open({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True}) is False,
+       "in auto mode with no stream they do not")
+    _flags(flag=True)
+    ok(pl._volatile_gate_open({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True}) is True,
+       "and with one they do")
+    _flags()
+
+    kept, refused = m._parse_stream_patterns("Sunshine-client, steam ab moon, moon gamescope")
+    ok(kept == ["sunshine-client", "moon"], f"custom patterns are kept lowercase, once ({kept})")
+    ok("steam" in refused and "ab" in refused and "gamescope" in refused,
+       "one that would match Steam, gamescope or almost anything is refused")
+    kept, refused = m._parse_stream_patterns(" ".join(f"app{i}xx" for i in range(12)))
+    ok(len(kept) == m.STREAM_PATTERNS_MAX and len(refused) == 12 - m.STREAM_PATTERNS_MAX,
+       "and there is a limit to how many")
+
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_apps": {"moonlight": False, "evil": True,
+                      "parsec": "yes"}, "streaming_custom_patterns": "x" * 5000})
+    _ls = m._load_settings()
+    ok(_ls["streaming_apps"] == {"moonlight": False}, "only known apps with a plain on or off are loaded")
+    ok(len(_ls["streaming_custom_patterns"]) <= 512, "and the pattern field is capped")
+
+    # Detection against a stand-in /proc.
+    _proc = tempfile.mkdtemp()
+    def _p(pid, cmd, comm):
+        d = os.path.join(_proc, str(pid)); os.makedirs(d)
+        open(os.path.join(d, "cmdline"), "wb").write(cmd)
+        open(os.path.join(d, "comm"), "w").write(comm + "\n")
+    _p(100, b"/app/bin/Moonlight\0--fullscreen\0", "moonlight")
+    _p(101, b"", "kworker/0:1")
+    _p(102, b"/usr/bin/sunshine-client\0", "sunshine-client")
+    _p(os.getpid(), b"python3 moonlight\0", "python3")
+    _real_proc = m.PROC_DIR
+    try:
+        m.PROC_DIR = _proc
+        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS}))
+        ok(found == {"app": "Moonlight", "process": "moonlight"},
+           f"a streaming app is found by its command line ({found})")
+        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS,
+                                                     "streaming_apps": {"moonlight": False}}))
+        ok(found is None, "an app the user unticked is not")
+        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS,
+            "streaming_apps": {"moonlight": False}, "streaming_custom_patterns": "sunshine-client"}))
+        ok(found and found["process"] == "sunshine-client", "a pattern of the user's own is")
+        shutil_rm = __import__("shutil").rmtree
+        shutil_rm(os.path.join(_proc, "100"))
+        ok(pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS})) is None,
+           "and the plugin's own process does not count, nor do kernel threads")
+    finally:
+        m.PROC_DIR = _real_proc
+
+    class Stream(m.Plugin):
+        def __init__(self, found=None):
+            super().__init__(); self.found = found; self.applied = 0; self.reverted = 0
+        def _find_stream(self, patterns): return self.found
+        async def reapply_volatile(self):
+            self.applied += 1; return {"success": True}
+        def _revert_volatile_fixes(self, settings): self.reverted += 1
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True})
+    st = Stream({"app": "Moonlight", "process": "moonlight"}); _flags()
+    asyncio.run(st._stream_pass())
+    ok(os.path.exists(m.STREAM_FLAG_FILE) and st.applied == 1, "a stream starting puts the fixes on")
+    asyncio.run(st._stream_pass())
+    ok(st.applied == 1, "once, not on every pass")
+    st.found = None
+    asyncio.run(st._stream_pass())
+    ok(os.path.exists(m.STREAM_FLAG_FILE) and st.reverted == 0,
+       "one pass without it keeps them on, so a restarting app does not flap them")
+    asyncio.run(st._stream_pass())
+    ok(not os.path.exists(m.STREAM_FLAG_FILE) and st.reverted == 1, "a second takes them off")
+    st = Stream(None); _flags(flag=True)
+    asyncio.run(st._stream_pass(settle=True))
+    ok(not os.path.exists(m.STREAM_FLAG_FILE) and st.reverted == 1,
+       "when Steam says something exited, they come off at once")
+    st = Stream(None); _flags(hold=True)
+    asyncio.run(st._stream_pass(settle=True))
+    ok(os.path.exists(m.STREAM_FLAG_FILE) and st.applied == 1,
+       "held on by the user, they stay on with nothing detected")
+    _flags()
+    m._save_settings({**m.DEFAULT_SETTINGS})
+    st = Stream({"app": "Moonlight", "process": "moonlight"})
+    asyncio.run(st._stream_pass())
+    ok(not os.path.exists(m.STREAM_FLAG_FILE) and st.applied == 0, "with auto mode off, detection does nothing")
+
+    class Cmds(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.cmds = []; self.drivers = []
+        def _get_wifi_interface(self): return "wlan0"
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(cmd)
+            if cmd[:3] == ["/usr/bin/sysctl", "-n", "net.core.rmem_max"]:
+                return _ok("212992")
+            return _ok()
+        def _apply_driver_fixes(self, enable, persist=True): self.drivers.append((enable, persist))
+        def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+        def _valve_powersave(self): return getattr(self, "valve", "3")
+    _real_nm, _real_mp = m.NM_CONF_PATH, m.MODPROBE_CONF_PATH
+    try:
+        m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+        m.MODPROBE_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+        m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
+                          "power_save_disabled": False}); _flags()
+        c = Cmds()
+        r1 = asyncio.run(c.set_power_save(True))
+        r2 = asyncio.run(c.set_buffer_tuning(True))
+        r3 = asyncio.run(c.set_cake(True))
+        _ls = m._load_settings()
+        ok(all(r.get("success") and r.get("paused") for r in (r1, r2, r3)) and not c.cmds,
+           "turning a fix on in auto mode with no stream records it and changes nothing yet")
+        ok(_ls["power_save_disabled"] and _ls["buffer_tuning_enabled"] and _ls["cake_enabled"],
+           "the choice is kept for the next stream")
+        r = asyncio.run(c.reapply_volatile())
+        ok(r.get("paused") and not c.cmds, "a game launch reapplies nothing while no stream runs")
+
+        _flags(flag=True); c = Cmds()
+        asyncio.run(c.set_power_save(True))
+        ok(["/usr/bin/iw", "dev", "wlan0", "set", "power_save", "off"] in c.cmds,
+           "with a stream running power save goes off")
+        ok(not os.path.exists(m.NM_CONF_PATH), "but NetworkManager's file, which would hold it off all day, is not written")
+        ok(c.drivers == [(True, False)], "nor the modprobe options, which only apply at the next module load")
+
+        c = Cmds(); c.valve = "3"
+        c._revert_volatile_fixes(m._load_settings())
+        ok(["/usr/bin/iw", "dev", "wlan0", "set", "power_save", "on"] in c.cmds and c.drivers == [(False, True)],
+           "after the stream power save comes back on")
+        ok(["/usr/bin/tc", "qdisc", "del", "dev", "wlan0", "root"] in c.cmds
+           and ["/usr/bin/ip", "link", "set", "wlan0", "txqueuelen", "1000"] in c.cmds,
+           "and CAKE comes off, with the queue length back to the default")
+        c = Cmds(); c.valve = "2"
+        c._revert_volatile_fixes(m._load_settings())
+        ok(not any(cmd[-2:] == ["power_save", "on"] for cmd in c.cmds),
+           "unless Steam's own power management is off, when it stays off")
+
+        # Drift: no stream means off on purpose, not drifted.
+        _flags(); c = Cmds()
+        status = {"live": {}, "drift": {}}; actions = []
+        c._collect_host_tuning(m._load_settings(), "u", "wlan0", status, actions)
+        ok("buffer_tuning" not in status["drift"] and "cake" not in status["drift"] and not actions,
+           "with no stream nothing reads as drifted, and CAKE is not put back")
+        _flags(flag=True); status = {"live": {}, "drift": {}}; actions = []
+        c._collect_host_tuning(m._load_settings(), "u", "wlan0", status, actions)
+        ok(status["drift"].get("buffer_tuning") and status["drift"].get("cake") and actions,
+           "during a stream a missing fix is drift as before")
+
+        # Turning auto mode on and off.
+        open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        open(m.MODPROBE_CONF_PATH, "w").write("options x y=1\n")
+        _flags()
+        m._save_settings({**m.DEFAULT_SETTINGS, "power_save_disabled": True})
+        st = Stream(None)
+        r = asyncio.run(st.set_streaming_mode(True))
+        ok(r.get("success") and m._load_settings()["streaming_mode_enabled"], "auto mode turns on")
+        ok(not os.path.exists(m.NM_CONF_PATH) and not os.path.exists(m.MODPROBE_CONF_PATH),
+           "and removes what held power save off all the time")
+        ok(st.reverted == 1 and not os.path.exists(m.STREAM_FLAG_FILE),
+           "with nothing streaming, the fixes that were on come off straight away")
+        _flags(hold=True)
+        r = asyncio.run(st.set_streaming_mode(False))
+        ok(st.applied == 1 and not os.path.exists(m.STREAM_HOLD_FILE),
+           "turning it off puts them back on for good, and drops the hold")
+        st = Stream(None); m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True})
+        r = asyncio.run(st.set_streaming_hold(True))
+        ok(r.get("held") and os.path.exists(m.STREAM_FLAG_FILE) and st.applied == 1,
+           "holding the fixes on applies them for a stream detection missed")
+        asyncio.run(st.set_streaming_hold(False))
+        ok(not os.path.exists(m.STREAM_FLAG_FILE) and st.reverted == 1, "and letting go takes them off")
+        r = asyncio.run(st.set_streaming_app("evil", True))
+        ok(r.get("success") is False, "only known apps can be ticked")
+        r = asyncio.run(st.set_streaming_patterns("steam sunshine-client"))
+        ok(m._load_settings()["streaming_custom_patterns"] == "sunshine-client" and "steam" in r.get("message", ""),
+           "a refused pattern is named back to the user")
+    finally:
+        m.NM_CONF_PATH, m.MODPROBE_CONF_PATH = _real_nm, _real_mp
+        _flags()
+
+    # Startup: a reload mid-stream keeps the fixes on.
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True}); _flags(flag=True)
+    st = Stream({"app": "Moonlight", "process": "moonlight"})
+    async def _start(p):
+        await p._startup_streaming(m._load_settings())
+        p._stream_task.cancel()
+    asyncio.run(_start(st))
+    ok(os.path.exists(m.STREAM_FLAG_FILE) and st.applied == 0 and st.reverted == 0,
+       "a plugin reload during a stream neither takes the fixes off nor reapplies them")
+    m._save_settings({**m.DEFAULT_SETTINGS}); _flags(flag=True, hold=True)
+    asyncio.run(m.Plugin()._startup_streaming(m._load_settings()))
+    ok(not os.path.exists(m.STREAM_FLAG_FILE) and not os.path.exists(m.STREAM_HOLD_FILE),
+       "with auto mode off a leftover flag is cleared, so the dispatcher never reads it")
+    _main_src = _src[_src.index("    async def _main(self):"):]
+    ok(_main_src.index("await self._startup_streaming(settings)")
+       < _main_src.index("if iface and self._volatile_gate_open("),
+       "startup looks for a stream before its own apply, which is gated")
+
+    # PCIe power states are put back to what the system had.
+    _dev = tempfile.mkdtemp(); os.makedirs(os.path.join(_dev, "link")); os.makedirs(os.path.join(_dev, "power"))
+    for name, val in (("l1_aspm", "0"), ("l1_2_aspm", "1")):
+        open(os.path.join(_dev, "link", name), "w").write(val)
+    open(os.path.join(_dev, "power", "control"), "w").write("auto")
+    _net = tempfile.mkdtemp(); os.makedirs(os.path.join(_net, "wlan0"))
+    os.symlink(_dev, os.path.join(_net, "wlan0", "device"))
+    _real_net, _real_root = m.SYSFS_NET, m.SYSFS_ROOT
+    class Pcie(m.Plugin):
+        def _get_wifi_interface(self): return "wlan0"
+    try:
+        m.SYSFS_NET, m.SYSFS_ROOT = _net, os.path.realpath(_dev)[:5]
+        if os.path.exists(m.PCIE_BASELINE_FILE): os.remove(m.PCIE_BASELINE_FILE)
+        Pcie()._apply_pcie_aspm_fix(True, record_all=True)
+        ok(open(os.path.join(_dev, "link", "l1_2_aspm")).read() == "0"
+           and open(os.path.join(_dev, "power", "control")).read() == "on", "PCIe power states go off")
+        Pcie()._apply_pcie_aspm_fix(False)
+        ok(open(os.path.join(_dev, "link", "l1_aspm")).read() == "0",
+           "and a state the firmware had off stays off when they are restored")
+        ok(open(os.path.join(_dev, "link", "l1_2_aspm")).read() == "1"
+           and open(os.path.join(_dev, "power", "control")).read() == "auto",
+           "while the rest go back to what they were")
+        m.SYSFS_ROOT = _real_root
+        # The kernel reports the L1 substates off once L1 is off. A baseline
+        # read file by file, after each write, recorded them as off.
+        class Coupled(Pcie):
+            def _record_pcie_baseline(self, targets, baseline, record_all):
+                return m.Plugin._record_pcie_baseline(targets, baseline, record_all)
+        for name, val in (("l1_aspm", "1"), ("l1_1_aspm", "1"), ("l1_2_aspm", "1")):
+            open(os.path.join(_dev, "link", name), "w").write(val)
+        os.remove(m.PCIE_BASELINE_FILE)
+        _real_open = open
+        import builtins
+        def _kernel_open(path, mode="r", *a, **k):
+            fh = _real_open(path, mode, *a, **k)
+            if "w" in mode and str(path).endswith("/link/l1_aspm"):
+                class W:
+                    def __enter__(s): return s
+                    def __exit__(s, *e):
+                        fh.close()
+                        if open_val[0] == "0":
+                            for sub in ("l1_1_aspm", "l1_2_aspm"):
+                                _real_open(os.path.join(_dev, "link", sub), "w").write("0")
+                    def write(s, v): open_val[0] = v; fh.write(v)
+                return W()
+            return fh
+        open_val = [""]
+        builtins.open = _kernel_open
+        try:
+            Coupled()._apply_pcie_aspm_fix(True, record_all=True)
+        finally:
+            builtins.open = _real_open
+        _b = json.load(open(m.PCIE_BASELINE_FILE))
+        ok(_b.get(os.path.join(os.path.realpath(_dev), "link", "l1_2_aspm")) == "1",
+           "the L1 substates are recorded as they were, not as turning L1 off made them read")
+        open(m.PCIE_BASELINE_FILE, "w").write(json.dumps({"/etc/passwd": "1", "/sys/x/l1_aspm": "evil",
+                                                          "/sys/x/control": "on"}))
+        ok(m._read_pcie_baseline() == {"/sys/x/control": "on"},
+           "a baseline naming anything outside /sys, or a value that file cannot hold, is ignored")
+    finally:
+        m.SYSFS_NET, m.SYSFS_ROOT = _real_net, _real_root
+
+    _tmpl = open("defaults/dispatcher.sh.tmpl").read()
+    _gate = _tmpl.index('[ "$STREAM_MODE" = "True" ] && [ ! -f /run/wifi-optimizer/streaming ]')
+    ok(_gate < _tmpl.index("# Apply power save") and "exit 0" in _tmpl[_gate:_gate + 200],
+       "the dispatcher leaves the fixes off between streams")
+    ok('case "$STREAM_MODE" in True|False) ;; *) STREAM_MODE="False" ;; esac' in _tmpl,
+       "and accepts only True or False for the mode, reading anything else as off")
+    ok(_tmpl.count('STREAM_MODE="False"') >= 3, "falling back to off when the settings cannot be read")
+    ok("rtw89_pci/parameters/disable_aspm_l1ss" in _tmpl, "the dispatcher applies the rtw89 fixes the profile lists")
+    _ix = open("src/index.tsx").read()
+    ok(_ix.index('<PanelSection title="Advanced">') < _ix.index("<StreamingSection")
+       < _ix.index('<PanelSection title="Live status">'),
+       "the streaming section sits after Advanced, since it changes when the others apply")
+    ok(all(f'gatedBadge("{k}"' in _ix for k in ("power_save", "buffer_tuning", "cake")),
+       "the three fixes it governs read as paused between streams, not as off or drifted")
+    _hook = _ix[_ix.index("RegisterForAppLifetimeNotifications"):_ix.index("onDismount()")]
+    ok(_hook.count("pokeDetection()") >= 2, "a game starting or stopping makes it look again")
+    ok("streaming={status?.live}" in _ix and "Auto mode: no stream, fixes paused"
+       in open("src/components/PanelHeader.tsx").read(),
+       "and the header always says which state it is in")
+    _sm = m.Plugin.__dict__
+    ok(all(n in _sm for n in ("set_streaming_mode", "set_streaming_hold", "set_streaming_app",
+                              "set_streaming_patterns", "list_streaming_apps", "poke_detection")),
+       "the panel has a call for each control")
+except Exception as _e:
+    import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))

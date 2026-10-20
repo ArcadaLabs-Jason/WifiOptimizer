@@ -54,14 +54,16 @@ try:
     print("True" if d.get("buffer_tuning_enabled", False) else "False")
     print(str(d.get("driver", "unknown")).replace("\n", " ")[:64])
     print("True" if d.get("cake_enabled", False) else "False")
+    print("True" if d.get("streaming_mode_enabled", False) else "False")
 except Exception:
-    print("True"); print("False"); print("unknown"); print("False")
+    print("True"); print("False"); print("unknown"); print("False"); print("False")
 ' "$SETTINGS_FILE" 2>/dev/null)
     {
         read -r POWER_SAVE
         read -r BUFFER_TUNING
         read -r DRIVER
         read -r CAKE
+        read -r STREAM_MODE
     } <<EOF
 $SETTINGS_RAW
 EOF
@@ -69,12 +71,16 @@ EOF
     case "$POWER_SAVE" in True|False) ;; *) POWER_SAVE="True" ;; esac
     case "$BUFFER_TUNING" in True|False) ;; *) BUFFER_TUNING="False" ;; esac
     case "$CAKE" in True|False) ;; *) CAKE="False" ;; esac
+    # Unreadable means not in auto mode: the fixes then apply as always,
+    # which costs some battery rather than a stream's stability.
+    case "$STREAM_MODE" in True|False) ;; *) STREAM_MODE="False" ;; esac
     case "$DRIVER" in rtw88|rtw89|ath11k_pci|ath12k|mt7921e|iwlwifi) ;; *) DRIVER="unknown" ;; esac
 else
     POWER_SAVE="True"
     BUFFER_TUNING="False"
     DRIVER="unknown"
     CAKE="False"
+    STREAM_MODE="False"
     logger -t "$LOG_TAG" "Settings missing, safe defaults only"
 fi
 
@@ -84,7 +90,15 @@ if [ -z "$POWER_SAVE" ]; then
     BUFFER_TUNING="False"
     DRIVER="unknown"
     CAKE="False"
+    STREAM_MODE="False"
     logger -t "$LOG_TAG" "Settings parse failed, safe defaults only"
+fi
+
+# Streaming auto mode: these fixes are only for while a stream runs, which
+# the plugin marks with a file in /run. Without it, leave them off.
+if [ "$STREAM_MODE" = "True" ] && [ ! -f /run/wifi-optimizer/streaming ]; then
+    logger -t "$LOG_TAG" "streaming auto mode: no stream running, fixes left off"
+    exit 0
 fi
 
 # Apply power save
@@ -94,6 +108,9 @@ if [ "$POWER_SAVE" = "True" ]; then
     if [ "$DRIVER" = "rtw88" ]; then
         echo Y 2>/dev/null > /sys/module/rtw88_core/parameters/disable_lps_deep
         echo Y 2>/dev/null > /sys/module/rtw88_pci/parameters/disable_aspm
+    elif [ "$DRIVER" = "rtw89" ]; then
+        echo Y 2>/dev/null > /sys/module/rtw89_pci/parameters/disable_aspm_l1
+        echo Y 2>/dev/null > /sys/module/rtw89_pci/parameters/disable_aspm_l1ss
     elif [ "$DRIVER" = "mt7921e" ]; then
         echo Y 2>/dev/null > /sys/module/mt7921e/parameters/disable_aspm
     fi

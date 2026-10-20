@@ -9,19 +9,35 @@ import type { UpdateProgress } from "./types";
 //
 // This lives at module level, not in the panel, because closing the Quick
 // Access menu unmounts the panel and the reload must still be asked for.
+//
+// It also keeps going in a copy of this module that Decky has dismounted.
+// An open Quick Access menu can go on showing that copy's panel after a
+// reload (and Decky issue #611 can start two copies), so the copy the user
+// pressed Update in may well be one of those. Measured on a Deck: with the
+// watch tied to the module's lifetime, nothing asked for the reload and the
+// update ended in the Steam restart this exists to avoid.
 
 const PLUGIN_NAME = "WiFi Optimizer";
 const POLL_MS = 1000;
+// The script's own limit is 15 minutes; a watch never outlives that.
+const MAX_WATCH_MS = 15 * 60 * 1000;
 // A "done" this recent, for the version now running, is the update that
 // just loaded this copy of the plugin.
 const JUST_UPDATED_S = 120;
 
 type Listener = (progress: UpdateProgress | null) => void;
 
+// Shared by every copy of this module on the page.
+type Shared = { reloadAsked?: string; announced?: string };
+const shared = (): Shared => {
+  const w = window as unknown as { __wifiOptimizerUpdate?: Shared };
+  w.__wifiOptimizerUpdate = w.__wifiOptimizerUpdate ?? {};
+  return w.__wifiOptimizerUpdate;
+};
+
 let timer: ReturnType<typeof setInterval> | null = null;
+let startedAt = 0;
 let inFlight = false;
-let reloadAsked = false;
-let disposed = false;
 let target = "";
 let current: UpdateProgress | null = null;
 const listeners = new Set<Listener>();
@@ -38,9 +54,11 @@ function stop() {
   }
 }
 
-function askDeckyToReload() {
-  if (reloadAsked || disposed) return;
-  reloadAsked = true;
+function askDeckyToReload(version: string) {
+  // Once per version across every copy of the module, so two copies
+  // following the same update cannot reload the plugin twice.
+  if (shared().reloadAsked === version) return;
+  shared().reloadAsked = version;
   // Out of the poll's own call, since the reload tears this module down.
   // DeckyBackend is Decky's internal client, not part of @decky/api, so a
   // Decky without it is expected; the script restarts plugin_loader then.
@@ -59,16 +77,24 @@ function askDeckyToReload() {
 }
 
 async function poll() {
-  if (inFlight || disposed) return;
+  if (inFlight) return;
+  if (Date.now() - startedAt > MAX_WATCH_MS) {
+    stop();
+    return;
+  }
   inFlight = true;
   try {
     const progress = await backend.getUpdateProgress();
-    if (disposed || !progress.success) return;
+    if (!progress.success) return;
     // Until the script has written anything, the file is either absent or
     // removed by apply_update, so an empty phase is just "starting".
     if (progress.phase && progress.version !== target) return;
     publish(progress);
-    if (progress.phase === "swapped") askDeckyToReload();
+    // Only while the old backend is still the one answering: once the new
+    // version answers, the reload has happened.
+    if (progress.phase === "swapped" && progress.running_version !== target) {
+      askDeckyToReload(target);
+    }
     if (progress.phase === "failed" || progress.phase === "done") stop();
   } catch (e) {
     // A reload or restart cancels calls in flight; that is the update
@@ -81,10 +107,9 @@ async function poll() {
 
 // Called once apply_update has started the script for this version.
 export function watchUpdate(version: string) {
-  if (disposed) return;
   stop();
   target = version;
-  reloadAsked = false;
+  startedAt = Date.now();
   publish(null);
   timer = setInterval(poll, POLL_MS);
 }
@@ -97,32 +122,36 @@ export function subscribeUpdate(fn: Listener): () => void {
   };
 }
 
-// On load: say so if the update that just finished is what loaded us. Keyed
-// on the window, since a reload can start this module twice (Decky #611).
-export async function announceIfJustUpdated() {
+// On load: pick up an update that is running (started from another copy of
+// the module, or before a reload), and say so if one just finished.
+export async function checkUpdateOnLoad() {
   try {
     const progress = await backend.getUpdateProgress();
-    const w = window as unknown as { __wifiOptimizerAnnounced?: string };
+    if (!progress.success || !progress.phase) return;
+    const running = progress.running_version;
     if (
-      !disposed &&
-      progress.success &&
-      (progress.phase === "loaded" || progress.phase === "done") &&
-      progress.version === progress.running_version &&
-      progress.age < JUST_UPDATED_S &&
-      w.__wifiOptimizerAnnounced !== progress.version
+      ["downloading", "installing", "swapped"].includes(progress.phase) &&
+      progress.version !== running
     ) {
-      w.__wifiOptimizerAnnounced = progress.version;
+      if (!timer) watchUpdate(progress.version);
+      return;
+    }
+    if (
+      (progress.phase === "loaded" || progress.phase === "done") &&
+      progress.version === running &&
+      progress.age < JUST_UPDATED_S &&
+      shared().announced !== progress.version
+    ) {
+      shared().announced = progress.version;
       toaster.toast({ title: PLUGIN_NAME, body: `Updated to v${progress.version}` });
     }
   } catch {
-    // Nothing to announce.
+    // Nothing to pick up or announce.
   }
 }
 
-// A reload can start this module twice (Decky issue #611), so everything it
-// started has to stop when Decky dismounts it.
+// When Decky dismounts this copy. The panel's subscriptions go; a watch in
+// progress does not (see the top of this file), and stops by itself.
 export function disposeUpdateWatch() {
-  disposed = true;
-  stop();
   listeners.clear();
 }

@@ -168,6 +168,42 @@ UPDATE_PHASES = ("downloading", "installing", "swapped", "loaded",
 UPDATE_ACTIVE_PHASES = ("downloading", "installing", "swapped", "loaded", "restarting")
 UPDATE_STATE_MAX_AGE = 900
 
+# Streaming auto mode: power save, buffer tuning and CAKE are applied only
+# while one of these is running, matched against each process's command line.
+# (id, label, patterns). Lowercase; a pattern is a plain substring.
+STREAMING_APPS = (
+    ("moonlight", "Moonlight", ("moonlight",)),
+    ("geforce_now", "GeForce NOW", ("com.nvidia.geforcenow", "play.geforcenow.com")),
+    ("chiaki", "Chiaki", ("chiaki",)),
+    ("steam_remote_play", "Steam Remote Play", ("/streaming_client",)),
+    ("steam_link", "Steam Link", ("steamlink",)),
+    ("greenlight", "Greenlight", ("greenlight",)),
+    ("parsec", "Parsec", ("parsecd",)),
+    ("xbox_cloud", "Xbox Cloud Gaming", ("xbox.com/play",)),
+)
+STREAMING_APP_IDS = tuple(app_id for app_id, _label, _patterns in STREAMING_APPS)
+# Patterns the user adds. Short ones would match half the system ("steam"
+# matches Steam itself, holding the fixes on for good), so they are refused.
+STREAM_PATTERN_MIN = 4
+STREAM_PATTERN_MAX = 64
+STREAM_PATTERNS_MAX = 8
+PROC_DIR = "/proc"
+# Present while the fixes should be in place: a stream is running or the
+# user is holding them on. The dispatcher checks it too. In /run, which only
+# root writes and a reboot clears.
+STREAM_FLAG_FILE = "/run/wifi-optimizer/streaming"
+# The user's "keep fixes on", for a stream detection missed. Until reboot.
+STREAM_HOLD_FILE = "/run/wifi-optimizer/streaming-hold"
+STREAM_POLL_SECONDS = 5
+# Passes without a stream before the fixes come off. A stream app that
+# restarts, or a pass that lands mid-exec, should not flap them.
+STREAM_MISSES_TO_CLOSE = 2
+# What the PCIe power files held before we first changed them this boot.
+PCIE_BASELINE_FILE = "/run/wifi-optimizer/pcie-baseline"
+# Every path the baseline may name is under here; the file is root's, but a
+# value read back is still checked before root writes it anywhere.
+SYSFS_ROOT = "/sys/"
+
 # Starts the update script in a unit of its own, outside plugin_loader's. A
 # Decky that stops its whole control group on restart (Decky PR #955 drops
 # KillMode=process) would otherwise kill the script part way through.
@@ -306,6 +342,12 @@ DEFAULT_SETTINGS = {
     "distro_id": "unknown",
     "distro_name": "Unknown",
     "update_channel": "stable",
+    # Streaming auto mode: off means the fixes apply all the time, as always.
+    "streaming_mode_enabled": False,
+    # App id -> watched. An app missing from this is watched.
+    "streaming_apps": {},
+    # Extra process patterns, separated by spaces or commas.
+    "streaming_custom_patterns": "",
     "last_applied": 0,
 }
 
@@ -446,6 +488,57 @@ def _write_update_state(phase: str, version: str) -> bool:
         return False
 
 
+# Command lines that are always running on a Deck. A pattern found inside one
+# of them would hold the streaming fixes on all the time.
+_ALWAYS_RUNNING = (
+    "/home/deck/.local/share/steam/ubuntu12_32/steam", "steamwebhelper",
+    "gamescope", "/home/deck/homebrew/services/pluginloader",
+    "/usr/bin/networkmanager", "/usr/lib/systemd/systemd", "pipewire",
+    "/usr/bin/python3",
+)
+
+
+def _parse_stream_patterns(text: str) -> tuple[list[str], list[str]]:
+    """(kept, refused) from the user's process pattern field."""
+    kept, refused = [], []
+    for token in re.split(r"[\s,]+", (text or "").lower()):
+        if not token or token in kept:
+            continue
+        if (STREAM_PATTERN_MIN <= len(token) <= STREAM_PATTERN_MAX
+                and not any(token in line for line in _ALWAYS_RUNNING)
+                and len(kept) < STREAM_PATTERNS_MAX):
+            kept.append(token)
+        else:
+            refused.append(token)
+    return kept, refused
+
+
+_PCIE_VALUES = {"control": ("on", "auto")}
+
+
+def _read_pcie_baseline() -> dict:
+    """What the PCIe power files held before we changed them this boot."""
+    try:
+        fd = os.open(PCIE_BASELINE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return {}
+    try:
+        if not _is_regular(os.fstat(fd).st_mode):
+            return {}
+        data = json.loads(os.read(fd, 8192) or b"{}")
+    except (OSError, ValueError):
+        return {}
+    finally:
+        os.close(fd)
+    if not isinstance(data, dict):
+        return {}
+    return {
+        k: v for k, v in data.items()
+        if isinstance(k, str) and k.startswith(SYSFS_ROOT)
+        and v in _PCIE_VALUES.get(os.path.basename(k), ("0", "1"))
+    }
+
+
 def _first_existing(paths: list[str]) -> str | None:
     """First path in the list that exists, or None."""
     for path in paths:
@@ -563,6 +656,11 @@ def _load_settings() -> dict:
         # values NetworkManager defines may come through.
         if merged.get("valve_powersave_before") not in _VALVE_POWERSAVE_VALUES + ("", "?"):
             merged["valve_powersave_before"] = "?"
+        merged["streaming_apps"] = {
+            k: v for k, v in merged.get("streaming_apps", {}).items()
+            if k in STREAMING_APP_IDS and isinstance(v, bool)
+        }
+        merged["streaming_custom_patterns"] = merged.get("streaming_custom_patterns", "")[:512]
         return merged
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -1230,9 +1328,12 @@ class Plugin:
             out.append(opt)
         return out
 
-    def _apply_driver_fixes(self, enable: bool):
+    def _apply_driver_fixes(self, enable: bool, persist: bool = True):
         """Apply or revert driver-specific power save fixes from DRIVER_PROFILES.
-        Silently no-ops for drivers with no sysfs paths or modprobe options."""
+        Silently no-ops for drivers with no sysfs paths or modprobe options.
+
+        persist=False leaves out the modprobe options, which take effect at
+        the next module load and so cannot follow a streaming session."""
         settings = _load_settings()
         profile = DRIVER_PROFILES.get(settings.get("driver"), {})
 
@@ -1247,7 +1348,7 @@ class Plugin:
                 decky.logger.info(f"sysfs path not writable: {path}")
 
         options = self._safe_modprobe_options(settings.get("driver", ""), profile)
-        if enable and options:
+        if enable and options and persist:
             try:
                 os.makedirs(os.path.dirname(MODPROBE_CONF_PATH), exist_ok=True)
                 with open(MODPROBE_CONF_PATH, "w") as f:
@@ -1262,7 +1363,7 @@ class Plugin:
             except FileNotFoundError:
                 pass
 
-    def _apply_pcie_aspm_fix(self, enable: bool) -> list[str]:
+    def _apply_pcie_aspm_fix(self, enable: bool, record_all: bool = False) -> list[str]:
         """Disable or restore PCIe ASPM for the WiFi device.
         Prevents throughput degradation during sustained streaming.
         Works on all PCIe-attached WiFi adapters.
@@ -1274,6 +1375,10 @@ class Plugin:
         device does not have is skipped (the OLED has no l0s_aspm). Restoring
         is not verified, because firmware can keep a state off that we ask
         for, which is not a failure of ours.
+
+        record_all: in streaming auto mode nothing of ours writes these files
+        before the first stream of a boot, so a value already matching ours
+        is the system's own and is recorded too.
         """
         not_applied = []
         try:
@@ -1298,9 +1403,17 @@ class Plugin:
                 "on" if enable else "auto",
             ))
 
+            # Restoring writes back what the system had, where we saw it
+            # before our first change this boot; the kernel's usual value
+            # otherwise. Streaming auto mode restores after every stream, so
+            # turning on a state the firmware had left off would add up.
+            baseline = _read_pcie_baseline()
+            recorded = enable and self._record_pcie_baseline(targets, baseline, record_all)
             for path, val in targets:
                 if not os.path.exists(path):
                     continue
+                if not enable:
+                    val = baseline.get(path, val)
                 try:
                     with open(path, "w") as f:
                         f.write(val)
@@ -1316,6 +1429,12 @@ class Plugin:
                 if current != val:
                     not_applied.append(os.path.basename(path))
 
+            if recorded:
+                try:
+                    os.makedirs(os.path.dirname(PCIE_BASELINE_FILE), mode=0o755, exist_ok=True)
+                except OSError:
+                    pass
+                _write_no_follow(PCIE_BASELINE_FILE, json.dumps(baseline))
             if not_applied:
                 decky.logger.error(
                     f"PCIe power states still enabled on {device_link}: "
@@ -1328,6 +1447,27 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"PCIe ASPM fix error: {e}")
         return not_applied
+
+    @staticmethod
+    def _record_pcie_baseline(targets: list, baseline: dict, record_all: bool) -> bool:
+        """Read every file before any is written. Turning L1 off makes the
+        kernel report its substates off too, so reading each one after the
+        write before it recorded them as off and kept them off on restore.
+        Measured on a Deck OLED."""
+        recorded = False
+        for path, val in targets:
+            if path in baseline or not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r") as f:
+                    before = f.read(16).strip()
+            except OSError:
+                continue
+            allowed = _PCIE_VALUES.get(os.path.basename(path), ("0", "1"))
+            if before in allowed and (before != val or record_all):
+                baseline[path] = before
+                recorded = True
+        return recorded
 
     def _install_dispatcher(self) -> bool:
         try:
@@ -1462,6 +1602,7 @@ class Plugin:
                     )
 
             _save_settings(settings)
+            await self._startup_streaming(settings)
 
             # Apply volatile settings that may have been lost on reboot.
             # The dispatcher handles reconnects, but on a fresh boot WiFi
@@ -1470,7 +1611,7 @@ class Plugin:
             # (overrides txqueuelen to 256), then power_save last (sticks
             # after any reconnects the dispatcher might trigger).
             iface = self._get_wifi_interface()
-            if iface:
+            if iface and self._volatile_gate_open(_load_settings()):
                 if settings.get("buffer_tuning_enabled"):
                     try:
                         await self.set_buffer_tuning(True)
@@ -1599,7 +1740,7 @@ class Plugin:
     async def _unload(self):
         try:
             decky.logger.info("WiFi Optimizer unloading")
-            for name in ("_backend_switch_task", "_stranded_task"):
+            for name in ("_backend_switch_task", "_stranded_task", "_stream_task"):
                 task = getattr(self, name, None)
                 if task and not task.done():
                     task.cancel()
@@ -1616,7 +1757,8 @@ class Plugin:
             self._revert_queue_tuning(_load_settings())
             self._release_valve_powersave(_load_settings())
             for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
-                         SETTINGS_FILE, ENFORCED_FILE, LEGACY_ENFORCED_FILE]:
+                         SETTINGS_FILE, ENFORCED_FILE, LEGACY_ENFORCED_FILE,
+                         STREAM_FLAG_FILE, STREAM_HOLD_FILE]:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -2044,6 +2186,9 @@ class Plugin:
         if status.get("success"):
             try:
                 status["settings"] = _load_settings()
+                status.setdefault("live", {}).update(
+                    self._streaming_live(status["settings"])
+                )
             except Exception as e:
                 decky.logger.error(f"settings refresh error: {e}")
 
@@ -3701,13 +3846,16 @@ class Plugin:
         current_rmem = self._run_cmd(
             ["/usr/bin/sysctl", "-n", "net.core.rmem_max"], timeout=timeout
         ).get("stdout", "").strip()
+        # In auto mode with no stream running these are off on purpose.
+        gate_open = self._volatile_gate_open(settings)
         status["live"]["buffer_tuning_applied"] = current_rmem == TUNED_RMEM_MAX
-        if settings.get("buffer_tuning_enabled") and current_rmem != TUNED_RMEM_MAX:
+        if (settings.get("buffer_tuning_enabled") and current_rmem != TUNED_RMEM_MAX
+                and gate_open):
             status["drift"]["buffer_tuning"] = True
 
         cake_active = self._get_cake_status(iface)
         status["live"]["cake_applied"] = cake_active
-        if settings.get("cake_enabled") and not cake_active:
+        if settings.get("cake_enabled") and not cake_active and gate_open:
             status["drift"]["cake"] = True
             # Nothing else clears this. Optimize Safe covers the safe tier
             # only, so without a reassertion here the drift warning stays up
@@ -4220,7 +4368,8 @@ class Plugin:
             )
             ps_off = "Power save: off" in ps_result.get("stdout", "")
             status["live"]["power_save_off"] = ps_off
-            if settings.get("power_save_disabled") and not ps_off:
+            if (settings.get("power_save_disabled") and not ps_off
+                    and self._volatile_gate_open(settings)):
                 status["drift"]["power_save"] = True
 
             # Link info
@@ -4333,6 +4482,10 @@ class Plugin:
 
     async def set_power_save(self, disabled: bool) -> dict:
         try:
+            if disabled and self._paused_by_streaming():
+                return self._record_paused("power_save_disabled")
+            # Auto mode keeps power save to the session: nothing persistent.
+            auto = bool(_load_settings().get("streaming_mode_enabled"))
 
             iface = self._get_wifi_interface()
 
@@ -4352,7 +4505,7 @@ class Plugin:
 
             # Write or remove NM config (persistent layer)
             before = _load_settings().get("valve_powersave_before")
-            if disabled:
+            if disabled and not auto:
                 # What Valve's file said before we first took power save
                 # over, so stopping can put it back. "" records "nothing".
                 if not os.path.exists(NM_CONF_PATH):
@@ -4364,7 +4517,7 @@ class Plugin:
                 os.makedirs(os.path.dirname(NM_CONF_PATH), exist_ok=True)
                 with open(NM_CONF_PATH, "w") as f:
                     f.write("[connection]\nwifi.powersave = 2\n")
-            else:
+            elif not disabled:
                 try:
                     os.remove(NM_CONF_PATH)
                 except FileNotFoundError:
@@ -4372,8 +4525,8 @@ class Plugin:
                 self._release_valve_powersave(_load_settings())
                 before = "?"
 
-            self._apply_driver_fixes(disabled)
-            not_applied = self._apply_pcie_aspm_fix(disabled)
+            self._apply_driver_fixes(disabled, persist=not auto)
+            not_applied = self._apply_pcie_aspm_fix(disabled, record_all=auto)
 
             # Save settings only after success
             settings = _load_settings()
@@ -5252,6 +5405,8 @@ class Plugin:
 
     async def set_buffer_tuning(self, enabled: bool) -> dict:
         try:
+            if enabled and self._paused_by_streaming():
+                return self._record_paused("buffer_tuning_enabled")
             settings = _load_settings()
             if enabled:
                 self._capture_sysctl_baseline(settings)
@@ -5318,6 +5473,8 @@ class Plugin:
     async def set_cake(self, enabled: bool) -> dict:
         """Enable or disable CAKE QoS (unlimited mode: FQ + AQM + ack-filter, no bandwidth shaper)."""
         try:
+            if enabled and self._paused_by_streaming():
+                return self._record_paused("cake_enabled")
             iface = self._get_wifi_interface()
             if not iface:
                 if enabled:
@@ -5450,6 +5607,9 @@ class Plugin:
         """Reapply volatile (non-reconnecting) settings. Safe to call mid-stream."""
         try:
             settings = _load_settings()
+            if not self._volatile_gate_open(settings):
+                # Auto mode with no stream: the fixes stay off until one starts.
+                return {"success": True, "applied": 0, "total": 0, "paused": True}
             applied = 0
             total = 0
 
@@ -5702,7 +5862,8 @@ class Plugin:
                 os.remove(SETTINGS_FILE)
             except FileNotFoundError:
                 pass
-            for path in (ENFORCED_FILE, LEGACY_ENFORCED_FILE):
+            for path in (ENFORCED_FILE, LEGACY_ENFORCED_FILE, STREAM_FLAG_FILE,
+                         STREAM_HOLD_FILE):
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -5733,6 +5894,290 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"reset_settings error: {e}")
             return self._unexpected_response(e)
+
+    # ---- Streaming auto mode ----
+    #
+    # Off by default, and off means nothing changes: the fixes apply all the
+    # time. On, power save, buffer tuning and CAKE are applied while a
+    # streaming app runs (or while the user holds them on) and taken off
+    # after. The lock, band, DNS and IPv6 stay global: changing them means a
+    # reconnect, which would drop the very stream this is for. Idea and
+    # first implementation by bassobr (issue #5).
+
+    def _volatile_gate_open(self, settings: dict) -> bool:
+        """Whether power save, buffer tuning and CAKE should be in place now."""
+        return not settings.get("streaming_mode_enabled") or os.path.isfile(STREAM_FLAG_FILE)
+
+    def _paused_by_streaming(self) -> bool:
+        return not self._volatile_gate_open(_load_settings())
+
+    def _record_paused(self, key: str) -> dict:
+        """Turn a fix on while auto mode has it paused: kept, applied later."""
+        settings = _load_settings()
+        settings[key] = True
+        _save_settings_with_timestamp(settings)
+        return {"success": True, "paused": True,
+                "message": "On. It applies while a streaming app is running."}
+
+    def _stream_patterns(self, settings: dict) -> list[tuple[str, str]]:
+        """(label, pattern) for every app watched, the user's own last."""
+        watched = settings.get("streaming_apps", {})
+        out = [(label, pattern) for app_id, label, patterns in STREAMING_APPS
+               if watched.get(app_id, True) for pattern in patterns]
+        kept, _refused = _parse_stream_patterns(settings.get("streaming_custom_patterns", ""))
+        out.extend((pattern, pattern) for pattern in kept)
+        return out
+
+    def _find_stream(self, patterns: list[tuple[str, str]]) -> dict | None:
+        """The first running process whose command line has a pattern in it."""
+        if not patterns:
+            return None
+        own = str(os.getpid())
+        try:
+            pids = [d for d in os.listdir(PROC_DIR) if d.isdigit() and d != own]
+        except OSError:
+            return None
+        for pid in pids:
+            try:
+                with open(os.path.join(PROC_DIR, pid, "cmdline"), "rb") as f:
+                    raw = f.read(4096)
+            except OSError:
+                continue
+            if not raw:
+                continue  # a kernel thread
+            cmdline = raw.replace(b"\0", b" ").decode("utf-8", "replace").lower()
+            for label, pattern in patterns:
+                if pattern in cmdline:
+                    try:
+                        with open(os.path.join(PROC_DIR, pid, "comm"), "rb") as f:
+                            name = f.read(64).decode("utf-8", "replace").strip()
+                    except OSError:
+                        name = ""
+                    return {"app": label, "process": name or pid}
+        return None
+
+    def _set_stream_flag(self, on: bool, path: str | None = None):
+        path = path or STREAM_FLAG_FILE
+        if on:
+            try:
+                os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+            except OSError:
+                pass
+            _write_no_follow(path, f"{int(time.time())}\n")
+        else:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+    def _revert_volatile_fixes(self, settings: dict):
+        """Take power save, buffer tuning and CAKE off, keeping them chosen."""
+        if settings.get("power_save_disabled"):
+            iface = self._get_wifi_interface()
+            # A 2 in Valve's file is Steam's own Wi-Fi power management
+            # switched off; power save then stays off because the user said.
+            if iface and self._valve_powersave() != "2":
+                self._run_cmd(["/usr/bin/iw", "dev", iface, "set", "power_save", "on"])
+            self._apply_driver_fixes(False)
+            self._apply_pcie_aspm_fix(False)
+        self._revert_queue_tuning(settings)
+
+    async def _stream_pass(self, settle: bool = False):
+        """Look for a stream, and apply or take off the fixes if that changed.
+
+        settle skips the wait before taking them off, for when the panel
+        knows something just exited or the user changed what is watched.
+        """
+        if getattr(self, "_stream_lock", None) is None:
+            self._stream_lock = asyncio.Lock()
+        async with self._stream_lock:
+            settings = _load_settings()
+            if not settings.get("streaming_mode_enabled"):
+                return
+            found = await asyncio.to_thread(self._find_stream, self._stream_patterns(settings))
+            held = os.path.isfile(STREAM_HOLD_FILE)
+            was_open = os.path.isfile(STREAM_FLAG_FILE)
+            self._stream_match = found
+            if found or held:
+                self._stream_misses = 0
+                want = True
+            else:
+                self._stream_misses = getattr(self, "_stream_misses", 0) + 1
+                want = (was_open and not settle
+                        and self._stream_misses < STREAM_MISSES_TO_CLOSE)
+            if want == was_open:
+                return
+            self._set_stream_flag(want)
+            if want:
+                why = f"{found['app']} ({found['process']})" if found else "held on"
+                decky.logger.info(f"Streaming auto mode: {why}, applying the fixes")
+                await self.reapply_volatile()
+            else:
+                decky.logger.info("Streaming auto mode: no stream running, fixes off")
+                await asyncio.to_thread(self._revert_volatile_fixes, settings)
+
+    async def _streaming_watch(self):
+        """Look every few seconds for as long as auto mode is on."""
+        while True:
+            await asyncio.sleep(STREAM_POLL_SECONDS)
+            try:
+                if not _load_settings().get("streaming_mode_enabled"):
+                    return
+                await self._stream_pass()
+            except Exception as e:
+                self._log_throttled("stream_watch", f"streaming watch error: {e}")
+
+    def _start_streaming_watch(self):
+        task = getattr(self, "_stream_task", None)
+        if task is None or task.done():
+            self._stream_task = asyncio.create_task(self._streaming_watch())
+
+    def _drop_persistent_power_save(self):
+        """Remove what keeps power save off beyond a session.
+
+        NetworkManager's file holds it off on every connect and the modprobe
+        options at every module load, both whether or not anything streams.
+        """
+        for path in (NM_CONF_PATH, MODPROBE_CONF_PATH):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        settings = _load_settings()
+        self._release_valve_powersave(settings)
+        settings["valve_powersave_before"] = "?"
+        _save_settings(settings)
+
+    async def _startup_streaming(self, settings: dict):
+        """Pick auto mode up where it was, before the startup apply runs.
+
+        A flag left in /run says a stream was running before this load (the
+        plugin was reloaded or updated mid-stream). Looking first keeps the
+        fixes on through that instead of taking them off and putting them
+        back a few seconds later.
+        """
+        if not settings.get("streaming_mode_enabled"):
+            for path in (STREAM_FLAG_FILE, STREAM_HOLD_FILE):
+                self._set_stream_flag(False, path)
+            return
+        await asyncio.to_thread(self._drop_persistent_power_save)
+        await self._stream_pass(settle=True)
+        self._start_streaming_watch()
+
+    def _streaming_live(self, settings: dict) -> dict:
+        """What the panel shows about auto mode."""
+        if not settings.get("streaming_mode_enabled"):
+            return {"streaming_mode": False}
+        match = getattr(self, "_stream_match", None) or {}
+        return {
+            "streaming_mode": True,
+            "streaming_active": os.path.isfile(STREAM_FLAG_FILE),
+            "streaming_held": os.path.isfile(STREAM_HOLD_FILE),
+            "streaming_app": match.get("app", ""),
+            "streaming_process": match.get("process", ""),
+        }
+
+    async def set_streaming_mode(self, enabled: bool) -> dict:
+        """Turn streaming auto mode on or off."""
+        try:
+            if self._profile_change_in_flight() or self._update_running():
+                return dict(self._BUSY_RESULT)
+            settings = _load_settings()
+            settings["streaming_mode_enabled"] = bool(enabled)
+            _save_settings_with_timestamp(settings)
+            if enabled:
+                await asyncio.to_thread(self._drop_persistent_power_save)
+                # Until now the fixes applied all the time, so they are on.
+                # One settled pass takes them off unless a stream is running.
+                self._set_stream_flag(True)
+                self._stream_misses = 0
+                await self._stream_pass(settle=True)
+                self._start_streaming_watch()
+            else:
+                task = getattr(self, "_stream_task", None)
+                if task and not task.done():
+                    task.cancel()
+                for path in (STREAM_FLAG_FILE, STREAM_HOLD_FILE):
+                    self._set_stream_flag(False, path)
+                self._stream_match = None
+                # Back to all the time, NetworkManager's file included.
+                await self.reapply_volatile()
+            decky.logger.info(f"Streaming auto mode {'on' if enabled else 'off'}")
+            return {"success": True, "streaming_mode": bool(enabled)}
+        except Exception as e:
+            decky.logger.error(f"set_streaming_mode error: {e}")
+            return self._unexpected_response(e)
+
+    async def set_streaming_hold(self, held: bool) -> dict:
+        """Keep the fixes on until reboot, for a stream that is not detected."""
+        try:
+            if not _load_settings().get("streaming_mode_enabled"):
+                return {"success": False, "message": "Streaming auto mode is off."}
+            self._set_stream_flag(bool(held), STREAM_HOLD_FILE)
+            await self._stream_pass(settle=True)
+            return {"success": True, "held": bool(held)}
+        except Exception as e:
+            decky.logger.error(f"set_streaming_hold error: {e}")
+            return self._unexpected_response(e)
+
+    async def set_streaming_app(self, app_id: str, watched: bool) -> dict:
+        """Watch or ignore one of the known streaming apps."""
+        try:
+            if app_id not in STREAMING_APP_IDS:
+                return {"success": False, "message": "Unknown app."}
+            settings = _load_settings()
+            apps = dict(settings.get("streaming_apps", {}))
+            apps[app_id] = bool(watched)
+            settings["streaming_apps"] = apps
+            _save_settings(settings)
+            await self._stream_pass(settle=True)
+            return {"success": True}
+        except Exception as e:
+            decky.logger.error(f"set_streaming_app error: {e}")
+            return self._unexpected_response(e)
+
+    async def set_streaming_patterns(self, text: str) -> dict:
+        """Save the user's own process patterns, refusing ones that would
+        match something always running."""
+        try:
+            kept, refused = _parse_stream_patterns(str(text)[:512])
+            settings = _load_settings()
+            settings["streaming_custom_patterns"] = " ".join(kept)
+            _save_settings(settings)
+            await self._stream_pass(settle=True)
+            result = {"success": True, "patterns": " ".join(kept)}
+            if refused:
+                result["message"] = (
+                    f"Left out: {' '.join(refused)}. Patterns need at least "
+                    f"{STREAM_PATTERN_MIN} characters and must not match "
+                    "something that is always running, like Steam."
+                )
+            return result
+        except Exception as e:
+            decky.logger.error(f"set_streaming_patterns error: {e}")
+            return self._unexpected_response(e)
+
+    def _streaming_app_list(self) -> list[dict]:
+        """The known apps, for the panel's list."""
+        watched = _load_settings().get("streaming_apps", {})
+        return [{"id": app_id, "label": label, "watched": watched.get(app_id, True)}
+                for app_id, label, _patterns in STREAMING_APPS]
+
+    async def list_streaming_apps(self) -> dict:
+        try:
+            return {"success": True, "apps": self._streaming_app_list()}
+        except Exception as e:
+            decky.logger.error(f"list_streaming_apps error: {e}")
+            return {"success": False, "apps": []}
+
+    async def poke_detection(self) -> dict:
+        """Look now. The panel calls this when Steam starts or stops a game."""
+        try:
+            await self._stream_pass(settle=True)
+            return {"success": True}
+        except Exception as e:
+            decky.logger.error(f"poke_detection error: {e}")
+            return {"success": False}
 
     # ---- Updates ----
 

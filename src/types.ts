@@ -23,6 +23,9 @@ export interface PluginSettings {
   last_connection_uuid: string;
   priority_set: boolean;
   update_channel: string;
+  streaming_mode_enabled: boolean;
+  streaming_apps: Record<string, boolean>;
+  streaming_custom_patterns: string;
   last_applied: number;
 }
 
@@ -48,6 +51,25 @@ export interface LiveStatus {
   wifi_backend?: string;
   pins_inactive_iwd?: boolean;
   backend_tool_available?: boolean;
+  /** Streaming auto mode is on. */
+  streaming_mode?: boolean;
+  /** In auto mode: the fixes are on now (a stream runs, or held on). */
+  streaming_active?: boolean;
+  streaming_held?: boolean;
+  /** What was detected: the app's name and the process that matched. */
+  streaming_app?: string;
+  streaming_process?: string;
+}
+
+export interface StreamingApp {
+  id: string;
+  label: string;
+  watched: boolean;
+}
+
+export interface StreamingAppList {
+  success: boolean;
+  apps: StreamingApp[];
 }
 
 export interface PluginStatus {
@@ -159,7 +181,15 @@ export interface UpdateProgress {
   running_version: string;
 }
 
-export type BadgeStatus = "active" | "locked" | "set" | "drifted" | "off" | "error" | "unknown";
+export type BadgeStatus =
+  | "active"
+  | "locked"
+  | "set"
+  | "drifted"
+  | "off"
+  | "error"
+  | "unknown"
+  | "paused";
 
 export const ERROR_MESSAGES: Record<string, string> = {
   no_wifi: "Not connected to WiFi. Connect first, then optimize.",

@@ -8,6 +8,7 @@ import type {
   BackendSwitchStartResult,
   BackendSwitchStatus,
   RegdomainInfo,
+  StreamingAppList,
 } from "./types";
 
 export const getStatus = callable<[], PluginStatus>("get_status");
@@ -31,6 +32,12 @@ export const applyUpdate = callable<[], MethodResult>("apply_update");
 export const getUpdateProgress = callable<[], UpdateProgress>("get_update_progress");
 export const startBackendSwitch = callable<[backend: string], BackendSwitchStartResult>("start_backend_switch");
 export const getBackendSwitchStatus = callable<[], BackendSwitchStatus>("get_backend_switch_status");
+export const setStreamingMode = callable<[enabled: boolean], MethodResult>("set_streaming_mode");
+export const setStreamingHold = callable<[held: boolean], MethodResult>("set_streaming_hold");
+export const setStreamingApp = callable<[appId: string, watched: boolean], MethodResult>("set_streaming_app");
+export const setStreamingPatterns = callable<[text: string], MethodResult>("set_streaming_patterns");
+export const listStreamingApps = callable<[], StreamingAppList>("list_streaming_apps");
+export const pokeDetection = callable<[], MethodResult>("poke_detection");
 export const getRegdomain = callable<[], RegdomainInfo>("get_regdomain");
 export const setRegdomain = callable<[country: string], MethodResult>("set_regdomain");
 export const getDiagnosticInfo = callable<[], Record<string, unknown>>("get_diagnostic_info");

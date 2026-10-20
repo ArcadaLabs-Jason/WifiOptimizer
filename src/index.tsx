@@ -38,10 +38,11 @@ import { UpdatesSection } from "./components/UpdatesSection";
 import { PanelHeader } from "./components/PanelHeader";
 import { PanelFooter } from "./components/PanelFooter";
 import { ActionsSection } from "./components/ActionsSection";
+import { StreamingSection } from "./components/StreamingSection";
 import {
   watchUpdate,
   subscribeUpdate,
-  announceIfJustUpdated,
+  checkUpdateOnLoad,
   disposeUpdateWatch,
 } from "./updateWatch";
 import { theme } from "./theme";
@@ -59,7 +60,8 @@ const BACKEND_SWITCH_MAX_S = 240;
 const IWD_PIN_NOTICE =
   "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
-// Long enough for the reloaded backend to have answered the update script.
+// Long enough for the reloaded backend to have answered the update script,
+// so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
 
 // What the panel says while an update runs, from what the script reports.
@@ -747,10 +749,18 @@ function Content() {
   const supports6GHz = s?.supports_6ghz ?? false;
   const isDeckLcd = s?.device_family === "deck_lcd";
 
+  // Streaming auto mode with no stream running: power save, buffer tuning
+  // and CAKE are off on purpose. They read as paused, not as off or drifted.
+  const streamingIdle = !!status?.live?.streaming_mode && !status?.live?.streaming_active;
+  const gatedBadge = (key: string, on: boolean | undefined) =>
+    streamingIdle && on && !errors[key]
+      ? { badge: "paused" as const, text: "paused" }
+      : getBadge(key, status, errors[key] ?? null);
+
   // Check if all safe optimizations are already active
   const allSafeActive =
     connected &&
-    status?.live?.power_save_off &&
+    (status?.live?.power_save_off || (streamingIdle && s?.power_save_disabled)) &&
     !status?.drift?.power_save &&
     s?.bssid_lock_enabled &&
     !status?.drift?.bssid_lock &&
@@ -759,7 +769,7 @@ function Content() {
     // this, the panel reports all clear while one of the four is inert.
     !status?.live?.bssid_lock_other_network &&
     status?.live?.dispatcher_installed &&
-    status?.live?.buffer_tuning_applied &&
+    (status?.live?.buffer_tuning_applied || (streamingIdle && s?.buffer_tuning_enabled)) &&
     !status?.drift?.buffer_tuning;
 
   return (
@@ -769,6 +779,7 @@ function Content() {
         version={status?.version ?? "?"}
         lastApplied={s?.last_applied ?? 0}
         lastEnforced={status?.live?.last_enforced}
+        streaming={status?.live}
         deviceLabel={s?.device_label !== "Unknown Device"
           ? `${s?.device_label} - ${s?.chip_label}`
           : s?.chip_label && s.chip_label !== "unknown"
@@ -984,7 +995,7 @@ function Content() {
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
           explanation="The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
-          {...getBadge("power_save", status, errors.power_save ?? null)}
+          {...gatedBadge("power_save", s?.power_save_disabled)}
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
           error={errors.power_save}
@@ -1030,7 +1041,7 @@ function Content() {
           label="Network buffer tuning"
           subtitle="Optimize UDP buffers and TX queue for streaming"
           explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
-          {...getBadge("buffer_tuning", status, errors.buffer_tuning ?? null)}
+          {...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled)}
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
           error={errors.buffer_tuning}
@@ -1213,7 +1224,7 @@ function Content() {
           label="Traffic shaping (CAKE)"
           subtitle="Fair queuing and bufferbloat prevention"
           explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
-          {...getBadge("cake", status, errors.cake ?? null)}
+          {...gatedBadge("cake", s?.cake_enabled)}
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.cake_enabled)}
           error={errors.cake}
@@ -1231,6 +1242,15 @@ function Content() {
           />
         )}
       </PanelSection>
+
+      <StreamingSection
+        settings={s}
+        live={status?.live}
+        disabled={isBusy || updating}
+        error={errors.streaming}
+        notice={notices.streaming}
+        onToggle={handleToggle}
+      />
 
       {/* Live status */}
       <PanelSection title="Live status">
@@ -1281,19 +1301,28 @@ export default definePlugin(() => {
 
   const announce = setTimeout(() => {
     timers.delete(announce);
-    if (!disposed) announceIfJustUpdated();
+    if (!disposed) checkUpdateOnLoad();
   }, ANNOUNCE_DELAY_MS);
   timers.add(announce);
 
   try {
+    const later = (ms: number, fn: () => void) => {
+      const id = setTimeout(() => {
+        timers.delete(id);
+        if (!disposed) fn();
+      }, ms);
+      timers.add(id);
+    };
     gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications(
       (notification: { bRunning: boolean }) => {
-        if (notification.bRunning && !disposed) {
-          const id = setTimeout(() => {
-            timers.delete(id);
-            if (!disposed) backend.reapplyVolatile().catch(() => {});
-          }, 3000);
-          timers.add(id);
+        if (disposed) return;
+        // Streaming auto mode looks now and again once the app has had time
+        // to start or exit, instead of waiting for its next pass. A no-op
+        // with auto mode off.
+        backend.pokeDetection().catch(() => {});
+        later(3000, () => backend.pokeDetection().catch(() => {}));
+        if (notification.bRunning) {
+          later(3000, () => backend.reapplyVolatile().catch(() => {}));
         }
       },
     );
