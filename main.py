@@ -3614,6 +3614,25 @@ class Plugin:
     # least this far apart.
     _LOCK_WEAKER_CHECK_SECONDS = 30
 
+    # With the lock on, nothing refreshes nmcli's scan list. Measured on a
+    # Deck (SteamOS 3.8.28, NetworkManager 1.52.1, wpa_supplicant): with the
+    # lock off the cached list kept 6-7 entries over three minutes and their
+    # signals changed between reads; with it on, every other access point
+    # read exactly the same on ten reads 25 s apart, only the associated one
+    # moved, and later the list had expired down to the pinned access point
+    # alone. A notice judged on that compares the live signal of the pinned
+    # access point with old numbers from where the lock was set, so it could
+    # fire wrongly or never. So the notice asks for a scan itself, at most
+    # this often: a scan takes the radio off-channel for a moment, which is
+    # a short latency spike, and it is never asked for during a stream.
+    _LOCK_SCAN_SECONDS = 60
+
+    # How long after asking for a scan before the cached list can be trusted.
+    # Measured on the same Deck: `nmcli dev wifi rescan` returned in 21 ms,
+    # because it only requests the scan, and about 8 s later the list held
+    # all seven access points with fresh signals.
+    _LOCK_SCAN_SETTLE_SECONDS = 8
+
     def _visible_access_points(
         self, iface: str, ssid: str, rescan: bool = False, cached_only: bool = False
     ) -> list[tuple[str, int, int, str]]:
@@ -4669,8 +4688,10 @@ class Plugin:
         in use, and pinning the access point we are on now. Candidates follow
         the lock's own rules (_lock_candidates), so what is offered is what a
         move would choose. Reads nmcli's cached scan on its own short
-        throttle, so a poll never waits on a rescan, and needs the finding to
-        hold on two reads before it is reported.
+        throttle, so a poll never waits on a rescan. The lock stops the scans
+        that keep that list current, so it asks for one now and then itself
+        (_lock_scan_is_fresh), and the finding has to hold on two reads taken
+        after two separate scans before it is reported.
         """
         pinned = live.get("bssid_lock", "").upper()
         # nmcli reports addresses upper-case and iw lower-case.
@@ -4700,6 +4721,10 @@ class Plugin:
             return
         self._lock_weaker_checked_at = now
         self._lock_weaker_checked_for = key
+        if not self._lock_scan_is_fresh(settings, iface, now):
+            # A stale list can neither start, confirm nor clear the finding:
+            # its other access points are wherever the lock was set, or gone.
+            return
         # The cached list: this runs inside the status poll, and letting nmcli
         # decide to rescan there held the poll for seconds.
         aps = self._visible_access_points(iface, ssid, cached_only=True)
@@ -4723,6 +4748,47 @@ class Plugin:
             return
         if now - since >= self._LOCK_WEAKER_CHECK_SECONDS:
             self._lock_weaker = {"signal": better[0][1], "current_signal": here}
+
+    def _lock_scan_is_fresh(self, settings: dict, iface: str, now: float) -> bool:
+        """Whether nmcli's cached list is fresh enough to judge the lock on.
+
+        Asks for a scan when one is due, and then says no: the answer takes a
+        few seconds to land (_LOCK_SCAN_SETTLE_SECONDS), and asking returns at
+        once rather than holding the poll. A read counts once it is past that
+        and before the next scan is due, and only one read per scan counts,
+        since two reads of one scan are one sample. Under a stream no scan is
+        asked for, so nothing is fresh and nothing new is said until it ends.
+        """
+        asked = getattr(self, "_lock_scan_at", None)
+        if asked is None or now - asked >= self._LOCK_SCAN_SECONDS:
+            if not self._stream_running(settings):
+                # Failures are ignored: one already in progress is fine, and
+                # the attempt still counts against the limit, so a refusal is
+                # not retried on every poll.
+                self._run_cmd(
+                    ["/usr/bin/nmcli", "dev", "wifi", "rescan", "ifname", iface],
+                    timeout=3,
+                )
+                self._lock_scan_at = now
+            return False
+        if now - asked < self._LOCK_SCAN_SETTLE_SECONDS:
+            return False
+        if getattr(self, "_lock_scan_used", None) == asked:
+            return False
+        self._lock_scan_used = asked
+        return True
+
+    def _stream_running(self, settings: dict) -> bool:
+        """Whether a game stream looks to be running, auto mode on or not.
+
+        Auto mode's flag says so when it is on, and the hold means the user
+        has said so. With auto mode off nothing keeps that flag, so the same
+        process search it uses is run here; scanning in the middle of a
+        stream is the one thing this must not do.
+        """
+        if os.path.isfile(STREAM_FLAG_FILE) or os.path.isfile(STREAM_HOLD_FILE):
+            return True
+        return self._find_stream(self._stream_patterns(settings)) is not None
 
     async def allow_wpa2(self) -> dict:
         """Let a WPA3-only profile use the WPA2-only access points of its network.

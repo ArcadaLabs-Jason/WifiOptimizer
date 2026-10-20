@@ -5264,13 +5264,20 @@ try:
     ONLY_ROUTER_5 = [("02:00:00:00:00:51", 88, 5180, "WPA2 WPA3"),
                      ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")]
 
+    LW_SCAN = getattr(m.Plugin, "_LOCK_SCAN_SECONDS", 60)
+    LW_SETTLE = getattr(m.Plugin, "_LOCK_SCAN_SETTLE_SECONDS", 8)
+
     class LockReach(m.Plugin):
-        def __init__(self, aps, km="wpa-psk"):
+        def __init__(self, aps, km="wpa-psk", stream=None):
             super().__init__(); self.aps = aps; self.km = km; self.reads = 0
-            self.cached_only = None
+            self.cached_only = None; self.scans = []; self.stream = stream
         def _profile_key_mgmt(self, uuid): return self.km
         def _visible_access_points(self, iface, ssid, rescan=False, cached_only=False):
             self.reads += 1; self.cached_only = cached_only; return list(self.aps)
+        def _run_cmd(self, cmd, timeout=5):
+            if "rescan" in cmd: self.scans.append(list(cmd))
+            return _ok()
+        def _find_stream(self, patterns): return self.stream
 
     def lw_settings(**extra):
         return {**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
@@ -5285,19 +5292,36 @@ try:
                                uuid, "wlan0", ssid, link)
         return getattr(r, "_lock_weaker", None)
 
+    def lw_shift(r, back, scan=None):
+        # Moves every remembered time `back` seconds into the past, and the
+        # last scan request by `scan` instead when given. Relative to now,
+        # never zero: the monotonic clock starts at boot, so on a runner that
+        # has just started, zero is still inside every window.
+        for name in ("_lock_weaker_checked_at", "_lock_weaker_since"):
+            at = getattr(r, name, None)
+            if at is not None:
+                setattr(r, name, at - back)
+        asked = getattr(r, "_lock_scan_at", None)
+        if asked is not None:
+            r._lock_scan_at = asked - (back if scan is None else scan)
+            # Still the same scan, so a read already made of it stays made.
+            if getattr(r, "_lock_scan_used", None) == asked:
+                r._lock_scan_used = r._lock_scan_at
+
+    def lw_fresh(r, **kw):
+        # One scan and one read of it: the read that asks for the scan cannot
+        # use it, the next one, past the settle time and before the next scan
+        # is due, can.
+        lw_shift(r, LW_SCAN + 1)
+        lw_read(r, **kw)
+        lw_shift(r, LW_WINDOW + 1)
+        return lw_read(r, **kw)
+
     def lw_later(r):
-        # Relative to now, never zero: the monotonic clock starts at boot, so
-        # on a runner that has just started, zero is still inside the window.
-        back = LW_WINDOW + 1
-        if getattr(r, "_lock_weaker_checked_at", None) is not None:
-            r._lock_weaker_checked_at = time.monotonic() - back
-        if getattr(r, "_lock_weaker_since", None) is not None:
-            r._lock_weaker_since = time.monotonic() - back
+        lw_shift(r, LW_WINDOW + 1)
 
     def lw_two_reads(r, **kw):
-        first = lw_read(r, **kw)
-        lw_later(r)
-        return first, lw_read(r, **kw)
+        return lw_fresh(r, **kw), lw_fresh(r, **kw)
 
     r = LockReach(HALL)
     first, second = lw_two_reads(r)
@@ -5307,11 +5331,11 @@ try:
     ok(r.cached_only is True, "and it only ever reads nmcli's cached scan")
 
     r = LockReach(HALL)
+    lw_fresh(r)
+    reads, scans = r.reads, len(r.scans)
     lw_read(r)
-    reads = r.reads
-    lw_read(r)
-    ok(r._lock_weaker is None and r.reads == reads,
-       "a second poll inside the window neither reports nor scans")
+    ok(r._lock_weaker is None and r.reads == reads and len(r.scans) == scans,
+       "a second poll inside the window neither reports, reads nor scans")
 
     r = LockReach([("02:00:00:00:00:51", 31 + 15, 5180, "WPA2 WPA3"),
                    ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")])
@@ -5362,14 +5386,12 @@ try:
     r = LockReach(HALL)
     lw_two_reads(r)
     r.aps = [("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")]
-    lw_later(r)
-    ok(lw_read(r) is None, "it clears when the stronger access point goes")
+    ok(lw_fresh(r) is None, "it clears when a fresh scan no longer has the stronger access point")
     r = LockReach(HALL)
     lw_two_reads(r)
     r.aps = [("02:00:00:00:00:51", 88, 5180, "WPA2 WPA3"),
              ("02:00:00:00:00:11", 80, 5745, "WPA2 WPA3")]
-    lw_later(r)
-    ok(lw_read(r) is None, "and when the pinned one recovers")
+    ok(lw_fresh(r) is None, "and when the pinned one recovers")
     r = LockReach(HALL)
     lw_two_reads(r)
     ok(lw_read(r, settings=lw_settings(bssid_lock_enabled=False)) is None,
@@ -5380,8 +5402,7 @@ try:
                    ("02:00:00:00:00:22", 31, 5220, "WPA2 WPA3"),
                    ("02:00:00:00:00:11", 31, 5745, "WPA2 WPA3")])
     ok(lw_two_reads(r)[1] is not None, "(the first pin's finding is reported)")
-    lw_later(r)
-    ok(lw_read(r, live=lw_live(pin="02:00:00:00:00:22", on="02:00:00:00:00:22")) is None,
+    ok(lw_fresh(r, live=lw_live(pin="02:00:00:00:00:22", on="02:00:00:00:00:22")) is None,
        "a different pin starts over rather than inheriting the old finding")
 
     for what, setup in [
@@ -5395,12 +5416,72 @@ try:
         ok(lw_read(r) is None, f"nothing is reported while {what}")
 
     r = LockReach(HALL)
+    lw_two_reads(r)
     _st = {"live": lw_live()}
-    r._report_lock_weaker(lw_settings(), _st, LW, "wlan0", "Net", "")
-    lw_later(r)
     r._report_lock_weaker(lw_settings(), _st, LW, "wlan0", "Net", "")
     ok(_st.get("lock_weaker") == {"signal": 88, "current_signal": 31},
        "the status carries it as lock_weaker")
+
+    # With the lock on there is no background scanning: measured on a Deck,
+    # every other access point read the same for four minutes, then expired.
+    r = LockReach(HALL)
+    lw_read(r)
+    ok(r.scans == [["/usr/bin/nmcli", "dev", "wifi", "rescan", "ifname", "wlan0"]],
+       "holding on a weak link with no stream, it asks nmcli for a scan")
+    ok(r._lock_weaker is None and getattr(r, "_lock_weaker_since", None) is None,
+       "and the read that asked cannot use it")
+    for what, kw in [("the lock is off", {"settings": lw_settings(bssid_lock_enabled=False)}),
+                     ("the link is healthy", {"link": "Connected to x\n\tsignal: -50 dBm\n"}),
+                     ("it is not on the pinned access point", {"live": lw_live(on="02:00:00:00:00:24")})]:
+        r = LockReach(HALL); lw_read(r, **kw)
+        ok(not r.scans, f"no scan when {what}")
+
+    for what, setup in [
+        ("auto mode's stream flag is up", lambda: open(m.STREAM_FLAG_FILE, "w").close()),
+        ("the user holds streaming on", lambda: open(m.STREAM_HOLD_FILE, "w").close()),
+        ("a streaming app is running with auto mode off", lambda: None),
+    ]:
+        for _f in (m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE):
+            if os.path.exists(_f): os.remove(_f)
+        setup()
+        r = LockReach(HALL, stream={"app": "Moonlight", "process": "moonlight"}
+                      if "app is running" in what else None)
+        got = [lw_fresh(r) for _ in range(3)]
+        ok(not r.scans and all(g is None for g in got)
+           and getattr(r, "_lock_weaker_since", None) is None,
+           f"never a scan while {what}, so nothing is said on the stale list")
+    for _f in (m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE):
+        if os.path.exists(_f): os.remove(_f)
+
+    r = LockReach(HALL)
+    lw_read(r)
+    lw_shift(r, LW_WINDOW + 1)
+    lw_read(r)
+    ok(len(r.scans) == 1, "inside the scan window no second scan is asked for")
+    lw_shift(r, LW_SCAN + 1)
+    lw_read(r)
+    ok(len(r.scans) == 2, "past it, one is")
+
+    r = LockReach(HALL)
+    lw_read(r)
+    lw_shift(r, LW_WINDOW + 1, scan=LW_SETTLE - 3)
+    lw_read(r)
+    ok(getattr(r, "_lock_weaker_since", None) is None,
+       "a read sooner than the settle time after the scan does not start a finding")
+    r = LockReach(HALL)
+    lw_fresh(r)
+    lw_shift(r, LW_WINDOW + 1, scan=LW_SETTLE)
+    ok(lw_read(r) is None and len(r.scans) == 1,
+       "a second read of the same scan does not confirm one")
+    r = LockReach(HALL)
+    lw_fresh(r)
+    lw_shift(r, LW_SCAN + 1)
+    lw_read(r)
+    lw_shift(r, LW_WINDOW + 1, scan=LW_SETTLE - 3)
+    ok(lw_read(r) is None, "nor does a read too soon after the next scan")
+    lw_shift(r, LW_WINDOW + 1, scan=LW_SETTLE)
+    ok(lw_read(r) == {"signal": 88, "current_signal": 31},
+       "while a read of that scan once it has settled does")
     _coll = _src_all[_src_all.index("    def _collect_status"):]
     _coll = _coll[:_coll.index("\n    def ", 10)]
     ok("self._report_lock_weaker(" in _coll, "and the status poll is what runs it")
