@@ -2893,7 +2893,7 @@ class TwoUpdates(m.Plugin):
         return {"update_available": False}
 async def two_updates():
     u = TwoUpdates()
-    return await asyncio.gather(u.apply_update(), u.apply_update()), u
+    return await asyncio.gather(u.apply_update("0.19.0-beta"), u.apply_update("0.19.0-beta")), u
 (r1, r2), u = asyncio.run(two_updates())
 ok(u.checks == 1, "two overlapping update requests run one update")
 class HeldUpdate(TwoUpdates):
@@ -2903,9 +2903,9 @@ class HeldUpdate(TwoUpdates):
         return {"update_available": False}
 async def refused_mid_check():
     u = HeldUpdate()
-    first = asyncio.ensure_future(u.apply_update())
+    first = asyncio.ensure_future(u.apply_update("0.19.0-beta"))
     await asyncio.sleep(0.01)
-    await u.apply_update()
+    await u.apply_update("0.19.0-beta")
     held = u._update_running()
     await first
     return held
@@ -3069,7 +3069,7 @@ try:
             async def _signed_release(self, version):
                 return {"ok": True, "url": "https://example.invalid/u.tar.gz", "sha256": "0" * 64}
         _state("failed 0.19.0-beta\n")
-        st = Starts(0); r = asyncio.run(st.apply_update())
+        st = Starts(0); r = asyncio.run(st.apply_update("0.19.0-beta"))
         ok(r.get("success") is True and r.get("version") == "0.19.0-beta",
            "a started update tells the panel which version to follow")
         ok(not os.path.lexists(m.UPDATE_STATE_FILE),
@@ -3204,7 +3204,7 @@ try:
     try:
         m.subprocess.Popen = _boom; m.tempfile.mkdtemp = _track_mkdtemp
         pf = PopenFails()
-        r = asyncio.run(pf.apply_update())
+        r = asyncio.run(pf.apply_update("9.9.9"))
         ok(r.get("success") is False and not pf._update_running(),
            "an update that could not start does not read as running afterwards")
         ok(_made and not os.path.exists(_made[-1]), "and its script directory is removed")
@@ -4666,8 +4666,21 @@ try:
        f"a release signed for this version gives back its checksums ({_r})")
     _legacy = _minisign(_SUMS, "wifi-optimizer v0.20.0-beta", legacy=True)
     ok(_legacy.split("\n")[1].startswith("RWQBAgME"), "the legacy test signature really is the Ed form")
-    ok(_quiet(m.verify_release_manifest, _SUMS, _legacy, "0.20.0-beta", keys=(_test_key,)).get("ok") is True,
-       "a legacy signature over the file itself verifies too")
+    ok(_quiet(m._minisign_verify, _SUMS, _legacy, (_test_key,)).get("ok") is True,
+       "a legacy signature over the file itself is understood")
+    _r = _quiet(m.verify_release_manifest, _SUMS, _legacy, "0.20.0-beta", keys=(_test_key,))
+    ok(_fail(_r, "signature does not verify"),
+       f"but a release manifest must use the prehashed form releases are signed with ({_r})")
+    # The algorithm is outside both signatures. Relabelled as legacy, a real
+    # signature is valid over the BLAKE2b hash of the file, so this is the
+    # form an attacker can produce without the key.
+    _relabel = _edit_line(_good, 1, lambda l: _b64(b"Ed" + base64.b64decode(l)[2:]))
+    _hashed = hashlib.blake2b(_SUMS, digest_size=64).digest()
+    ok(_quiet(m._minisign_verify, _hashed, _relabel, (_test_key,)).get("ok") is True,
+       "a prehashed signature relabelled as legacy really does verify over the file's hash")
+    _r = _quiet(m.verify_release_manifest, _hashed, _relabel, "0.20.0-beta", keys=(_test_key,))
+    ok(_fail(_r, "signature does not verify"),
+       f"and is refused as a manifest because of its form, not left to the checksum parser ({_r})")
     _r = _quiet(m._minisign_verify, _SUMS + b"x", _legacy, (_test_key,))
     ok(_fail(_r, "signature does not verify"), "and fails once the file changes")
     _r = _quiet(m._minisign_verify, _SUMS, _edit_line(_legacy, 1, lambda l: _b64(b"ED" + base64.b64decode(l)[2:])),
@@ -4948,8 +4961,8 @@ try:
             out[f"{_DL}/v{version}/SHA256SUMS.minisig"] = sig.encode() if isinstance(sig, str) and sig != "down" else sig
         return out
 
-    def _apply(rel):
-        r = asyncio.run(rel.apply_update())
+    def _apply(rel, approved=None):
+        r = asyncio.run(rel.apply_update(rel.version if approved is None else approved))
         if getattr(rel, "_update_dir", None) and os.path.isdir(rel._update_dir):
             shutil.rmtree(rel._update_dir)
         rel._update_dir = None
@@ -4975,6 +4988,34 @@ try:
         _r = _apply(_st)
         ok(_st.launched and _st.launched[0][4:7] == [f"{_DL}/v{_VER}/{_TAR}", f"WifiOptimizer-{_VER}", f"v{_VER}"],
            "stable fetches the same release asset and unpacks the same directory")
+
+        # What installs is what the user approved. GitHub is asked again
+        # when they press the button, and a different answer, an older
+        # signed release above all, must not be installed in its place.
+        _changed = "The available update changed. Check again and retry."
+        _again = "Check for updates again, then retry."
+        for _what, _approved, _msg in [
+            ("an approval for an older version", "0.20.0-beta", _changed),
+            ("an approval for a newer version", "0.22.0", _changed),
+            ("an empty approval", "", _again),
+            ("a malformed approval", "0.21.0-beta;rm", _again),
+            ("an overlong approval", "1." * 40 + "1", _again),
+            ("an approval that is not text", 21, _again),
+        ]:
+            _rel = Release(_files())
+            _r = _apply(_rel, _approved)
+            ok(_r.get("success") is False and _r.get("message") == _msg and not _rel.launched
+               and not _rel.cmds and not _rel._update_running() and _rel._update_starting is False,
+               f"{_what}: refused before anything is fetched, the claim released ({_r.get('message')!r})")
+        _rel = Release(_files())
+        _r = asyncio.run(_rel.apply_update())
+        ok(_r.get("success") is False and _r.get("message") == _again and not _rel.launched
+           and not _rel._update_running(), "no approval at all: refused the same way")
+        _tsx = open("src/index.tsx").read()
+        ok('backend.applyUpdate(updateInfo?.latest_version ?? "")' in _tsx
+           and 'callable<[version: string], MethodResult>("apply_update")' in open("src/backend.ts").read()
+           and 'applyUpdate(updateInfo?.latest_version ?? "")' in open("dist/index.js").read(),
+           "the panel passes the version it showed, and the built bundle does too")
 
         _wrong_comment = _minisign(_REL_SUMS, "wifi-optimizer v0.20.0-beta")
         _no_tar = f"{_TAR_SHA}  wifi-optimizer-v0.20.0-beta.tar.gz\n".encode()

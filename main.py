@@ -775,8 +775,9 @@ def _save_settings_with_timestamp(data: dict):
 # Each entry is a minisign public key as the second line of a minisign.pub
 # file, the base64 that starts "RW". A string is what a person compares
 # against the published key, so it is pinned as one. The first key signs
-# releases. The second is a rescue key, kept offline and used only to sign a
-# release that rotates the first one out if it is ever lost or leaked.
+# releases. The second is a rescue key, kept apart from the first and used
+# only to sign a release that rotates the first one out if it is ever lost or
+# leaked.
 TRUSTED_RELEASE_KEYS = (
     # Release key, id FE0DCD913B7044FA.
     "RWT6RHA7kc0N/vvpQCVTRBrSXNZpv7hBFPZpSRX9m5v55Mrl15BB1heh",
@@ -959,13 +960,15 @@ def _parse_minisig(text):
     }
 
 
-def _minisign_verify(data: bytes, minisig_text: str, keys) -> dict:
+def _minisign_verify(data: bytes, minisig_text: str, keys,
+                     algorithms=(b"Ed", b"ED")) -> dict:
     """Check a minisign signature on data against the pinned keys.
 
     {"ok": True, "trusted_comment": text} or {"ok": False, "error": reason}.
     Both signatures must hold: the one over the file, and the global one that
     binds the trusted comment to it. What the comment says is left to the
-    caller, which knows what it expects.
+    caller, which knows what it expects. algorithms is which signature forms
+    the caller accepts.
     """
     if not isinstance(data, bytes):
         return {"ok": False, "error": "nothing to verify"}
@@ -982,6 +985,8 @@ def _minisign_verify(data: bytes, minisig_text: str, keys) -> dict:
     public_key = next((pk for kid, pk in pinned if kid == parsed["key_id"]), None)
     if public_key is None:
         return {"ok": False, "error": "signature is not from a pinned key"}
+    if parsed["algorithm"] not in algorithms:
+        return {"ok": False, "error": "signature does not verify"}
     # "ED" signs a BLAKE2b-512 hash of the file, what minisign writes by
     # default now. "Ed" signs the file itself, as older minisign did.
     if parsed["algorithm"] == b"ED":
@@ -1045,7 +1050,12 @@ def verify_release_manifest(sums_bytes: bytes, minisig_text: str,
             return {"ok": False, "error": "checksum list malformed"}
         if len(sums_bytes) > RELEASE_SUMS_MAX:
             return {"ok": False, "error": "checksum list too large"}
-        result = _minisign_verify(sums_bytes, minisig_text, keys)
+        # Only the prehashed form, which is what releases are signed with.
+        # The algorithm is not covered by either signature, so accepting the
+        # legacy form too would let a relabelled signature be checked over
+        # the hash of the file as if it were the file. That cannot parse as
+        # a checksum list today, but it should not rest on the parser.
+        result = _minisign_verify(sums_bytes, minisig_text, keys, algorithms=(b"ED",))
         if not result["ok"]:
             return result
         if result["trusted_comment"] != f"wifi-optimizer v{expected_version}":
@@ -7039,8 +7049,9 @@ class Plugin:
         decky.logger.info(f"Release v{version} signature verified, {name} sha256={sha256}")
         return {"ok": True, "url": f"{base}/{name}", "sha256": sha256}
 
-    async def apply_update(self) -> dict:
-        """Download and install the update from the selected channel.
+    async def apply_update(self, version: str = "") -> dict:
+        """Install the update the user approved: version is the one the
+        panel showed them, from its last check_for_update.
 
         The script runs on its own; the panel follows it through
         get_update_progress and asks Decky to reload the plugin once the new
@@ -7063,12 +7074,21 @@ class Plugin:
             # check above while the version lookup runs.
             self._update_starting = True
             claimed = True
+            if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
+                decky.logger.error(f"Update refused: approved version {version!r} malformed")
+                return {"success": False, "message": "Check for updates again, then retry."}
             info = await self.check_for_update()
             if not info.get("update_available"):
                 return {"success": False, "message": "No update available."}
 
             channel = info.get("channel", "stable")
             latest = info["latest_version"]
+            # GitHub is asked again here, and its answer may not be what the
+            # user saw. Installing something else would skip the choice they
+            # made, a "Go back to" above all, so it has to be the same one.
+            if latest != version:
+                decky.logger.error(f"Update refused: approved v{version}, GitHub now offers v{latest}")
+                return {"success": False, "message": "The available update changed. Check again and retry."}
             plugin_dir = decky.DECKY_PLUGIN_DIR
             label = f"beta v{latest}" if channel == "beta" else f"v{latest}"
 

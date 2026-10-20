@@ -710,7 +710,12 @@ function Content() {
     setUpdateError(null);
     setUpdating(true);
     try {
-      const result = (await backend.applyUpdate()) as MethodResult & { version?: string };
+      // The version the user was shown. The backend checks GitHub again and
+      // installs only if it still offers this one, so a "Go back to" is
+      // never replaced by something they did not choose.
+      const result = (await backend.applyUpdate(updateInfo?.latest_version ?? "")) as MethodResult & {
+        version?: string;
+      };
       // Refused outright (no update after all, a backend switch running):
       // say why now instead of showing "Updating..." for a minute.
       if (!result.success) {
