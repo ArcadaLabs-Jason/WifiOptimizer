@@ -111,7 +111,13 @@ async function poll() {
 // fresh: a new update the user just started, rather than a copy of the
 // module picking up one already running.
 export function watchUpdate(version: string, fresh = false) {
-  if (fresh) shared().reloadAsked = undefined;
+  // Both guards are once per version, so a version installed again later in
+  // the same Steam session would get neither the reload nor the "Updated"
+  // toast. A new update the user started clears them.
+  if (fresh) {
+    shared().reloadAsked = undefined;
+    shared().announced = undefined;
+  }
   stop();
   target = version;
   startedAt = Date.now();

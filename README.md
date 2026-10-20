@@ -91,7 +91,7 @@ The plugin detects your WiFi hardware at startup and applies the right optimizat
 
 The plugin has two parts:
 
-1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It notices when settings have drifted after wake: most are restored on their own, and anything left is one tap away.
+1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It notices when settings have drifted, after wake or because something else changed them: most are restored on their own, and anything left is one tap away.
 
 2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers, CAKE). In streaming auto mode it only does that while a stream is running. If you uninstall the plugin, the script removes itself.
 

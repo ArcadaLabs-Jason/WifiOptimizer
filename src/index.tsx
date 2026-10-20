@@ -953,7 +953,9 @@ function Content() {
       {/* Drift alert */}
       {connected && !!s?.last_applied && driftCount > 0 && (
         <Banner variant="warning" icon="⚠">
-          {driftCount} setting{driftCount > 1 ? "s" : ""} drifted after wake.
+          {driftCount > 1
+            ? `${driftCount} settings no longer match what you set.`
+            : "1 setting no longer matches what you set."}
         </Banner>
       )}
       {connected && !!s?.last_applied && driftCount > 0 && (

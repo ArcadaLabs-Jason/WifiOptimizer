@@ -3098,8 +3098,12 @@ try:
     _done = _idx[_idx.index('progress?.phase === "done"'):]
     ok(_done.index("setUpdateInfo(null)") < _done.index("runUpdateCheck(true)") < _done.index("} else if (progress)"),
        "a panel left open across the update stops offering the version it just installed")
-    ok("watchUpdate(version, true)" in _idx and "if (fresh) shared().reloadAsked = undefined" in _watch,
+    _fresh = _watch[_watch.index("export function watchUpdate"):_watch.index("export function subscribeUpdate")]
+    ok("watchUpdate(version, true)" in _idx and "if (fresh)" in _fresh
+       and "shared().reloadAsked = undefined" in _fresh,
        "the panel follows an update it started, and asks for the reload again even for a version installed earlier")
+    ok("shared().announced = undefined" in _fresh,
+       "and says it updated again too, for a version installed earlier in the same session")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
