@@ -157,7 +157,8 @@ ENFORCED_FILE = "/run/wifi-optimizer/last_enforced"
 # A version string from the network ends up in a filename, a URL and a root
 # shell script, so it is validated the moment it is parsed rather than at each
 # use. Digits and dots, with an optional alphanumeric prerelease suffix.
-VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}(-[A-Za-z0-9.]+)?\Z")
+# ASCII digits only: \d would also accept digits from other scripts.
+VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?\Z")
 
 # How far the update script has got, as "<phase> <version>". In /run for the
 # same reason as ENFORCED_FILE: the panel acts on what it says, so only root
@@ -1150,7 +1151,7 @@ EXPECTED="$6"
 EXPECTED_SHA="${7:-}"
 
 STATE=/run/wifi-optimizer/update-state
-TMP=$(mktemp -d) || exit 1
+TMP=""
 OWN_LOCK=0
 FINISHED=0
 # The panel shows these as the update goes, and on "swapped" asks Decky to
@@ -1162,7 +1163,7 @@ set_state() {
         mv -f "$STATE.tmp" "$STATE" 2>/dev/null
 }
 cleanup() {
-    rm -rf "$TMP"
+    [ -n "$TMP" ] && rm -rf "$TMP"
     # Only the update holding the lock may clear staged files; another one
     # exiting early must not delete what the running one is about to move.
     if [ "$OWN_LOCK" = 1 ]; then
@@ -1173,6 +1174,10 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 1' TERM INT HUP
+# Made once the trap is set: a failure here (a full /tmp) used to exit
+# before it, leaving this script's directory behind, and while that exists
+# the plugin believes an update is still running.
+TMP=$(mktemp -d) || exit 1
 
 # One update at a time. A retry after the panel gave up waiting used to
 # start a second copy alongside the first, and both restarted Decky.
@@ -1193,8 +1198,10 @@ set_state downloading
 
 sleep 2
 
-# Bounded, so a stalled download ends instead of outliving the panel's wait.
-OPTS="--connect-timeout 15 --speed-limit 1024 --speed-time 30 --max-time 300"
+# Bounded, so a stalled download ends instead of outliving the panel's wait,
+# and in size, far above a real release (under 1 MB), so a huge one cannot
+# fill /tmp, which is memory.
+OPTS="--connect-timeout 15 --speed-limit 1024 --speed-time 30 --max-time 300 --max-filesize 52428800"
 curl -sSL --fail --proto '=https' --tlsv1.2 $OPTS "$DOWNLOAD_URL" -o "$TMP/update.tar.gz" || {
     logger -t wifi-optimizer "Update failed: download error"
     exit 1
@@ -5344,13 +5351,17 @@ class Plugin:
                 with open(NM_CONF_PATH, "w") as f:
                     f.write("[connection]\nwifi.powersave = 2\n")
             elif not disabled:
+                # Only our own file can have put our value into Valve's. With
+                # none to remove (always so in streaming auto mode, which never
+                # writes it), a 2 there is the user's own Steam setting, and
+                # releasing it at the end of every stream turned it back on.
                 try:
                     os.remove(NM_CONF_PATH)
                     self._reload_nm_conf()
+                    self._release_valve_powersave(_load_settings())
+                    before = "?"
                 except FileNotFoundError:
                     pass
-                self._release_valve_powersave(_load_settings())
-                before = "?"
 
             self._apply_driver_fixes(disabled, persist=not auto)
             # Only when auto mode is putting the fixes on from off. Any other
@@ -6908,6 +6919,10 @@ class Plugin:
 
     async def reset_settings(self) -> dict:
         """Delete settings and revert to defaults."""
+        # An update reloads the plugin when it finishes, which would cut a
+        # reset off between clearing the pins and saving the defaults.
+        if self._update_running():
+            return dict(self._BUSY_RESULT)
         try:
             # Before the settings naming them are discarded.
             self._clear_profile_pins()
@@ -7142,10 +7157,12 @@ class Plugin:
                 os.remove(path)
             except FileNotFoundError:
                 pass
+        settings = _load_settings()
         if had_conf:
             self._reload_nm_conf()
-        settings = _load_settings()
-        self._release_valve_powersave(settings)
+            # Only while our file existed can a 2 in Valve's be ours. On a
+            # load with none, it is the user's Steam setting and stays.
+            self._release_valve_powersave(settings)
         # With our file gone nothing of ours can reach Valve's any more, so
         # what it says now is the user's own (Steam's Wi-Fi power management
         # setting). Recorded, so a later Reset or uninstall leaves it alone
@@ -7346,7 +7363,9 @@ class Plugin:
         """
         try:
             settings = _load_settings()
-            if not settings.get("update_notify", True):
+            # While an update installs, the one on offer is likely the one
+            # being installed.
+            if not settings.get("update_notify", True) or self._update_running():
                 return {"notify": False}
             info = await self.check_for_update()
             if not info.get("success"):

@@ -98,7 +98,12 @@ async function poll() {
     if (progress.phase === "swapped" && progress.running_version !== target) {
       askDeckyToReload(target);
     }
-    if (progress.phase === "failed" || progress.phase === "done") stop();
+    if (progress.phase === "failed" || progress.phase === "done") {
+      stop();
+      // Told once. Kept, it was replayed to every panel opened afterwards,
+      // so a failed update kept saying so after a successful check.
+      current = null;
+    }
   } catch (e) {
     // A reload or restart cancels calls in flight; that is the update
     // working, and the next copy of the plugin takes over from here.
@@ -207,9 +212,11 @@ async function noticeOnce(): Promise<number> {
     // A second copy of the module (Decky issue #611) must not toast too.
     if (shared().noticeShown === notice.version) return NOTICE_EVERY_MS;
     shared().noticeShown = notice.version;
+    // Steam shows a toast's body on one line and cuts the rest, so it is
+    // kept short; tapping it opens the panel, where the update button is.
     toaster.toast({
       title: PLUGIN_NAME,
-      body: `v${notice.version} is available. Open the plugin to update.`,
+      body: `Update available: v${notice.version}`,
       onClick: openPanel,
     });
     await backend.markUpdateNotified(notice.version);

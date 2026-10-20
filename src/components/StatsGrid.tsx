@@ -34,10 +34,18 @@ interface StatsGridProps {
   connected: boolean;
 }
 
+// iw reports the rate with its modulation details ("866.7 MBit/s VHT-MCS 9
+// 80MHz short GI VHT-NSS 2"), which wrapped over four lines. The rate is the
+// part worth showing; anything not in that form is shown as it came.
+function speedLabel(raw: string | undefined): string | undefined {
+  const found = raw ? /^\s*([\d.]+)\s*MBit\/s/i.exec(raw) : null;
+  return found ? `${Math.round(parseFloat(found[1]))} Mbit/s` : raw;
+}
+
 export function StatsGrid({ live, connected }: StatsGridProps) {
   const na = "--";
   const signal = connected ? live.signal_dbm ?? na : na;
-  const speed = connected ? live.tx_bitrate ?? na : na;
+  const speed = connected ? speedLabel(live.tx_bitrate) ?? na : na;
   const band = connected ? bandLabel(live.frequency) : na;
   const freq = connected ? live.frequency ?? "" : "";
   const channel = connected ? live.channel ?? na : na;

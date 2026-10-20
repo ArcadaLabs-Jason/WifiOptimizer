@@ -286,10 +286,17 @@ function bandColor(freqStr) {
         return theme.warning.text; // 2.4 GHz (suboptimal)
     return theme.success.text; // 5/6 GHz (good)
 }
+// iw reports the rate with its modulation details ("866.7 MBit/s VHT-MCS 9
+// 80MHz short GI VHT-NSS 2"), which wrapped over four lines. The rate is the
+// part worth showing; anything not in that form is shown as it came.
+function speedLabel(raw) {
+    const found = raw ? /^\s*([\d.]+)\s*MBit\/s/i.exec(raw) : null;
+    return found ? `${Math.round(parseFloat(found[1]))} Mbit/s` : raw;
+}
 function StatsGrid({ live, connected }) {
     const na = "--";
     const signal = connected ? live.signal_dbm ?? na : na;
-    const speed = connected ? live.tx_bitrate ?? na : na;
+    const speed = connected ? speedLabel(live.tx_bitrate) ?? na : na;
     const band = connected ? bandLabel(live.frequency) : na;
     const freq = connected ? live.frequency ?? "" : "";
     const channel = connected ? live.channel ?? na : na;
@@ -665,8 +672,12 @@ async function poll() {
         if (progress.phase === "swapped" && progress.running_version !== target) {
             askDeckyToReload(target);
         }
-        if (progress.phase === "failed" || progress.phase === "done")
+        if (progress.phase === "failed" || progress.phase === "done") {
             stop();
+            // Told once. Kept, it was replayed to every panel opened afterwards,
+            // so a failed update kept saying so after a successful check.
+            current = null;
+        }
     }
     catch (e) {
         // A reload or restart cancels calls in flight; that is the update
@@ -773,9 +784,11 @@ async function noticeOnce() {
         if (shared().noticeShown === notice.version)
             return NOTICE_EVERY_MS;
         shared().noticeShown = notice.version;
+        // Steam shows a toast's body on one line and cuts the rest, so it is
+        // kept short; tapping it opens the panel, where the update button is.
         toaster.toast({
             title: PLUGIN_NAME,
-            body: `v${notice.version} is available. Open the plugin to update.`,
+            body: `Update available: v${notice.version}`,
             onClick: openPanel,
         });
         await markUpdateNotified(notice.version);
@@ -820,14 +833,18 @@ const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
 const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 // The update script allows the download up to five minutes on a slow link,
 // so the panel waits a little longer than that before calling it failed.
-const UPDATE_TIMEOUT_MS = 6 * 60 * 1000;
+// Longer than an update can take on a slow link: up to about 2 minutes for
+// the check and the signature, 5 for the download, and the reload. A limit
+// inside that was reached while the update was still going, and the next
+// progress report took the "didn't complete" message straight back off.
+const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE = "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
-const RESET_CONFIRM_TEXT = "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the 5 GHz preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
+const RESET_CONFIRM_TEXT = "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -1445,7 +1462,11 @@ function Content() {
                 watchUpdate(version, true);
         }
         catch {
-            // The script runs on its own; the safety timeout covers a lost reply.
+            // The script may well be running anyway. Follow it, so the plugin is
+            // still reloaded when the files are in place rather than Steam
+            // restarted; if nothing started, the watch and the safety timeout end.
+            if (updateInfo?.latest_version)
+                watchUpdate(updateInfo.latest_version, true);
         }
     };
     const handleCheckForUpdate = async () => {
@@ -1519,6 +1540,22 @@ function Content() {
     const supports6GHz = s?.supports_6ghz ?? false;
     // One band preference, shown as two toggles: 5 GHz and, where it can work, 6 GHz.
     const on6GHz = !!s?.band_preference_enabled && s?.band_preference === "6GHz";
+    // Each toggle reports under its own key; band_preference is what Force
+    // Reapply and Fix now report under, shown on whichever band is set.
+    const band5Error = errors.band_5ghz ?? (on6GHz ? undefined : errors.band_preference);
+    const band6Error = errors.band_6ghz ?? (on6GHz ? errors.band_preference : undefined);
+    // A result from one band toggle is stale once the other is used.
+    const clearBandMessages = () => {
+        const drop = (prev) => {
+            const next = { ...prev };
+            delete next.band_5ghz;
+            delete next.band_6ghz;
+            delete next.band_preference;
+            return next;
+        };
+        setErrors(drop);
+        setNotices(drop);
+    };
     const isDeckLcd = s?.device_family === "deck_lcd";
     // Streaming auto mode with no stream running: power save, buffer tuning
     // and CAKE are off on purpose. They read as paused, not as off or drifted.
@@ -1599,17 +1636,24 @@ function Content() {
                                 color: errors.regdomain ? theme.error.text : theme.text.tertiary,
                             }, children: errors.regdomain ?? notices.regdomain }) })), regdomain?.readable && !regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", opacity: 0.8, padding: "4px 0" }, children: ["WiFi region: ", regdomain.governing || "unknown", ". This device's WiFi card sets its own region, so it cannot be changed here. That is normal on the Steam Deck and does not mean a band is missing."] }) })), SP_JSX.jsx(InfoRow, { label: "Force 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""}. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.${supports6GHz
                             ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
-                            : ""}`, ...getBadge(on6GHz ? undefined : "band_preference", status, on6GHz ? null : errors.band_preference ?? null), checked: (s?.band_preference_enabled ?? false) && !on6GHz, disabled: isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz)), error: on6GHz ? undefined : errors.band_preference, notice: on6GHz
-                            ? undefined
-                            : notices.band_preference ??
-                                (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
-                                    ? IWD_PIN_NOTICE
-                                    : status?.external?.band
-                                        ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
-                                        : undefined), onChange: (val) => handleToggle("band_preference", () => 
-                        // Never "6GHz": turning that off leaves it recorded as the band.
-                        setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")) }), (status?.live?.six_ghz_offered || on6GHz) && (SP_JSX.jsx(InfoRow, { label: "Force 6 GHz band", subtitle: "Stay on 6 GHz where your router has it", explanation: "6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect.", ...getBadge(on6GHz ? "band_preference" : undefined, status, errors.band_6ghz ?? (on6GHz ? errors.band_preference : null) ?? null), checked: on6GHz, disabled: isBusy || updating || (!connected && !on6GHz), error: errors.band_6ghz ?? (on6GHz ? errors.band_preference : undefined), notice: notices.band_6ghz ??
-                            (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined), onChange: (val) => handleToggle("band_6ghz", () => setBandPreference(val, "6GHz")) })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
+                            : ""}`, ...getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null), checked: (s?.band_preference_enabled ?? false) && !on6GHz, disabled: isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz)), error: band5Error, notice: notices.band_5ghz ??
+                            (on6GHz
+                                ? undefined
+                                : notices.band_preference ??
+                                    (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
+                                        ? IWD_PIN_NOTICE
+                                        : status?.external?.band
+                                            ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
+                                            : undefined)), onChange: (val) => {
+                            clearBandMessages();
+                            handleToggle("band_5ghz", () => 
+                            // Never "6GHz": turning that off leaves it recorded as the band.
+                            setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a"));
+                        } }), (status?.live?.six_ghz_offered || on6GHz) && (SP_JSX.jsx(InfoRow, { label: "Force 6 GHz band", subtitle: "Stay on 6 GHz where your router has it", explanation: "6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect.", ...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null), checked: on6GHz, disabled: isBusy || updating || (!connected && !on6GHz), error: band6Error, notice: notices.band_6ghz ??
+                            (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined), onChange: (val) => {
+                            clearBandMessages();
+                            handleToggle("band_6ghz", () => setBandPreference(val, "6GHz"));
+                        } })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
                             if (!val)
                                 resetDnsDraft();
                             handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput));
@@ -1630,7 +1674,7 @@ function Content() {
                                 ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
                                 : status?.live?.ipv6_other_network
                                     ? "On for the network it was turned on for, not this one."
-                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...gatedBadge("cake", s?.cake_enabled), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsx(StreamingSection, { settings: s, live: status?.live, disabled: isBusy || updating, error: errors.streaming, notice: notices.streaming, onToggle: handleToggle }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, notify: s?.update_notify ?? true, onNotifyChange: handleNotifyChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
+                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...gatedBadge("cake", s?.cake_enabled), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsx(StreamingSection, { settings: s, live: status?.live, disabled: isBusy || updating, error: errors.streaming, notice: notices.streaming, onToggle: handleToggle }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy || updating, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, notify: s?.update_notify ?? true, onNotifyChange: handleNotifyChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
 }
 var index = definePlugin(() => {
     let gameLifetimeUnsub = null;

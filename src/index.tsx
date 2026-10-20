@@ -57,7 +57,11 @@ const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
 const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 // The update script allows the download up to five minutes on a slow link,
 // so the panel waits a little longer than that before calling it failed.
-const UPDATE_TIMEOUT_MS = 6 * 60 * 1000;
+// Longer than an update can take on a slow link: up to about 2 minutes for
+// the check and the signature, 5 for the download, and the reload. A limit
+// inside that was reached while the update was still going, and the next
+// progress report took the "didn't complete" message straight back off.
+const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE =
@@ -66,7 +70,7 @@ const BACKEND_POLL_MAX_FAILURES = 5;
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
 const RESET_CONFIRM_TEXT =
-  "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the 5 GHz preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
+  "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -730,7 +734,10 @@ function Content() {
       const version = result.version ?? updateInfo?.latest_version;
       if (version) watchUpdate(version, true);
     } catch {
-      // The script runs on its own; the safety timeout covers a lost reply.
+      // The script may well be running anyway. Follow it, so the plugin is
+      // still reloaded when the files are in place rather than Steam
+      // restarted; if nothing started, the watch and the safety timeout end.
+      if (updateInfo?.latest_version) watchUpdate(updateInfo.latest_version, true);
     }
   };
 
@@ -812,6 +819,22 @@ function Content() {
   const supports6GHz = s?.supports_6ghz ?? false;
   // One band preference, shown as two toggles: 5 GHz and, where it can work, 6 GHz.
   const on6GHz = !!s?.band_preference_enabled && s?.band_preference === "6GHz";
+  // Each toggle reports under its own key; band_preference is what Force
+  // Reapply and Fix now report under, shown on whichever band is set.
+  const band5Error = errors.band_5ghz ?? (on6GHz ? undefined : errors.band_preference);
+  const band6Error = errors.band_6ghz ?? (on6GHz ? errors.band_preference : undefined);
+  // A result from one band toggle is stale once the other is used.
+  const clearBandMessages = () => {
+    const drop = (prev: Record<string, string>) => {
+      const next = { ...prev };
+      delete next.band_5ghz;
+      delete next.band_6ghz;
+      delete next.band_preference;
+      return next;
+    };
+    setErrors(drop);
+    setNotices(drop);
+  };
   const isDeckLcd = s?.device_family === "deck_lcd";
 
   // Streaming auto mode with no stream running: power save, buffer tuning
@@ -1218,43 +1241,46 @@ function Content() {
               ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
               : ""
           }`}
-          {...getBadge(on6GHz ? undefined : "band_preference", status, on6GHz ? null : errors.band_preference ?? null)}
+          {...getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null)}
           checked={(s?.band_preference_enabled ?? false) && !on6GHz}
           disabled={isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz))}
-          error={on6GHz ? undefined : errors.band_preference}
+          error={band5Error}
           notice={
-            on6GHz
+            notices.band_5ghz ??
+            (on6GHz
               ? undefined
               : notices.band_preference ??
                 (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
                   ? IWD_PIN_NOTICE
                   : status?.external?.band
                   ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
-                  : undefined)
+                  : undefined))
           }
-          onChange={(val: boolean) =>
-            handleToggle("band_preference", () =>
+          onChange={(val: boolean) => {
+            clearBandMessages();
+            handleToggle("band_5ghz", () =>
               // Never "6GHz": turning that off leaves it recorded as the band.
               backend.setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")
-            )
-          }
+            );
+          }}
         />
         {(status?.live?.six_ghz_offered || on6GHz) && (
           <InfoRow
             label="Force 6 GHz band"
             subtitle="Stay on 6 GHz where your router has it"
             explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
-            {...getBadge(on6GHz ? "band_preference" : undefined, status, errors.band_6ghz ?? (on6GHz ? errors.band_preference : null) ?? null)}
+            {...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null)}
             checked={on6GHz}
             disabled={isBusy || updating || (!connected && !on6GHz)}
-            error={errors.band_6ghz ?? (on6GHz ? errors.band_preference : undefined)}
+            error={band6Error}
             notice={
               notices.band_6ghz ??
               (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
             }
-            onChange={(val: boolean) =>
-              handleToggle("band_6ghz", () => backend.setBandPreference(val, "6GHz"))
-            }
+            onChange={(val: boolean) => {
+              clearBandMessages();
+              handleToggle("band_6ghz", () => backend.setBandPreference(val, "6GHz"));
+            }}
           />
         )}
         <InfoRow
@@ -1403,7 +1429,7 @@ function Content() {
 
       <ActionsSection
         connected={connected}
-        isBusy={isBusy}
+        isBusy={isBusy || updating}
         onForceReapply={handleForceReapply}
         onReset={handleResetSettings}
         resetError={errors.reset}

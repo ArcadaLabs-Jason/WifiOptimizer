@@ -3870,7 +3870,7 @@ try:
     ok("} catch (e) {" in _ht, "a toggle whose call throws shows an error instead of nothing")
     ok("disabled={isBusy}" not in _tsx and _tsx.count("isBusy || updating") >= 15,
        "every control is held while an update installs")
-    ok("const UPDATE_TIMEOUT_MS = 6 * 60 * 1000;" in _tsx,
+    ok("const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;" in _tsx,
        "the panel waits longer for an update than the script allows its download")
     _bp = _tsx[_tsx.index("const beginBackendPoll"):]
     _bp = _bp[:_bp.index("}, BACKEND_POLL_INTERVAL);")]
@@ -4263,6 +4263,19 @@ try:
         c = RealValve(); c._drop_persistent_power_save()
         ok(["/usr/bin/nmcli", "general", "reload", "conf"] not in c.cmds,
            "and nothing is reloaded when there was no file of ours to remove")
+        # QA gate 2026-10-20: with no file of ours, a 2 in Valve's file is the
+        # user's own Steam setting, and used to be undone on every load and at
+        # the end of every stream.
+        open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=wpa_supplicant\n")
+        m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "valve_powersave_before": ""})
+        c = RealValve(); c._drop_persistent_power_save()
+        ok(m.Plugin()._valve_powersave() == "2" and m._load_settings()["valve_powersave_before"] == "2",
+           "a load with no file of ours leaves the user's Steam power management setting alone, and records it as theirs")
+        m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "power_save_disabled": True,
+                          "valve_powersave_before": "?"})
+        c = RealValve(); asyncio.run(c.set_power_save(False))
+        ok(m.Plugin()._valve_powersave() == "2",
+           "and so does the end of a stream in auto mode, which never writes a file of ours")
     finally:
         m.WIFI_BACKEND_CONF, m.NM_CONF_PATH, m.MODPROBE_CONF_PATH = _rv, _real_nm2, _real_mp2
 
@@ -4618,7 +4631,7 @@ try:
        "and nothing resets on the first press")
     _rct = _ix[_ix.index("const RESET_CONFIRM_TEXT"):]
     _rct = _rct[:_rct.index(";")]
-    ok(all(w in _rct for w in ("Buffer tuning", "CAKE", "lock", "5 GHz", "IPv6", "DNS")),
+    ok(all(w in _rct for w in ("Buffer tuning", "CAKE", "lock", "band preference", "IPv6", "DNS")),
        "the confirmation says what a reset undoes")
     ok("Reset WiFi Optimizer?" in open("dist/index.js").read(), "and the built bundle carries it")
 except Exception as _e:
@@ -5509,8 +5522,63 @@ try:
        "checked a couple of minutes after load, then twice a day")
     ok("const stopUpdateNotices = startUpdateNotices();" in _ix and "stopUpdateNotices();" in _ix,
        "started with the plugin, not the panel, and stopped when Decky unloads it")
-    ok("is available. Open the plugin to update." in _dist and "Tell me about updates" in _dist,
+    ok("Update available: v" in _dist and "Tell me about updates" in _dist,
        "the built bundle has the notice and the toggle")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("panel copy found in the visual review")
+try:
+    _ix = open("src/index.tsx").read(); _sg = open("src/components/StatsGrid.tsx").read()
+    _uw = open("src/updateWatch.ts").read(); _dist = open("dist/index.js").read()
+    ok("the band preference, the IPv6 setting" in _ix and "the 5 GHz preference" not in _ix,
+       "the reset confirmation names the band preference, which can now be 6 GHz")
+    ok("speedLabel(live.tx_bitrate)" in _sg and "Mbit/s" in _dist,
+       "the speed tile shows the rate, not iw's whole modulation string")
+    _body = _uw[_uw.index("toaster.toast({", _uw.index("async function noticeOnce")):]
+    _body = _body[:_body.index("});")]
+    ok("body: `Update available: v${notice.version}`" in _body,
+       "the update toast fits on the one line Steam gives it")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("QA gate fixes (2026-10-20)")
+try:
+    _ix = open("src/index.tsx").read(); _uw = open("src/updateWatch.ts").read()
+    _src = open("main.py").read(); _script = m.UPDATE_SCRIPT
+    ok(_script.index("trap cleanup EXIT") < _script.index("TMP=$(mktemp -d) || exit 1")
+       and '[ -n "$TMP" ] && rm -rf "$TMP"' in _script,
+       "the update script sets its cleanup before its first step that can fail, so no stray directory says an update is running")
+    ok("--max-filesize 52428800" in _script, "the payload download is bounded in size, not only in time")
+    ok(not m.VERSION_RE.match("١.٢.٣") and m.VERSION_RE.match("0.24.1-beta"),
+       "a version is ASCII digits only")
+    ok('handleToggle("band_5ghz"' in _ix and 'handleToggle("band_6ghz"' in _ix
+       and 'handleToggle("band_preference"' not in _ix and _ix.count("clearBandMessages();") == 2,
+       "each band toggle reports under its own key and clears the other's stale result")
+    ok("isBusy={isBusy || updating}" in _ix, "Reset and Force Reapply wait while an update installs")
+    ok("UPDATE_TIMEOUT_MS = 10 * 60 * 1000" in _ix, "the panel's update timeout outlasts a slow update")
+    _catch = _ix[_ix.index("const handleApplyUpdate"):]
+    _catch = _catch[_catch.index("} catch {"):]
+    _catch = _catch[:_catch.index("\n  };")]
+    ok("watchUpdate(updateInfo.latest_version, true)" in _catch,
+       "a lost reply still follows the update, so the plugin is reloaded rather than Steam restarted")
+    ok("current = null;" in _uw[_uw.index('if (progress.phase === "failed" || progress.phase === "done") {'):],
+       "a finished update's result is told once, not replayed to every panel opened later")
+
+    class Busy(m.Plugin):
+        def __init__(self): super().__init__(); self.checked = 0
+        def _update_running(self): return True
+        async def check_for_update(self):
+            self.checked += 1; return {"success": True, "update_available": True, "latest_version": "9.9.9"}
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _b = Busy()
+    ok(asyncio.run(_b.update_notice()) == {"notify": False} and _b.checked == 0,
+       "no update notice while an update installs")
+    _r = asyncio.run(_b.reset_settings())
+    ok(_r.get("success") is False and os.path.exists(m.SETTINGS_FILE),
+       f"reset waits for an update to finish instead of being cut off by its reload ({_r.get('message')!r})")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
