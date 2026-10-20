@@ -327,6 +327,79 @@ r._reach_checked_at = time.monotonic() - (m.Plugin._DUPLICATE_CHECK_SECONDS + 1)
 r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
 ok(r._wpa2_blocked is None, "and past it the finding is re-read, so it clears when the radio goes")
 
+# A BSSID pin stops background scans, so the cached list keeps the other
+# access points at what they read when the pin was set.
+class PinnedReach(Reach):
+    def __init__(self, km, aps, stream=False):
+        super().__init__(km, aps); self.scans = []; self.reads = 0; self.stream = stream
+    def _visible_access_points(self, iface, ssid, rescan=False, cached_only=False):
+        self.reads += 1; return super()._visible_access_points(iface, ssid, rescan, cached_only)
+    def _run_cmd(self, cmd, timeout=5):
+        if "rescan" in cmd: self.scans.append(list(cmd))
+        return {"success": True, "stdout": "", "stderr": "", "returncode": 0}
+    def _stream_running(self, settings): return self.stream
+
+ON = "62:e9:31:0d:1f:e7"
+PIN = "62:E9:31:0D:1F:E7"
+def reach_later(r, back):
+    # Every remembered time moved `back` seconds into the past, relative to
+    # now and never zero (the monotonic clock starts at boot).
+    for name in ("_reach_checked_at", "_lock_scan_at"):
+        if getattr(r, name, None) is not None:
+            setattr(r, name, getattr(r, name) - back)
+    for name in ("_reach_scan_used", "_lock_scan_used"):
+        if getattr(r, name, None) is not None:
+            setattr(r, name, getattr(r, name) - back)
+
+r = PinnedReach("sae", JASONS_ROOM)
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(r.scans == [["/usr/bin/nmcli", "dev", "wifi", "rescan", "ifname", "wlan0"]] and r.reads == 0
+   and r._wpa2_blocked is None,
+   "pinned: a scan is asked for and nothing is judged on the stale list")
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(len(r.scans) == 1 and r.reads == 0, "and the next poll, before it can land, neither scans again nor reads")
+reach_later(r, m.Plugin._LOCK_SCAN_SETTLE_SECONDS + 3)
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(r.reads == 1 and r._wpa2_blocked == {"signal": 100, "current_signal": 52} and len(r.scans) == 1,
+   "once the scan has landed it is read, and the finding made from it")
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(r.reads == 1, "then the usual five-minute throttle applies")
+reach_later(r, m.Plugin._DUPLICATE_CHECK_SECONDS + 1)
+r.aps = []
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(len(r.scans) == 2 and r.reads == 1 and r._wpa2_blocked is not None,
+   "when due again it asks for a new scan and keeps its finding until that lands")
+reach_later(r, m.Plugin._LOCK_SCAN_SETTLE_SECONDS + 3)
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(r.reads == 2 and r._wpa2_blocked is None, "and a fresh list without the radio clears it")
+
+r = PinnedReach("wpa-psk", JASONS_ROOM)
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(not r.scans and r._wpa2_blocked is None, "a profile that allows WPA2 never costs a scan")
+r = PinnedReach("sae", JASONS_ROOM, stream=True)
+for _ in range(3):
+    r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+    reach_later(r, m.Plugin._LOCK_SCAN_SETTLE_SECONDS + 3)
+ok(not r.scans and r.reads == 0 and r._wpa2_blocked is None,
+   "during a stream nothing is scanned and nothing judged")
+r = PinnedReach("sae", JASONS_ROOM)
+r._lock_scan_at = time.monotonic() - (m.Plugin._LOCK_SCAN_SETTLE_SECONDS + 3)
+r._lock_scan_used = r._lock_scan_at
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+ok(not r.scans and r.reads == 1 and r._wpa2_blocked is not None,
+   "a scan the lock's own check asked for, and already read, is shared rather than repeated")
+ok(r._lock_scan_used == r._lock_scan_at, "and reading it here does not use up the lock's read")
+r = PinnedReach("sae", JASONS_ROOM)
+r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, "")
+ok(not r.scans and r.reads == 1 and r._wpa2_blocked is not None,
+   "with no pin the cached list is current and read at once, as before")
+r._recheck_security_reach("other-uuid", "wlan0", "Home", ON, {}, PIN)
+ok(r._wpa2_blocked is None, "a different profile does not inherit the finding while it waits for a scan")
+_src = open("main.py").read()
+ok('live.get("connected_bssid", ""),\n                                     settings, live.get("bssid_lock", ""))' in _src
+   and 'self._report_network_problems(status, uuid, iface, active_ssid() or "", settings)' in _src,
+   "the status poll hands the check the profile's pin and the settings")
+
 class Allow(m.Plugin):
     """Profile security as NetworkManager holds it, and whether a reconnect takes."""
     def __init__(self, km="sae", connects=True, lock=False):
@@ -5067,8 +5140,10 @@ try:
         return r
 
     _real_keys = m.TRUSTED_RELEASE_KEYS
+    _real_delay = m.RELEASE_FETCH_RETRY_DELAY
     try:
         m.TRUSTED_RELEASE_KEYS = (_test_key,)
+        m.RELEASE_FETCH_RETRY_DELAY = 0
         _rel_ok = Release(_files())
         _r = _apply(_rel_ok)
         _argv = _rel_ok.launched[0] if _rel_ok.launched else []
@@ -5151,6 +5226,57 @@ try:
         ok(_r.get("success") is False and not _rel.launched and not _rel.cmds,
            "a version that is not one is refused before anything is fetched")
 
+        # A slow first connection to GitHub made a real update fail once
+        # (connect timeout 5 s, no second try). Each try now waits as long
+        # as the payload download does, and a network error gets one more.
+        _sig_url = f"{_DL}/v{_VER}/SHA256SUMS.minisig"
+        ok(all(c[c.index("--connect-timeout") + 1] == "15" and int(c[c.index("--max-time") + 1]) <= 60
+               for c in _gets),
+           "each fetch waits 15 s to connect, like the payload download, and at most a minute in all")
+
+        class Flaky(Release):
+            """GitHub's download host failing the first tries of some files."""
+            def __init__(self, files, fails):
+                super().__init__(files); self.fails = dict(fails)
+            def _run_cmd(self, cmd, timeout=5):
+                left = self.fails.get(cmd[-1])
+                if left:
+                    self.fails[cmd[-1]] = (left[0] - 1, left[1])
+                    if left[0] > 0:
+                        self.cmds.append(cmd)
+                        return left[1]
+                return super()._run_cmd(cmd, timeout)
+
+        _timed_out = {"success": False, "stdout": "000", "returncode": 28,
+                      "stderr": "curl: (28) Connection timed out after 15001 milliseconds"}
+        _rel = Flaky(_files(), {_sig_url: (1, _timed_out)})
+        _r = _apply(_rel)
+        ok(_r.get("success") is True and [c[-1] for c in _rel.cmds].count(_sig_url) == 2,
+           f"a connect timeout on the signature is tried once more, and the update goes ahead ({_r})")
+        _rel = Flaky(_files(), {_sig_url: (5, _timed_out)})
+        _r = _apply(_rel)
+        ok(_r.get("message") == "Couldn't download the release's signature. Try again later."
+           and [c[-1] for c in _rel.cmds].count(_sig_url) == 2 and not _rel.launched,
+           "but only once: a host still unreachable is refused after the second try")
+        for _what, _fail in [
+            ("a 404, which means the release is unsigned", {"success": False, "stdout": "404", "returncode": 22, "stderr": ""}),
+            ("a server error", {"success": False, "stdout": "500", "returncode": 22, "stderr": ""}),
+            ("a file over the size cap", {"success": False, "stdout": "200", "returncode": 63, "stderr": ""}),
+        ]:
+            _rel = Flaky(_files(), {_sig_url: (5, _fail)})
+            _r = _apply(_rel)
+            ok(_r.get("success") is False and [c[-1] for c in _rel.cmds].count(_sig_url) == 1
+               and not _rel.launched, f"{_what}: not tried again ({_r.get('message')!r})")
+        _rel = Flaky(_files(), {_sig_url: (5, _timed_out)})
+        _got = _rel._fetch_release_file(_sig_url, m.RELEASE_SIG_MAX, time.monotonic() + 5)
+        _c = _rel.cmds[0] if _rel.cmds else []
+        ok(_got == {"data": None, "missing": False} and len(_rel.cmds) == 1
+           and _c[_c.index("--max-time") + 1] == "10",
+           "with the budget nearly spent there is no second try, and the last one still gets 10 s")
+        _ui_ms = int(re.search(r"UPDATE_TIMEOUT_MS = (\d+) \* (\d+) \* (\d+);", _tsx).group(1)) * 60 * 1000
+        ok(m.RELEASE_FETCH_BUDGET + 10 + 15 <= _ui_ms / 1000 / 2,
+           f"the whole signature step ({m.RELEASE_FETCH_BUDGET} s + a last try) fits in half the panel's timeout")
+
         m.TRUSTED_RELEASE_KEYS = ()
         _rel = Release(_files())
         _r = _apply(_rel)
@@ -5158,6 +5284,7 @@ try:
            "with no key pinned, even a well-formed release is refused: the updater fails closed")
     finally:
         m.TRUSTED_RELEASE_KEYS = _real_keys
+        m.RELEASE_FETCH_RETRY_DELAY = _real_delay
     _rel = Release(_files())
     _r = _apply(_rel)
     ok(_r.get("success") is False and not _rel.launched,

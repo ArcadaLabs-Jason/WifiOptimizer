@@ -814,6 +814,17 @@ TRUSTED_RELEASE_KEYS = (
 RELEASE_SIG_MAX = 4096
 RELEASE_SUMS_MAX = 65536
 
+# Fetching the two signature files. A slow first connection to GitHub's
+# download host is common, so each try gets the same connect timeout as the
+# payload download and one more try after a network error. The budget covers
+# both files and every try, well inside the panel's own update timeout.
+RELEASE_FETCH_BUDGET = 110
+RELEASE_FETCH_TRY_MAX = 60
+RELEASE_FETCH_RETRY_DELAY = 2
+# curl: could not resolve, could not connect, timed out, TLS handshake
+# failed, connection reset while receiving.
+RELEASE_FETCH_NETWORK_RC = (6, 7, 28, 35, 56)
+
 # Ed25519 per RFC 8032. Verification only: releases are signed elsewhere.
 _ED_P = 2 ** 255 - 19
 _ED_L = 2 ** 252 + 27742317777372353535851937790883648493
@@ -4477,7 +4488,7 @@ class Plugin:
     # NetworkManager reports a clash both ways, and on the night this was
     # measured one of two clashes appeared only as the DHCP form.
     def _report_network_problems(self, status: dict, uuid: str, iface: str,
-                                 ssid: str):
+                                 ssid: str, settings: dict):
         """Problems with the network itself, not with any setting of ours.
 
         Each is checked on its own throttle and only reported; nothing here
@@ -4487,7 +4498,8 @@ class Plugin:
         self._recheck_address_conflict(live.get("ip_address", ""))
         if getattr(self, "_address_conflict", None):
             status["address_conflict"] = dict(self._address_conflict)
-        self._recheck_security_reach(uuid, iface, ssid, live.get("connected_bssid", ""))
+        self._recheck_security_reach(uuid, iface, ssid, live.get("connected_bssid", ""),
+                                     settings, live.get("bssid_lock", ""))
         if getattr(self, "_wpa2_blocked", None):
             status["wpa2_only_stronger"] = dict(self._wpa2_blocked)
 
@@ -4611,7 +4623,8 @@ class Plugin:
             status["drift"]["dns"] = True
 
     def _recheck_security_reach(self, uuid: str, iface: str, ssid: str,
-                                current_bssid: str):
+                                current_bssid: str, settings: dict | None = None,
+                                pinned: str = ""):
         """Notice a stronger access point the saved security cannot use.
 
         A profile saved as WPA3-only cannot join an access point of the same
@@ -4623,7 +4636,12 @@ class Plugin:
 
         Reported only past the same margin the lock uses to move, so a
         roughly equal access point is not worth a notice. Reads nmcli's
-        cached scan on the duplicate check's throttle, so it adds no scans.
+        cached scan on the duplicate check's throttle. With no BSSID pinned
+        that adds no scans, since background scans keep the list current.
+        A pin (pinned, the profile's BSSID) stops those scans and leaves the
+        other access points at whatever they read when it was set, so then
+        the check waits for a fresh list (_lock_scan_is_fresh), keeping its
+        last finding meanwhile.
         """
         now = time.monotonic()
         if (
@@ -4632,11 +4650,24 @@ class Plugin:
             and getattr(self, "_reach_checked_for", None) == uuid
         ):
             return
-        self._reach_checked_at = now
-        self._reach_checked_for = uuid
-        self._wpa2_blocked = None
+        if getattr(self, "_reach_checked_for", None) != uuid:
+            # Nothing found for another profile applies to this one.
+            self._wpa2_blocked = None
+            self._reach_checked_for = uuid
+        # Checked before any scan is asked for: a profile that already
+        # allows WPA2 has nothing to find.
         if self._profile_key_mgmt(uuid) != "sae" or not ssid:
+            self._reach_checked_at = now
+            self._wpa2_blocked = None
             return
+        if pinned and not self._lock_scan_is_fresh(settings or {}, iface, now,
+                                                   "_reach_scan_used"):
+            # Look again once a scan asked for now has had time to land.
+            self._reach_checked_at = (now - self._DUPLICATE_CHECK_SECONDS
+                                      + self._LOCK_SCAN_SETTLE_SECONDS + 2)
+            return
+        self._reach_checked_at = now
+        self._wpa2_blocked = None
         # The cached list: this runs inside the status poll, and letting nmcli
         # decide to rescan there held the poll for seconds.
         aps = self._visible_access_points(iface, ssid, cached_only=True)
@@ -4749,15 +4780,18 @@ class Plugin:
         if now - since >= self._LOCK_WEAKER_CHECK_SECONDS:
             self._lock_weaker = {"signal": better[0][1], "current_signal": here}
 
-    def _lock_scan_is_fresh(self, settings: dict, iface: str, now: float) -> bool:
+    def _lock_scan_is_fresh(self, settings: dict, iface: str, now: float,
+                            used: str = "_lock_scan_used") -> bool:
         """Whether nmcli's cached list is fresh enough to judge the lock on.
 
         Asks for a scan when one is due, and then says no: the answer takes a
         few seconds to land (_LOCK_SCAN_SETTLE_SECONDS), and asking returns at
         once rather than holding the poll. A read counts once it is past that
         and before the next scan is due, and only one read per scan counts,
-        since two reads of one scan are one sample. Under a stream no scan is
-        asked for, so nothing is fresh and nothing new is said until it ends.
+        since two reads of one scan are one sample. Each check keeps its own
+        record of that (used) and they share the scans, so a second check
+        never adds one. Under a stream no scan is asked for, so nothing is
+        fresh and nothing new is said until it ends.
         """
         asked = getattr(self, "_lock_scan_at", None)
         if asked is None or now - asked >= self._LOCK_SCAN_SECONDS:
@@ -4773,9 +4807,9 @@ class Plugin:
             return False
         if now - asked < self._LOCK_SCAN_SETTLE_SECONDS:
             return False
-        if getattr(self, "_lock_scan_used", None) == asked:
+        if getattr(self, used, None) == asked:
             return False
-        self._lock_scan_used = asked
+        setattr(self, used, asked)
         return True
 
     def _stream_running(self, settings: dict) -> bool:
@@ -5225,7 +5259,7 @@ class Plugin:
             self._recheck_rival_profiles(settings, uuid, active_ssid, actions)
             if getattr(self, "_dup_conflict", False):
                 status["external"]["duplicate_profiles"] = True
-            self._report_network_problems(status, uuid, iface, active_ssid() or "")
+            self._report_network_problems(status, uuid, iface, active_ssid() or "", settings)
             self._report_lock_weaker(settings, status, uuid, iface,
                                      active_ssid() or "", link_out)
             actions.extend(
@@ -7315,33 +7349,44 @@ class Plugin:
                 "message": "Couldn't check for updates.",
             }
 
-    def _fetch_release_file(self, url: str, limit: int) -> dict:
+    def _fetch_release_file(self, url: str, limit: int, deadline: float) -> dict:
         """Download one small release file into memory.
 
         {"data": bytes or None, "missing": bool}. missing means GitHub
-        answered 404: the release has no such file. curl writes to a private
-        file rather than to its output, because the signature covers these
-        exact bytes and _run_cmd decodes and strips what it captures.
+        answered 404: the release has no such file, so it is never retried.
+        A network error is tried once more if deadline (time.monotonic())
+        leaves room. curl writes to a private file rather than to its output,
+        because the signature covers these exact bytes and _run_cmd decodes
+        and strips what it captures.
         """
         directory = tempfile.mkdtemp(prefix="wifi-optimizer-release-")
         path = os.path.join(directory, "file")
         try:
             os.chmod(directory, 0o700)
-            result = self._run_cmd(
-                [
-                    "/usr/bin/curl", "-sSL", "--fail", "--proto", "=https", "--tlsv1.2",
-                    "--connect-timeout", "5", "--max-time", "15", "--max-filesize", str(limit),
-                    "-w", "%{http_code}", "-o", path, url,
-                ],
-                20,
-            )
-            if not result["success"]:
-                missing = result.get("stdout", "").strip() == "404"
-                decky.logger.error(
-                    f"Release file {url} not downloaded: rc={result.get('returncode')}, "
-                    f"http={result.get('stdout', '')[:8]!r}, {result.get('stderr', '')[:200]}"
+            for attempt in (1, 2):
+                left = int(deadline - time.monotonic())
+                limit_s = max(10, min(RELEASE_FETCH_TRY_MAX, left))
+                result = self._run_cmd(
+                    [
+                        "/usr/bin/curl", "-sSL", "--fail", "--proto", "=https", "--tlsv1.2",
+                        "--connect-timeout", "15", "--max-time", str(limit_s),
+                        "--max-filesize", str(limit), "-w", "%{http_code}", "-o", path, url,
+                    ],
+                    limit_s + 5,
                 )
-                return {"data": None, "missing": missing}
+                if result["success"]:
+                    break
+                http = result.get("stdout", "").strip()
+                decky.logger.error(
+                    f"Release file {url} not downloaded (try {attempt}): rc={result.get('returncode')}, "
+                    f"http={http[:8]!r}, {result.get('stderr', '')[:200]}"
+                )
+                if http == "404":
+                    return {"data": None, "missing": True}
+                network = http == "000" or result.get("returncode") in RELEASE_FETCH_NETWORK_RC
+                if attempt == 2 or not network or deadline - time.monotonic() < 20:
+                    return {"data": None, "missing": False}
+                time.sleep(RELEASE_FETCH_RETRY_DELAY)
             with open(path, "rb") as f:
                 data = f.read(limit + 1)
             if len(data) > limit:
@@ -7373,8 +7418,9 @@ class Plugin:
         if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
             return refuse("Received an unexpected version from GitHub.", f"version {version!r}")
         base = f"{RELEASE_DOWNLOAD}/v{version}"
-        sums = await asyncio.to_thread(self._fetch_release_file, f"{base}/SHA256SUMS", RELEASE_SUMS_MAX)
-        sig = await asyncio.to_thread(self._fetch_release_file, f"{base}/SHA256SUMS.minisig", RELEASE_SIG_MAX)
+        deadline = time.monotonic() + RELEASE_FETCH_BUDGET
+        sums = await asyncio.to_thread(self._fetch_release_file, f"{base}/SHA256SUMS", RELEASE_SUMS_MAX, deadline)
+        sig = await asyncio.to_thread(self._fetch_release_file, f"{base}/SHA256SUMS.minisig", RELEASE_SIG_MAX, deadline)
         if sums["missing"] or sig["missing"]:
             return refuse("This release isn't signed, so it wasn't installed.", "no signature files")
         if sums["data"] is None or sig["data"] is None:
