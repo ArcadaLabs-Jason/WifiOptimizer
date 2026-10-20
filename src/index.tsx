@@ -431,7 +431,11 @@ function Content() {
         if (progress?.phase === "failed") {
           setUpdating(false);
           setUpdateError("The update didn't finish. Try again, or check the plugin log.");
-        } else if (progress && progress.phase !== "done") {
+        } else if (progress?.phase === "done") {
+          // Seen by a panel left open across the reload; the new copy of the
+          // plugin is the one running now.
+          setUpdating(false);
+        } else if (progress) {
           setUpdating(true);
         }
       }),

@@ -3080,7 +3080,7 @@ try:
     ok("disposeUpdateWatch()" in _idx[_idx.index("onDismount()"):],
        "the panel's subscriptions go when Decky dismounts the plugin")
     _dispose = _watch[_watch.index("export function disposeUpdateWatch"):]
-    ok("stop()" not in _dispose and "disposed" not in _watch,
+    ok("stop()" not in _dispose and "disposed" not in _watch and "if (!timer)" in _dispose,
        "but a watch in progress carries on: the panel left on screen after a reload may be the one the user pressed")
     ok('progress.phase === "swapped" && progress.running_version !== target' in _watch
        and "shared().reloadAsked === version" in _watch,
@@ -3994,6 +3994,79 @@ try:
     finally:
         m.NM_CONF_PATH, m.MODPROBE_CONF_PATH = _real_nm, _real_mp
         _flags()
+
+    # Review round fixes.
+    _rv = m.WIFI_BACKEND_CONF
+    _real_nm2, _real_mp2 = m.NM_CONF_PATH, m.MODPROBE_CONF_PATH
+    try:
+        m.WIFI_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "99-valve-wifi-backend.conf")
+        m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+        m.MODPROBE_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+        open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=wpa_supplicant\n")
+        open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        m._save_settings({**m.DEFAULT_SETTINGS, "valve_powersave_before": "2"})
+        class RealValve(Cmds):
+            def _valve_powersave(self): return m.Plugin._valve_powersave(self)
+        c = RealValve(); c._drop_persistent_power_save()
+        ok(["/usr/bin/nmcli", "general", "reload", "conf"] in c.cmds,
+           "NetworkManager reads its config again once our file is gone, or it holds power save off until reboot")
+        ok(m._load_settings()["valve_powersave_before"] == "2",
+           "Steam's own power management setting stays recorded as the user's")
+        m.Plugin()._release_valve_powersave(m._load_settings())
+        ok(m.Plugin()._valve_powersave() == "2", "so a later Reset or uninstall leaves it alone")
+        c = RealValve(); c._drop_persistent_power_save()
+        ok(["/usr/bin/nmcli", "general", "reload", "conf"] not in c.cmds,
+           "and nothing is reloaded when there was no file of ours to remove")
+    finally:
+        m.WIFI_BACKEND_CONF, m.NM_CONF_PATH, m.MODPROBE_CONF_PATH = _rv, _real_nm2, _real_mp2
+
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "cake_enabled": True}); _flags()
+    c = Cmds(); st_ = {"drift": {"cake": True}, "live": {}}
+    c._apply_cake({"iface": "wlan0"}, m._load_settings(), st_, {})
+    ok(not any(cmd[:2] == ["/usr/bin/tc", "qdisc"] for cmd in c.cmds),
+       "a CAKE reassertion proposed before auto mode came on does not put CAKE back while paused")
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "cake_enabled": True,
+                      "buffer_tuning_enabled": True})
+    c = Cmds(); asyncio.run(c.set_buffer_tuning(False))
+    ok(["/usr/bin/ip", "link", "set", "wlan0", "txqueuelen", "1000"] in c.cmds,
+       "turning buffer tuning off while CAKE is paused leaves the queue length at the default")
+    c = Cmds(); asyncio.run(c.set_cake(False))
+    ok(["/usr/bin/ip", "link", "set", "wlan0", "txqueuelen", "1000"] in c.cmds,
+       "and turning CAKE off while tuning is paused does too")
+
+    class Aspm(Cmds):
+        def __init__(self):
+            super().__init__(); self.record = []
+        def _apply_pcie_aspm_fix(self, enable, record_all=False):
+            self.record.append(record_all); return []
+    _flags(flag=True)
+    a = Aspm(); asyncio.run(a.set_power_save(True))
+    ok(a.record == [False], "fixes already on are not read as the system's own PCIe values")
+    a = Aspm(); a._gate_opening = True; asyncio.run(a.set_power_save(True))
+    ok(a.record == [True], "only fixes coming on from off are")
+
+    st = Stream(None); m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True}); _flags(flag=True)
+    st._stream_misses = 0
+    asyncio.run(st.poke_detection())
+    ok(os.path.exists(m.STREAM_FLAG_FILE) and st.reverted == 0,
+       "a poke from Steam counts as one look, so a stream app restarting does not flap the fixes")
+    st._stream_match = {"app": "Moonlight", "process": "moonlight"}; st._stream_misses = 0
+    asyncio.run(st._stream_pass())
+    ok(st._streaming_live(m._load_settings()).get("streaming_app") == "Moonlight",
+       "and the panel keeps naming the stream until the fixes actually come off")
+    _flags()
+
+    async def _toggle_waits():
+        sw = Stream(None); m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True})
+        lock = sw._stream_guard(); await lock.acquire()
+        t = asyncio.ensure_future(sw.set_streaming_mode(False))
+        await asyncio.sleep(0.05)
+        before_release = m._load_settings()["streaming_mode_enabled"]
+        lock.release(); await t
+        return before_release, m._load_settings()["streaming_mode_enabled"]
+    _b, _a = asyncio.run(_toggle_waits())
+    ok(_b is True and _a is False,
+       "turning auto mode off waits for a pass that is applying or taking off the fixes")
 
     # Startup: a reload mid-stream keeps the fixes on.
     m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True}); _flags(flag=True)

@@ -2361,7 +2361,10 @@ class Plugin:
         Returning early leaves the action undone and the next poll free to
         propose it again.
         """
-        if not settings.get("cake_enabled"):
+        # The gate is checked again here, against settings read now: the poll
+        # that proposed this may have started before auto mode was turned on,
+        # and putting CAKE back then leaves it on with the panel saying paused.
+        if not settings.get("cake_enabled") or not self._volatile_gate_open(settings):
             status["drift"].pop("cake", None)
             return
         # This runs on the event loop, and a kernel without sch_cake
@@ -4520,13 +4523,18 @@ class Plugin:
             elif not disabled:
                 try:
                     os.remove(NM_CONF_PATH)
+                    self._reload_nm_conf()
                 except FileNotFoundError:
                     pass
                 self._release_valve_powersave(_load_settings())
                 before = "?"
 
             self._apply_driver_fixes(disabled, persist=not auto)
-            not_applied = self._apply_pcie_aspm_fix(disabled, record_all=auto)
+            # Only when auto mode is putting the fixes on from off. Any other
+            # call finds them already on, and would record our own values.
+            not_applied = self._apply_pcie_aspm_fix(
+                disabled, record_all=auto and getattr(self, "_gate_opening", False)
+            )
 
             # Save settings only after success
             settings = _load_settings()
@@ -5443,7 +5451,8 @@ class Plugin:
             # TX queue length (CAKE needs 256; defer to it if active)
             iface = self._get_wifi_interface()
             if iface:
-                if settings.get("cake_enabled"):
+                # CAKE paused by auto mode is not on the interface to defer to.
+                if settings.get("cake_enabled") and self._volatile_gate_open(settings):
                     txq = "256"
                 else:
                     txq = "2000" if enabled else "1000"
@@ -5520,7 +5529,8 @@ class Plugin:
                         }
                 # Restore txqueuelen based on whether buffer tuning is active
                 settings = _load_settings()
-                txq = "2000" if settings.get("buffer_tuning_enabled") else "1000"
+                tuned = settings.get("buffer_tuning_enabled") and self._volatile_gate_open(settings)
+                txq = "2000" if tuned else "1000"
                 self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", txq])
                 decky.logger.info(f"CAKE disabled on {iface}")
 
@@ -5988,33 +5998,49 @@ class Plugin:
         settle skips the wait before taking them off, for when the panel
         knows something just exited or the user changed what is watched.
         """
+        async with self._stream_guard():
+            await self._stream_pass_locked(settle)
+
+    def _stream_guard(self) -> asyncio.Lock:
+        """Held for every change to whether the fixes are on, so a pass and a
+        toggle never apply and take off the fixes at the same time."""
         if getattr(self, "_stream_lock", None) is None:
             self._stream_lock = asyncio.Lock()
-        async with self._stream_lock:
-            settings = _load_settings()
-            if not settings.get("streaming_mode_enabled"):
-                return
-            found = await asyncio.to_thread(self._find_stream, self._stream_patterns(settings))
-            held = os.path.isfile(STREAM_HOLD_FILE)
-            was_open = os.path.isfile(STREAM_FLAG_FILE)
+        return self._stream_lock
+
+    async def _stream_pass_locked(self, settle: bool = False):
+        settings = _load_settings()
+        if not settings.get("streaming_mode_enabled"):
+            return
+        found = await asyncio.to_thread(self._find_stream, self._stream_patterns(settings))
+        held = os.path.isfile(STREAM_HOLD_FILE)
+        was_open = os.path.isfile(STREAM_FLAG_FILE)
+        if found or held:
             self._stream_match = found
-            if found or held:
-                self._stream_misses = 0
-                want = True
-            else:
-                self._stream_misses = getattr(self, "_stream_misses", 0) + 1
-                want = (was_open and not settle
-                        and self._stream_misses < STREAM_MISSES_TO_CLOSE)
-            if want == was_open:
-                return
-            self._set_stream_flag(want)
-            if want:
-                why = f"{found['app']} ({found['process']})" if found else "held on"
-                decky.logger.info(f"Streaming auto mode: {why}, applying the fixes")
+            self._stream_misses = 0
+            want = True
+        else:
+            self._stream_misses = getattr(self, "_stream_misses", 0) + 1
+            want = (was_open and not settle
+                    and self._stream_misses < STREAM_MISSES_TO_CLOSE)
+        if not want:
+            # Kept through the countdown above, so the panel goes on naming
+            # the stream until the fixes actually come off.
+            self._stream_match = None
+        if want == was_open:
+            return
+        self._set_stream_flag(want)
+        if want:
+            why = f"{found['app']} ({found['process']})" if found else "held on"
+            decky.logger.info(f"Streaming auto mode: {why}, applying the fixes")
+            self._gate_opening = True
+            try:
                 await self.reapply_volatile()
-            else:
-                decky.logger.info("Streaming auto mode: no stream running, fixes off")
-                await asyncio.to_thread(self._revert_volatile_fixes, settings)
+            finally:
+                self._gate_opening = False
+        else:
+            decky.logger.info("Streaming auto mode: no stream running, fixes off")
+            await asyncio.to_thread(self._revert_volatile_fixes, settings)
 
     async def _streaming_watch(self):
         """Look every few seconds for as long as auto mode is on."""
@@ -6038,15 +6064,37 @@ class Plugin:
         NetworkManager's file holds it off on every connect and the modprobe
         options at every module load, both whether or not anything streams.
         """
+        had_conf = os.path.exists(NM_CONF_PATH)
         for path in (NM_CONF_PATH, MODPROBE_CONF_PATH):
             try:
                 os.remove(path)
             except FileNotFoundError:
                 pass
+        if had_conf:
+            self._reload_nm_conf()
         settings = _load_settings()
         self._release_valve_powersave(settings)
-        settings["valve_powersave_before"] = "?"
+        # With our file gone nothing of ours can reach Valve's any more, so
+        # what it says now is the user's own (Steam's Wi-Fi power management
+        # setting). Recorded, so a later Reset or uninstall leaves it alone
+        # rather than taking an unrecorded 2 for ours.
+        found = self._valve_powersave()
+        settings["valve_powersave_before"] = (
+            "" if found is None else found if found in _VALVE_POWERSAVE_VALUES else "?"
+        )
         _save_settings(settings)
+
+    def _reload_nm_conf(self):
+        """Have NetworkManager read its config files again.
+
+        It reads them at startup and keeps them, so a file of ours removed
+        mid-boot would otherwise go on holding power save off at every
+        reconnect until the next reboot. Reloading the config leaves
+        connections alone.
+        """
+        result = self._run_cmd(["/usr/bin/nmcli", "general", "reload", "conf"], timeout=10)
+        if not result["success"]:
+            decky.logger.info(f"nmcli general reload conf: {result['stderr'][:120]}")
 
     async def _startup_streaming(self, settings: dict):
         """Pick auto mode up where it was, before the startup apply runs.
@@ -6082,26 +6130,28 @@ class Plugin:
         try:
             if self._profile_change_in_flight() or self._update_running():
                 return dict(self._BUSY_RESULT)
-            settings = _load_settings()
-            settings["streaming_mode_enabled"] = bool(enabled)
-            _save_settings_with_timestamp(settings)
+            # Taken first, so a pass already applying or taking off the fixes
+            # (in a worker thread, which cancelling would not stop) finishes
+            # before this changes anything. The watch then ends on its own.
+            async with self._stream_guard():
+                settings = _load_settings()
+                settings["streaming_mode_enabled"] = bool(enabled)
+                _save_settings_with_timestamp(settings)
+                if enabled:
+                    await asyncio.to_thread(self._drop_persistent_power_save)
+                    # Until now the fixes applied all the time, so they are
+                    # on. A settled pass takes them off unless a stream runs.
+                    self._set_stream_flag(True)
+                    self._stream_misses = 0
+                    await self._stream_pass_locked(settle=True)
+                else:
+                    for path in (STREAM_FLAG_FILE, STREAM_HOLD_FILE):
+                        self._set_stream_flag(False, path)
+                    self._stream_match = None
+                    # Back to all the time, NetworkManager's file included.
+                    await self.reapply_volatile()
             if enabled:
-                await asyncio.to_thread(self._drop_persistent_power_save)
-                # Until now the fixes applied all the time, so they are on.
-                # One settled pass takes them off unless a stream is running.
-                self._set_stream_flag(True)
-                self._stream_misses = 0
-                await self._stream_pass(settle=True)
                 self._start_streaming_watch()
-            else:
-                task = getattr(self, "_stream_task", None)
-                if task and not task.done():
-                    task.cancel()
-                for path in (STREAM_FLAG_FILE, STREAM_HOLD_FILE):
-                    self._set_stream_flag(False, path)
-                self._stream_match = None
-                # Back to all the time, NetworkManager's file included.
-                await self.reapply_volatile()
             decky.logger.info(f"Streaming auto mode {'on' if enabled else 'off'}")
             return {"success": True, "streaming_mode": bool(enabled)}
         except Exception as e:
@@ -6171,9 +6221,14 @@ class Plugin:
             return {"success": False, "apps": []}
 
     async def poke_detection(self) -> dict:
-        """Look now. The panel calls this when Steam starts or stops a game."""
+        """Look now. The panel calls this when Steam starts or stops a game.
+
+        Counted as an ordinary pass: the panel pokes again a few seconds
+        later, so a stream app that is restarting is seen again before its
+        fixes would come off.
+        """
         try:
-            await self._stream_pass(settle=True)
+            await self._stream_pass()
             return {"success": True}
         except Exception as e:
             decky.logger.error(f"poke_detection error: {e}")

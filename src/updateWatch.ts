@@ -150,8 +150,10 @@ export async function checkUpdateOnLoad() {
   }
 }
 
-// When Decky dismounts this copy. The panel's subscriptions go; a watch in
-// progress does not (see the top of this file), and stops by itself.
+// When Decky dismounts this copy. Nothing is stopped: a watch in progress
+// stops by itself (see the top of this file), and a panel still on screen
+// keeps its subscription until it unmounts, so it hears how the update ended
+// instead of waiting out its timeout and calling a finished update failed.
 export function disposeUpdateWatch() {
-  listeners.clear();
+  if (!timer) listeners.clear();
 }

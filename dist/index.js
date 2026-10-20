@@ -713,10 +713,13 @@ async function checkUpdateOnLoad() {
         // Nothing to pick up or announce.
     }
 }
-// When Decky dismounts this copy. The panel's subscriptions go; a watch in
-// progress does not (see the top of this file), and stops by itself.
+// When Decky dismounts this copy. Nothing is stopped: a watch in progress
+// stops by itself (see the top of this file), and a panel still on screen
+// keeps its subscription until it unmounts, so it hears how the update ended
+// instead of waiting out its timeout and calling a finished update failed.
 function disposeUpdateWatch() {
-    listeners.clear();
+    if (!timer)
+        listeners.clear();
 }
 
 const REFRESH_INTERVAL = 3000;
@@ -1070,7 +1073,12 @@ function Content() {
             setUpdating(false);
             setUpdateError("The update didn't finish. Try again, or check the plugin log.");
         }
-        else if (progress && progress.phase !== "done") {
+        else if (progress?.phase === "done") {
+            // Seen by a panel left open across the reload; the new copy of the
+            // plugin is the one running now.
+            setUpdating(false);
+        }
+        else if (progress) {
             setUpdating(true);
         }
     }), []);
