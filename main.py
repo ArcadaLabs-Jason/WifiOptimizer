@@ -157,6 +157,22 @@ ENFORCED_FILE = "/run/wifi-optimizer/last_enforced"
 # use. Digits and dots, with an optional alphanumeric prerelease suffix.
 VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}(-[A-Za-z0-9.]+)?\Z")
 
+# How far the update script has got, as "<phase> <version>". In /run for the
+# same reason as ENFORCED_FILE: the panel acts on what it says, so only root
+# may write it.
+UPDATE_STATE_FILE = "/run/wifi-optimizer/update-state"
+UPDATE_PHASES = ("downloading", "installing", "swapped", "loaded",
+                 "restarting", "done", "failed")
+# Phases a script that is still running reports. Older than the script's own
+# time limit, they are left over from one that was killed.
+UPDATE_ACTIVE_PHASES = ("downloading", "installing", "swapped", "loaded", "restarting")
+UPDATE_STATE_MAX_AGE = 900
+
+# Starts the update script in a unit of its own, outside plugin_loader's. A
+# Decky that stops its whole control group on restart (Decky PR #955 drops
+# KillMode=process) would otherwise kill the script part way through.
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+
 # Interface names are used to build sysfs paths. Kernel names cannot contain a
 # separator, but the value is checked rather than assumed.
 IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z")
@@ -394,6 +410,42 @@ def _read_small_int(path: str) -> int:
         os.close(fd)
 
 
+def _read_update_state() -> tuple[str, str, float]:
+    """(phase, version, age in seconds) from the update script, or ("", "", 0).
+
+    Read the way _read_small_int reads, and only a phase and version that
+    look like ones the script writes are believed.
+    """
+    try:
+        fd = os.open(UPDATE_STATE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return "", "", 0
+    try:
+        st = os.fstat(fd)
+        if not _is_regular(st.st_mode):
+            return "", "", 0
+        parts = os.read(fd, 128).decode("ascii", "replace").split()
+    except OSError:
+        return "", "", 0
+    finally:
+        os.close(fd)
+    if len(parts) != 2 or parts[0] not in UPDATE_PHASES or not VERSION_RE.match(parts[1]):
+        return "", "", 0
+    return parts[0], parts[1], max(0.0, time.time() - st.st_mtime)
+
+
+def _write_update_state(phase: str, version: str) -> bool:
+    """Replace the update state in one step, so a reader never sees half."""
+    tmp = UPDATE_STATE_FILE + ".plugin"
+    if not _write_no_follow(tmp, f"{phase} {version}\n"):
+        return False
+    try:
+        os.replace(tmp, UPDATE_STATE_FILE)
+        return True
+    except OSError:
+        return False
+
+
 def _first_existing(paths: list[str]) -> str | None:
     """First path in the list that exists, or None."""
     for path in paths:
@@ -549,6 +601,139 @@ def _save_settings_with_timestamp(data: dict):
     """Save settings and update last_applied timestamp in one write."""
     data["last_applied"] = int(time.time())
     _save_settings(data)
+
+
+# The update script, run as root with its values as arguments (see
+# apply_update). Raw, so what is written here is exactly what bash reads.
+UPDATE_SCRIPT = r"""#!/bin/bash
+set -u
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+SELF_DIR="$1"
+PLUGIN_DIR="$2"
+DOWNLOAD_URL="$3"
+SRC_NAME="$4"
+LABEL="$5"
+EXPECTED="$6"
+
+STATE=/run/wifi-optimizer/update-state
+TMP=$(mktemp -d) || exit 1
+OWN_LOCK=0
+FINISHED=0
+# The panel shows these as the update goes, and on "swapped" asks Decky to
+# reload the plugin. Only the update holding the lock may write them.
+set_state() {
+    [ "$OWN_LOCK" = 1 ] || return 0
+    mkdir -p -m 0755 /run/wifi-optimizer 2>/dev/null
+    printf '%s %s\n' "$1" "$EXPECTED" > "$STATE.tmp" 2>/dev/null &&
+        mv -f "$STATE.tmp" "$STATE" 2>/dev/null
+}
+cleanup() {
+    rm -rf "$TMP"
+    # Only the update holding the lock may clear staged files; another one
+    # exiting early must not delete what the running one is about to move.
+    if [ "$OWN_LOCK" = 1 ]; then
+        rm -f "$PLUGIN_DIR"/*.wifiopt-new "$PLUGIN_DIR"/*/*.wifiopt-new
+        [ "$FINISHED" = 1 ] || set_state failed
+    fi
+    rm -rf "$SELF_DIR"
+}
+trap cleanup EXIT
+trap 'exit 1' TERM INT HUP
+
+# One update at a time. A retry after the panel gave up waiting used to
+# start a second copy alongside the first, and both restarted Decky.
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/wifi-optimizer-update.lock || exit 1
+    flock -n 9 || { logger -t wifi-optimizer "Update already running"; exit 0; }
+fi
+OWN_LOCK=1
+set_state downloading
+
+sleep 2
+
+# Bounded, so a stalled download ends instead of outliving the panel's wait.
+OPTS="--connect-timeout 15 --speed-limit 1024 --speed-time 30 --max-time 300"
+curl -sSL --fail --proto '=https' --tlsv1.2 $OPTS "$DOWNLOAD_URL" -o "$TMP/update.tar.gz" || {
+    logger -t wifi-optimizer "Update failed: download error"
+    exit 1
+}
+
+# Recorded so a bad or unexpected payload is traceable after the fact.
+SUM=$(sha256sum "$TMP/update.tar.gz" 2>/dev/null | cut -d' ' -f1)
+logger -t wifi-optimizer "Update payload sha256=$SUM"
+
+tar xzf "$TMP/update.tar.gz" -C "$TMP" --no-same-owner --no-same-permissions || {
+    logger -t wifi-optimizer "Update failed: extract error"
+    exit 1
+}
+SRC="$TMP/$SRC_NAME"
+
+FILES="plugin.json main.py decky.pyi dist/index.js defaults/dispatcher.sh.tmpl package.json"
+for f in $FILES; do
+    if [ ! -f "$SRC/$f" ]; then
+        logger -t wifi-optimizer "Update failed: payload incomplete ($f)"
+        exit 1
+    fi
+done
+GOT=$(grep -o '"version": *"[^"]*"' "$SRC/package.json" | head -n 1 | cut -d'"' -f4)
+if [ "$GOT" != "$EXPECTED" ]; then
+    logger -t wifi-optimizer "Update failed: payload is version $GOT, expected $EXPECTED"
+    exit 1
+fi
+
+# Copy everything beside the live files first, and only then move each into
+# place. A copy that fails part way (a full disk) leaves the installed
+# version whole. package.json goes last because it carries the version: if
+# anything before it fails, the installed version is unchanged and the same
+# update is offered again.
+set_state installing
+mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults" || {
+    logger -t wifi-optimizer "Update failed: could not create directories"
+    exit 1
+}
+for f in $FILES; do
+    rm -f "$PLUGIN_DIR/$f.wifiopt-new"
+    cp "$SRC/$f" "$PLUGIN_DIR/$f.wifiopt-new" || {
+        logger -t wifi-optimizer "Update failed: could not copy $f"
+        exit 1
+    }
+done
+for f in $FILES; do
+    mv -f "$PLUGIN_DIR/$f.wifiopt-new" "$PLUGIN_DIR/$f" || {
+        logger -t wifi-optimizer "Update failed: could not replace $f"
+        exit 1
+    }
+done
+rm -f "$PLUGIN_DIR/dist/index.js.map"
+cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
+
+# The new files are in place. The panel now asks Decky to reload just this
+# plugin, the way Decky's own store does, and the new backend answers
+# "loaded" once it is running. Restarting plugin_loader instead restarts all
+# of Steam, so that is only the fallback: for a Decky without the reload, or
+# a panel that was not there to ask.
+set_state swapped
+for _ in $(seq 1 45); do
+    sleep 1
+    if [ "$(cat "$STATE" 2>/dev/null)" = "loaded $EXPECTED" ]; then
+        FINISHED=1
+        set_state done
+        logger -t wifi-optimizer "Updated to $LABEL, reloaded the plugin"
+        exit 0
+    fi
+done
+
+set_state restarting
+if systemctl restart plugin_loader; then
+    FINISHED=1
+    set_state done
+    logger -t wifi-optimizer "Updated to $LABEL, restarted plugin_loader"
+else
+    logger -t wifi-optimizer "Updated to $LABEL, but Decky did not restart. Restart the Deck to load it."
+    exit 1
+fi
+"""
 
 
 class Plugin:
@@ -1233,6 +1418,7 @@ class Plugin:
     async def _main(self):
         try:
             decky.logger.info("WiFi Optimizer starting")
+            self._acknowledge_update()
             self._rotate_logs()
             self._ensure_backend_switch_state()
             info = await self.get_device_info()
@@ -5713,7 +5899,12 @@ class Plugin:
             }
 
     async def apply_update(self) -> dict:
-        """Download and install update from the selected channel, then restart Decky."""
+        """Download and install the update from the selected channel.
+
+        The script runs on its own; the panel follows it through
+        get_update_progress and asks Decky to reload the plugin once the new
+        files are in place, with a plugin_loader restart as the fallback.
+        """
         claimed = False
         try:
             self._ensure_backend_switch_state()
@@ -5754,102 +5945,7 @@ class Plugin:
             # shell. PATH is pinned rather than inherited, and every binary is
             # resolved through it so this still works on distros that lay out
             # /usr differently.
-            script = """#!/bin/bash
-set -u
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-
-SELF_DIR="$1"
-PLUGIN_DIR="$2"
-DOWNLOAD_URL="$3"
-SRC_NAME="$4"
-LABEL="$5"
-EXPECTED="$6"
-
-TMP=$(mktemp -d) || exit 1
-OWN_LOCK=0
-cleanup() {
-    rm -rf "$TMP"
-    # Only the update holding the lock may clear staged files; another one
-    # exiting early must not delete what the running one is about to move.
-    if [ "$OWN_LOCK" = 1 ]; then
-        rm -f "$PLUGIN_DIR"/*.wifiopt-new "$PLUGIN_DIR"/*/*.wifiopt-new
-    fi
-    rm -rf "$SELF_DIR"
-}
-trap cleanup EXIT
-
-# One update at a time. A retry after the panel gave up waiting used to
-# start a second copy alongside the first, and both restarted Decky.
-if command -v flock >/dev/null 2>&1; then
-    exec 9>/run/wifi-optimizer-update.lock || exit 1
-    flock -n 9 || { logger -t wifi-optimizer "Update already running"; exit 0; }
-fi
-OWN_LOCK=1
-
-sleep 2
-
-# Bounded, so a stalled download ends instead of outliving the panel's wait.
-OPTS="--connect-timeout 15 --speed-limit 1024 --speed-time 30 --max-time 300"
-curl -sSL --fail --proto '=https' --tlsv1.2 $OPTS "$DOWNLOAD_URL" -o "$TMP/update.tar.gz" || {
-    logger -t wifi-optimizer "Update failed: download error"
-    exit 1
-}
-
-# Recorded so a bad or unexpected payload is traceable after the fact.
-SUM=$(sha256sum "$TMP/update.tar.gz" 2>/dev/null | cut -d' ' -f1)
-logger -t wifi-optimizer "Update payload sha256=$SUM"
-
-tar xzf "$TMP/update.tar.gz" -C "$TMP" --no-same-owner --no-same-permissions || {
-    logger -t wifi-optimizer "Update failed: extract error"
-    exit 1
-}
-SRC="$TMP/$SRC_NAME"
-
-FILES="plugin.json main.py decky.pyi dist/index.js defaults/dispatcher.sh.tmpl package.json"
-for f in $FILES; do
-    if [ ! -f "$SRC/$f" ]; then
-        logger -t wifi-optimizer "Update failed: payload incomplete ($f)"
-        exit 1
-    fi
-done
-GOT=$(grep -o '"version": *"[^"]*"' "$SRC/package.json" | head -n 1 | cut -d'"' -f4)
-if [ "$GOT" != "$EXPECTED" ]; then
-    logger -t wifi-optimizer "Update failed: payload is version $GOT, expected $EXPECTED"
-    exit 1
-fi
-
-# Copy everything beside the live files first, and only then move each into
-# place. A copy that fails part way (a full disk) leaves the installed
-# version whole. package.json goes last because it carries the version: if
-# anything before it fails, the installed version is unchanged and the same
-# update is offered again.
-mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults" || {
-    logger -t wifi-optimizer "Update failed: could not create directories"
-    exit 1
-}
-for f in $FILES; do
-    rm -f "$PLUGIN_DIR/$f.wifiopt-new"
-    cp "$SRC/$f" "$PLUGIN_DIR/$f.wifiopt-new" || {
-        logger -t wifi-optimizer "Update failed: could not copy $f"
-        exit 1
-    }
-done
-for f in $FILES; do
-    mv -f "$PLUGIN_DIR/$f.wifiopt-new" "$PLUGIN_DIR/$f" || {
-        logger -t wifi-optimizer "Update failed: could not replace $f"
-        exit 1
-    }
-done
-rm -f "$PLUGIN_DIR/dist/index.js.map"
-cp "$SRC/dist/index.js.map" "$PLUGIN_DIR/dist/" 2>/dev/null || true
-
-if systemctl restart plugin_loader; then
-    logger -t wifi-optimizer "Updated to $LABEL, restarted plugin_loader"
-else
-    logger -t wifi-optimizer "Updated to $LABEL, but Decky did not restart. Restart the Deck to load it."
-    exit 1
-fi
-"""
+            script = UPDATE_SCRIPT
             # Not a fixed path under /tmp. That directory is world writable, so
             # any local user could pre-create the file we are about to write,
             # keep ownership of it, and have root execute whatever they put in
@@ -5864,14 +5960,18 @@ fi
             )
             with os.fdopen(fd, "w") as f:
                 f.write(script)
+            # What an earlier update left behind ("failed", "done") would be
+            # read by the panel as the outcome of this one. Nothing is running
+            # (checked above), so it is history.
             try:
-                subprocess.Popen(
+                os.remove(UPDATE_STATE_FILE)
+            except OSError:
+                pass
+            try:
+                await asyncio.to_thread(
+                    self._launch_updater,
                     ["/bin/bash", script_path, script_dir, plugin_dir,
                      download_url, src_dir, label, latest],
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=_child_env(),
                 )
             except Exception:
                 # Nothing started, so nothing will remove the directory, and
@@ -5888,7 +5988,7 @@ fi
             self._update_dir = script_dir
 
             decky.logger.info(f"Update to {label} initiated (channel={channel})")
-            return {"success": True, "message": f"Updating to {label}..."}
+            return {"success": True, "message": f"Updating to {label}...", "version": latest}
         except Exception as e:
             decky.logger.error(f"apply_update error: {e}")
             return self._unexpected_response(e)
@@ -5898,11 +5998,72 @@ fi
             if claimed:
                 self._update_starting = False
 
+    def _launch_updater(self, argv: list[str]):
+        """Start the update script so that nothing happening to Decky stops it.
+
+        It runs in a transient systemd unit of its own. Started directly it
+        is part of plugin_loader's control group, and a plugin_loader with
+        the default KillMode stops the whole group, script included, however
+        it was detached. Where systemd-run is missing or refuses, it starts
+        directly as before; the script's lock stops a second copy running if
+        systemd-run did start one after all.
+        """
+        if os.path.exists(SYSTEMD_RUN):
+            unit = f"wifi-optimizer-update-{int(time.time())}-{os.getpid()}"
+            result = self._run_cmd(
+                [SYSTEMD_RUN, "--unit", unit, "--collect", "--quiet",
+                 f"--property=RuntimeMaxSec={UPDATE_STATE_MAX_AGE}", "--", *argv],
+                timeout=15,
+            )
+            if result["success"]:
+                decky.logger.info(f"Update script started in unit {unit}")
+                return
+            decky.logger.error(
+                f"systemd-run could not start the update ({result['stderr'][:200]}), "
+                "starting it directly"
+            )
+        subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_child_env(),
+        )
+
     def _update_running(self) -> bool:
         if getattr(self, "_update_starting", False):
             return True
         directory = getattr(self, "_update_dir", None)
-        return bool(directory) and os.path.isdir(directory)
+        if directory and os.path.isdir(directory):
+            return True
+        # After a reload this is a new backend that did not start the script,
+        # which is still finishing. What the script reports covers that.
+        phase, _, age = _read_update_state()
+        return phase in UPDATE_ACTIVE_PHASES and age < UPDATE_STATE_MAX_AGE
+
+    async def get_update_progress(self) -> dict:
+        """How far a running update has got, for the panel to show and act on."""
+        try:
+            phase, version, age = _read_update_state()
+            if phase in UPDATE_ACTIVE_PHASES and age >= UPDATE_STATE_MAX_AGE:
+                phase = "failed"
+            return {"success": True, "phase": phase, "version": version, "age": int(age),
+                    "running_version": decky.DECKY_PLUGIN_VERSION}
+        except Exception as e:
+            decky.logger.error(f"get_update_progress error: {e}")
+            return {"success": False, "phase": "", "version": "", "age": 0,
+                    "running_version": ""}
+
+    def _acknowledge_update(self):
+        """Tell a waiting update script that this version is the one running.
+
+        Without the answer the script restarts plugin_loader, which restarts
+        Steam, on the assumption that the reload never happened.
+        """
+        phase, version, _ = _read_update_state()
+        if phase == "swapped" and version == decky.DECKY_PLUGIN_VERSION:
+            if _write_update_state("loaded", version):
+                decky.logger.info(f"Reloaded as {version} after an update")
 
     # ---- WiFi backend switch (iwd / wpa_supplicant) ----
 

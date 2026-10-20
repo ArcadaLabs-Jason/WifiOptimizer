@@ -137,6 +137,28 @@ export interface UpdateCheckResult {
   message?: string;
 }
 
+// What the update script reports while it runs. "swapped" means the new
+// files are in place and the plugin should be reloaded.
+export type UpdatePhase =
+  | ""
+  | "downloading"
+  | "installing"
+  | "swapped"
+  | "loaded"
+  | "restarting"
+  | "done"
+  | "failed";
+
+export interface UpdateProgress {
+  success: boolean;
+  phase: UpdatePhase;
+  version: string;
+  // Seconds since the script last reported.
+  age: number;
+  // The version of the backend answering.
+  running_version: string;
+}
+
 export type BadgeStatus = "active" | "locked" | "set" | "drifted" | "off" | "error" | "unknown";
 
 export const ERROR_MESSAGES: Record<string, string> = {

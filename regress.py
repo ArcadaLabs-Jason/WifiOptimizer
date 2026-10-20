@@ -22,6 +22,8 @@ m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
 # Never read the host's own network devices: a Linux machine running this
 # would otherwise answer from its real sysfs and skip every nmcli stub.
 m.SYSFS_NET = os.path.join(tempfile.mkdtemp(), "no-sysfs")
+# Nor the host's /run, where the update script reports its progress.
+m.UPDATE_STATE_FILE = os.path.join(tempfile.mkdtemp(), "update-state")
 FAILS = []
 def ok(c, l):
     print(("PASS  " if c else "FAIL  ")+l)
@@ -2945,17 +2947,135 @@ ok(r.get("success") is False and m._load_settings()["cake_enabled"] is True,
 
 section("update script: staged, versioned, one at a time")
 _src = open("main.py").read()
-_i = _src.index('script = """#!/bin/bash'); _j = _src.index('"""', _i + 20)
-_script = _src[_i + 10:_j]
+_script = m.UPDATE_SCRIPT
 ok("flock -n" in _script, "a second update exits instead of running alongside")
 ok("--max-time" in _script and "--fail" in _script, "the download is bounded and fails on HTTP errors")
-ok(_script.index("wifiopt-new\" ||") < _script.index("mv -f"),
+ok(_script.index("wifiopt-new\" ||") < _script.index('mv -f "$PLUGIN_DIR'),
    "everything is copied beside the live files before anything is replaced")
 ok(_script.rindex("package.json") > _script.index('FILES="') and
    _script[_script.index('FILES="'):].split("\n")[0].rstrip('"').endswith("package.json"),
    "package.json, which carries the version, is moved into place last")
 ok('"$GOT" != "$EXPECTED"' in _script, "a payload of the wrong version is refused")
 ok("if systemctl restart plugin_loader" in _script, "a failed restart is not reported as success")
+
+section("update: reload only the plugin, restart Decky only as the fallback")
+try:
+    _last_mv = _script.rindex('mv -f "$PLUGIN_DIR/$f.wifiopt-new"')
+    ok(_last_mv < _script.index("set_state swapped") < _script.index("systemctl restart plugin_loader"),
+       "the panel is told to reload only after every file is in place, and the restart comes after that")
+    _loop = _script[_script.index("set_state swapped"):_script.index("set_state restarting")]
+    ok('"loaded $EXPECTED"' in _loop and "seq 1 45" in _loop and "exit 0" in _loop,
+       "the script waits for the new version to answer, and stops there when it does")
+    ok("set_state failed" in _script[_script.index("cleanup() {"):_script.index("trap cleanup EXIT")],
+       "an update that stops early reports failed")
+    import subprocess as _sp
+    _sh = os.path.join(tempfile.mkdtemp(), "update.sh"); open(_sh, "w").write(_script)
+    _syn = _sp.run(["/bin/bash", "-n", _sh], capture_output=True, text=True)
+    ok(_syn.returncode == 0, f"the update script parses ({_syn.stderr.strip()[:120]})")
+    ok("trap 'exit 1' TERM INT HUP" in _script, "and so does one that is killed, through the exit trap")
+    ok('[ "$OWN_LOCK" = 1 ] || return 0' in _script,
+       "a second copy refused the lock writes no progress over the running one's")
+    ok(_script.index("set_state downloading") > _script.index("OWN_LOCK=1"),
+       "progress is only written once the lock is held")
+    ok("printf '%s %s\\n' \"$1\" \"$EXPECTED\" > \"$STATE.tmp\"" in _script
+       and 'mv -f "$STATE.tmp" "$STATE"' in _script,
+       "each state is one line, written whole and moved into place")
+
+    def _state(text, age=0):
+        if os.path.lexists(m.UPDATE_STATE_FILE): os.remove(m.UPDATE_STATE_FILE)
+        if text is not None:
+            open(m.UPDATE_STATE_FILE, "w").write(text)
+            t = time.time() - age; os.utime(m.UPDATE_STATE_FILE, (t, t))
+    _state("swapped 0.19.0-beta\n")
+    ph, ver, _ = m._read_update_state()
+    ok((ph, ver) == ("swapped", "0.19.0-beta"), "a state the script writes is read back")
+    for bad in ("rebooting 0.19.0", "swapped 0.19;rm", "swapped", "swapped 1.0 extra", ""):
+        _state(bad)
+        ok(m._read_update_state()[0] == "", f"a state it would not write is ignored: {bad!r}")
+    _state(None); _victim = os.path.join(tempfile.mkdtemp(), "v"); open(_victim, "w").write("swapped 1.0")
+    os.symlink(_victim, m.UPDATE_STATE_FILE)
+    ok(m._read_update_state()[0] == "", "the state is not read through a link")
+    os.remove(m.UPDATE_STATE_FILE); os.mkfifo(m.UPDATE_STATE_FILE)
+    ok(m._read_update_state()[0] == "", "nor from a FIFO")
+    os.remove(m.UPDATE_STATE_FILE)
+
+    _state("downloading 0.19.0-beta\n")
+    ok(m.Plugin()._update_running() is True,
+       "a backend that did not start the script still sees it running, as after a reload")
+    _state("downloading 0.19.0-beta\n", age=m.UPDATE_STATE_MAX_AGE + 5)
+    ok(m.Plugin()._update_running() is False, "but not one older than the script's own time limit")
+    ok(asyncio.run(m.Plugin().get_update_progress())["phase"] == "failed",
+       "which the panel is told failed")
+    for done in ("done 0.19.0-beta", "failed 0.19.0-beta"):
+        _state(done)
+        ok(m.Plugin()._update_running() is False, f"a finished update is not running: {done}")
+
+    _real_ver = m.decky.DECKY_PLUGIN_VERSION
+    try:
+        m.decky.DECKY_PLUGIN_VERSION = "0.19.0-beta"
+        _state("swapped 0.19.0-beta\n"); m.Plugin()._acknowledge_update()
+        ok(m._read_update_state()[:2] == ("loaded", "0.19.0-beta"),
+           "the new backend tells the waiting script it is the version it installed")
+        _state("swapped 0.19.1-beta\n"); m.Plugin()._acknowledge_update()
+        ok(m._read_update_state()[0] == "swapped", "the old one, still running, does not")
+        _state("restarting 0.19.0-beta\n"); m.Plugin()._acknowledge_update()
+        ok(m._read_update_state()[0] == "restarting", "and nothing is acknowledged once the script gave up waiting")
+    finally:
+        m.decky.DECKY_PLUGIN_VERSION = _real_ver
+    _main_src = _src[_src.index("    async def _main(self):"):]
+    ok(_main_src.index("self._acknowledge_update()") < _main_src.index("self._rotate_logs()"),
+       "startup acknowledges the update before anything slow")
+
+    class Launch(m.Plugin):
+        def __init__(self, rc):
+            super().__init__(); self.rc = rc; self.cmds = []
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(cmd)
+            return {"success": self.rc == 0, "stdout": "", "stderr": "nope", "returncode": self.rc}
+    _real_sr, _real_popen = m.SYSTEMD_RUN, m.subprocess.Popen
+    _popened = []
+    try:
+        m.SYSTEMD_RUN = os.path.join(tempfile.mkdtemp(), "systemd-run"); open(m.SYSTEMD_RUN, "w").close()
+        m.subprocess.Popen = lambda argv, **k: _popened.append((argv, k))
+        lu = Launch(0); lu._launch_updater(["/bin/bash", "/x/update.sh", "a"])
+        c = lu.cmds[0] if lu.cmds else []
+        ok(c[:1] == [m.SYSTEMD_RUN] and "--collect" in c and c[c.index("--") + 1:] == ["/bin/bash", "/x/update.sh", "a"]
+           and not _popened, "the update script runs in a systemd unit of its own, outside plugin_loader's")
+        ok(any(a.startswith("--property=RuntimeMaxSec=") for a in c), "with a time limit")
+        lu = Launch(1); lu._launch_updater(["/bin/bash", "/x/update.sh", "a"])
+        ok(_popened and _popened[-1][0] == ["/bin/bash", "/x/update.sh", "a"]
+           and _popened[-1][1].get("start_new_session") is True,
+           "and starts directly when systemd-run refuses")
+        os.remove(m.SYSTEMD_RUN); _popened.clear()
+        lu = Launch(0); lu._launch_updater(["/bin/bash", "/x/update.sh"])
+        ok(not lu.cmds and _popened, "or is not there at all")
+
+        class Starts(Launch):
+            async def check_for_update(self):
+                return {"update_available": True, "channel": "beta", "latest_version": "0.19.0-beta"}
+        _state("failed 0.19.0-beta\n")
+        st = Starts(0); r = asyncio.run(st.apply_update())
+        ok(r.get("success") is True and r.get("version") == "0.19.0-beta",
+           "a started update tells the panel which version to follow")
+        ok(not os.path.lexists(m.UPDATE_STATE_FILE),
+           "and an earlier update's outcome is cleared, so it is not read as this one's")
+        if st._update_dir and os.path.isdir(st._update_dir):
+            import shutil; shutil.rmtree(st._update_dir)
+    finally:
+        m.SYSTEMD_RUN, m.subprocess.Popen = _real_sr, _real_popen
+
+    _watch = open("src/updateWatch.ts").read()
+    _name = json.load(open("plugin.json"))["name"]
+    ok(f'PLUGIN_NAME = "{_name}"' in _watch and '"loader/reload_plugin", PLUGIN_NAME' in _watch,
+       "the panel asks Decky to reload the plugin by the name in plugin.json")
+    ok("typeof deckyBackend?.call !== \"function\"" in _watch,
+       "and copes with a Decky that has no such call, leaving the restart to the script")
+    _idx = open("src/index.tsx").read()
+    ok("disposeUpdateWatch()" in _idx[_idx.index("onDismount()"):],
+       "the watch stops when Decky dismounts the plugin, which a reload can do twice")
+    ok("watchUpdate(version)" in _idx, "the panel follows an update it started")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("files the desktop user owns: read and written without trusting them")
 try:

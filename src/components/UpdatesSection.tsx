@@ -5,6 +5,8 @@ import { theme } from "../theme";
 interface UpdatesSectionProps {
   channel: string;
   updating: boolean;
+  // What the update is doing right now, while updating.
+  updatingText: string;
   checkingUpdate: boolean;
   updateInfo: UpdateCheckResult | null;
   updateError: string | null;
@@ -28,6 +30,7 @@ const CHANNEL_OPTIONS = [
 export function UpdatesSection({
   channel,
   updating,
+  updatingText,
   checkingUpdate,
   updateInfo,
   updateError,
@@ -56,7 +59,7 @@ export function UpdatesSection({
       {updating ? (
         <PanelSectionRow>
           <div style={{ fontSize: theme.fontSize.body, color: theme.info.text }}>
-            Updating... plugin will restart momentarily.
+            {updatingText}
           </div>
         </PanelSectionRow>
       ) : updateInfo?.update_available ? (

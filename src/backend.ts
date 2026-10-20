@@ -4,6 +4,7 @@ import type {
   MethodResult,
   OptimizeSafeResult,
   UpdateCheckResult,
+  UpdateProgress,
   BackendSwitchStartResult,
   BackendSwitchStatus,
   RegdomainInfo,
@@ -27,6 +28,7 @@ export const resetSettings = callable<[], MethodResult>("reset_settings");
 export const setUpdateChannel = callable<[channel: string], MethodResult>("set_update_channel");
 export const checkForUpdate = callable<[], UpdateCheckResult>("check_for_update");
 export const applyUpdate = callable<[], MethodResult>("apply_update");
+export const getUpdateProgress = callable<[], UpdateProgress>("get_update_progress");
 export const startBackendSwitch = callable<[backend: string], BackendSwitchStartResult>("start_backend_switch");
 export const getBackendSwitchStatus = callable<[], BackendSwitchStatus>("get_backend_switch_status");
 export const getRegdomain = callable<[], RegdomainInfo>("get_regdomain");

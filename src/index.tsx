@@ -24,6 +24,7 @@ import type {
   MethodResult,
   OptimizeSafeResult,
   UpdateCheckResult,
+  UpdateProgress,
   BadgeStatus,
   BackendSwitchStatus,
   RegdomainInfo,
@@ -37,6 +38,12 @@ import { UpdatesSection } from "./components/UpdatesSection";
 import { PanelHeader } from "./components/PanelHeader";
 import { PanelFooter } from "./components/PanelFooter";
 import { ActionsSection } from "./components/ActionsSection";
+import {
+  watchUpdate,
+  subscribeUpdate,
+  announceIfJustUpdated,
+  disposeUpdateWatch,
+} from "./updateWatch";
 import { theme } from "./theme";
 
 const REFRESH_INTERVAL = 3000;
@@ -52,6 +59,26 @@ const BACKEND_SWITCH_MAX_S = 240;
 const IWD_PIN_NOTICE =
   "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
+// Long enough for the reloaded backend to have answered the update script.
+const ANNOUNCE_DELAY_MS = 4000;
+
+// What the panel says while an update runs, from what the script reports.
+function updatingText(progress: UpdateProgress | null): string {
+  const v = progress?.version ? ` v${progress.version}` : "";
+  switch (progress?.phase) {
+    case "downloading":
+      return `Downloading${v}...`;
+    case "installing":
+      return `Installing${v}...`;
+    case "swapped":
+    case "loaded":
+      return "Reloading the plugin...";
+    case "restarting":
+      return "Restarting Decky to finish. Steam will restart.";
+    default:
+      return "Starting the update...";
+  }
+}
 
 function getBadge(
   driftKey: string | undefined,
@@ -192,6 +219,7 @@ function Content() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
 
   // --- Backend switch state ---
   const [backendSwitch, setBackendSwitch] = useState<BackendSwitchStatus | null>(null);
@@ -392,8 +420,24 @@ function Content() {
     }
   }, [status?.connected, runUpdateCheck]);
 
-  // Safety timeout: if an update was initiated but plugin_loader hasn't killed
-  // us within the time the script allows itself, it probably failed (network
+  // Follow the update script. The watch itself is module level, so a panel
+  // closed and reopened mid-update picks the progress back up from here.
+  useEffect(
+    () =>
+      subscribeUpdate((progress) => {
+        setUpdateProgress(progress);
+        if (progress?.phase === "failed") {
+          setUpdating(false);
+          setUpdateError("The update didn't finish. Try again, or check the plugin log.");
+        } else if (progress && progress.phase !== "done") {
+          setUpdating(true);
+        }
+      }),
+    [],
+  );
+
+  // Safety timeout: if an update was initiated but the plugin hasn't been
+  // reloaded within the time the script allows itself, it probably failed (network
   // drop, tarball corruption, etc.). Revert the UI so the user isn't stuck staring
   // at "Updating..." forever, and surface a message they can act on.
   useEffect(() => {
@@ -625,15 +669,18 @@ function Content() {
     setUpdateError(null);
     setUpdating(true);
     try {
-      const result = await backend.applyUpdate();
+      const result = (await backend.applyUpdate()) as MethodResult & { version?: string };
       // Refused outright (no update after all, a backend switch running):
       // say why now instead of showing "Updating..." for a minute.
       if (!result.success) {
         setUpdating(false);
         setUpdateError(result.message ?? "Couldn't start the update.");
+        return;
       }
+      const version = result.version ?? updateInfo?.latest_version;
+      if (version) watchUpdate(version);
     } catch {
-      // plugin_loader restart killed the connection; expected
+      // The script runs on its own; the safety timeout covers a lost reply.
     }
   };
 
@@ -754,7 +801,7 @@ function Content() {
         <PanelSection>
           <PanelSectionRow>
             <div style={{ fontSize: theme.fontSize.body, color: theme.info.text }}>
-              Updating... plugin will restart momentarily.
+              {updatingText(updateProgress)}
             </div>
           </PanelSectionRow>
         </PanelSection>
@@ -1210,6 +1257,7 @@ function Content() {
       <UpdatesSection
         channel={s?.update_channel ?? "stable"}
         updating={updating}
+        updatingText={updatingText(updateProgress)}
         checkingUpdate={checkingUpdate}
         updateInfo={updateInfo}
         updateError={updateError}
@@ -1230,6 +1278,12 @@ export default definePlugin(() => {
   // reapply pending, which then called into a backend being torn down.
   let disposed = false;
   const timers = new Set<ReturnType<typeof setTimeout>>();
+
+  const announce = setTimeout(() => {
+    timers.delete(announce);
+    if (!disposed) announceIfJustUpdated();
+  }, ANNOUNCE_DELAY_MS);
+  timers.add(announce);
 
   try {
     gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications(
@@ -1261,6 +1315,7 @@ export default definePlugin(() => {
       timers.forEach((id) => clearTimeout(id));
       timers.clear();
       gameLifetimeUnsub?.unregister();
+      disposeUpdateWatch();
     },
   };
 });

@@ -16,6 +16,7 @@ if (api._version != API_VERSION) {
     console.warn(`[@decky/api] Requested API version ${API_VERSION} but the running loader only supports version ${api._version}. Some features may not work.`);
 }
 const callable = api.callable;
+const toaster = api.toaster;
 const definePlugin = (fn) => {
     return (...args) => {
         return fn(...args);
@@ -102,6 +103,7 @@ const resetSettings = callable("reset_settings");
 const setUpdateChannel = callable("set_update_channel");
 const checkForUpdate = callable("check_for_update");
 const applyUpdate = callable("apply_update");
+const getUpdateProgress = callable("get_update_progress");
 const startBackendSwitch = callable("start_backend_switch");
 const getBackendSwitchStatus = callable("get_backend_switch_status");
 const getRegdomain = callable("get_regdomain");
@@ -397,8 +399,8 @@ const CHANNEL_OPTIONS = [
 // stuck / failed update, and a button that context-switches between
 // "Updating...", "Update Now", "Up to date", and "Check for Updates"
 // depending on state.
-function UpdatesSection({ channel, updating, checkingUpdate, updateInfo, updateError, onChannelChange, onApply, onCheck, busy = false, }) {
-    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Updates", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Update channel", rgOptions: CHANNEL_OPTIONS, selectedOption: channel, onChange: (option) => onChannelChange(option.data) }) }), updateError && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text }, children: ["\u26A0 ", updateError] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: "Updating... plugin will restart momentarily." }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+function UpdatesSection({ channel, updating, updatingText, checkingUpdate, updateInfo, updateError, onChannelChange, onApply, onCheck, busy = false, }) {
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Updates", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "Update channel", rgOptions: CHANNEL_OPTIONS, selectedOption: channel, onChange: (option) => onChannelChange(option.data) }) }), updateError && !updating && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text }, children: ["\u26A0 ", updateError] }) })), updating ? (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText }) })) : updateInfo?.update_available ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.body,
                                 color: updateInfo.is_downgrade ? theme.info.text : theme.success.text,
                             }, children: updateInfo.is_downgrade
@@ -495,6 +497,123 @@ function ActionsSection({ connected, isBusy, onForceReapply, onReset, resetError
     return (SP_JSX.jsxs(DFL.PanelSection, { title: "Actions", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: !connected || isBusy, onClick: onForceReapply, children: "Force Reapply All" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy, onClick: onReset, children: "Reset Settings" }) }), resetError && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.tiny, color: theme.error.text }, children: resetError }) }))] }));
 }
 
+// Follows a running update and, once the new files are in place, asks Decky
+// to reload this plugin, which is what Decky's own store does after an
+// install. Restarting plugin_loader instead restarts all of Steam, so the
+// update script only falls back to that when no reload happens.
+//
+// This lives at module level, not in the panel, because closing the Quick
+// Access menu unmounts the panel and the reload must still be asked for.
+const PLUGIN_NAME = "WiFi Optimizer";
+const POLL_MS = 1000;
+// A "done" this recent, for the version now running, is the update that
+// just loaded this copy of the plugin.
+const JUST_UPDATED_S = 120;
+let timer = null;
+let inFlight = false;
+let reloadAsked = false;
+let disposed = false;
+let target = "";
+let current = null;
+const listeners = new Set();
+function publish(progress) {
+    current = progress;
+    listeners.forEach((fn) => fn(progress));
+}
+function stop() {
+    if (timer) {
+        clearInterval(timer);
+        timer = null;
+    }
+}
+function askDeckyToReload() {
+    if (reloadAsked || disposed)
+        return;
+    reloadAsked = true;
+    // Out of the poll's own call, since the reload tears this module down.
+    // DeckyBackend is Decky's internal client, not part of @decky/api, so a
+    // Decky without it is expected; the script restarts plugin_loader then.
+    setTimeout(() => {
+        const deckyBackend = window.DeckyBackend;
+        if (typeof deckyBackend?.call !== "function") {
+            console.warn("WiFi Optimizer: Decky cannot reload a plugin here, waiting for a restart");
+            return;
+        }
+        Promise.resolve(deckyBackend.call("loader/reload_plugin", PLUGIN_NAME)).catch((e) => console.error("WiFi Optimizer: reload request failed, waiting for a restart", e));
+    }, 0);
+}
+async function poll() {
+    if (inFlight || disposed)
+        return;
+    inFlight = true;
+    try {
+        const progress = await getUpdateProgress();
+        if (disposed || !progress.success)
+            return;
+        // Until the script has written anything, the file is either absent or
+        // removed by apply_update, so an empty phase is just "starting".
+        if (progress.phase && progress.version !== target)
+            return;
+        publish(progress);
+        if (progress.phase === "swapped")
+            askDeckyToReload();
+        if (progress.phase === "failed" || progress.phase === "done")
+            stop();
+    }
+    catch (e) {
+        // A reload or restart cancels calls in flight; that is the update
+        // working, and the next copy of the plugin takes over from here.
+        console.debug("WiFi Optimizer: update progress unavailable", e);
+    }
+    finally {
+        inFlight = false;
+    }
+}
+// Called once apply_update has started the script for this version.
+function watchUpdate(version) {
+    if (disposed)
+        return;
+    stop();
+    target = version;
+    reloadAsked = false;
+    publish(null);
+    timer = setInterval(poll, POLL_MS);
+}
+function subscribeUpdate(fn) {
+    listeners.add(fn);
+    fn(current);
+    return () => {
+        listeners.delete(fn);
+    };
+}
+// On load: say so if the update that just finished is what loaded us. Keyed
+// on the window, since a reload can start this module twice (Decky #611).
+async function announceIfJustUpdated() {
+    try {
+        const progress = await getUpdateProgress();
+        const w = window;
+        if (!disposed &&
+            progress.success &&
+            (progress.phase === "loaded" || progress.phase === "done") &&
+            progress.version === progress.running_version &&
+            progress.age < JUST_UPDATED_S &&
+            w.__wifiOptimizerAnnounced !== progress.version) {
+            w.__wifiOptimizerAnnounced = progress.version;
+            toaster.toast({ title: PLUGIN_NAME, body: `Updated to v${progress.version}` });
+        }
+    }
+    catch {
+        // Nothing to announce.
+    }
+}
+// A reload can start this module twice (Decky issue #611), so everything it
+// started has to stop when Decky dismounts it.
+function disposeUpdateWatch() {
+    disposed = true;
+    stop();
+    listeners.clear();
+}
+
 const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
 const BACKEND_POLL_INTERVAL = 750;
@@ -507,6 +626,25 @@ const BACKEND_SWITCH_MAX_S = 240;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE = "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
+// Long enough for the reloaded backend to have answered the update script.
+const ANNOUNCE_DELAY_MS = 4000;
+// What the panel says while an update runs, from what the script reports.
+function updatingText(progress) {
+    const v = progress?.version ? ` v${progress.version}` : "";
+    switch (progress?.phase) {
+        case "downloading":
+            return `Downloading${v}...`;
+        case "installing":
+            return `Installing${v}...`;
+        case "swapped":
+        case "loaded":
+            return "Reloading the plugin...";
+        case "restarting":
+            return "Restarting Decky to finish. Steam will restart.";
+        default:
+            return "Starting the update...";
+    }
+}
 function getBadge(driftKey, status, errorKey) {
     // Only surface a badge when it tells the user something the toggle position
     // doesn't - failure or drift between our setting and the system state.
@@ -619,6 +757,7 @@ function Content() {
     const [checkingUpdate, setCheckingUpdate] = SP_REACT.useState(false);
     const [updating, setUpdating] = SP_REACT.useState(false);
     const [updateError, setUpdateError] = SP_REACT.useState(null);
+    const [updateProgress, setUpdateProgress] = SP_REACT.useState(null);
     // --- Backend switch state ---
     const [backendSwitch, setBackendSwitch] = SP_REACT.useState(null);
     // --- Refs ---
@@ -817,8 +956,20 @@ function Content() {
             runUpdateCheck();
         }
     }, [status?.connected, runUpdateCheck]);
-    // Safety timeout: if an update was initiated but plugin_loader hasn't killed
-    // us within the time the script allows itself, it probably failed (network
+    // Follow the update script. The watch itself is module level, so a panel
+    // closed and reopened mid-update picks the progress back up from here.
+    SP_REACT.useEffect(() => subscribeUpdate((progress) => {
+        setUpdateProgress(progress);
+        if (progress?.phase === "failed") {
+            setUpdating(false);
+            setUpdateError("The update didn't finish. Try again, or check the plugin log.");
+        }
+        else if (progress && progress.phase !== "done") {
+            setUpdating(true);
+        }
+    }), []);
+    // Safety timeout: if an update was initiated but the plugin hasn't been
+    // reloaded within the time the script allows itself, it probably failed (network
     // drop, tarball corruption, etc.). Revert the UI so the user isn't stuck staring
     // at "Updating..." forever, and surface a message they can act on.
     SP_REACT.useEffect(() => {
@@ -1049,16 +1200,20 @@ function Content() {
         setUpdateError(null);
         setUpdating(true);
         try {
-            const result = await applyUpdate();
+            const result = (await applyUpdate());
             // Refused outright (no update after all, a backend switch running):
             // say why now instead of showing "Updating..." for a minute.
             if (!result.success) {
                 setUpdating(false);
                 setUpdateError(result.message ?? "Couldn't start the update.");
+                return;
             }
+            const version = result.version ?? updateInfo?.latest_version;
+            if (version)
+                watchUpdate(version);
         }
         catch {
-            // plugin_loader restart killed the connection; expected
+            // The script runs on its own; the safety timeout covers a lost reply.
         }
     };
     const handleCheckForUpdate = async () => {
@@ -1135,7 +1290,7 @@ function Content() {
                         ? s.chip_label
                         : undefined }), supportTier === 3 && (SP_JSX.jsx(Banner, { variant: "info", children: "Unknown WiFi hardware detected. Some optimizations may not apply." })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleApplyUpdate, children: updateInfo.is_downgrade
                             ? `Go back to v${updateInfo.latest_version}`
-                            : `Update to v${updateInfo.latest_version}` }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: "Updating... plugin will restart momentarily." }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), status?.external?.duplicate_profiles && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent. The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority." })), status?.address_conflict && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Another device on your network is using the same address as the Deck (", status.address_conflict.ip, "), so the connection may not work. That's the router, not a WiFi setting. Restarting the router usually fixes it."] })), status?.wpa2_only_stronger && (SP_JSX.jsxs(Banner, { variant: "info", children: ["A stronger access point on this network (signal", " ", status.wpa2_only_stronger.signal, " vs", " ", status.wpa2_only_stronger.current_signal, ") only offers WPA2, and this network is saved as WPA3-only, so the Deck can't use it. Access points that offer WPA3 keep using it. Only allow this if that access point is yours: anyone nearby can broadcast your network's name.", errors.allow_wpa2 && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.allow_wpa2 }))] })), status?.wpa2_only_stronger && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleAllowWpa2, children: "Allow WPA2 here" }) }) })), status?.external?.pin_released && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "WiFi could not connect for a while, so the locked access point or band preference was released to let it reconnect. The setting is still on and applies again to whichever access point works." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [driftCount, " setting", driftCount > 1 ? "s" : "", " drifted after wake."] })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleRepairDrift, children: "Fix now" }) }) })), status?.success === false && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u26A0", children: status?.message ?? "Couldn't read WiFi status." })), status?.success !== false && !connected && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "Not connected to WiFi. Connect first, then optimize." })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
+                            : `Update to v${updateInfo.latest_version}` }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText(updateProgress) }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), status?.external?.duplicate_profiles && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent. The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority." })), status?.address_conflict && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Another device on your network is using the same address as the Deck (", status.address_conflict.ip, "), so the connection may not work. That's the router, not a WiFi setting. Restarting the router usually fixes it."] })), status?.wpa2_only_stronger && (SP_JSX.jsxs(Banner, { variant: "info", children: ["A stronger access point on this network (signal", " ", status.wpa2_only_stronger.signal, " vs", " ", status.wpa2_only_stronger.current_signal, ") only offers WPA2, and this network is saved as WPA3-only, so the Deck can't use it. Access points that offer WPA3 keep using it. Only allow this if that access point is yours: anyone nearby can broadcast your network's name.", errors.allow_wpa2 && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.allow_wpa2 }))] })), status?.wpa2_only_stronger && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleAllowWpa2, children: "Allow WPA2 here" }) }) })), status?.external?.pin_released && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "WiFi could not connect for a while, so the locked access point or band preference was released to let it reconnect. The setting is still on and applies again to whichever access point works." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [driftCount, " setting", driftCount > 1 ? "s" : "", " drifted after wake."] })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleRepairDrift, children: "Fix now" }) }) })), status?.success === false && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u26A0", children: status?.message ?? "Couldn't read WiFi status." })), status?.success !== false && !connected && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "Not connected to WiFi. Connect first, then optimize." })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
                 const r = backendSwitch.result;
                 // Treat reconnect timeout as a warning even when the backend-level
                 // switch succeeded - the system is switched but WiFi didn't come back.
@@ -1213,7 +1368,7 @@ function Content() {
                                 ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
                                 : status?.live?.ipv6_other_network
                                     ? "On for the network it was turned on for, not this one."
-                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...getBadge("cake", status, errors.cake ?? null), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
+                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...getBadge("cake", status, errors.cake ?? null), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
 }
 var index = definePlugin(() => {
     let gameLifetimeUnsub = null;
@@ -1221,6 +1376,12 @@ var index = definePlugin(() => {
     // reapply pending, which then called into a backend being torn down.
     let disposed = false;
     const timers = new Set();
+    const announce = setTimeout(() => {
+        timers.delete(announce);
+        if (!disposed)
+            announceIfJustUpdated();
+    }, ANNOUNCE_DELAY_MS);
+    timers.add(announce);
     try {
         gameLifetimeUnsub = SteamClient.GameSessions.RegisterForAppLifetimeNotifications((notification) => {
             if (notification.bRunning && !disposed) {
@@ -1246,6 +1407,7 @@ var index = definePlugin(() => {
             timers.forEach((id) => clearTimeout(id));
             timers.clear();
             gameLifetimeUnsub?.unregister();
+            disposeUpdateWatch();
         },
     };
 });
