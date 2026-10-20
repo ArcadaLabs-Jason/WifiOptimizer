@@ -762,12 +762,11 @@ def _save_settings_with_timestamp(data: dict):
     _save_settings(data)
 
 
-# Release signatures. An update today is trusted because it came from GitHub
-# over TLS. Checking a signature as well means a compromised account or a
-# tampered release asset cannot push code that runs as root. Nothing calls
-# this yet: which key signs releases is still to be decided, and until a key
-# is pinned below every check fails. Using it from the updater is a separate
-# change.
+# Release signatures. Coming from GitHub over TLS is not enough on its own:
+# a compromised account or a tampered release asset could then push code that
+# runs as root. So every release carries a SHA256SUMS file signed with a key
+# pinned below, and the updater installs nothing that list does not vouch
+# for. With no key pinned every check fails, and so does every update.
 #
 # The format is minisign's, so releases can be signed with the stock tool and
 # checked here without anything Decky does not bundle. Ed25519 is written out
@@ -775,9 +774,15 @@ def _save_settings_with_timestamp(data: dict):
 #
 # Each entry is a minisign public key as the second line of a minisign.pub
 # file, the base64 that starts "RW". A string is what a person compares
-# against the published key, so it is pinned as one. Empty until a key is
-# chosen.
-TRUSTED_RELEASE_KEYS = ()
+# against the published key, so it is pinned as one. The first key signs
+# releases. The second is a rescue key, kept offline and used only to sign a
+# release that rotates the first one out if it is ever lost or leaked.
+TRUSTED_RELEASE_KEYS = (
+    # Release key, id FE0DCD913B7044FA.
+    "RWT6RHA7kc0N/vvpQCVTRBrSXNZpv7hBFPZpSRX9m5v55Mrl15BB1heh",
+    # Rescue key, id 0DB3B91752AFFB43.
+    "RWRD+69SF7mzDbaCBVP3Pj5/5sOngkf/rVfOxCocbSTf+H8OP115i+8g",
+)
 
 # Bounds on what is read. A real signature file is about 300 bytes and a
 # checksum list a few lines, so anything near these is not ours.
@@ -1053,6 +1058,16 @@ def verify_release_manifest(sums_bytes: bytes, minisig_text: str,
         return {"ok": False, "error": "verification failed"}
 
 
+# Where releases are looked up and downloaded. Every release, beta or stable,
+# carries the same three files: the source tarball, SHA256SUMS listing its
+# checksum, and SHA256SUMS.minisig signing that list.
+RELEASES_API = "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases"
+RELEASE_DOWNLOAD = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases/download"
+# A page of releases, notes included, is tens of kilobytes. Anything past
+# this is not GitHub answering the question we asked.
+RELEASES_LIST_MAX = 4 * 1024 * 1024
+
+
 # The update script, run as root with its values as arguments (see
 # apply_update). Raw, so what is written here is exactly what bash reads.
 UPDATE_SCRIPT = r"""#!/bin/bash
@@ -1065,6 +1080,9 @@ DOWNLOAD_URL="$3"
 SRC_NAME="$4"
 LABEL="$5"
 EXPECTED="$6"
+# The tarball's sha256, from the release's signed SHA256SUMS. It is what
+# makes the download trustworthy, so there is no way on without one.
+EXPECTED_SHA="${7:-}"
 
 STATE=/run/wifi-optimizer/update-state
 TMP=$(mktemp -d) || exit 1
@@ -1098,6 +1116,14 @@ if command -v flock >/dev/null 2>&1; then
     flock -n 9 || { logger -t wifi-optimizer "Update already running"; exit 0; }
 fi
 OWN_LOCK=1
+# Checked once the lock is held, so the panel is told this one failed.
+case "$EXPECTED_SHA" in
+    *[!0123456789abcdef]*) EXPECTED_SHA="" ;;
+esac
+if [ "${#EXPECTED_SHA}" != 64 ]; then
+    logger -t wifi-optimizer "Update failed: no signed checksum to check the payload against"
+    exit 1
+fi
 set_state downloading
 
 sleep 2
@@ -1109,9 +1135,15 @@ curl -sSL --fail --proto '=https' --tlsv1.2 $OPTS "$DOWNLOAD_URL" -o "$TMP/updat
     exit 1
 }
 
-# Recorded so a bad or unexpected payload is traceable after the fact.
+# Recorded so a bad or unexpected payload is traceable after the fact, and
+# compared before anything is extracted: until it matches, the file is just
+# whatever the network handed us.
 SUM=$(sha256sum "$TMP/update.tar.gz" 2>/dev/null | cut -d' ' -f1)
 logger -t wifi-optimizer "Update payload sha256=$SUM"
+if [ "$SUM" != "$EXPECTED_SHA" ]; then
+    logger -t wifi-optimizer "Update failed: payload does not match its signed checksum"
+    exit 1
+fi
 
 tar xzf "$TMP/update.tar.gz" -C "$TMP" --no-same-owner --no-same-permissions || {
     logger -t wifi-optimizer "Update failed: extract error"
@@ -6760,8 +6792,57 @@ class Plugin:
     def _is_older(self, candidate: str, than: str) -> bool:
         return self._version_parts(candidate) < self._version_parts(than)
 
+    async def _github_api(self, url: str) -> dict:
+        """GET a GitHub API url. The _run_cmd result, with an answer too
+        large to be a real one turned into a failure."""
+        result = await asyncio.to_thread(
+            self._run_cmd,
+            [
+                "/usr/bin/curl", "-sL", "--proto", "=https", "--connect-timeout", "3", "--max-time", "10",
+                "--max-filesize", str(RELEASES_LIST_MAX),
+                "-H", "Accept: application/vnd.github.v3+json", url,
+            ],
+            15,
+        )
+        if len(result.get("stdout") or "") > RELEASES_LIST_MAX:
+            return {**result, "success": False, "stderr": "response too large"}
+        return result
+
+    @classmethod
+    def _newest_release(cls, releases) -> str:
+        """The highest version among published releases, or "".
+
+        Highest by version, not newest by date: a stable release newer than
+        every beta is the one a beta user should be offered, and the order
+        releases were made in says nothing about which is ahead. Drafts and
+        any tag that is not "v" and a version are skipped, never repaired.
+        Ties between prereleases of one number go to the later name, so the
+        answer does not depend on the order GitHub lists them in.
+        """
+        if not isinstance(releases, list):
+            return ""
+        best = None
+        for release in releases:
+            if not isinstance(release, dict) or release.get("draft"):
+                continue
+            tag = release.get("tag_name")
+            if not isinstance(tag, str) or not tag.startswith("v"):
+                continue
+            version = tag[1:]
+            if len(version) > 64 or not VERSION_RE.match(version):
+                continue
+            key = (cls._version_parts(version), version)
+            if best is None or key > best:
+                best = key
+        return best[1] if best else ""
+
     async def check_for_update(self) -> dict:
-        """Check GitHub for a newer version (stable release or beta branch)."""
+        """Check GitHub's releases for a newer version on the chosen channel.
+
+        Stable asks for the latest release, which GitHub never answers with
+        a prerelease. Beta looks at recent releases of both kinds and takes
+        the highest version.
+        """
         try:
             current = decky.DECKY_PLUGIN_VERSION
             settings = _load_settings()
@@ -6769,25 +6850,9 @@ class Plugin:
             decky.logger.info(f"Update check: current={current}, channel={channel}")
 
             if channel == "beta":
-                result = await asyncio.to_thread(
-                    self._run_cmd,
-                    [
-                        "/usr/bin/curl", "-sL", "--proto", "=https", "--connect-timeout", "3", "--max-time", "10",
-                        "-H", "Accept: application/vnd.github.raw+json",
-                        "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/contents/package.json?ref=beta",
-                    ],
-                    15,
-                )
+                result = await self._github_api(f"{RELEASES_API}?per_page=30")
             else:
-                result = await asyncio.to_thread(
-                    self._run_cmd,
-                    [
-                        "/usr/bin/curl", "-sL", "--proto", "=https", "--connect-timeout", "3", "--max-time", "10",
-                        "-H", "Accept: application/vnd.github.v3+json",
-                        "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest",
-                    ],
-                    15,
-                )
+                result = await self._github_api(f"{RELEASES_API}/latest")
 
             if not result["success"] or not result["stdout"]:
                 decky.logger.error(f"Update check: curl failed - rc={result.get('returncode')}, stderr={result.get('stderr', '')[:200]}")
@@ -6802,10 +6867,10 @@ class Plugin:
             data = json.loads(result["stdout"])
 
             if channel == "beta":
-                latest = data.get("version", "")
+                latest = self._newest_release(data)
             else:
-                tag = data.get("tag_name", "")
-                latest = tag.lstrip("v")
+                tag = data.get("tag_name", "") if isinstance(data, dict) else ""
+                latest = tag.lstrip("v") if isinstance(tag, str) else ""
 
             if latest and (len(latest) > 64 or not VERSION_RE.match(latest)):
                 # Refuse rather than sanitise. This value reaches a download
@@ -6821,7 +6886,10 @@ class Plugin:
                 }
 
             if not latest:
-                msg = data.get("message", "couldn't parse version")
+                # GitHub explains a refusal (a rate limit) in "message".
+                msg = data.get("message") if isinstance(data, dict) else None
+                if not isinstance(msg, str) or not msg:
+                    msg = "No releases found." if channel == "beta" else "couldn't parse version"
                 decky.logger.error(f"Update check: no version - {msg}")
                 return {
                     "success": False,
@@ -6889,6 +6957,88 @@ class Plugin:
                 "message": "Couldn't check for updates.",
             }
 
+    def _fetch_release_file(self, url: str, limit: int) -> dict:
+        """Download one small release file into memory.
+
+        {"data": bytes or None, "missing": bool}. missing means GitHub
+        answered 404: the release has no such file. curl writes to a private
+        file rather than to its output, because the signature covers these
+        exact bytes and _run_cmd decodes and strips what it captures.
+        """
+        directory = tempfile.mkdtemp(prefix="wifi-optimizer-release-")
+        path = os.path.join(directory, "file")
+        try:
+            os.chmod(directory, 0o700)
+            result = self._run_cmd(
+                [
+                    "/usr/bin/curl", "-sSL", "--fail", "--proto", "=https", "--tlsv1.2",
+                    "--connect-timeout", "5", "--max-time", "15", "--max-filesize", str(limit),
+                    "-w", "%{http_code}", "-o", path, url,
+                ],
+                20,
+            )
+            if not result["success"]:
+                missing = result.get("stdout", "").strip() == "404"
+                decky.logger.error(
+                    f"Release file {url} not downloaded: rc={result.get('returncode')}, "
+                    f"http={result.get('stdout', '')[:8]!r}, {result.get('stderr', '')[:200]}"
+                )
+                return {"data": None, "missing": missing}
+            with open(path, "rb") as f:
+                data = f.read(limit + 1)
+            if len(data) > limit:
+                decky.logger.error(f"Release file {url} is larger than {limit} bytes")
+                return {"data": None, "missing": False}
+            return {"data": data, "missing": False}
+        except OSError as e:
+            decky.logger.error(f"Release file {url} not read: {e}")
+            return {"data": None, "missing": False}
+        finally:
+            for leftover, remove in ((path, os.remove), (directory, os.rmdir)):
+                try:
+                    remove(leftover)
+                except OSError:
+                    pass
+
+    async def _signed_release(self, version: str) -> dict:
+        """The tarball's URL and signed sha256 for a release, or why not.
+
+        {"ok": True, "url": ..., "sha256": ...} or {"ok": False, "message":
+        text for the panel}. The release's SHA256SUMS must carry a signature
+        from a pinned key whose trusted comment names this version, and must
+        list the tarball. Anything less and nothing is installed.
+        """
+        def refuse(message, reason):
+            decky.logger.error(f"Update to v{version} refused: {reason}")
+            return {"ok": False, "message": message}
+
+        if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
+            return refuse("Received an unexpected version from GitHub.", f"version {version!r}")
+        base = f"{RELEASE_DOWNLOAD}/v{version}"
+        sums = await asyncio.to_thread(self._fetch_release_file, f"{base}/SHA256SUMS", RELEASE_SUMS_MAX)
+        sig = await asyncio.to_thread(self._fetch_release_file, f"{base}/SHA256SUMS.minisig", RELEASE_SIG_MAX)
+        if sums["missing"] or sig["missing"]:
+            return refuse("This release isn't signed, so it wasn't installed.", "no signature files")
+        if sums["data"] is None or sig["data"] is None:
+            return refuse("Couldn't download the release's signature. Try again later.",
+                          "signature files not downloaded")
+        try:
+            sig_text = sig["data"].decode("utf-8")
+        except UnicodeDecodeError:
+            sig_text = None
+        # Pure Python arithmetic, a fraction of a second, kept off the loop.
+        check = await asyncio.to_thread(verify_release_manifest, sums["data"], sig_text, version)
+        if not check.get("ok"):
+            return refuse("This release's signature didn't check out, so it wasn't installed.",
+                          check.get("error", "verification failed"))
+        name = f"wifi-optimizer-v{version}.tar.gz"
+        sha256 = check["sha256"].get(name)
+        if not sha256:
+            return refuse("This release's signed checksums don't cover the update, so it wasn't installed.",
+                          f"{name} not in SHA256SUMS")
+        decky.logger.info(f"Release v{version} signature verified, {name} sha256={sha256}")
+        return {"ok": True, "url": f"{base}/{name}", "sha256": sha256}
+
     async def apply_update(self) -> dict:
         """Download and install the update from the selected channel.
 
@@ -6920,16 +7070,17 @@ class Plugin:
             channel = info.get("channel", "stable")
             latest = info["latest_version"]
             plugin_dir = decky.DECKY_PLUGIN_DIR
+            label = f"beta v{latest}" if channel == "beta" else f"v{latest}"
 
-            if channel == "beta":
-                download_url = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/heads/beta.tar.gz"
-                src_dir = "WifiOptimizer-beta"
-                label = f"beta v{latest}"
-            else:
-                tag = f"v{latest}"
-                download_url = f"https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/tags/{tag}.tar.gz"
-                src_dir = f"WifiOptimizer-{latest}"
-                label = f"v{latest}"
+            # Nothing is downloaded to run until the release's signed
+            # checksum list has been checked here. The script then refuses a
+            # tarball whose sha256 is not the one that list gives.
+            signed = await self._signed_release(latest)
+            if not signed["ok"]:
+                return {"success": False, "message": signed["message"]}
+            download_url = signed["url"]
+            sha256 = signed["sha256"]
+            src_dir = f"WifiOptimizer-{latest}"
 
             # Values reaching the script are passed as ARGUMENTS, never
             # interpolated, so nothing derived from the network can be read as
@@ -6962,7 +7113,7 @@ class Plugin:
                 await asyncio.to_thread(
                     self._launch_updater,
                     ["/bin/bash", script_path, script_dir, plugin_dir,
-                     download_url, src_dir, label, latest],
+                     download_url, src_dir, label, latest, sha256],
                 )
             except Exception:
                 # Nothing started, so nothing will remove the directory, and

@@ -1006,7 +1006,9 @@ for cand, than, want, label in cases:
 class Chan(m.Plugin):
     def __init__(self, latest): super().__init__(); self.latest = latest
     def _run_cmd(self, cmd, timeout=5):
-        return {"success":True,"stdout":json.dumps({"version":self.latest}),
+        # The beta channel reads the list of releases, as GitHub's API gives it.
+        return {"success":True,"stdout":json.dumps([{"tag_name":"v"+self.latest,"draft":False,
+                                                     "prerelease":"-" in self.latest}]),
                 "stderr":"","returncode":0}
 # The installed version comes from decky at runtime; without setting it the
 # harness compares against 0.0.0 and nothing is ever a downgrade.
@@ -3063,6 +3065,9 @@ try:
         class Starts(Launch):
             async def check_for_update(self):
                 return {"update_available": True, "channel": "beta", "latest_version": "0.19.0-beta"}
+            # The signature check has its own section; here it passes.
+            async def _signed_release(self, version):
+                return {"ok": True, "url": "https://example.invalid/u.tar.gz", "sha256": "0" * 64}
         _state("failed 0.19.0-beta\n")
         st = Starts(0); r = asyncio.run(st.apply_update())
         ok(r.get("success") is True and r.get("version") == "0.19.0-beta",
@@ -3187,6 +3192,9 @@ try:
     class PopenFails(m.Plugin):
         async def check_for_update(self):
             return {"update_available": True, "channel": "stable", "latest_version": "9.9.9"}
+        # Signed, so the failure under test is the launch's, not the check's.
+        async def _signed_release(self, version):
+            return {"ok": True, "url": "https://example.invalid/u.tar.gz", "sha256": "0" * 64}
     _real_popen = m.subprocess.Popen
     _made = []
     _real_mkdtemp = m.tempfile.mkdtemp
@@ -4504,7 +4512,7 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
-section("release signatures: checked strictly, and not used yet")
+section("release signatures: checked strictly, and required for every update")
 try:
     import base64, hashlib
     _b64 = lambda raw: base64.b64encode(raw).decode("ascii")
@@ -4735,48 +4743,363 @@ try:
     ok(_fail(_quiet(m.verify_release_manifest, "text", _good, "0.20.0-beta", keys=(_test_key,)), None),
        "a checksum list given as text fails without raising")
 
-    ok(m.TRUSTED_RELEASE_KEYS == (), "no release key is pinned yet")
-    for _r in (_quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta"),
-               _quiet(m.verify_release_manifest, _FORK_SUMS, _FORK_SIG, "0.15.1"),
-               _quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta", keys=())):
-        ok(_r == {"ok": False, "error": "no release keys pinned"},
-           f"so every release fails closed, saying why ({_r})")
+    # The keys releases are checked against. Pinned as strings so a person
+    # can compare them with the ones SECURITY.md publishes.
+    _MAIN_KEY = "RWT6RHA7kc0N/vvpQCVTRBrSXNZpv7hBFPZpSRX9m5v55Mrl15BB1heh"
+    _RESCUE_KEY = "RWRD+69SF7mzDbaCBVP3Pj5/5sOngkf/rVfOxCocbSTf+H8OP115i+8g"
+    ok(m.TRUSTED_RELEASE_KEYS == (_MAIN_KEY, _RESCUE_KEY),
+       "exactly the release key and the rescue key are pinned, in that order")
+    _ids = [m._parse_minisign_key(k) for k in m.TRUSTED_RELEASE_KEYS]
+    ok(all(_ids) and [k[0][::-1].hex().upper() for k in _ids] == ["FE0DCD913B7044FA", "0DB3B91752AFFB43"],
+       "each parses, with the key id minisign prints for it")
+    _sec = open("SECURITY.md").read()
+    ok(all(k in _sec for k in (_MAIN_KEY, _RESCUE_KEY, "FE0DCD913B7044FA", "0DB3B91752AFFB43")),
+       "and SECURITY.md publishes both, with their ids")
 
-    # Not used yet. Wiring this into the updater should be a deliberate step,
-    # made by changing these checks along with it.
+    # Real minisign 0.12 output from a throwaway key whose secret is gone:
+    # what the release script will write, for version 9.9.9.
+    _MS_PUB = "RWR6Nddm88NQqXySQcM4BmPoVCdHizp6GZ4SH+tQc0O5G83P2KNMJrcN"
+    _MS_SUMS = b"a" * 64 + b"  wifi-optimizer-v9.9.9.tar.gz\n"
+    _MS_SIG = (
+        "untrusted comment: signature from minisign secret key\n"
+        "RUR6Nddm88NQqVx4Pf2QGttkF6nwIZURt4EVgcox3s4vEkXFLx9MMQNX4QMAZOYovSKYdsArO/QyR7NAaQWXUx9XHuc+fymGPQI=\n"
+        "trusted comment: wifi-optimizer v9.9.9\n"
+        "Cgqm3jP786tXixb9l2myCOKJhya+Y5a6Yn8VwerdwZKtUohAjCrr9pQprdWtGBE6kDmnp3fwAs79t2IuftsgDg==\n")
+    _r = _quiet(m.verify_release_manifest, _MS_SUMS, _MS_SIG, "9.9.9", keys=(_MS_PUB,))
+    ok(_r == {"ok": True, "sha256": {"wifi-optimizer-v9.9.9.tar.gz": "a" * 64}},
+       f"a release manifest made by minisign 0.12 verifies, in the format the release script writes ({_r})")
+    _r = _quiet(m.verify_release_manifest, _MS_SUMS, _MS_SIG, "9.9.9")
+    ok(_fail(_r, "signature is not from a pinned key"), f"but not under the pinned keys ({_r})")
+
+    for _r in (_quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta"),
+               _quiet(m.verify_release_manifest, _FORK_SUMS, _FORK_SIG, "0.15.1")):
+        ok(_fail(_r, "signature is not from a pinned key"),
+           f"nor does anything signed by another key ({_r})")
+    _r = _quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta", keys=())
+    ok(_r == {"ok": False, "error": "no release keys pinned"}, f"with no keys pinned, everything fails closed ({_r})")
+    _real_keys = m.TRUSTED_RELEASE_KEYS
+    try:
+        m.TRUSTED_RELEASE_KEYS = ()
+        _r = _quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta")
+        ok(_r == {"ok": False, "error": "no release keys pinned"},
+           f"including when the pinned list itself is empty, read at call time ({_r})")
+    finally:
+        m.TRUSTED_RELEASE_KEYS = _real_keys
+
+    # Used, and only where it should be: the updater, through _signed_release.
     _vtree = ast.parse(open("main.py").read())
     _vfuncs = {"verify_release_manifest", "_minisign_verify", "_parse_minisig", "_parse_minisign_key",
                "_parse_sha256sums", "_ed25519_verify", "_b64_exact",
                "_ed_add", "_ed_mul", "_ed_encode", "_ed_decode"}
-    _vconsts = {"TRUSTED_RELEASE_KEYS", "RELEASE_SIG_MAX", "RELEASE_SUMS_MAX", "_SHA256SUMS_LINE",
-                "_ED_P", "_ED_L", "_ED_D", "_ED_SQRT_M1", "_ED_B"}
-    _vnames = _vfuncs | _vconsts
     _defined = {n.name for n in _vtree.body if isinstance(n, ast.FunctionDef)}
     ok(_vfuncs <= _defined, f"the verifier's functions are all at module level ({sorted(_vfuncs - _defined)})")
-    _uses = []
-    for _node in _vtree.body:
-        if isinstance(_node, ast.FunctionDef) and _node.name in _vfuncs:
-            continue
-        if (isinstance(_node, ast.Assign) and len(_node.targets) == 1
-                and getattr(_node.targets[0], "id", None) in _vconsts):
-            continue
-        for _sub in ast.walk(_node):
-            _name = getattr(_sub, "id", None) if isinstance(_sub, ast.Name) else (
-                _sub.attr if isinstance(_sub, ast.Attribute) else None)
-            if _name in _vnames:
-                _uses.append((_name, _sub.lineno))
-    ok(not _uses, f"nothing outside the verifier uses it, the Plugin class included ({_uses})")
+    _users = set()
+    for _cls in (n for n in _vtree.body if isinstance(n, ast.ClassDef)):
+        for _fn in (n for n in _cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            if any(isinstance(s, ast.Name) and s.id == "verify_release_manifest" for s in ast.walk(_fn)):
+                _users.add(_fn.name)
+    ok(_users == {"_signed_release"}, f"the plugin checks signatures in one place ({sorted(_users)})")
     _main_src = open("main.py").read()
     _au = _main_src[_main_src.index("    async def apply_update"):]
     _au = _au[:_au.index("\n    def _launch_updater")]
-    ok(not any(n in _au or n in m.UPDATE_SCRIPT for n in _vnames) and "minisig" not in m.UPDATE_SCRIPT,
-       "apply_update and the update script do not check signatures yet")
+    ok("await self._signed_release(latest)" in _au and 'if not signed["ok"]:' in _au
+       and _au.index("await self._signed_release(latest)") < _au.index('if not signed["ok"]:')
+       < _au.index("self._launch_updater"),
+       "apply_update checks the signature, and stops on a failure, before it launches anything")
+    ok('download_url = signed["url"]' in _au and 'sha256 = signed["sha256"]' in _au
+       and "latest, sha256]" in _au,
+       "and what it downloads and the sha256 it hands the script both come from the signed list")
+    ok("archive/refs/heads" not in _main_src and "archive/refs/tags" not in _main_src
+       and "contents/package.json" not in _main_src,
+       "no download of a branch or tag archive, and no version read from a branch, is left")
+    _scr = m.UPDATE_SCRIPT
+    ok('EXPECTED_SHA="${7:-}"' in _scr
+       and _scr.index('if [ "${#EXPECTED_SHA}" != 64 ]') < _scr.index("set_state downloading"),
+       "the update script refuses to start without a sha256 to check against")
+    ok(_scr.index('if [ "$SUM" != "$EXPECTED_SHA" ]') < _scr.index("tar xzf"),
+       "and compares the payload with it before extracting anything")
     _elsewhere = open("install.sh").read() + "".join(
         open(os.path.join(dp, f)).read() for dp, _dn, fs in os.walk("src") for f in fs)
     ok("minisig" not in _elsewhere and "verify_release" not in _elsewhere,
-       "nor do the installer or the panel")
+       "the panel and the installer do not handle signatures: the updater in the backend does")
     _vblock = _main_src[_main_src.index("# Release signatures."):_main_src.index("# The update script, run as root")]
     ok(all(ord(ch) < 128 for ch in _vblock), "the verifier is plain ASCII")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("updates: the beta channel takes the highest release")
+try:
+    class Releases(m.Plugin):
+        """GitHub's API answering with a fixed list of releases."""
+        def __init__(self, releases, raw=None):
+            super().__init__(); self.releases = releases; self.raw = raw; self.cmds = []
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(cmd)
+            out = self.raw if self.raw is not None else json.dumps(self.releases)
+            return {"success": True, "stdout": out, "stderr": "", "returncode": 0}
+
+    def _rel(tag, draft=False, pre=None):
+        return {"tag_name": tag, "draft": draft, "prerelease": ("-" in str(tag)) if pre is None else pre}
+
+    def _beta_check(releases, current="0.20.0-beta", raw=None):
+        m.decky.DECKY_PLUGIN_VERSION = current
+        m._save_settings({**m.DEFAULT_SETTINGS, "update_channel": "beta"})
+        rc = Releases(releases, raw)
+        return asyncio.run(rc.check_for_update()), rc
+
+    _real_ver = m.decky.DECKY_PLUGIN_VERSION
+    try:
+        _r, _rc = _beta_check([_rel("v0.20.0-beta")])
+        _c = _rc.cmds[0] if _rc.cmds else []
+        ok(_c[-1:] == ["https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases?per_page=30"]
+           and "Accept: application/vnd.github.v3+json" in _c,
+           f"the beta channel asks for the list of releases ({_c[-1:]})")
+        ok(_c[:1] == ["/usr/bin/curl"] and "=https" in _c and "--max-time" in _c and "--max-filesize" in _c,
+           "over https only, with a time limit and a size limit")
+        ok(_r.get("success") is True and _r.get("update_available") is False,
+           "the version already installed is not offered again")
+
+        _set = [_rel("v0.20.0-beta"), _rel("v0.21.0-beta"), _rel("v0.19.2"), _rel("v0.20.1-beta")]
+        for _order in (_set, _set[::-1], _set[2:] + _set[:2]):
+            _r, _ = _beta_check(_order)
+            ok(_r.get("latest_version") == "0.21.0-beta" and _r.get("update_available") is True,
+               f"the highest version wins whatever order GitHub lists them in ({[x['tag_name'] for x in _order]})")
+        _r, _ = _beta_check([_rel("v0.21.0-beta"), _rel("v0.21.0"), _rel("v0.20.5-beta")])
+        ok(_r.get("latest_version") == "0.21.0" and not _r.get("is_downgrade"),
+           "a stable release newer than every beta is the one picked")
+        _r, _ = _beta_check([_rel("v9.0.0", draft=True), _rel("v0.21.0-beta")])
+        ok(_r.get("latest_version") == "0.21.0-beta", "a draft is ignored")
+        _bad = [_rel("0.30.0"), _rel("v0.30;rm"), _rel("v" + "1." * 40 + "1"), _rel(None), _rel(5),
+                _rel("latest"), _rel("v0.30.0-"), _rel("v../0.30"), _rel("V0.30.0"), "v0.30.0", None,
+                {"draft": False}]
+        _r, _ = _beta_check(_bad + [_rel("v0.21.0-beta")])
+        ok(_r.get("latest_version") == "0.21.0-beta", f"tags that are not v and a version are ignored ({_r})")
+        _r, _ = _beta_check(_bad)
+        ok(_r.get("success") is False and _r.get("update_available") is False,
+           "and a list with nothing usable offers nothing")
+        _r, _ = _beta_check([])
+        ok(_r.get("success") is False and _r.get("update_available") is False
+           and _r.get("message") == "No releases found.",
+           f"an empty list is handled, and said ({_r.get('message')!r})")
+        _r, _ = _beta_check(None, raw=json.dumps({"message": "API rate limit exceeded"}))
+        ok(_r.get("success") is False and _r.get("message") == "API rate limit exceeded",
+           "GitHub's own reason for refusing is passed on")
+        _r, _ = _beta_check(None, raw="[" + " " * (m.RELEASES_LIST_MAX + 1) + "]")
+        ok(_r.get("success") is False and _r.get("update_available") is False,
+           "an answer too large to be real is not parsed")
+        _r, _ = _beta_check([_rel("v0.19.0")], current="0.20.0-beta")
+        ok(_r.get("update_available") is True and _r.get("is_downgrade") is True,
+           "when only an older release is published, beta still offers it, labelled as going back")
+
+        m.decky.DECKY_PLUGIN_VERSION = "0.19.0"
+        m._save_settings({**m.DEFAULT_SETTINGS, "update_channel": "stable"})
+        _rc = Releases(None, raw=json.dumps({"tag_name": "v0.20.0", "draft": False}))
+        _r = asyncio.run(_rc.check_for_update())
+        ok(_rc.cmds and _rc.cmds[0][-1] == "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest"
+           and _r.get("latest_version") == "0.20.0" and _r.get("update_available") is True,
+           "the stable channel still asks for the latest release, which GitHub never answers with a beta")
+        _rc = Releases(None, raw=json.dumps({"tag_name": "v0.21.0-beta"}))
+        _r = asyncio.run(_rc.check_for_update())
+        ok(_r.get("update_available") is False, "and still refuses a prerelease that comes back anyway")
+        _rc = Releases(None, raw=json.dumps([_rel("v0.21.0")]))
+        _r = asyncio.run(_rc.check_for_update())
+        ok(_r.get("success") is False and _r.get("update_available") is False,
+           "a list where one release was expected offers nothing, without raising")
+    finally:
+        m.decky.DECKY_PLUGIN_VERSION = _real_ver
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("updates: nothing is installed without a valid signature")
+try:
+    import shutil
+    _DL = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases/download"
+    _VER = "0.21.0-beta"
+    _TAR = f"wifi-optimizer-v{_VER}.tar.gz"
+    _TAR_SHA = hashlib.sha256(b"the release tarball").hexdigest()
+    _REL_SUMS = f"{_TAR_SHA}  {_TAR}\n".encode()
+    _REL_SIG = _minisign(_REL_SUMS, f"wifi-optimizer v{_VER}")
+
+    class Release(m.Plugin):
+        """A release on GitHub, served by a curl that writes where it is told."""
+        def __init__(self, files, channel="beta", version=_VER):
+            super().__init__(); self.files = files; self.channel = channel; self.version = version
+            self.cmds = []; self.launched = []
+        async def check_for_update(self):
+            return {"update_available": True, "channel": self.channel, "latest_version": self.version}
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(cmd)
+            body = self.files.get(cmd[-1])
+            if body is None:
+                return {"success": False, "stdout": "404", "stderr": "error: 404", "returncode": 22}
+            if body == "down":
+                return {"success": False, "stdout": "000", "stderr": "could not resolve", "returncode": 6}
+            open(cmd[cmd.index("-o") + 1], "wb").write(body)
+            return {"success": True, "stdout": "200", "stderr": "", "returncode": 0}
+        def _launch_updater(self, argv):
+            self.launched.append(argv)
+
+    def _files(sums=_REL_SUMS, sig=_REL_SIG, version=_VER):
+        out = {}
+        if sums is not None: out[f"{_DL}/v{version}/SHA256SUMS"] = sums
+        if sig is not None:
+            out[f"{_DL}/v{version}/SHA256SUMS.minisig"] = sig.encode() if isinstance(sig, str) and sig != "down" else sig
+        return out
+
+    def _apply(rel):
+        r = asyncio.run(rel.apply_update())
+        if getattr(rel, "_update_dir", None) and os.path.isdir(rel._update_dir):
+            shutil.rmtree(rel._update_dir)
+        rel._update_dir = None
+        return r
+
+    _real_keys = m.TRUSTED_RELEASE_KEYS
+    try:
+        m.TRUSTED_RELEASE_KEYS = (_test_key,)
+        _rel_ok = Release(_files())
+        _r = _apply(_rel_ok)
+        _argv = _rel_ok.launched[0] if _rel_ok.launched else []
+        ok(_r.get("success") is True and _r.get("version") == _VER, f"a correctly signed release starts ({_r})")
+        ok(_argv[:1] == ["/bin/bash"] and _argv[4:] == [f"{_DL}/v{_VER}/{_TAR}", f"WifiOptimizer-{_VER}",
+                                                        f"beta v{_VER}", _VER, _TAR_SHA],
+           f"the script gets the release's tarball, its directory and its signed sha256 ({_argv[4:]})")
+        _gets = [c for c in _rel_ok.cmds if c[:1] == ["/usr/bin/curl"]]
+        ok([c[-1] for c in _gets] == [f"{_DL}/v{_VER}/SHA256SUMS", f"{_DL}/v{_VER}/SHA256SUMS.minisig"],
+           "the checksum list and its signature are fetched for that release's tag")
+        ok(all("--fail" in c and "=https" in c and "--max-filesize" in c and "--max-time" in c for c in _gets),
+           "each over https only, failing on an HTTP error, bounded in size and time")
+        ok(not _rel_ok._update_running(), "and the claim is released afterwards")
+        _st = Release(_files(), channel="stable")
+        _r = _apply(_st)
+        ok(_st.launched and _st.launched[0][4:7] == [f"{_DL}/v{_VER}/{_TAR}", f"WifiOptimizer-{_VER}", f"v{_VER}"],
+           "stable fetches the same release asset and unpacks the same directory")
+
+        _wrong_comment = _minisign(_REL_SUMS, "wifi-optimizer v0.20.0-beta")
+        _no_tar = f"{_TAR_SHA}  wifi-optimizer-v0.20.0-beta.tar.gz\n".encode()
+        _cases = [
+            ("no signature file", _files(sig=None), "This release isn't signed, so it wasn't installed."),
+            ("no checksum list", _files(sums=None), "This release isn't signed, so it wasn't installed."),
+            ("a signature that does not verify", _files(sig=_edit_b64(_REL_SIG, 1, 30)),
+             "This release's signature didn't check out, so it wasn't installed."),
+            ("a checksum list changed after signing", _files(sums=_REL_SUMS.replace(b"  ", b"  x")),
+             "This release's signature didn't check out, so it wasn't installed."),
+            ("a signature for another version", _files(sig=_wrong_comment),
+             "This release's signature didn't check out, so it wasn't installed."),
+            ("a signature by a key that is not pinned", _files(sig=_MS_SIG),
+             "This release's signature didn't check out, so it wasn't installed."),
+            ("a signature file that is not text", _files(sig=b"\xff\xfe" + _REL_SIG.encode()),
+             "This release's signature didn't check out, so it wasn't installed."),
+            ("a signed list without the tarball", _files(sums=_no_tar, sig=_minisign(_no_tar, f"wifi-optimizer v{_VER}")),
+             "This release's signed checksums don't cover the update, so it wasn't installed."),
+            ("the signature not downloadable", _files(sig="down"),
+             "Couldn't download the release's signature. Try again later."),
+            ("an oversized checksum list", _files(sums=b"x" * (m.RELEASE_SUMS_MAX + 1)),
+             "Couldn't download the release's signature. Try again later."),
+        ]
+        for _what, _fs, _msg in _cases:
+            _rel = Release(_fs)
+            _r = _apply(_rel)
+            ok(_r.get("success") is False and _r.get("message") == _msg and not _rel.launched
+               and not _rel._update_running() and _rel._update_starting is False,
+               f"{_what}: refused, nothing launched, the claim released ({_r.get('message')!r})")
+        ok(all(ord(ch) < 128 for _w, _f, _msg in _cases for ch in _msg),
+           "every refusal is plain ASCII")
+
+        _rel = Release(_files(), version="0.21;rm")
+        _r = _apply(_rel)
+        ok(_r.get("success") is False and not _rel.launched and not _rel.cmds,
+           "a version that is not one is refused before anything is fetched")
+
+        m.TRUSTED_RELEASE_KEYS = ()
+        _rel = Release(_files())
+        _r = _apply(_rel)
+        ok(_r.get("success") is False and not _rel.launched and not _rel._update_running(),
+           "with no key pinned, even a well-formed release is refused: the updater fails closed")
+    finally:
+        m.TRUSTED_RELEASE_KEYS = _real_keys
+    _rel = Release(_files())
+    _r = _apply(_rel)
+    ok(_r.get("success") is False and not _rel.launched,
+       "and a release signed by anything but the pinned keys is refused by the plugin as shipped")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("update script: the payload must match its signed checksum, run for real")
+try:
+    import io, tarfile, subprocess as _sp, shutil
+    # The real script under bash, with the commands that would touch the
+    # network or the system replaced by shell functions: curl copies a local
+    # tarball, tar notes that it ran, logger writes to a file. The paths it
+    # keeps in /run are moved into a scratch directory, the one edit made to
+    # the script's text.
+    _fx = tempfile.mkdtemp()
+    _payload = os.path.join(_fx, "payload.tar.gz")
+    with tarfile.open(_payload, "w:gz") as _tf:
+        for _name, _body in [("plugin.json", "{}"), ("main.py", "# new\n"), ("decky.pyi", ""),
+                             ("dist/index.js", "// new\n"), ("dist/index.js.map", "{}"),
+                             ("defaults/dispatcher.sh.tmpl", "#!/bin/sh\n"),
+                             ("package.json", '{\n  "version": "9.9.9"\n}\n')]:
+            _data = _body.encode()
+            _info = tarfile.TarInfo(f"WifiOptimizer-9.9.9/{_name}"); _info.size = len(_data)
+            _tf.addfile(_info, io.BytesIO(_data))
+    _payload_sha = hashlib.sha256(open(_payload, "rb").read()).hexdigest()
+    _STUBS = r'''
+curl() { : > "$FX/curl-ran"; local o=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && o="$2"; shift; done; cp "$FX/payload.tar.gz" "$o"; }
+tar() { : > "$FX/tar-ran"; command tar "$@"; }
+logger() { echo "$*" >> "$FX/log"; }
+sleep() { :; }
+systemctl() { echo "$*" >> "$FX/systemctl"; return 0; }
+export -f curl tar logger sleep systemctl
+exec /bin/bash "$0" "$@"
+'''
+
+    def _run_script(sha_args):
+        for _f in ("curl-ran", "tar-ran", "log", "systemctl"):
+            if os.path.exists(os.path.join(_fx, _f)): os.remove(os.path.join(_fx, _f))
+        run_dir = tempfile.mkdtemp()
+        self_dir = tempfile.mkdtemp(); plugin = tempfile.mkdtemp()
+        open(os.path.join(plugin, "main.py"), "w").write("# old\n")
+        script = os.path.join(self_dir, "update.sh")
+        open(script, "w").write(m.UPDATE_SCRIPT.replace("/run/wifi-optimizer", os.path.join(run_dir, "wo")))
+        p = _sp.run(["/bin/bash", "-c", _STUBS, script, self_dir, plugin,
+                     "https://example.invalid/wifi-optimizer-v9.9.9.tar.gz", "WifiOptimizer-9.9.9",
+                     "v9.9.9", "9.9.9", *sha_args],
+                    capture_output=True, text=True, timeout=60, env={**os.environ, "FX": _fx})
+        log = open(os.path.join(_fx, "log")).read() if os.path.exists(os.path.join(_fx, "log")) else ""
+        state_file = os.path.join(run_dir, "wo", "update-state")
+        state = open(state_file).read().strip() if os.path.exists(state_file) else ""
+        out = {"rc": p.returncode, "log": log, "state": state,
+               "curl": os.path.exists(os.path.join(_fx, "curl-ran")),
+               "tar": os.path.exists(os.path.join(_fx, "tar-ran")),
+               "main": open(os.path.join(plugin, "main.py")).read(),
+               "self_left": os.path.exists(self_dir), "err": p.stderr[-300:]}
+        shutil.rmtree(plugin, ignore_errors=True); shutil.rmtree(run_dir, ignore_errors=True)
+        shutil.rmtree(self_dir, ignore_errors=True)
+        return out
+
+    _o = _run_script([_payload_sha])
+    ok(_o["rc"] == 0 and _o["main"] == "# new\n" and _o["state"] == "done 9.9.9",
+       f"a payload matching its signed sha256 installs ({_o['rc']}, {_o['state']!r}, {_o['err']!r})")
+    ok(f"Update payload sha256={_payload_sha}" in _o["log"] and not _o["self_left"],
+       "logging its sha256, and the script removes itself")
+    _other = hashlib.sha256(b"something else").hexdigest()
+    _o = _run_script([_other])
+    ok(_o["rc"] != 0 and "Update failed: payload does not match its signed checksum" in _o["log"],
+       f"a payload that does not match exits non-zero, saying why ({_o['rc']}, {_o['log'][-120:]!r})")
+    ok(_o["curl"] and not _o["tar"] and _o["main"] == "# old\n",
+       "after the download but before anything is extracted, and the installed files are untouched")
+    ok(_o["state"] == "failed 9.9.9" and not _o["self_left"], "the panel is told it failed")
+    for _what, _args in [("uppercase hex", [_payload_sha.upper()]), ("63 characters", [_payload_sha[:-1]]),
+                         ("65 characters", [_payload_sha + "0"]), ("not hex", ["z" * 64]),
+                         ("a space inside", [_payload_sha[:32] + " " + _payload_sha[33:]]),
+                         ("empty", [""]), ("missing", [])]:
+        _o = _run_script(_args)
+        ok(_o["rc"] != 0 and not _o["curl"] and not _o["tar"] and _o["main"] == "# old\n"
+           and "no signed checksum" in _o["log"],
+           f"a 7th argument that is {_what} is refused before any download ({_o['rc']}, {_o['log'][-80:]!r})")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

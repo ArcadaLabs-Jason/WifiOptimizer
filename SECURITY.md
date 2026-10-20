@@ -10,11 +10,40 @@ Include what you found, the plugin version, your device and OS, and the steps to
 
 The plugin's backend runs as root, as every Decky plugin backend does. It changes NetworkManager profiles, kernel settings and system files, and it reads a settings file that lives in a directory your desktop user can write to. A bug in how it handles that input can be a way to run something as root.
 
+## Signed releases
+
+Every release, stable and beta, carries three files: the source tarball `wifi-optimizer-v<version>.tar.gz`, a `SHA256SUMS` file listing its checksum, and `SHA256SUMS.minisig`, a [minisign](https://jedisct1.github.io/minisign/) signature of that list. The signature's trusted comment names the release, `wifi-optimizer v<version>`.
+
+The in-app updater checks the signature against the keys below, which are built into the plugin, and checks that the comment names the version it is installing. It then checks the downloaded tarball against the signed checksum before unpacking it. If any of that fails, nothing is installed. A release without these files is not installed either.
+
+Release key, id `FE0DCD913B7044FA`:
+
+```
+RWT6RHA7kc0N/vvpQCVTRBrSXNZpv7hBFPZpSRX9m5v55Mrl15BB1heh
+```
+
+Rescue key, id `0DB3B91752AFFB43`:
+
+```
+RWRD+69SF7mzDbaCBVP3Pj5/5sOngkf/rVfOxCocbSTf+H8OP115i+8g
+```
+
+The release key signs releases. The rescue key is kept offline. It is only used to sign a release that replaces the release key, if that key is ever lost or leaked.
+
+To check a release by hand, download the three files into one directory and run:
+
+```bash
+minisign -Vm SHA256SUMS -P RWT6RHA7kc0N/vvpQCVTRBrSXNZpv7hBFPZpSRX9m5v55Mrl15BB1heh
+sha256sum -c SHA256SUMS
+```
+
+The first should print the trusted comment with the version you downloaded, and the second should report the tarball as OK.
+
 ## In scope
 
 - The plugin backend (`main.py`)
 - The NetworkManager dispatcher script (`defaults/dispatcher.sh.tmpl`, installed to `/etc/NetworkManager/dispatcher.d/`)
-- The updater (the update script in `main.py`, and how it downloads and installs a release)
+- The updater (the update script in `main.py`, and how it downloads, checks and installs a release)
 - The install script (`install.sh`)
 
 Problems in Decky Loader itself, SteamOS, NetworkManager or the kernel are best reported to those projects, though I am happy to hear about anything this plugin makes worse.

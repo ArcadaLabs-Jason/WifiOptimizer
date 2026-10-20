@@ -28,6 +28,8 @@ Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > 
 
 **Updating:** The plugin checks for updates automatically when you open it. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. You can also update manually by running the install command above again.
 
+Releases are signed. Before installing an update, the plugin checks the release's signature against the keys built into it and the download against the signed checksum, and installs nothing that doesn't match. [SECURITY.md](SECURITY.md) lists the keys and how to check a release yourself. The beta channel installs the newest release of either kind, beta or stable.
+
 > **Note:** If you're on a version before v0.6.6, the in-app updater had bugs. Please update manually using the install command above to get working auto-updates.
 
 ## Getting started
