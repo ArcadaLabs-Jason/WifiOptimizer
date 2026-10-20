@@ -26,7 +26,7 @@ This requires a user password - set one with `passwd` in Konsole if you haven't 
 
 Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
 
-**Updating:** The plugin checks for updates automatically when you open it. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and restarts itself. You can also update manually by running the install command above again.
+**Updating:** The plugin checks for updates automatically when you open it. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. You can also update manually by running the install command above again.
 
 > **Note:** If you're on a version before v0.6.6, the in-app updater had bugs. Please update manually using the install command above to get working auto-updates.
 
@@ -64,6 +64,14 @@ Want to go further? The remaining optimizations are available as individual togg
 | WiFi region | Sets the wireless regulatory domain, which decides the channels your device may use. The wrong region can hide 5 GHz and 6 GHz channels entirely. | Only offered on devices whose WiFi card does not carry its own region. Steam Deck cards do, so the panel reports the region in use and offers no control there. |
 | WiFi backend (iwd / wpa_supplicant) | Switches between `iwd` and `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. On SteamOS 3.8 this goes through the same system service as the setting in SteamOS Settings, so the two agree. Switching to `iwd` pauses the access point lock and Force 5 GHz. | Only shown when the system provides a way to switch; some networks (certain WPA3, enterprise setups) behave differently between the two |
 
+**Streaming auto mode**
+
+Off by default. When it's on, Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) apply only while a streaming app is running, and come off when it exits, so the rest of the time your device saves battery as it normally would. Background scanning, Force 5 GHz, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.
+
+It watches for Moonlight, GeForce NOW, Chiaki, Steam Remote Play, Steam Link, Greenlight, Parsec and Xbox Cloud Gaming, each of which can be unticked, plus any process names you add. The top of the panel always says which state you're in. If a stream isn't picked up, turn on **Keep fixes on**, which holds the fixes on until you restart, or add the app's process name.
+
+Idea and first implementation by [bassobr](https://github.com/bassobr) ([#5](https://github.com/ArcadaLabs-Jason/WifiOptimizer/issues/5)).
+
 ## Hardware support
 
 | Device | WiFi Chip | Driver | Notes |
@@ -83,11 +91,12 @@ The plugin has two parts:
 
 1. **The Decky plugin** runs in the Quick Access Menu. It applies optimizations when you toggle them and shows live status (signal, speed, frequency, channel). It notices when settings have drifted after wake: most are restored on their own, and anything left is one tap away.
 
-2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers, CAKE). If you uninstall the plugin, the script removes itself.
+2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers, CAKE). In streaming auto mode it only does that while a stream is running. If you uninstall the plugin, the script removes itself.
 
 The panel polls for live status only while it is open. Two things run without
 it: the dispatcher script, whenever WiFi reconnects, and a reapply of the
-volatile settings shortly after a game launches.
+volatile settings shortly after a game launches. In streaming auto mode the
+plugin also checks every few seconds whether a streaming app is running.
 
 ## Uninstall
 
