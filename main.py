@@ -350,6 +350,13 @@ DEFAULT_SETTINGS = {
     "streaming_apps": {},
     # Extra process patterns, separated by spaces or commas.
     "streaming_custom_patterns": "",
+    # The settings.json.corrupt the user has been told about, as its inode,
+    # modification time in nanoseconds and size. Kept on disk rather than in
+    # memory because Decky can reload the plugin between the file being set
+    # aside and the panel showing it, and a flag in memory went with the old
+    # process, so the notice never appeared. A later corruption replaces the
+    # file, which no longer matches, so the notice comes back for it.
+    "corrupt_acknowledged": [],
     "last_applied": 0,
 }
 
@@ -588,12 +595,6 @@ def _clean_sysctl_baseline(value) -> dict:
 _VALVE_POWERSAVE_VALUES = ("0", "1", "2", "3")
 
 
-# Set when a settings file that could not be parsed was moved aside, and
-# cleared once the panel has told the user. Module level, like the loader
-# that sets it, so every caller of _load_settings is covered.
-_settings_recovered = False
-
-
 def _set_aside_corrupt_settings(read_stat: os.stat_result, reason: Exception):
     """Move a settings file that does not parse to settings.json.corrupt.
 
@@ -604,7 +605,6 @@ def _set_aside_corrupt_settings(read_stat: os.stat_result, reason: Exception):
     aside again, and a previous .corrupt file is replaced: one is enough to
     recover from, and they cannot pile up.
     """
-    global _settings_recovered
     try:
         # Only the file that was read. A save that landed since then put a
         # good file at this name, and moving that aside would lose it.
@@ -612,13 +612,30 @@ def _set_aside_corrupt_settings(read_stat: os.stat_result, reason: Exception):
         if (now.st_dev, now.st_ino) != (read_stat.st_dev, read_stat.st_ino):
             return
         os.replace(SETTINGS_FILE, SETTINGS_FILE + ".corrupt")
-        _settings_recovered = True
         decky.logger.error(
             f"Settings file could not be read ({type(reason).__name__}); "
             "kept it as settings.json.corrupt and started from defaults"
         )
     except OSError as e:
         decky.logger.error(f"Settings file could not be read or set aside: {e}")
+
+
+def _corrupt_settings_identity() -> list | None:
+    """Inode, modification time in nanoseconds and size of the settings file
+    set aside as unreadable, or None when there is none.
+
+    Looked at without following links and only counted when it is a regular
+    file: the directory is the user's, so anything can sit at this name, and
+    only a file this plugin moved there is worth telling them about. A stat
+    and nothing more, as the status poll calls this every few seconds.
+    """
+    try:
+        st = os.lstat(SETTINGS_FILE + ".corrupt")
+    except OSError:
+        return None
+    if not _is_regular(st.st_mode):
+        return None
+    return [st.st_ino, st.st_mtime_ns, st.st_size]
 
 
 def _load_settings() -> dict:
@@ -718,6 +735,13 @@ def _clean_settings(data: dict) -> dict:
         if k in STREAMING_APP_IDS and isinstance(v, bool)
     }
     merged["streaming_custom_patterns"] = merged.get("streaming_custom_patterns", "")[:512]
+    # Only ever compared, but a malformed value would never match and would
+    # keep the notice up however often it was dismissed. bool is excluded by
+    # name because Python counts it as an int.
+    acknowledged = merged.get("corrupt_acknowledged", [])
+    if not (len(acknowledged) == 3
+            and all(type(n) is int and n >= 0 for n in acknowledged)):
+        merged["corrupt_acknowledged"] = []
     return merged
 
 
@@ -2660,17 +2684,39 @@ class Plugin:
         once: get_status is also called by the plugin itself (Fix now, the
         stranded pin watch), and a one-shot flag those calls consumed would
         never reach the user.
+
+        Worked out from the set-aside file and the acknowledgement saved in
+        settings, not from anything held in memory, so a plugin reload or a
+        Steam restart in between cannot lose it. The settings are the ones
+        this status already carries, so the poll reads nothing extra.
         """
-        if _settings_recovered:
+        identity = _corrupt_settings_identity()
+        settings = status.get("settings")
+        acknowledged = (settings.get("corrupt_acknowledged")
+                        if isinstance(settings, dict) else None)
+        if identity is not None and identity != acknowledged:
             status["settings_recovered"] = True
         else:
             status.pop("settings_recovered", None)
 
     async def acknowledge_settings_recovered(self) -> dict:
         """The panel has shown the notice; stop reporting it."""
-        global _settings_recovered
-        _settings_recovered = False
-        return {"success": True}
+        try:
+            # The file is looked at before the settings are loaded. Loading
+            # can itself set aside a newly unreadable file, and that one has
+            # not been shown to anyone yet, so it must not be the one
+            # recorded as seen.
+            identity = _corrupt_settings_identity()
+            if identity is None:
+                return {"success": True}
+            settings = _load_settings()
+            if settings.get("corrupt_acknowledged") != identity:
+                settings["corrupt_acknowledged"] = identity
+                _save_settings(settings)
+            return {"success": True}
+        except Exception as e:
+            decky.logger.error(f"acknowledge_settings_recovered error: {e}")
+            return self._unexpected_response(e)
 
     def _apply_status_actions(self, status: dict, pending: dict, actions: list):
         """Carry out what _collect_status proposed, on the event loop.
@@ -6387,6 +6433,12 @@ class Plugin:
                 os.remove(NM_CONF_PATH)
             except FileNotFoundError:
                 pass
+            # A settings file set aside as unreadable is kept through a reset,
+            # since it may be the only copy of what the user had. Whether
+            # they have already dismissed the notice about it is kept too:
+            # dropping that would bring back a notice they have seen, about a
+            # file that has not changed.
+            acknowledged = _load_settings().get("corrupt_acknowledged", [])
             self._release_valve_powersave(_load_settings())
             try:
                 os.remove(MODPROBE_CONF_PATH)
@@ -6430,6 +6482,7 @@ class Plugin:
             distro = self._detect_distro()
             fresh["distro_id"] = distro["id"]
             fresh["distro_name"] = distro["name"]
+            fresh["corrupt_acknowledged"] = acknowledged
             _save_settings(fresh)
 
             decky.logger.info("Settings reset to defaults")

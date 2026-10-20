@@ -4197,7 +4197,6 @@ try:
     try:
         _d = tempfile.mkdtemp(); m.SETTINGS_FILE = os.path.join(_d, "settings.json")
         _corrupt = m.SETTINGS_FILE + ".corrupt"
-        m._settings_recovered = False
         _bad = '{"dns_uuids": ["aaaaaaaa-0000-0000-0000-0000000000a6"], "dns_enabled": tru'
         open(m.SETTINGS_FILE, "w").write(_bad)
         ok(m._load_settings() == m.DEFAULT_SETTINGS, "a settings file that does not parse loads as defaults")
@@ -4205,7 +4204,8 @@ try:
            "and is kept, unchanged, as settings.json.corrupt")
         ok(not os.path.exists(m.SETTINGS_FILE),
            "so saving the defaults afterwards cannot overwrite the user's data")
-        ok(getattr(m, "_settings_recovered", False) is True, "and the event is recorded for the panel")
+        _identity = getattr(m, "_corrupt_settings_identity", lambda: None)
+        ok(_identity() is not None, "and the kept file is what records the event for the panel")
         m._save_settings(m._load_settings())
         ok(open(_corrupt).read() == _bad, "a later load and save leave the kept copy alone")
         open(m.SETTINGS_FILE, "w").write("[1, 2, 3]")
@@ -4226,23 +4226,115 @@ try:
            and not os.path.exists(_corrupt), "nor does an oversized one")
         os.remove(m.SETTINGS_FILE)
 
-        class RecoveredStatus(m.Plugin):
-            def _collect_status(self):
-                return ({"success": True, "connected": False, "settings": {}, "live": {},
-                         "drift": {}, "external": {}}, {}, [])
-        m._settings_recovered = True
-        _rp = RecoveredStatus()
-        ok(asyncio.run(_rp.get_status()).get("settings_recovered") is True,
-           "the status tells the panel the settings were reset")
-        ok(asyncio.run(_rp.get_status()).get("settings_recovered") is True,
-           "on every poll, not once, so the plugin's own status reads cannot swallow it")
+        def _reloaded():
+            """A plugin as a reload leaves it: a fresh copy of the module, so
+            nothing the old process held in memory carries over, pointed at
+            the same files."""
+            _spec = importlib.util.spec_from_file_location("wifiopt_reloaded", "main.py")
+            fresh = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(fresh)
+            for name in ("SETTINGS_FILE", "SYSFS_NET", "UPDATE_STATE_FILE", "STREAM_FLAG_FILE",
+                         "STREAM_HOLD_FILE", "PCIE_BASELINE_FILE", "PROC_DIR"):
+                setattr(fresh, name, getattr(m, name))
+            class RecoveredStatus(fresh.Plugin):
+                def _collect_status(self):
+                    return ({"success": True, "connected": False, "settings": {}, "live": {},
+                             "drift": {}, "external": {}}, {}, [])
+            return RecoveredStatus()
+        def _shown(plugin):
+            return asyncio.run(plugin.get_status()).get("settings_recovered") is True
+
+        # As on the Deck: the panel's poll sets the file aside in one process
+        # and Decky reloads the plugin before the notice is shown.
+        open(m.SETTINGS_FILE, "w").write(_bad)
+        _rp = _reloaded()
+        ok(_shown(_rp), "the status tells the panel the settings were reset")
+        ok(_shown(_rp), "on every poll, not once, so the plugin's own status reads cannot swallow it")
+        ok(not os.path.exists(m.SETTINGS_FILE) and os.path.isfile(_corrupt),
+           "(the poll itself set the unreadable file aside)")
+        _rp = _reloaded()
+        ok(_shown(_rp), "and still does after a plugin reload, which keeps nothing in memory")
         _ack = getattr(_rp, "acknowledge_settings_recovered", None)
         ok(_ack is not None and asyncio.run(_ack()).get("success") is True
-           and "settings_recovered" not in asyncio.run(_rp.get_status()),
-           "until the panel says the user has seen it")
+           and not _shown(_rp), "until the panel says the user has seen it")
+        ok(m._load_settings().get("corrupt_acknowledged") == _identity() is not None,
+           "the acknowledgement is saved in settings, naming the kept file")
+        ok(not _shown(_reloaded()), "so it stays dismissed after a reload")
+        ok(open(_corrupt).read() == _bad, "and dismissing it leaves the kept copy alone")
+        _before = open(m.SETTINGS_FILE).read()
+        ok(asyncio.run(_rp.acknowledge_settings_recovered()).get("success") is True
+           and open(m.SETTINGS_FILE).read() == _before,
+           "dismissing it again changes nothing")
+
+        # A different file at the name than the one acknowledged, with the
+        # acknowledgement itself still in settings.
+        _swap = os.path.join(_d, "swap")
+        open(_swap, "w").write(_bad + " ")
+        os.replace(_swap, _corrupt)
+        ok(m._load_settings().get("corrupt_acknowledged") != [] and _shown(_reloaded()),
+           "a different kept file than the one dismissed is reported again")
+        asyncio.run(_rp.acknowledge_settings_recovered())
+        ok(not _shown(_reloaded()), "(and dismissed again)")
+        # The ordinary way it happens: the settings file breaks once more.
+        m._save_settings({**m._load_settings(), "dns_enabled": True})
+        open(m.SETTINGS_FILE, "w").write('{"broken": ')
+        _rp = _reloaded()
+        ok(_shown(_rp) and open(_corrupt).read() == '{"broken": ',
+           "a second corruption after dismissing the first shows the notice again")
+        asyncio.run(_rp.acknowledge_settings_recovered())
+        ok(not _shown(_reloaded()), "(and dismissed again)")
+
+        # Reset keeps the kept copy, and so keeps whether it was dismissed:
+        # a notice already seen does not come back for an unchanged file.
+        m._save_settings({**m._load_settings(), "streaming_custom_patterns": "moonlight"})
+        asyncio.run(Sysctl(STOCK_618).reset_settings())
+        ok(os.path.isfile(_corrupt) and m._load_settings().get("streaming_custom_patterns") == ""
+           and not _shown(_reloaded()),
+           "a reset keeps the kept file and does not bring back a dismissed notice")
+        m._save_settings({**m._load_settings(), "corrupt_acknowledged": []})
+        asyncio.run(Sysctl(STOCK_618).reset_settings())
+        ok(_shown(_reloaded()), "nor hide one that has not been dismissed")
+        _src_ack = open("main.py").read()
+        _src_ack = _src_ack[_src_ack.index("    async def acknowledge_settings_recovered(self"):]
+        _src_ack = _src_ack[:_src_ack.index("\n    def ", 10)]
+        ok(_src_ack.index("_corrupt_settings_identity()") < _src_ack.index("_load_settings()"),
+           "dismissing looks at the kept file before loading settings, which can set a new one aside")
+
+        # Nothing at the name, or something that is not a file this plugin
+        # moved there: no notice, and nothing followed.
+        os.remove(_corrupt)
+        ok(not _shown(_reloaded()), "no kept file, no notice")
+        ok(asyncio.run(_rp.acknowledge_settings_recovered()).get("success") is True,
+           "and dismissing with nothing kept still succeeds")
+        _target = os.path.join(_d, "elsewhere")
+        open(_target, "w").write(_bad)
+        os.symlink(_target, _corrupt)
+        m._save_settings({**m._load_settings(), "corrupt_acknowledged": []})
+        ok(not _shown(_reloaded()) and _identity() is None,
+           "a link at the kept file's name is not reported")
+        asyncio.run(_rp.acknowledge_settings_recovered())
+        ok(os.path.islink(_corrupt) and open(_target).read() == _bad
+           and m._load_settings().get("corrupt_acknowledged") == [],
+           "nor followed, and dismissing records nothing for it")
+        os.remove(_corrupt)
+        os.mkdir(_corrupt)
+        ok(not _shown(_reloaded()) and _identity() is None, "nor is a directory there")
+        os.rmdir(_corrupt)
+
+        # The acknowledgement comes from a file the desktop user can edit.
+        open(_corrupt, "w").write(_bad)
+        _good = _identity()
+        for _junk in ("1 2 3", [1, 2], [1, 2, 3, 4], [-1, 2, 3], [True, 2, 3], [1.0, 2, 3],
+                      ["1", "2", "3"], None, {"ino": 1}, [[1], 2, 3]):
+            m._save_settings({**m.DEFAULT_SETTINGS, "corrupt_acknowledged": _junk})
+            ok(m._load_settings().get("corrupt_acknowledged") == [] and _shown(_reloaded()),
+               f"a malformed acknowledgement ({_junk!r}) is dropped and the notice shown")
+        m._save_settings({**m.DEFAULT_SETTINGS, "corrupt_acknowledged": _good})
+        ok(m._load_settings().get("corrupt_acknowledged") == _good and not _shown(_reloaded()),
+           "while a well-formed one survives a load")
+        os.remove(_corrupt)
+        ok(not hasattr(m, "_settings_recovered"), "and no flag in memory decides it any more")
     finally:
         m.SETTINGS_FILE = _real_settings
-        m._settings_recovered = False
     _ix = open("src/index.tsx").read()
     ok("status?.settings_recovered" in _ix and "{ERROR_MESSAGES.parse_error}" in _ix
        and "backend.acknowledgeSettingsRecovered()" in _ix,
