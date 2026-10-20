@@ -67,8 +67,10 @@ _tree = ast.parse(open("main.py").read())
 # the module list of the 3.3.0 and 3.2.10 PluginLoader binaries; check any
 # addition the same way before relying on it (os, re, time and pwd live in
 # base_library.zip or are built in, so they do not show in that list).
+# hashlib (with _blake2 and _sha512 or _sha2) and base64 (with binascii) are
+# in both, for the release signature check.
 BUNDLED = {"os", "re", "copy", "pwd", "json", "tempfile", "time",
-           "asyncio", "subprocess", "decky"}
+           "asyncio", "subprocess", "decky", "hashlib", "base64"}
 _imported = set()
 for node in ast.walk(_tree):
     if isinstance(node, ast.Import):
@@ -4500,6 +4502,283 @@ try:
         _t = open(_f, encoding="utf-8").read()
         ok(all(ord(ch) < 128 for ch in _t), f"{_f} is plain ASCII")
 except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("release signatures: checked strictly, and not used yet")
+try:
+    import base64, hashlib
+    _b64 = lambda raw: base64.b64encode(raw).decode("ascii")
+
+    # The test's own signer, so a signature can be made for any input. Not in
+    # main.py: the plugin never signs. Built on main.py's point arithmetic,
+    # which the RFC vectors below check independently, and checked itself by
+    # reproducing the RFC's signatures from its secret keys.
+    def _ed_sign(seed, msg):
+        h = hashlib.sha512(seed).digest()
+        a = int.from_bytes(h[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+        pub = m._ed_encode(m._ed_mul(a, m._ED_B))
+        r = int.from_bytes(hashlib.sha512(h[32:] + msg).digest(), "little") % m._ED_L
+        big_r = m._ed_encode(m._ed_mul(r, m._ED_B))
+        k = int.from_bytes(hashlib.sha512(big_r + pub + msg).digest(), "little") % m._ED_L
+        return pub, big_r + ((r + k * a) % m._ED_L).to_bytes(32, "little")
+
+    def _quiet(fn, *a, **k):
+        """fn's answer, or a failure that says it raised."""
+        try:
+            return fn(*a, **k)
+        except Exception as e:
+            return {"ok": None, "raised": repr(e)}
+
+    def _flip(raw, i):
+        raw = bytearray(raw); raw[i] ^= 0x01; return bytes(raw)
+
+    # RFC 8032 section 7.1, TEST 1 to 3: (secret key, public key, message, signature).
+    _RFC = [
+        ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+         "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+        ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+         "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+         "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+         "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+         "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+    ]
+    for _n, (_sk, _pk, _msg, _sig) in enumerate(_RFC, 1):
+        _sk, _pk, _msg, _sig = (bytes.fromhex(x) for x in (_sk, _pk, _msg, _sig))
+        ok(m._ed25519_verify(_pk, _msg, _sig) is True, f"RFC 8032 TEST {_n} verifies")
+        _bad_msg = _msg + b"\x00" if not _msg else _flip(_msg, 0)
+        ok(m._ed25519_verify(_pk, _bad_msg, _sig) is False, f"TEST {_n} with the message changed does not")
+        ok(m._ed25519_verify(_pk, _msg, _flip(_sig, 5)) is False
+           and m._ed25519_verify(_pk, _msg, _flip(_sig, 40)) is False,
+           f"TEST {_n} with a byte of R or of S changed does not")
+        ok(m._ed25519_verify(_flip(_pk, 3), _msg, _sig) is False, f"TEST {_n} under a changed key does not")
+        ok(_ed_sign(_sk, _msg) == (_pk, _sig), f"the test signer reproduces TEST {_n}")
+
+    _pk1, _sig1 = bytes.fromhex(_RFC[0][1]), bytes.fromhex(_RFC[0][3])
+    _s1 = int.from_bytes(_sig1[32:], "little")
+    ok(m._ed25519_verify(_pk1, b"", _sig1[:32] + (_s1 + m._ED_L).to_bytes(32, "little")) is False,
+       "S + L, which is the same signature mathematically, is refused (S must be below L)")
+    _p_plus_1 = (m._ED_P + 1).to_bytes(32, "little")
+    ok(m._ed_decode(_p_plus_1) is None and m._ed_decode((1).to_bytes(32, "little")) is not None,
+       "a y written past p is refused even where its reduction is a point")
+    ok(m._ed_decode(((1 << 255) | 1).to_bytes(32, "little")) is None,
+       "and so is x = 0 with its sign bit set")
+    _off = next(y for y in range(2, 50) if m._ed_decode(y.to_bytes(32, "little")) is None)
+    ok(m._ed25519_verify(_off.to_bytes(32, "little"), b"", _sig1) is False
+       and m._ed25519_verify(_pk1, b"", _off.to_bytes(32, "little") + _sig1[32:]) is False,
+       "a key or an R that is not on the curve is refused")
+    ok(m._ed25519_verify(_pk1, b"", _sig1[:63]) is False and m._ed25519_verify(_pk1[:31], b"", _sig1) is False
+       and m._ed25519_verify("x" * 32, b"", _sig1) is False,
+       "short or wrongly typed inputs are refused")
+
+    # A release of a fork of this plugin, signed with stock minisign
+    # (prehashed, key id 72A411FD74FD614A). Interop: what minisign writes,
+    # this accepts.
+    _FORK_PUB = ("untrusted comment: minisign public key 72A411FD74FD614A\n"
+                 "RWRypBH9dP1hSud4CEL0adABUoisOgrxh+9UrPX+DX1larLQNfIRGTgm\n")
+    _FORK_SUMS = (b"aa9dbf2aa399593a6da26f9698cafc5fc7d493cf5ed6dafbadbf00ebe6674257"
+                  b"  wifi-optimizer-streaming-0.15.1.zip\n")
+    _FORK_SIG = (
+        "untrusted comment: signature from wifi-optimizer-streaming CI\n"
+        "RURypBH9dP1hSg+b1b791+S3B7U7Sh0PIaIlVYBHpZ377DqdtETw8Gm2pOztb+zFPy8y6Xg8zvjM4+M3/h9CLCJkDYsAoyGAzgU=\n"
+        "trusted comment: wifi-optimizer-streaming v0.15.1\n"
+        "8gNDLHgzLd4nxYpnuxaQZaSaazlXxo+5ifALNgt0OtXd/92RbuKlidb+NclYVJs0eYIv62fxA48GCSFo/jtkAQ==\n")
+    _fork_key = _FORK_PUB.split("\n")[1]
+    _fv = _quiet(m._minisign_verify, _FORK_SUMS, _FORK_SIG, (_FORK_PUB,))
+    ok(_fv == {"ok": True, "trusted_comment": "wifi-optimizer-streaming v0.15.1"},
+       f"a release signed by stock minisign verifies, both signatures and the key id ({_fv})")
+    ok(_quiet(m._minisign_verify, _FORK_SUMS, _FORK_SIG, (_fork_key,)).get("ok") is True,
+       "with the key given bare as well as as the whole .pub file")
+    ok(m._parse_minisign_key(_FORK_PUB) == (bytes.fromhex("72a411fd74fd614a"), base64.b64decode(_fork_key)[10:]),
+       "the key id read is the one minisign prints")
+    _fr = _quiet(m.verify_release_manifest, _FORK_SUMS, _FORK_SIG, "0.15.1", keys=(_fork_key,))
+    ok(_fr == {"ok": False, "error": "signature is for a different release"},
+       f"but its trusted comment is not ours, so it is no release of this plugin ({_fr})")
+
+    def _edit_line(text, idx, fn):
+        lines = text.split("\n"); lines[idx] = fn(lines[idx]); return "\n".join(lines)
+    def _edit_b64(text, idx, at):
+        return _edit_line(text, idx, lambda l: _b64(_flip(base64.b64decode(l), at)))
+    def _fail(r, why):
+        return r.get("ok") is False and (why is None or r.get("error") == why)
+
+    _tampered = [
+        ("a byte of SHA256SUMS", _FORK_SUMS.replace(b"aa9d", b"aa9e"), _FORK_SIG, "signature does not verify"),
+        ("a byte of the signature", _FORK_SUMS, _edit_b64(_FORK_SIG, 1, 30), "signature does not verify"),
+        ("a byte of the global signature", _FORK_SUMS, _edit_b64(_FORK_SIG, 3, 10),
+         "trusted comment signature does not verify"),
+        ("the trusted comment", _FORK_SUMS, _FORK_SIG.replace("v0.15.1", "v0.15.2"),
+         "trusted comment signature does not verify"),
+        ("the key id in the signature", _FORK_SUMS, _edit_b64(_FORK_SIG, 1, 4), "signature is not from a pinned key"),
+        ("the algorithm, prehashed to legacy", _FORK_SUMS,
+         _edit_line(_FORK_SIG, 1, lambda l: _b64(b"Ed" + base64.b64decode(l)[2:])), "signature does not verify"),
+    ]
+    for _what, _d, _s, _why in _tampered:
+        _r = _quiet(m._minisign_verify, _d, _s, (_fork_key,))
+        ok(_fail(_r, _why), f"changing {_what} fails ({_r})")
+
+    _test_seed = hashlib.sha256(b"wifi-optimizer regress test key").digest()
+    _test_id = bytes.fromhex("0102030405060708")
+    _test_pub = _ed_sign(_test_seed, b"")[0]
+    _test_key = _b64(b"Ed" + _test_id + _test_pub)
+
+    def _minisign(data, comment, legacy=False, seed=_test_seed, key_id=_test_id):
+        signed = data if legacy else hashlib.blake2b(data, digest_size=64).digest()
+        sig = _ed_sign(seed, signed)[1]
+        gsig = _ed_sign(seed, sig + comment.encode("utf-8"))[1]
+        return ("untrusted comment: signature from a test key\n"
+                + _b64((b"Ed" if legacy else b"ED") + key_id + sig)
+                + "\ntrusted comment: " + comment + "\n" + _b64(gsig) + "\n")
+
+    _r = _quiet(m._minisign_verify, _FORK_SUMS, _FORK_SIG, (_test_key,))
+    ok(_fail(_r, "signature is not from a pinned key"), f"a different pinned key does not accept it ({_r})")
+    # The fork's key under another id: the signature itself is good, so only
+    # matching the id refuses it.
+    _relabelled = _b64(b"Ed" + _test_id + base64.b64decode(_fork_key)[10:])
+    _r = _quiet(m._minisign_verify, _FORK_SUMS, _FORK_SIG, (_relabelled,))
+    ok(_fail(_r, "signature is not from a pinned key"), f"the key id must match, not only the key ({_r})")
+    # And the other way: the fork's id on a key that did not sign it.
+    _wrong_key = _b64(b"Ed" + bytes.fromhex("72a411fd74fd614a") + _test_pub)
+    _r = _quiet(m._minisign_verify, _FORK_SUMS, _FORK_SIG, (_wrong_key,))
+    ok(_fail(_r, "signature does not verify"), f"an id matched to the wrong key does not verify ({_r})")
+    ok(_quiet(m._minisign_verify, _FORK_SUMS, _FORK_SIG, (_test_key, _fork_key)).get("ok") is True,
+       "with more than one key pinned, the one named by the id is used")
+
+    _SUMS = (b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  WifiOptimizer-0.20.0-beta.tar.gz\n"
+             b"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210  wifi-optimizer.zip\n")
+    _good = _minisign(_SUMS, "wifi-optimizer v0.20.0-beta")
+    _r = _quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta", keys=(_test_key,))
+    ok(_r == {"ok": True, "sha256": {
+        "WifiOptimizer-0.20.0-beta.tar.gz": "0123456789abcdef" * 4,
+        "wifi-optimizer.zip": "fedcba9876543210" * 4}},
+       f"a release signed for this version gives back its checksums ({_r})")
+    _legacy = _minisign(_SUMS, "wifi-optimizer v0.20.0-beta", legacy=True)
+    ok(_legacy.split("\n")[1].startswith("RWQBAgME"), "the legacy test signature really is the Ed form")
+    ok(_quiet(m.verify_release_manifest, _SUMS, _legacy, "0.20.0-beta", keys=(_test_key,)).get("ok") is True,
+       "a legacy signature over the file itself verifies too")
+    _r = _quiet(m._minisign_verify, _SUMS + b"x", _legacy, (_test_key,))
+    ok(_fail(_r, "signature does not verify"), "and fails once the file changes")
+    _r = _quiet(m._minisign_verify, _SUMS, _edit_line(_legacy, 1, lambda l: _b64(b"ED" + base64.b64decode(l)[2:])),
+                (_test_key,))
+    ok(_fail(_r, "signature does not verify"), "a legacy signature relabelled as prehashed fails")
+    for _ver, _comment in [("0.20.0", "wifi-optimizer v0.20.0-beta"),
+                           ("0.20.0-beta", "wifi-optimizer v0.20.0-beta "),
+                           ("0.20.0-beta", "wifi-optimizer 0.20.0-beta"),
+                           ("0.20.0-beta", "wifi-optimizer-streaming v0.20.0-beta"),
+                           ("0.20.0-beta", "")]:
+        _r = _quiet(m.verify_release_manifest, _SUMS, _minisign(_SUMS, _comment), _ver, keys=(_test_key,))
+        ok(_fail(_r, "signature is for a different release"),
+           f"a trusted comment of {_comment!r} is no signature for v{_ver} ({_r})")
+    for _ver in ["", "0.20.0;rm", "../0.20", None, 20]:
+        _r = _quiet(m.verify_release_manifest, _SUMS, _good, _ver, keys=(_test_key,))
+        ok(_fail(_r, "version malformed"), f"an expected version of {_ver!r} is refused ({_r})")
+
+    for _what, _sums in [
+        ("uppercase hex", _SUMS.replace(b"abcdef", b"ABCDEF")),
+        ("one space", _SUMS.replace(b"  wifi", b" wifi")),
+        ("binary mode", _SUMS.replace(b"  wifi", b" *wifi")),
+        ("a path", _SUMS.replace(b"  wifi", b"  dist/wifi")),
+        ("a name with ..", _SUMS.replace(b"wifi-optimizer.zip", b"wifi..zip")),
+        ("a name that is ..", _SUMS.replace(b"wifi-optimizer.zip", b"..")),
+        ("a name starting with -", _SUMS.replace(b"wifi-optimizer.zip", b"-wifi.zip")),
+        ("a duplicate", _SUMS + _SUMS.split(b"\n")[0] + b"\n"),
+        ("a blank line", _SUMS + b"\n"),
+        ("a short digest", _SUMS.replace(b"0123456789abcdef0123", b"0123456789abcdef012")),
+        ("CRLF", _SUMS.replace(b"\n", b"\r\n")),
+        ("nothing", b""),
+        ("non-ASCII", _SUMS.replace(b"wifi-optimizer.zip", b"wifi-\xc3\xa9.zip")),
+    ]:
+        _r = _quiet(m.verify_release_manifest, _sums, _minisign(_sums, "wifi-optimizer v0.20.0-beta"),
+                    "0.20.0-beta", keys=(_test_key,))
+        ok(_fail(_r, "checksum list malformed"), f"a signed checksum list with {_what} is still refused ({_r})")
+    _big = _SUMS * (m.RELEASE_SUMS_MAX // len(_SUMS) + 1)
+    _r = _quiet(m.verify_release_manifest, _big, _minisign(_big, "wifi-optimizer v0.20.0-beta"),
+                "0.20.0-beta", keys=(_test_key,))
+    ok(_fail(_r, "checksum list too large"), f"an oversized checksum list is refused before anything else ({_r})")
+
+    _lines = _good[:-1].split("\n")
+    _ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    _malformed = [
+        ("three lines", "\n".join(_lines[:3]) + "\n"),
+        ("five lines", _good + "extra\n"),
+        ("a blank line between", _good.replace("\ntrusted", "\n\ntrusted")),
+        ("no untrusted comment prefix", _good.replace("untrusted comment: ", "comment: ")),
+        ("no trusted comment prefix", _good.replace("trusted comment: wifi", "trusted: wifi")),
+        ("CRLF line ends", _good.replace("\n", "\r\n")),
+        ("a bad base64 character", _edit_line(_good, 1, lambda l: "!" + l[1:])),
+        ("base64 with whitespace", _edit_line(_good, 3, lambda l: l[:10] + " " + l[10:])),
+        # The last character before the padding carries bits that must be
+        # zero; setting one decodes to the same bytes in a lenient decoder.
+        ("non-canonical base64", _edit_line(_good, 3, lambda l: l[:-3] + _ALPHABET[_ALPHABET.index(l[-3]) ^ 1] + "==")),
+        ("a signature line one byte short", _edit_line(_good, 1, lambda l: _b64(base64.b64decode(l)[:-1]))),
+        ("a signature line one byte long", _edit_line(_good, 1, lambda l: _b64(base64.b64decode(l) + b"\x00"))),
+        ("a global signature one byte short", _edit_line(_good, 3, lambda l: _b64(base64.b64decode(l)[:-1]))),
+        ("an unknown algorithm", _edit_line(_good, 1, lambda l: _b64(b"Ex" + base64.b64decode(l)[2:]))),
+        ("an oversized comment", _good.replace("a test key", "x" * m.RELEASE_SIG_MAX)),
+        ("nothing", ""),
+        ("bytes, not text", _good.encode()),
+        ("None", None),
+        ("a lone surrogate in the comment", _good.replace("v0.20.0-beta", "v0.20.0-beta\udc80")),
+    ]
+    for _what, _s in _malformed:
+        _r = _quiet(m.verify_release_manifest, _SUMS, _s, "0.20.0-beta", keys=(_test_key,))
+        ok(_fail(_r, None), f"a signature file with {_what} fails without raising ({_r})")
+    for _what, _keys in [("a key that is not base64 of the right length", ("RWQ" + "A" * 52,)),
+                         ("a key of zeros", ("RWQ" + "A" * 53,)), ("a key of the wrong type", (b"RWQ",)),
+                         ("a key with a three-line file", ("a\nb\n" + _test_key,)), ("keys not iterable", 5)]:
+        _r = _quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta", keys=_keys)
+        ok(_fail(_r, None), f"{_what} fails without raising ({_r})")
+    ok(_fail(_quiet(m.verify_release_manifest, "text", _good, "0.20.0-beta", keys=(_test_key,)), None),
+       "a checksum list given as text fails without raising")
+
+    ok(m.TRUSTED_RELEASE_KEYS == (), "no release key is pinned yet")
+    for _r in (_quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta"),
+               _quiet(m.verify_release_manifest, _FORK_SUMS, _FORK_SIG, "0.15.1"),
+               _quiet(m.verify_release_manifest, _SUMS, _good, "0.20.0-beta", keys=())):
+        ok(_r == {"ok": False, "error": "no release keys pinned"},
+           f"so every release fails closed, saying why ({_r})")
+
+    # Not used yet. Wiring this into the updater should be a deliberate step,
+    # made by changing these checks along with it.
+    _vtree = ast.parse(open("main.py").read())
+    _vfuncs = {"verify_release_manifest", "_minisign_verify", "_parse_minisig", "_parse_minisign_key",
+               "_parse_sha256sums", "_ed25519_verify", "_b64_exact",
+               "_ed_add", "_ed_mul", "_ed_encode", "_ed_decode"}
+    _vconsts = {"TRUSTED_RELEASE_KEYS", "RELEASE_SIG_MAX", "RELEASE_SUMS_MAX", "_SHA256SUMS_LINE",
+                "_ED_P", "_ED_L", "_ED_D", "_ED_SQRT_M1", "_ED_B"}
+    _vnames = _vfuncs | _vconsts
+    _defined = {n.name for n in _vtree.body if isinstance(n, ast.FunctionDef)}
+    ok(_vfuncs <= _defined, f"the verifier's functions are all at module level ({sorted(_vfuncs - _defined)})")
+    _uses = []
+    for _node in _vtree.body:
+        if isinstance(_node, ast.FunctionDef) and _node.name in _vfuncs:
+            continue
+        if (isinstance(_node, ast.Assign) and len(_node.targets) == 1
+                and getattr(_node.targets[0], "id", None) in _vconsts):
+            continue
+        for _sub in ast.walk(_node):
+            _name = getattr(_sub, "id", None) if isinstance(_sub, ast.Name) else (
+                _sub.attr if isinstance(_sub, ast.Attribute) else None)
+            if _name in _vnames:
+                _uses.append((_name, _sub.lineno))
+    ok(not _uses, f"nothing outside the verifier uses it, the Plugin class included ({_uses})")
+    _main_src = open("main.py").read()
+    _au = _main_src[_main_src.index("    async def apply_update"):]
+    _au = _au[:_au.index("\n    def _launch_updater")]
+    ok(not any(n in _au or n in m.UPDATE_SCRIPT for n in _vnames) and "minisig" not in m.UPDATE_SCRIPT,
+       "apply_update and the update script do not check signatures yet")
+    _elsewhere = open("install.sh").read() + "".join(
+        open(os.path.join(dp, f)).read() for dp, _dn, fs in os.walk("src") for f in fs)
+    ok("minisig" not in _elsewhere and "verify_release" not in _elsewhere,
+       "nor do the installer or the panel")
+    _vblock = _main_src[_main_src.index("# Release signatures."):_main_src.index("# The update script, run as root")]
+    ok(all(ord(ch) < 128 for ch in _vblock), "the verifier is plain ASCII")
+except Exception as _e:
+    import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))

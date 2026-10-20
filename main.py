@@ -11,6 +11,8 @@ QoS) on every WiFi reconnect independently of Decky.
 import os
 import re
 import copy
+import base64
+import hashlib
 import pwd
 import json
 import tempfile
@@ -758,6 +760,297 @@ def _save_settings_with_timestamp(data: dict):
     """Save settings and update last_applied timestamp in one write."""
     data["last_applied"] = int(time.time())
     _save_settings(data)
+
+
+# Release signatures. An update today is trusted because it came from GitHub
+# over TLS. Checking a signature as well means a compromised account or a
+# tampered release asset cannot push code that runs as root. Nothing calls
+# this yet: which key signs releases is still to be decided, and until a key
+# is pinned below every check fails. Using it from the updater is a separate
+# change.
+#
+# The format is minisign's, so releases can be signed with the stock tool and
+# checked here without anything Decky does not bundle. Ed25519 is written out
+# below for the same reason: hashlib and base64 are the only modules it needs.
+#
+# Each entry is a minisign public key as the second line of a minisign.pub
+# file, the base64 that starts "RW". A string is what a person compares
+# against the published key, so it is pinned as one. Empty until a key is
+# chosen.
+TRUSTED_RELEASE_KEYS = ()
+
+# Bounds on what is read. A real signature file is about 300 bytes and a
+# checksum list a few lines, so anything near these is not ours.
+RELEASE_SIG_MAX = 4096
+RELEASE_SUMS_MAX = 65536
+
+# Ed25519 per RFC 8032. Verification only: releases are signed elsewhere.
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_add(p: tuple, q: tuple) -> tuple:
+    """Add two points in extended coordinates (X, Y, Z, T).
+
+    The formula from RFC 8032 section 5.1.4. It holds for any two points,
+    a point and itself included, so it doubles as well.
+    """
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _ED_P
+    b = (y1 + x1) * (y2 + x2) % _ED_P
+    c = 2 * t1 * t2 * _ED_D % _ED_P
+    d = 2 * z1 * z2 % _ED_P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _ED_P, g * h % _ED_P, f * g % _ED_P, e * h % _ED_P)
+
+
+def _ed_mul(s: int, p: tuple) -> tuple:
+    """s times p. Both are public when verifying, so taking longer for some
+    scalars than others gives nothing away."""
+    q = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            q = _ed_add(q, p)
+        p = _ed_add(p, p)
+        s >>= 1
+    return q
+
+
+def _ed_encode(p: tuple) -> bytes:
+    """A point as its 32-byte encoding: y, with the low bit of x on top."""
+    x, y, z, _t = p
+    zi = pow(z, _ED_P - 2, _ED_P)
+    x, y = x * zi % _ED_P, y * zi % _ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_decode(s: bytes):
+    """The point a 32-byte encoding names, or None.
+
+    Strict, per RFC 8032 section 5.1.3: a y at or past p, a y with no x on
+    the curve, and a sign bit set on x = 0 are all refused, so each point has
+    exactly one encoding that is accepted.
+    """
+    if not isinstance(s, bytes) or len(s) != 32:
+        return None
+    y = int.from_bytes(s, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    if y >= _ED_P:
+        return None
+    u = (y * y - 1) % _ED_P
+    v = (_ED_D * y * y + 1) % _ED_P
+    x2 = u * pow(v, _ED_P - 2, _ED_P) % _ED_P
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P != 0:
+        x = x * _ED_SQRT_M1 % _ED_P
+    if (x * x - x2) % _ED_P != 0:
+        return None
+    if x == 0 and sign:
+        return None
+    if x & 1 != sign:
+        x = _ED_P - x
+    return (x, y, 1, x * y % _ED_P)
+
+
+# The base point: y = 4/5, with the even x.
+_ED_B = _ed_decode((4 * pow(5, _ED_P - 2, _ED_P) % _ED_P).to_bytes(32, "little"))
+
+
+def _ed25519_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    """Whether signature is public_key's Ed25519 signature on message.
+
+    The check is the cofactorless one, [S]B == R + [k]A, compared as
+    encodings. An S at or past the group order is refused rather than
+    reduced: otherwise one signature has many valid forms.
+    """
+    if not (isinstance(public_key, bytes) and isinstance(message, bytes)
+            and isinstance(signature, bytes)):
+        return False
+    if len(public_key) != 32 or len(signature) != 64:
+        return False
+    a = _ed_decode(public_key)
+    r = _ed_decode(signature[:32])
+    if a is None or r is None:
+        return False
+    s = int.from_bytes(signature[32:], "little")
+    if s >= _ED_L:
+        return False
+    k = int.from_bytes(
+        hashlib.sha512(signature[:32] + public_key + message).digest(), "little"
+    ) % _ED_L
+    return _ed_encode(_ed_mul(s, _ED_B)) == _ed_encode(_ed_add(r, _ed_mul(k, a)))
+
+
+def _b64_exact(text: str, length: int):
+    """Decode base64 that must be in its one canonical form and decode to
+    exactly length bytes, or None. Re-encoding catches padding bits and
+    other spellings that a lenient decoder would let through."""
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if len(raw) != length or base64.b64encode(raw).decode("ascii") != text:
+        return None
+    return raw
+
+
+def _parse_minisign_key(key):
+    """(key id, public key) from a minisign public key, or None.
+
+    Takes the whole minisign.pub file (an untrusted comment line, then the
+    key) or just the key line. The key is "Ed", an 8-byte id and the 32-byte
+    Ed25519 key.
+    """
+    if not isinstance(key, str):
+        return None
+    lines = key[:-1].split("\n") if key.endswith("\n") else key.split("\n")
+    if len(lines) == 2 and lines[0].startswith("untrusted comment: "):
+        lines = lines[1:]
+    if len(lines) != 1:
+        return None
+    raw = _b64_exact(lines[0], 42)
+    if raw is None or raw[:2] != b"Ed":
+        return None
+    return raw[2:10], raw[10:]
+
+
+def _parse_minisig(text):
+    """The parts of a minisign signature file, or None.
+
+    Four lines: an untrusted comment, the signature, the trusted comment and
+    the global signature over the signature and that comment. Anything else
+    is refused, including a carriage return, since that would make the
+    trusted comment a different string from the one that was signed.
+    """
+    if not isinstance(text, str) or len(text.encode("utf-8", "replace")) > RELEASE_SIG_MAX:
+        return None
+    if "\r" in text:
+        return None
+    lines = text[:-1].split("\n") if text.endswith("\n") else text.split("\n")
+    if len(lines) != 4:
+        return None
+    if not lines[0].startswith("untrusted comment: "):
+        return None
+    if not lines[2].startswith("trusted comment: "):
+        return None
+    sig = _b64_exact(lines[1], 74)
+    global_sig = _b64_exact(lines[3], 64)
+    if sig is None or global_sig is None or sig[:2] not in (b"Ed", b"ED"):
+        return None
+    try:
+        comment = lines[2][len("trusted comment: "):].encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return {
+        "algorithm": sig[:2],
+        "key_id": sig[2:10],
+        "signature": sig[10:],
+        "trusted_comment": comment,
+        "global_signature": global_sig,
+    }
+
+
+def _minisign_verify(data: bytes, minisig_text: str, keys) -> dict:
+    """Check a minisign signature on data against the pinned keys.
+
+    {"ok": True, "trusted_comment": text} or {"ok": False, "error": reason}.
+    Both signatures must hold: the one over the file, and the global one that
+    binds the trusted comment to it. What the comment says is left to the
+    caller, which knows what it expects.
+    """
+    if not isinstance(data, bytes):
+        return {"ok": False, "error": "nothing to verify"}
+    parsed = _parse_minisig(minisig_text)
+    if parsed is None:
+        return {"ok": False, "error": "signature file malformed"}
+    try:
+        pinned = [_parse_minisign_key(k) for k in keys]
+    except TypeError:
+        return {"ok": False, "error": "no release keys pinned"}
+    pinned = [k for k in pinned if k is not None]
+    if not pinned:
+        return {"ok": False, "error": "no release keys pinned"}
+    public_key = next((pk for kid, pk in pinned if kid == parsed["key_id"]), None)
+    if public_key is None:
+        return {"ok": False, "error": "signature is not from a pinned key"}
+    # "ED" signs a BLAKE2b-512 hash of the file, what minisign writes by
+    # default now. "Ed" signs the file itself, as older minisign did.
+    if parsed["algorithm"] == b"ED":
+        signed = hashlib.blake2b(data, digest_size=64).digest()
+    else:
+        signed = data
+    if not _ed25519_verify(public_key, signed, parsed["signature"]):
+        return {"ok": False, "error": "signature does not verify"}
+    if not _ed25519_verify(public_key, parsed["signature"] + parsed["trusted_comment"],
+                           parsed["global_signature"]):
+        return {"ok": False, "error": "trusted comment signature does not verify"}
+    return {"ok": True, "trusted_comment": parsed["trusted_comment"].decode("utf-8")}
+
+
+# One line of a SHA256SUMS file as sha256sum writes it in text mode. The name
+# is a bare filename, never a path: it will be looked for in one directory.
+_SHA256SUMS_LINE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]{0,127})\Z")
+
+
+def _parse_sha256sums(data: bytes):
+    """{filename: sha256 hex} from a SHA256SUMS file, or None.
+
+    Every line must parse, no name may appear twice, and no name may climb
+    out of the directory it is meant for.
+    """
+    if not isinstance(data, bytes) or len(data) > RELEASE_SUMS_MAX:
+        return None
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    lines = text[:-1].split("\n") if text.endswith("\n") else text.split("\n")
+    sums = {}
+    for line in lines:
+        match = _SHA256SUMS_LINE.match(line)
+        if match is None or ".." in match.group(2) or match.group(2) in sums:
+            return None
+        sums[match.group(2)] = match.group(1)
+    return sums or None
+
+
+def verify_release_manifest(sums_bytes: bytes, minisig_text: str,
+                            expected_version: str, keys=None) -> dict:
+    """Check a release's signed SHA256SUMS before trusting anything in it.
+
+    {"ok": True, "sha256": {filename: hex}} or {"ok": False, "error": reason}.
+    The signature must come from a pinned key, and its trusted comment must
+    name exactly this version. That comment is covered by the signature, so
+    an old release signed by the same key cannot be passed off as a newer
+    one. Fails closed: anything unexpected is a failure, never an exception.
+    keys defaults to TRUSTED_RELEASE_KEYS, read at call time.
+    """
+    try:
+        if keys is None:
+            keys = TRUSTED_RELEASE_KEYS
+        if not keys:
+            return {"ok": False, "error": "no release keys pinned"}
+        if not isinstance(expected_version, str) or not VERSION_RE.match(expected_version):
+            return {"ok": False, "error": "version malformed"}
+        if not isinstance(sums_bytes, bytes):
+            return {"ok": False, "error": "checksum list malformed"}
+        if len(sums_bytes) > RELEASE_SUMS_MAX:
+            return {"ok": False, "error": "checksum list too large"}
+        result = _minisign_verify(sums_bytes, minisig_text, keys)
+        if not result["ok"]:
+            return result
+        if result["trusted_comment"] != f"wifi-optimizer v{expected_version}":
+            return {"ok": False, "error": "signature is for a different release"}
+        sums = _parse_sha256sums(sums_bytes)
+        if sums is None:
+            return {"ok": False, "error": "checksum list malformed"}
+        return {"ok": True, "sha256": sums}
+    except Exception:
+        return {"ok": False, "error": "verification failed"}
 
 
 # The update script, run as root with its values as arguments (see
