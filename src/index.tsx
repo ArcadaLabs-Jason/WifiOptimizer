@@ -794,6 +794,8 @@ function Content() {
   const supportTier = status?.support_tier ?? 1;
   const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
   const supports6GHz = s?.supports_6ghz ?? false;
+  // One band preference, shown as two toggles: 5 GHz and, where it can work, 6 GHz.
+  const on6GHz = !!s?.band_preference_enabled && s?.band_preference === "6GHz";
   const isDeckLcd = s?.device_family === "deck_lcd";
 
   // Streaming auto mode with no stream running: power save, buffer tuning
@@ -1200,24 +1202,45 @@ function Content() {
               ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
               : ""
           }`}
-          {...getBadge("band_preference", status, errors.band_preference ?? null)}
-          checked={s?.band_preference_enabled ?? false}
-          disabled={isBusy || updating || (!connected && !s?.band_preference_enabled)}
-          error={errors.band_preference}
+          {...getBadge(on6GHz ? undefined : "band_preference", status, on6GHz ? null : errors.band_preference ?? null)}
+          checked={(s?.band_preference_enabled ?? false) && !on6GHz}
+          disabled={isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz))}
+          error={on6GHz ? undefined : errors.band_preference}
           notice={
-            notices.band_preference ??
-            (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
-              ? IWD_PIN_NOTICE
-              : status?.external?.band
-              ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
-              : undefined)
+            on6GHz
+              ? undefined
+              : notices.band_preference ??
+                (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
+                  ? IWD_PIN_NOTICE
+                  : status?.external?.band
+                  ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
+                  : undefined)
           }
           onChange={(val: boolean) =>
             handleToggle("band_preference", () =>
-              backend.setBandPreference(val, s?.band_preference ?? "a")
+              // Never "6GHz": turning that off leaves it recorded as the band.
+              backend.setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")
             )
           }
         />
+        {(status?.live?.six_ghz_offered || on6GHz) && (
+          <InfoRow
+            label="Force 6 GHz band"
+            subtitle="Stay on 6 GHz where your router has it"
+            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
+            {...getBadge(on6GHz ? "band_preference" : undefined, status, errors.band_6ghz ?? (on6GHz ? errors.band_preference : null) ?? null)}
+            checked={on6GHz}
+            disabled={isBusy || updating || (!connected && !on6GHz)}
+            error={errors.band_6ghz ?? (on6GHz ? errors.band_preference : undefined)}
+            notice={
+              notices.band_6ghz ??
+              (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+            }
+            onChange={(val: boolean) =>
+              handleToggle("band_6ghz", () => backend.setBandPreference(val, "6GHz"))
+            }
+          />
+        )}
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"

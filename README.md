@@ -42,7 +42,7 @@ Releases are signed. From v0.21.0-beta on, before installing an update, the plug
    - Tunes network buffers (handles streaming traffic bursts)
 3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
 
-Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5 GHz, custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
+Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5 GHz (or 6 GHz, where your setup supports it), custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
 
 ## All optimizations
 
@@ -60,6 +60,7 @@ Want to go further? The remaining optimizations are available as individual togg
 | Optimization | What it does | Why it's manual |
 |---|---|---|
 | Force 5 GHz band | Locks WiFi to 5 GHz to avoid Bluetooth interference on 2.4 GHz | Won't connect if your network is 2.4 GHz only, and keeps a 6 GHz capable device off 6 GHz. Refused when no 5 GHz access point for your network is in range. Paused while the `iwd` backend is in use, for the same reason as the access point lock. |
+| Force 6 GHz band | Locks WiFi to 6 GHz, the least crowded band, on routers with WiFi 6E or newer | Only shown on a 6 GHz capable card with NetworkManager 1.58 or newer (expected with SteamOS 3.9) and the `wpa_supplicant` backend. Needs WPA3: a network saved for WPA2 works from NetworkManager 1.58.1. Refused when no 6 GHz access point for your network is in range, and if the device can't connect on 6 GHz the band is put back as it was. 6 GHz reaches less far than 5 GHz; out of range, the pin is released after a minute like the others. |
 | Traffic shaping (CAKE) | Replaces the default network queue with CAKE for fair queuing, bufferbloat prevention, and ACK filtering. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |

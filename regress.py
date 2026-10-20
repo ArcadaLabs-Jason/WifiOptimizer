@@ -1869,7 +1869,8 @@ ok(Scan(["Net:5955 MHz"])._band_is_reachable("wlan0", "u", "a") is False
    "a 6 GHz access point satisfies neither band")
 _fb = getattr(m.Plugin, "_freq_band", lambda f: None)
 for freq, want in [("2412", "bg"), ("2484 MHz", "bg"), ("5180.0", "a"),
-                   ("5825", "a"), ("5955", ""), ("6115 MHz", ""), ("", ""), ("junk", "")]:
+                   ("5825", "a"), ("5955", "6GHz"), ("6115 MHz", "6GHz"), ("5925", "6GHz"),
+                   ("7125", "6GHz"), ("7130", ""), ("5850", ""), ("", ""), ("junk", "")]:
     ok(_fb(freq) == want, f"{freq!r} is band {want!r}")
 _six = {**m.DEFAULT_SETTINGS, "band_preference_enabled": True,
         "band_preference": "a", "band_preference_ssid": "Net"}
@@ -3348,6 +3349,156 @@ try:
     ok(r.get("success") and ("ipv4.dns", "1.1.1.1 9.9.9.9") in dc.mods,
        "comma-separated servers from an older version are accepted")
 except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Force 6 GHz: offered and allowed only where it can work, put back if it does not")
+try:
+    _six_dev = {"supports_6ghz": True, "distro_id": "steamos"}
+
+    class Band6(Band):
+        """The band setter on a 6 GHz capable device and NetworkManager."""
+        def __init__(self, nm="nmcli tool, version 1.58.1", km="wpa-psk", pmf="0 (default)",
+                     link="Connected to 02:00:00:00:00:66\n\tfreq: 6115", **kw):
+            super().__init__(link=link, **kw)
+            self.nm = nm; self.km = km; self.pmf = pmf; self.versions_read = 0
+        bands_in_range = (5180, 6115)
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd == ["/usr/bin/nmcli", "--version"]:
+                self.versions_read += 1
+                if self.nm is None:
+                    return {"success": False, "stdout": "", "stderr": "", "returncode": 1}
+                return {"success": True, "stdout": self.nm, "stderr": "", "returncode": 0}
+            return super()._run_cmd(cmd, timeout)
+        def _profile_key_mgmt(self, uuid): return self.km
+        def _read_profile_field(self, uuid, field, timeout=5):
+            return self.pmf if field == "802-11-wireless-security.pmf" else ""
+        def _backend_is_iwd(self): return False
+
+    for _out, _want in [("nmcli tool, version 1.52.1-1.5", (1, 52, 1)),
+                        ("nmcli tool, version 1.58.0", (1, 58, 0)),
+                        ("nmcli tool, version 1.58-rc1", (1, 58, 0)),
+                        ("something else", None)]:
+        ok(Band6(nm=_out)._nm_version() == _want, f"{_out!r} reads as {_want}")
+    d = Band6(nm=None)
+    ok(d._nm_version() is None and d._nm_version() is None and d.versions_read == 2,
+       "a failed read is not kept, so the next caller tries again")
+    d = Band6()
+    d._nm_version(); d._nm_version()
+    ok(d.versions_read == 1, "a good read is kept: nmcli is asked once")
+
+    for _v, _km, _pmf, _dev, _ok_, _what in [
+        ("1.58.1", "wpa-psk", "0 (default)", _six_dev, True, "a WPA2-style profile on 1.58.1"),
+        ("1.58.0", "sae", "0 (default)", _six_dev, True, "a WPA3 profile on 1.58.0"),
+        ("1.58.0", "wpa-psk", "0 (default)", _six_dev, False,
+         "a WPA2-style profile on 1.58.0, which would not reconnect on its own"),
+        ("1.58.1", "wpa-psk", "1 (disable)", _six_dev, False, "management frame protection turned off"),
+        ("1.58.1", "wpa-eap", "0 (default)", _six_dev, False, "an enterprise network"),
+        ("1.58.1", "", "0 (default)", _six_dev, False, "an open network"),
+        ("1.52.1-1.5", "sae", "0 (default)", _six_dev, False, "NetworkManager 1.52, as on SteamOS 3.8"),
+        ("1.58.1", "sae", "0 (default)", {"supports_6ghz": False}, False, "a card without 6 GHz"),
+    ]:
+        m._save_settings({**m.DEFAULT_SETTINGS, **_dev})
+        _r = Band6(nm=f"nmcli tool, version {_v}", km=_km, pmf=_pmf)._six_ghz_refusal(BU)
+        ok((_r is None) == _ok_ and (_ok_ or (_r.get("success") is False and _r.get("message"))),
+           f"{_what}: {'allowed' if _ok_ else 'refused, with a reason'} ({(_r or {}).get('message')!r})")
+    m._save_settings({**m.DEFAULT_SETTINGS, **_six_dev})
+    _r = Band6(nm="nmcli tool, version 1.52.1-1.5")._six_ghz_refusal(BU)
+    ok("SteamOS 3.9" in _r.get("message", ""), "on SteamOS the refusal says which release brings it")
+
+    _dev_ok = Band6()
+    _dev_ok._nm_version()
+    ok(_dev_ok._six_ghz_offered({"supports_6ghz": True}, {"live": {"wifi_backend": "wpa_supplicant"}}) is True,
+       "offered with a 6 GHz card and NetworkManager 1.58")
+    ok(_dev_ok._six_ghz_offered({"supports_6ghz": True}, {"live": {"wifi_backend": "iwd"}}) is False
+       and _dev_ok._six_ghz_offered({"supports_6ghz": False}, {"live": {}}) is False,
+       "not under iwd, which ignores the band, nor without the card")
+    _old = Band6(nm="nmcli tool, version 1.52.1-1.5"); _old._nm_version()
+    ok(_old._six_ghz_offered({"supports_6ghz": True}, {"live": {}}) is False
+       and Band6()._six_ghz_offered({"supports_6ghz": True}, {"live": {}}) is False,
+       "nor on 1.52, nor before the version has been read: the poll never forks for it")
+
+    ok(m._clean_settings({"band_preference": "6GHz"})["band_preference"] == "6GHz"
+       and m._clean_settings({"band_preference": "6ghz"})["band_preference"] == "a",
+       "the settings file keeps 6GHz and nothing like it")
+
+    asyncio.sleep = _no_sleep
+    try:
+        m._save_settings(band_settings(**_six_dev))
+        d = Band6()
+        res = asyncio.run(d.set_band_preference(True, "6GHz"))
+        ok(res.get("success") is True and wrote(d, BU, "6GHz"), f"6 GHz is applied and checked ({res})")
+        _st = m._load_settings()
+        ok(_st.get("band_preference") == "6GHz" and _st.get("band_preference_enabled") is True,
+           "and recorded")
+
+        m._save_settings(band_settings(**_six_dev))
+        d = Band6(nm="nmcli tool, version 1.58.0")
+        res = asyncio.run(d.set_band_preference(True, "6GHz"))
+        ok(res.get("success") is False and not d.mods and d.reconnects == 0,
+           "a refusal writes nothing and leaves the radio alone")
+        m._save_settings(band_settings(**_six_dev))
+        d = Band6(); d.bands_in_range = (5180, 2462)
+        res = asyncio.run(d.set_band_preference(True, "6GHz"))
+        ok(res.get("success") is False and "6 GHz" in res.get("message", "") and not d.mods,
+           f"nor with no 6 GHz access point of this network in range ({res.get('message')!r})")
+
+        # The scan showed one, but the device came back on 5 GHz.
+        m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
+                                       band_preference_ssid="Home", band_preference_uuids=[BU],
+                                       **_six_dev))
+        d = Band6(link="Connected to 02:00:00:00:00:55\n\tfreq: 5180")
+        res = asyncio.run(d.set_band_preference(True, "6GHz"))
+        _st = m._load_settings()
+        ok(res.get("success") is False and res.get("message", "").startswith("Couldn't connect on 6 GHz"),
+           f"landing anywhere but 6 GHz is reported ({res.get('message')!r})")
+        ok(d.mods[-1] == (BU, "802-11-wireless.band", "a") and d.reconnects == 2,
+           "the band is written back to 5 GHz and the device reconnected")
+        ok(_st.get("band_preference") == "a" and _st.get("band_preference_enabled") is True
+           and _st.get("band_preference_uuids") == [BU],
+           "and the settings say 5 GHz again")
+        m._save_settings(band_settings(**_six_dev))
+        d = Band6(landed=BOLD)
+        res = asyncio.run(d.set_band_preference(True, "6GHz"))
+        ok(res.get("success") is False and d.mods[-1] == (BU, "802-11-wireless.band", "")
+           and m._load_settings().get("band_preference_enabled") is not True,
+           "coming back on another profile is not 6 GHz either; with no band before, none is left")
+        _real_wait = m.Plugin._ASSOCIATION_WAIT_SECONDS
+        m.Plugin._ASSOCIATION_WAIT_SECONDS = 0
+        try:
+            m._save_settings(band_settings(bssid_lock_enabled=True, bssid_lock_connection_uuid=BU,
+                                           **_six_dev))
+            d = Band6(link="")
+            res = asyncio.run(d.set_band_preference(True, "6GHz"))
+        finally:
+            m.Plugin._ASSOCIATION_WAIT_SECONDS = _real_wait
+        ok(res.get("success") is False and (BU, "802-11-wireless.band", "") in d.mods
+           and d.reconnects == 2 and m._load_settings().get("bssid_lock_enabled") is True,
+           "no association at all is put back too, with the lock left on to re-pin")
+    finally:
+        asyncio.sleep = _real_sleep
+
+    _pref6 = {**m.DEFAULT_SETTINGS, "band_preference_enabled": True,
+              "band_preference": "6GHz", "band_preference_ssid": "Net"}
+    ok(m.Plugin()._band_conflicts(_pref6, "6115", "Net") is False
+       and m.Plugin()._band_conflicts(_pref6, "5180", "Net") is True,
+       "with 6 GHz preferred, a 6 GHz association is the one that does not conflict")
+    ok(m.Plugin()._pin_rules_out("802-11-wireless.band", "6GHz", [("A", 5180, 70)]) is True
+       and m.Plugin()._pin_rules_out("802-11-wireless.band", "6GHz", [("A", 5180, 70), ("B", 6115, 40)]) is False,
+       "a 6 GHz pin is released when nothing on 6 GHz is in range, like the others")
+    _aps6 = [("A", 80, 5180, "WPA2 WPA3"), ("B", 60, 6115, "WPA3")]
+    ok([ap[0] for ap in m.Plugin()._lock_candidates(_aps6, "Net", _pref6, "")] == ["B"],
+       "the lock only picks among 6 GHz access points then")
+
+    _tsx = open("src/index.tsx").read(); _dist = open("dist/index.js").read()
+    ok('backend.setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")' in _tsx,
+       "the 5 GHz toggle never sends 6GHz, which stays recorded after 6 GHz is turned off")
+    ok('label="Force 6 GHz band"' in _tsx and 'backend.setBandPreference(val, "6GHz")' in _tsx
+       and "Force 6 GHz band" in _dist and "six_ghz_offered" in _dist,
+       "the panel has the 6 GHz toggle, shown from the status flag, and the built bundle does too")
+    ok('status["live"]["six_ghz_offered"] = self._six_ghz_offered(settings, status)' in open("main.py").read(),
+       "the status poll reports whether to offer it")
+except Exception as _e:
+    import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("6 GHz and the band: what a released pin may and may not be written back over")

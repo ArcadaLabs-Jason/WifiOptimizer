@@ -44,6 +44,8 @@ export interface LiveStatus {
   dns?: string;
   ipv6_method?: string;
   band?: string;
+  /** The card and NetworkManager can hold a network to 6 GHz. */
+  six_ghz_offered?: boolean;
   buffer_tuning_applied?: boolean;
   cake_applied?: boolean;
   dispatcher_installed?: boolean;

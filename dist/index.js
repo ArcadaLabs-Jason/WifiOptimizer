@@ -1422,6 +1422,8 @@ function Content() {
     const supportTier = status?.support_tier ?? 1;
     const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
     const supports6GHz = s?.supports_6ghz ?? false;
+    // One band preference, shown as two toggles: 5 GHz and, where it can work, 6 GHz.
+    const on6GHz = !!s?.band_preference_enabled && s?.band_preference === "6GHz";
     const isDeckLcd = s?.device_family === "deck_lcd";
     // Streaming auto mode with no stream running: power save, buffer tuning
     // and CAKE are off on purpose. They read as paused, not as off or drifted.
@@ -1502,12 +1504,17 @@ function Content() {
                                 color: errors.regdomain ? theme.error.text : theme.text.tertiary,
                             }, children: errors.regdomain ?? notices.regdomain }) })), regdomain?.readable && !regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", opacity: 0.8, padding: "4px 0" }, children: ["WiFi region: ", regdomain.governing || "unknown", ". This device's WiFi card sets its own region, so it cannot be changed here. That is normal on the Steam Deck and does not mean a band is missing."] }) })), SP_JSX.jsx(InfoRow, { label: "Force 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""}. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.${supports6GHz
                             ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
-                            : ""}`, ...getBadge("band_preference", status, errors.band_preference ?? null), checked: s?.band_preference_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.band_preference_enabled), error: errors.band_preference, notice: notices.band_preference ??
-                            (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
-                                ? IWD_PIN_NOTICE
-                                : status?.external?.band
-                                    ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
-                                    : undefined), onChange: (val) => handleToggle("band_preference", () => setBandPreference(val, s?.band_preference ?? "a")) }), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
+                            : ""}`, ...getBadge(on6GHz ? undefined : "band_preference", status, on6GHz ? null : errors.band_preference ?? null), checked: (s?.band_preference_enabled ?? false) && !on6GHz, disabled: isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz)), error: on6GHz ? undefined : errors.band_preference, notice: on6GHz
+                            ? undefined
+                            : notices.band_preference ??
+                                (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
+                                    ? IWD_PIN_NOTICE
+                                    : status?.external?.band
+                                        ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
+                                        : undefined), onChange: (val) => handleToggle("band_preference", () => 
+                        // Never "6GHz": turning that off leaves it recorded as the band.
+                        setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")) }), (status?.live?.six_ghz_offered || on6GHz) && (SP_JSX.jsx(InfoRow, { label: "Force 6 GHz band", subtitle: "Stay on 6 GHz where your router has it", explanation: "6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect.", ...getBadge(on6GHz ? "band_preference" : undefined, status, errors.band_6ghz ?? (on6GHz ? errors.band_preference : null) ?? null), checked: on6GHz, disabled: isBusy || updating || (!connected && !on6GHz), error: errors.band_6ghz ?? (on6GHz ? errors.band_preference : undefined), notice: notices.band_6ghz ??
+                            (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined), onChange: (val) => handleToggle("band_6ghz", () => setBandPreference(val, "6GHz")) })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
                             if (!val)
                                 resetDnsDraft();
                             handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput));

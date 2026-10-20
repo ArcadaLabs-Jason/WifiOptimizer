@@ -228,6 +228,17 @@ BSSID_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 # malformed one is not merely a bad setting.
 REGDOMAIN_RE = re.compile(r"^(?:[A-Z]{2}|00)\Z")
 
+# NetworkManager's 802-11-wireless.band values the band preference may write,
+# and how the panel names them. "6GHz" exists from NetworkManager 1.58.
+BAND_NAMES = {"a": "5 GHz", "bg": "2.4 GHz", "6GHz": "6 GHz"}
+
+# The NetworkManager that knows band "6GHz", and the first that lets a
+# WPA2-style (wpa-psk) profile join a WPA3-only access point, which every
+# 6 GHz one is. 1.58.0 only allows that when the user connects by hand, so
+# such a profile would not reconnect on its own after sleep or a dropout.
+NM_6GHZ_BAND = (1, 58, 0)
+NM_6GHZ_WPA_PSK = (1, 58, 1)
+
 # DNS servers are free text from the panel. They are passed to nmcli as a
 # single argument, so there is no shell involved, but the value is stored and
 # replayed later and should be addresses and nothing else.
@@ -688,7 +699,7 @@ def _clean_settings(data: dict) -> dict:
     # An out-of-range band would be rejected by the setter, including on
     # the path that turns the preference OFF - leaving a profile pinned to
     # a band with no control able to clear it.
-    if merged.get("band_preference") not in ("a", "bg"):
+    if merged.get("band_preference") not in BAND_NAMES:
         merged["band_preference"] = "a"
     # These lists are handed to nmcli as root. argv rather than a shell,
     # so junk is not dangerous, but a list of it turns a reset into a
@@ -2001,6 +2012,8 @@ class Plugin:
             distro = self._detect_distro()
             settings["distro_id"] = distro["id"]
             settings["distro_name"] = distro["name"]
+            # Read here so the status collector can use it without forking.
+            await asyncio.to_thread(self._nm_version)
             # `iw reg set` does not survive a reboot, so a region the user
             # chose has to be put back here. This runs when the plugin loads,
             # which can be after the first association - so the very first
@@ -4121,7 +4134,7 @@ class Plugin:
         # it would block the setting for no reason the user could act on.
         if not iface or self._band_presence(iface, uuid, band) is not False:
             return None
-        name = "5 GHz" if band == "a" else "2.4 GHz"
+        name = BAND_NAMES.get(band, band)
         decky.logger.info(
             f"Refusing band {band!r}: no {name} access point for "
             f"{self._get_profile_ssid(uuid)!r} in the scan of {iface}"
@@ -4138,8 +4151,8 @@ class Plugin:
 
         NetworkManager's band "a" is the 5 GHz band only. A 6 GHz access point
         fails its compatibility check against a profile pinned to "a", so a
-        6 GHz association is neither "a" nor "bg", and counting it as 5 GHz
-        let the plugin write a band that pushes the device off 6 GHz.
+        6 GHz association is "6GHz", never "a", and counting it as 5 GHz let
+        the plugin write a band that pushes the device off 6 GHz.
         """
         found = re.match(r"\s*(\d+)", str(freq or ""))
         if not found:
@@ -4151,6 +4164,9 @@ class Plugin:
         # wpa_supplicant to associate within.
         if 4900 <= mhz <= 5825:
             return "a"
+        # The 6 GHz band, 5925 to 7125 MHz.
+        if 5925 <= mhz <= 7125:
+            return "6GHz"
         return ""
 
     def _band_is_reachable(self, iface: str, uuid: str, want: str) -> bool:
@@ -5252,6 +5268,7 @@ class Plugin:
                 uuid, "802-11-wireless.band", timeout=T
             )
             status["live"]["band"] = live_band
+            status["live"]["six_ghz_offered"] = self._six_ghz_offered(settings, status)
             if (live_band and not settings.get("band_preference_enabled")
                     and "802-11-wireless.band" not in settings.get("pins_owned", [])):
                 status["external"]["band"] = True
@@ -5522,12 +5539,12 @@ class Plugin:
             # wanted band is actually visible for this network.
             want = current.get("band_preference")
             if not self._band_is_reachable(iface, uuid, want):
-                other = "5 GHz" if want == "a" else "2.4 GHz"
+                name = BAND_NAMES.get(want, want)
                 return {
                     "success": False,
                     "error": "nmcli_failed",
                     "message": (
-                        f"No {other} access point is in range for this "
+                        f"No {name} access point is in range for this "
                         f"network, which it is set to require. Turn the "
                         f"band preference off to lock anyway."
                     ),
@@ -5570,12 +5587,12 @@ class Plugin:
                 current, frequency, active_ssid
             ):
                 want = current.get("band_preference")
-                other = "5 GHz" if want == "a" else "2.4 GHz"
+                name = BAND_NAMES.get(want, want)
                 return {
                     "success": False,
                     "error": "nmcli_failed",
                     "message": (
-                        f"Couldn't reach an access point on {other}, "
+                        f"Couldn't reach an access point on {name}, "
                         f"which this network is set to require. Turn "
                         f"the band preference off to lock anyway."
                     ),
@@ -5915,6 +5932,127 @@ class Plugin:
                             )
                     break
 
+    def _nm_version(self) -> tuple[int, int, int] | None:
+        """NetworkManager's version as (major, minor, micro), None if unread.
+
+        Read once and kept, since it only changes with an OS update, which
+        restarts the plugin. A failed read is not kept, so the next caller
+        tries again. _main warms it, so the status collector can read
+        _nm_version_seen without forking. Release candidates print as
+        "1.58-rc1", which counts as 1.58.0.
+        """
+        if hasattr(self, "_nm_version_seen"):
+            return self._nm_version_seen
+        out = self._run_cmd(["/usr/bin/nmcli", "--version"], timeout=3)
+        if not out["success"]:
+            return None
+        found = re.search(r"version (\d+)\.(\d+)(?:\.(\d+))?", out.get("stdout", ""))
+        self._nm_version_seen = (
+            (int(found.group(1)), int(found.group(2)), int(found.group(3) or 0))
+            if found else None
+        )
+        return self._nm_version_seen
+
+    def _six_ghz_offered(self, settings: dict, status: dict) -> bool:
+        """Whether the panel offers Force 6 GHz: the card and NetworkManager
+        can do it. From memoised values only, since the status collector runs
+        this. The setter checks the rest (_six_ghz_refusal) with a reason the
+        user can act on."""
+        version = getattr(self, "_nm_version_seen", None)
+        return bool(
+            settings.get("supports_6ghz")
+            and version and version >= NM_6GHZ_BAND
+            and status.get("live", {}).get("wifi_backend") != "iwd"
+        )
+
+    def _six_ghz_refusal(self, uuid: str) -> dict | None:
+        """Why this profile cannot be held to 6 GHz here, or None if it can.
+
+        Every 6 GHz access point uses WPA3. A profile saved for WPA3 (sae)
+        joins one on any NetworkManager that has the band. One saved the
+        usual SteamOS way (wpa-psk) only joins it on 1.58.1 or later, and
+        only with protected management frames allowed: 1.58.0 lets it
+        connect when asked but never on its own, so after sleep or a dropout
+        it would stay disconnected. Anything else, open or enterprise, is
+        refused rather than guessed at.
+        """
+        def refuse(message):
+            decky.logger.info(f"Refusing band '6GHz' on {uuid}: {message}")
+            return {"success": False, "error": "band_unavailable", "message": message}
+
+        settings = _load_settings()
+        if not settings.get("supports_6ghz"):
+            return refuse("This device's WiFi card doesn't support 6 GHz.")
+        version = self._nm_version()
+        steamos = settings.get("distro_id") == "steamos"
+        if version is None or version < NM_6GHZ_BAND:
+            return refuse(
+                "6 GHz needs NetworkManager 1.58 or newer"
+                + (", expected with SteamOS 3.9." if steamos else ".")
+            )
+        key_mgmt = self._profile_key_mgmt(uuid)
+        if key_mgmt == "sae":
+            return None
+        if key_mgmt != "wpa-psk":
+            return refuse("6 GHz needs a network secured with a WPA3 password.")
+        if version < NM_6GHZ_WPA_PSK:
+            return refuse(
+                "6 GHz uses WPA3, and this network is saved for WPA2. "
+                "NetworkManager 1.58.1 or newer can use WPA3 for it."
+            )
+        pmf = self._read_profile_field(uuid, "802-11-wireless-security.pmf")
+        if pmf.split(" ")[0] in ("1", "disable"):
+            return refuse(
+                "This network is saved with protected management frames "
+                "turned off, and 6 GHz requires them."
+            )
+        return None
+
+    async def _confirm_six_ghz(self, uuid: str, before: dict,
+                               had_lock: bool) -> dict | None:
+        """Check the reconnect landed on 6 GHz, and put things back if not.
+
+        None when it did. Otherwise the band, and the settings that record
+        it, go back to what they were before, the device reconnects, and the
+        lock (if it was on) re-pins where it lands. A 6 GHz access point that
+        showed in the scan can still refuse us, a 64-character hex key cannot
+        be used for WPA3, and this is checked here rather than left for the
+        stranded-pin release a minute later.
+        """
+        iface = self._get_wifi_interface()
+        seen = await self._await_association(iface) if iface else {"link": "", "error": "no interface"}
+        frequency = self._parse_link(seen.get("link", "")).get("frequency", "")
+        if (self._freq_band(frequency) == "6GHz"
+                and self._get_active_connection_uuid() == uuid):
+            return None
+        decky.logger.error(
+            f"Band '6GHz' on {uuid} did not connect on 6 GHz "
+            f"(frequency {frequency!r}{', ' + seen['error'] if seen.get('error') else ''}); "
+            f"putting the band back"
+        )
+        previous = before.get("band_preference", "") if before.get("band_preference_enabled") else ""
+        undone = self._nmcli_modify(uuid, "802-11-wireless.band", previous)
+        if not undone["success"]:
+            decky.logger.error(
+                f"Could not put the band back on {uuid}: {undone.get('stderr', '')[:120]}"
+            )
+        settings = _load_settings()
+        for key in ("band_preference_enabled", "band_preference",
+                    "band_preference_uuids", "band_preference_ssid", "pins_owned"):
+            settings[key] = copy.deepcopy(before.get(key, DEFAULT_SETTINGS[key]))
+        _save_settings_with_timestamp(settings)
+        if not self._hard_reconnect(uuid):
+            return dict(self._RADIO_OFF_RESULT)
+        if had_lock:
+            await asyncio.sleep(3)
+            self._relock_after_band_change(uuid)
+        return {
+            "success": False,
+            "error": "band_unavailable",
+            "message": "Couldn't connect on 6 GHz, so the band was put back to how it was.",
+            "reconnected": True,
+        }
+
     async def set_band_preference(self, enabled: bool, band: str = "a") -> dict:
         # This setter deliberately clears the BSSID, cycles the radio and
         # re-locks once NM associates on the new band. It awaits in the
@@ -5932,11 +6070,11 @@ class Plugin:
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
 
-            if band not in ("a", "bg"):
+            if band not in BAND_NAMES:
                 return {
                     "success": False,
                     "error": "nmcli_failed",
-                    "message": f"Invalid band '{band}'. Must be 'a' (5 GHz) or 'bg' (2.4 GHz).",
+                    "message": f"Invalid band '{band}'. Must be 'a' (5 GHz), 'bg' (2.4 GHz) or '6GHz'.",
                 }
             if enabled and await asyncio.to_thread(self._backend_is_iwd):
                 return {"success": False, "error": "needs_wpa_supplicant",
@@ -5962,6 +6100,10 @@ class Plugin:
                         "error": "nmcli_failed",
                         "message": "Couldn't identify this network. Try again in a moment.",
                     }
+                if band == "6GHz":
+                    refused = await asyncio.to_thread(self._six_ghz_refusal, uuid)
+                    if refused:
+                        return refused
                 # A scan can take 15 s; the guard above is what makes
                 # awaiting it safe.
                 refused = await asyncio.to_thread(self._band_unreachable, uuid, band)
@@ -6003,6 +6145,7 @@ class Plugin:
             # Temporarily clear BSSID lock so NM can find an AP on the
             # requested band. Re-lock to the new BSSID after reconnect.
             settings = _load_settings()
+            before = copy.deepcopy(settings)
             had_bssid_lock = settings.get("bssid_lock_enabled", False)
             if enabled and had_bssid_lock:
                 unlocked = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
@@ -6052,6 +6195,11 @@ class Plugin:
 
             if not self._hard_reconnect(uuid):
                 return dict(self._RADIO_OFF_RESULT)
+
+            if enabled and band == "6GHz":
+                failed = await self._confirm_six_ghz(uuid, before, had_bssid_lock)
+                if failed:
+                    return failed
 
             # Re-lock BSSID to whatever AP NM picked on the new band
             if enabled and had_bssid_lock:
