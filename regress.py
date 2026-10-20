@@ -402,11 +402,16 @@ ok('live.get("connected_bssid", ""),\n                                     setti
 
 class Allow(m.Plugin):
     """Profile security as NetworkManager holds it, and whether a reconnect takes."""
-    def __init__(self, km="sae", connects=True, lock=False):
+    def __init__(self, km="sae", connects=True, lock=False, found=True, **extra):
         super().__init__(); self.km = km; self.connects = connects
         self.writes = []; self.lock_calls = 0
-        m._save_settings({"bssid_lock_enabled": lock})
+        m._save_settings({"bssid_lock_enabled": lock, **extra})
+        # What the status poll found, which is what the panel's button acts on.
+        if found:
+            self._wpa2_blocked = {"signal": 80, "current_signal": 40}
+            self._reach_checked_for = WU
     def _resolve_uuid(self, msg=None): return WU, None
+    def _get_profile_ssid(self, uuid, timeout=5): return "Home"
     def _profile_key_mgmt(self, uuid): return self.km
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.writes.append((key, value)); self.km = value
@@ -449,6 +454,35 @@ try:
     res = asyncio.run(a.allow_wpa2())
     ok(not res.get("success") and res.get("error") == "not_needed" and not a.writes,
        "a profile that already allows WPA2 is not rewritten")
+
+    a = Allow(found=False)
+    res = asyncio.run(a.allow_wpa2())
+    ok(not res.get("success") and res.get("error") == "not_needed" and not a.writes,
+       "nor is one with no stronger WPA2-only access point found for it")
+    a = Allow(); a._reach_checked_for = "aa0fd3f5-0000-0000-0000-000000000000"
+    res = asyncio.run(a.allow_wpa2())
+    ok(not res.get("success") and not a.writes,
+       "a finding made for another profile does not count")
+    _six = {"band_preference_enabled": True, "band_preference": "6GHz",
+            "band_preference_ssid": "Home"}
+    a = Allow(**_six)
+    res = asyncio.run(a.allow_wpa2())
+    ok(not res.get("success") and res.get("error") == "band_6ghz" and not a.writes,
+       "held to 6 GHz on this network it refuses: 6 GHz is WPA3 only, and wpa-psk may not join it")
+    a = Allow(**{**_six, "band_preference_ssid": "Office"})
+    res = asyncio.run(a.allow_wpa2())
+    ok(res.get("success") and a.writes, "6 GHz held for another network does not stop it here")
+
+    class Wpa2Reach(m.Plugin):
+        """The finding, from a cached scan of one network on two bands."""
+        def _visible_access_points(self, iface, ssid, cached_only=False):
+            return [("AA:00:00:00:00:02", 85, 5180, "WPA2"),
+                    ("AA:00:00:00:00:01", 40, 6115, "WPA3")]
+    _find = getattr(Wpa2Reach(), "_wpa2_finding", lambda *_a: "missing")
+    ok(_find("wlan0", "Home", "aa:00:00:00:00:01", {}) == {"signal": 85, "current_signal": 40},
+       "a much stronger WPA2-only access point is found")
+    ok(_find("wlan0", "Home", "aa:00:00:00:00:01", _six) is None,
+       "but not one on another band than the network is held to")
 finally:
     asyncio.sleep = _real_sleep
 
@@ -3358,18 +3392,26 @@ try:
     class Band6(Band):
         """The band setter on a 6 GHz capable device and NetworkManager."""
         def __init__(self, nm="nmcli tool, version 1.58.1", km="wpa-psk", pmf="0 (default)",
-                     link="Connected to 02:00:00:00:00:66\n\tfreq: 6115", **kw):
+                     link="Connected to 02:00:00:00:00:66\n\tfreq: 6115", profile_band=None, **kw):
             super().__init__(link=link, **kw)
             self.nm = nm; self.km = km; self.pmf = pmf; self.versions_read = 0
+            self.profile_band = profile_band   # what the profile holds; None = unreadable
+            self.km_reads = 0
         bands_in_range = (5180, 6115)
         def _run_cmd(self, cmd, timeout=5):
+            if cmd[:4] == ["/usr/bin/nmcli", "-t", "-f", "802-11-wireless.band"]:
+                if self.profile_band is None:
+                    return {"success": False, "stdout": "", "stderr": "", "returncode": 10}
+                return {"success": True, "stdout": f"802-11-wireless.band:{self.profile_band}\n",
+                        "stderr": "", "returncode": 0}
             if cmd == ["/usr/bin/nmcli", "--version"]:
                 self.versions_read += 1
                 if self.nm is None:
                     return {"success": False, "stdout": "", "stderr": "", "returncode": 1}
                 return {"success": True, "stdout": self.nm, "stderr": "", "returncode": 0}
             return super()._run_cmd(cmd, timeout)
-        def _profile_key_mgmt(self, uuid): return self.km
+        def _profile_key_mgmt(self, uuid):
+            self.km_reads += 1; return self.km
         def _read_profile_field(self, uuid, field, timeout=5):
             return self.pmf if field == "802-11-wireless-security.pmf" else ""
         def _backend_is_iwd(self): return False
@@ -3474,8 +3516,68 @@ try:
         ok(res.get("success") is False and (BU, "802-11-wireless.band", "") in d.mods
            and d.reconnects == 2 and m._load_settings().get("bssid_lock_enabled") is True,
            "no association at all is put back too, with the lock left on to re-pin")
+
+        # Put back means the band the profile itself held, which the settings
+        # need not agree with.
+        for _held, _what in [("bg", "a band set outside the plugin"),
+                             ("", "no band, on a copy the preference never reached")]:
+            m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
+                                           band_preference_ssid="Home", band_preference_uuids=[BU],
+                                           **_six_dev))
+            d = Band6(link="Connected to 02:00:00:00:00:55\n\tfreq: 5180", profile_band=_held)
+            res = asyncio.run(d.set_band_preference(True, "6GHz"))
+            ok(res.get("success") is False and d.mods[-1] == (BU, "802-11-wireless.band", _held),
+               f"a failed 6 GHz change restores the profile's own band: {_what} ({d.mods[-1]})")
+        m._save_settings(band_settings(bssid_lock_enabled=True, bssid_lock_connection_uuid=BU,
+                                       **_six_dev))
+        d = Band6(profile_band="bg", refuse={(BU, "802-11-wireless.bssid")})
+        res = asyncio.run(d.set_band_preference(True, "6GHz"))
+        ok(res.get("success") is False and d.mods[-1] == (BU, "802-11-wireless.band", "bg"),
+           "and so does a failed lock release in the middle of one")
+
+        # A preference set on another network keeps that scope, so changing
+        # the band here would reassert it there.
+        for _band in ("6GHz", "a"):
+            m._save_settings(band_settings(band_preference_enabled=True,
+                                           band_preference="bg" if _band == "a" else "a",
+                                           band_preference_ssid="Office",
+                                           band_preference_uuids=[BOLD], **_six_dev))
+            d = Band6()
+            res = asyncio.run(d.set_band_preference(True, _band))
+            _st = m._load_settings()
+            ok(res.get("success") is False and res.get("error") == "band_scoped_elsewhere"
+               and "Office" in res.get("message", "") and not d.mods and d.reconnects == 0
+               and _st.get("band_preference_ssid") == "Office",
+               f"band {_band!r} is refused while the preference belongs to another network")
+        m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
+                                       band_preference_ssid="Office",
+                                       band_preference_uuids=[BOLD], **_six_dev))
+        d = Band6()
+        res = asyncio.run(d.set_band_preference(False))
+        ok(res.get("success") is True and m._load_settings().get("band_preference_enabled") is False,
+           "while turning it off from there still works")
     finally:
         asyncio.sleep = _real_sleep
+
+    # The drift reassertion writes 6GHz into whichever profile of the network
+    # is in use, which the setter's check never saw.
+    _act6 = {"kind": "band", "uuid": BU, "value": "6GHz", "observed": "a"}
+    for _v, _km, _writes, _what in [
+        ("1.58.0", "wpa-psk", False, "a WPA2-style copy on 1.58.0 is left alone"),
+        ("1.58.1", "wpa-psk", True, "one that can join 6 GHz is reasserted"),
+    ]:
+        m._save_settings({**m.DEFAULT_SETTINGS, **_six_dev})
+        _set6 = {**m._load_settings(), "band_preference_enabled": True,
+                 "band_preference": "6GHz", "band_preference_ssid": "Home"}
+        d = Band6(nm=f"nmcli tool, version {_v}", km=_km)
+        _status = {"drift": {"band_preference": True}, "live": {}}
+        d._apply_band(dict(_act6), _set6, _status, {})
+        ok(wrote(d, BU, "6GHz") is _writes and _status["drift"].get("band_preference") is True,
+           f"drift reassert of 6 GHz: {_what}, the drift still reported until it lands")
+    d = Band6(nm="nmcli tool, version 1.58.0")
+    for _ in range(3):
+        d._apply_band(dict(_act6), _set6, {"drift": {}, "live": {}}, {})
+    ok(d.km_reads == 1, f"and the check is asked once, not on every poll ({d.km_reads} reads)")
 
     _pref6 = {**m.DEFAULT_SETTINGS, "band_preference_enabled": True,
               "band_preference": "6GHz", "band_preference_ssid": "Net"}
@@ -5960,6 +6062,35 @@ try:
            "the user is told the move did not happen and why")
         ok(g._lock_weaker is None and getattr(g, "_profile_change_depth", 0) == 0,
            "with the notice cleared and the claim released")
+
+        class NoPutBack(LockedMesh):
+            """Writing the previous pin back fails, and maybe clearing it too."""
+            def __init__(self, *a, clear_fails=False, **kw):
+                super().__init__(*a, **kw); self.clear_fails = clear_fails
+            def _nmcli_modify(self, u, k, v, timeout=5):
+                if k == "802-11-wireless.bssid" and (
+                        v.upper() == "02:00:00:00:00:11" or (v == "" and self.clear_fails)):
+                    self.mods.append((k, v))
+                    return {"success": False, "stdout": "", "stderr": "failed", "returncode": 1}
+                return super()._nmcli_modify(u, k, v, timeout)
+        for _clear_fails in (False, True):
+            lock_on()
+            g = NoPutBack(MESH, "02:00:00:00:00:11", reachable={"02:00:00:00:00:11"},
+                          clear_fails=_clear_fails)
+            g.pinned = "02:00:00:00:00:11"; g._ASSOCIATION_WAIT_SECONDS = 1.0
+            g._lock_weaker = {"signal": 100, "current_signal": 45}
+            r = asyncio.run(g.move_bssid_lock())
+            _s = m._load_settings()
+            if not _clear_fails:
+                ok(r.get("error") == "move_failed" and "turned off" in r.get("message", "")
+                   and g.pinned == "" and _s["bssid_lock_enabled"] is False
+                   and _s["bssid_lock_value"] == "",
+                   "if the previous pin cannot be put back, the pin comes off and the lock reads off")
+            else:
+                ok(r.get("error") == "move_failed" and "Turn the lock off" in r.get("message", "")
+                   and _s["bssid_lock_enabled"] is True
+                   and _s["bssid_lock_value"].upper() == "02:00:00:00:00:51",
+                   "and if even that fails, the settings say where it is really pinned, and the user is told")
 
         lock_on()
         g = mesh_pinned(scan=NEAR)

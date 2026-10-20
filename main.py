@@ -2894,6 +2894,12 @@ class Plugin:
             return
         if self._reassert_exhausted("band"):
             return
+        # The setter checks a profile can be held to 6 GHz before writing it,
+        # but the profile drifting here may be another saved copy of the
+        # network, which it never saw. One that cannot join a 6 GHz access
+        # point is left alone, with the drift still reported.
+        if action["value"] == "6GHz" and self._six_ghz_refusal_cached(uuid):
+            return
         healed = self._nmcli_modify(
             uuid, "802-11-wireless.band", action["value"], timeout=2
         )
@@ -4080,14 +4086,19 @@ class Plugin:
         """
         if key_mgmt:
             aps = [ap for ap in aps if self._ap_accepts(ap[3], key_mgmt)]
+        aps = self._on_preferred_band(aps, ssid, settings)
+        refused = self._recent_ap_failures(settings)
+        if refused:
+            aps = [ap for ap in aps if ap[0] not in refused]
+        return aps
+
+    def _on_preferred_band(self, aps: list, ssid: str, settings: dict) -> list:
+        """The access points left once a band preference for this network applies."""
         if settings.get("band_preference_enabled") and settings.get(
             "band_preference_ssid"
         ) == ssid:
             want = settings.get("band_preference")
             aps = [ap for ap in aps if self._freq_band(ap[2]) == want]
-        refused = self._recent_ap_failures(settings)
-        if refused:
-            aps = [ap for ap in aps if ap[0] not in refused]
         return aps
 
     def _lock_target(
@@ -4699,10 +4710,24 @@ class Plugin:
                                       + self._LOCK_SCAN_SETTLE_SECONDS + 2)
             return
         self._reach_checked_at = now
-        self._wpa2_blocked = None
+        # Decided in full before it is recorded: allow_wpa2 reads the finding
+        # from the event loop while this runs in the status worker.
+        self._wpa2_blocked = self._wpa2_finding(iface, ssid, current_bssid,
+                                                settings or {})
+
+    def _wpa2_finding(self, iface: str, ssid: str, current_bssid: str,
+                      settings: dict) -> dict | None:
+        """The WPA2-only access point clearly stronger than where we are, if any.
+
+        Only among those on the preferred band, when one is set for this
+        network: one on another band is not somewhere the device may go, and
+        no WPA2-only access point is on 6 GHz at all.
+        """
         # The cached list: this runs inside the status poll, and letting nmcli
         # decide to rescan there held the poll for seconds.
-        aps = self._visible_access_points(iface, ssid, cached_only=True)
+        aps = self._on_preferred_band(
+            self._visible_access_points(iface, ssid, cached_only=True), ssid, settings
+        )
         blocked = [
             ap for ap in aps
             if not self._ap_accepts(ap[3], "sae")
@@ -4714,9 +4739,10 @@ class Plugin:
             usable[0][1] if usable else None,
         )
         if not blocked or here is None:
-            return
+            return None
         if blocked[0][1] - here >= self._AP_UPGRADE_MARGIN:
-            self._wpa2_blocked = {"signal": blocked[0][1], "current_signal": here}
+            return {"signal": blocked[0][1], "current_signal": here}
+        return None
 
     def _report_lock_weaker(self, settings: dict, status: dict, uuid: str,
                             iface: str, ssid: str, link: str):
@@ -4875,6 +4901,23 @@ class Plugin:
             if self._profile_key_mgmt(uuid) != "sae":
                 return {"success": False, "error": "not_needed",
                         "message": "This network already allows WPA2."}
+            # Held to 6 GHz, where every access point uses WPA3, there is
+            # nothing to gain, and a wpa-psk profile cannot join 6 GHz on
+            # NetworkManager 1.58.0 or with management frames off.
+            settings = _load_settings()
+            if (settings.get("band_preference_enabled")
+                    and settings.get("band_preference") == "6GHz"
+                    and settings.get("band_preference_ssid")
+                    and settings.get("band_preference_ssid") == self._get_profile_ssid(uuid)):
+                return {"success": False, "error": "band_6ghz",
+                        "message": "This network is held to 6 GHz, which only uses WPA3."}
+            # Only for what the panel reported: a stronger WPA2-only access
+            # point of this network, seen for this profile.
+            if (not getattr(self, "_wpa2_blocked", None)
+                    or getattr(self, "_reach_checked_for", None) != uuid):
+                return {"success": False, "error": "not_needed",
+                        "message": "No stronger WPA2-only access point is in range now, "
+                                   "so nothing was changed."}
             done = self._nmcli_modify(
                 uuid, "802-11-wireless-security.key-mgmt", "wpa-psk"
             )
@@ -5814,8 +5857,36 @@ class Plugin:
             f"alone for a while"
         )
         self._record_ap_failure(chosen)
-        self._nmcli_modify(uuid, "802-11-wireless.bssid", previous)
+        put_back = self._nmcli_modify(uuid, "802-11-wireless.bssid", previous)
         restored = _load_settings()
+        if not put_back["success"]:
+            # Still pinned to the access point that refused us. Take the pin
+            # off instead, and say the lock is off, rather than reconnect into
+            # a profile no access point will accept.
+            decky.logger.error(
+                f"Could not restore the lock to {previous} on {uuid}: "
+                f"{put_back.get('stderr', '')[:120]}; turning the lock off"
+            )
+            cleared = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+            if cleared["success"]:
+                restored["bssid_lock_enabled"] = False
+                restored["bssid_lock_value"] = ""
+                restored["bssid_lock_connection_uuid"] = ""
+                message = ("The stronger access point would not accept the "
+                           "connection, and the lock could not go back, so it "
+                           "was turned off.")
+            else:
+                # Left as it really is; the stranded-pin release takes it off
+                # once the device has been offline long enough.
+                restored["bssid_lock_value"] = chosen
+                message = ("The stronger access point would not accept the "
+                           "connection, and the lock could not be changed. "
+                           "Turn the lock off to release it.")
+            _save_settings_with_timestamp(restored)
+            if not self._hard_reconnect(uuid):
+                return dict(self._RADIO_OFF_RESULT)
+            return {"success": False, "error": "move_failed",
+                    "reconnected": True, "message": message}
         restored["bssid_lock_value"] = previous
         _save_settings_with_timestamp(restored)
         if not self._hard_reconnect(uuid):
@@ -6028,8 +6099,36 @@ class Plugin:
             )
         return None
 
+    # How long the reassertion trusts an answer from _six_ghz_refusal. It
+    # costs up to three nmcli calls on the event loop, and a profile's
+    # security changes rarely.
+    _SIX_GHZ_CHECK_SECONDS = 600
+
+    def _six_ghz_refusal_cached(self, uuid: str) -> dict | None:
+        """_six_ghz_refusal for the status pass, asked once per profile a while."""
+        now = time.monotonic()
+        seen = getattr(self, "_six_ghz_checked", {})
+        if uuid in seen and now - seen[uuid][0] < self._SIX_GHZ_CHECK_SECONDS:
+            return seen[uuid][1]
+        refused = self._six_ghz_refusal(uuid)
+        self._six_ghz_checked = {**seen, uuid: (now, refused)}
+        return refused
+
+    def _profile_band(self, uuid: str) -> str | None:
+        """The band this profile holds now ("" for none), or None if unreadable."""
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "802-11-wireless.band",
+             "con", "show", "uuid", uuid],
+            timeout=5,
+        )
+        _, sep, value = result.get("stdout", "").partition(":")
+        value = value.strip()
+        if not result["success"] or not sep or (value and value not in BAND_NAMES):
+            return None
+        return value
+
     async def _confirm_six_ghz(self, uuid: str, before: dict,
-                               had_lock: bool) -> dict | None:
+                               had_lock: bool, previous_band: str) -> dict | None:
         """Check the reconnect landed on 6 GHz, and put things back if not.
 
         None when it did. Otherwise the band, and the settings that record
@@ -6050,8 +6149,7 @@ class Plugin:
             f"(frequency {frequency!r}{', ' + seen['error'] if seen.get('error') else ''}); "
             f"putting the band back"
         )
-        previous = before.get("band_preference", "") if before.get("band_preference_enabled") else ""
-        undone = self._nmcli_modify(uuid, "802-11-wireless.band", previous)
+        undone = self._nmcli_modify(uuid, "802-11-wireless.band", previous_band)
         if not undone["success"]:
             decky.logger.error(
                 f"Could not put the band back on {uuid}: {undone.get('stderr', '')[:120]}"
@@ -6120,6 +6218,21 @@ class Plugin:
                         "error": "nmcli_failed",
                         "message": "Couldn't identify this network. Try again in a moment.",
                     }
+                # A preference set on another network keeps that scope when
+                # the band changes, so the band picked here would be written
+                # back into that network's profiles, which never saw it.
+                held = _load_settings()
+                scoped_to = held.get("band_preference_ssid", "")
+                if (held.get("band_preference_enabled") and scoped_to
+                        and scoped_to != scope_ssid):
+                    return {
+                        "success": False,
+                        "error": "band_scoped_elsewhere",
+                        "message": (
+                            f"The band preference is set for {scoped_to}. "
+                            "Turn it off first to set one here."
+                        ),
+                    }
                 if band == "6GHz":
                     refused = await asyncio.to_thread(self._six_ghz_refusal, uuid)
                     if refused:
@@ -6153,6 +6266,15 @@ class Plugin:
                     # Still set. Keep the record, or nothing knows about it.
                     if "unknown connection" not in detail.lower():
                         unresolved_bands.append(other)
+            # What a failed change puts back: the profile's own band, read
+            # before the write, rather than one derived from the settings,
+            # which can disagree with it (another copy of the network, or a
+            # band set outside the plugin).
+            settings = _load_settings()
+            previous_band = self._profile_band(uuid)
+            if previous_band is None:
+                previous_band = (settings.get("band_preference", "")
+                                 if settings.get("band_preference_enabled") else "")
             result = self._nmcli_modify(uuid, "802-11-wireless.band", value)
             if not result["success"]:
                 return {
@@ -6175,9 +6297,7 @@ class Plugin:
                     # satisfies, and the reconnect below would activate it.
                     # Put the band back and report, rather than strand it.
                     rollback = self._nmcli_modify(
-                        uuid, "802-11-wireless.band",
-                        settings.get("band_preference", "") if
-                        settings.get("band_preference_enabled") else "",
+                        uuid, "802-11-wireless.band", previous_band
                     )
                     if not rollback["success"]:
                         decky.logger.error(
@@ -6217,7 +6337,8 @@ class Plugin:
                 return dict(self._RADIO_OFF_RESULT)
 
             if enabled and band == "6GHz":
-                failed = await self._confirm_six_ghz(uuid, before, had_bssid_lock)
+                failed = await self._confirm_six_ghz(uuid, before, had_bssid_lock,
+                                                     previous_band)
                 if failed:
                     return failed
 
@@ -6769,8 +6890,9 @@ class Plugin:
                 # Only on the network the preference belongs to. Reapplying it
                 # anywhere else writes a band into that network's profile and
                 # reconnects into it, which strands a network that has no
-                # access point on that band. A deliberate toggle still
-                # re-scopes; this path is programmatic.
+                # access point on that band. The setter refuses a change
+                # made elsewhere too; this skips quietly, as the path is
+                # programmatic.
                 scoped_to = settings.get("band_preference_ssid", "")
                 here = self._get_profile_ssid(
                     self._get_active_connection_uuid() or ""
