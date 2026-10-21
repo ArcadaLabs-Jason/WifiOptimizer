@@ -24,7 +24,7 @@ WiFi Optimizer fixes this from Game Mode. One tap, and it stays fixed.
 https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases/latest/download/wifi-optimizer.zip
 ```
 
-That link always points at the latest stable release. You can also download `wifi-optimizer.zip` from the [releases page](https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases) and use **Install Plugin from ZIP File** > **Browse** instead. The zip is listed in each release's signed checksums and has its own VirusTotal scan, so you can check it before installing ([SECURITY.md](SECURITY.md)). If WiFi Optimizer is already installed, Decky removes it first, which resets its settings, so for updates use the update button in the plugin instead.
+That link always points at the latest stable release. You can also download `wifi-optimizer.zip` from the [releases page](https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases) and use **Install Plugin from ZIP File** > **Browse** instead. The zip is listed in each release's signed checksums and has its own VirusTotal scan, so you can check it before installing ([SECURITY.md](SECURITY.md)). Decky shows its standard warning for plugins that aren't from its store; tap **Continue**, then **Install**. Installing the zip over an existing copy keeps your settings, but for updates the update button in the plugin is better: it checks the release signature before installing, and Decky's zip install doesn't.
 
 **From Konsole.** Open Desktop Mode > Konsole and run:
 
