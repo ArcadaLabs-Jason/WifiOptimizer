@@ -1510,7 +1510,7 @@ function Content() {
         <InfoRow
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
-          explanation="The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
+          explanation="The OS saves WiFi power in several places: the wireless chip, the PCIe link between the chip and the CPU, and low power modes in the driver. These can cause latency spikes, packets sent in batches, and lower throughput during a long stream. This turns them off, so the WiFi hardware stays fully awake. It uses a little more battery."
           {...gatedBadge("power_save", s?.power_save_disabled)}
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
@@ -1522,18 +1522,21 @@ function Content() {
         />
         <InfoRow
           label="Stop background scanning"
-          subtitle="Pins one access point - disable to roam"
-          explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Pinning the connection to one access point stops these scans entirely. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock."
+          subtitle="Pins one access point. Turn off to roam."
+          explanation="While connected, your device scans now and then for a better access point. Each scan takes the radio off your channel for a moment, which can drop packets and make a game stream stutter. Pinning the connection to one access point turns off these roaming scans. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock. Turning it on or off reconnects WiFi for a few seconds."
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
-            ? { badge: "unknown" as const, text: "other network" }
+            ? otherNetworkBadge
             : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
           checked={s?.bssid_lock_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.bssid_lock_enabled)}
+          working={working === "bssid_lock"}
           error={errors.bssid_lock}
           notice={
             notices.bssid_lock ??
             (status?.live?.pins_inactive_iwd && s?.bssid_lock_enabled
               ? IWD_PIN_NOTICE
+              : status?.live?.bssid_lock_other_network && s?.bssid_lock_enabled
+              ? OTHER_NETWORK_TEXT
               : status?.external?.bssid_lock
               ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
               : undefined)
@@ -1544,7 +1547,7 @@ function Content() {
         />
         <InfoRow
           label="Auto-fix on wake"
-          subtitle="Reapplies settings after sleep (NM dispatcher)"
+          subtitle="Reapplies settings after sleep"
           explanation="The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
           {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
@@ -1558,7 +1561,7 @@ function Content() {
         <InfoRow
           label="Network buffer tuning"
           subtitle="Optimize UDP buffers and TX queue for streaming"
-          explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
+          explanation="Increases the kernel's network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when WiFi connects if Auto-fix on wake is on."
           {...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled)}
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
@@ -1625,8 +1628,8 @@ function Content() {
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
               WiFi region: {regdomain.governing || "unknown"}. This device's
               WiFi card sets its own region, so it cannot be changed here. That
-              is normal for many cards, the Steam Deck's included, and does not
-              mean a band is missing.
+              is normal for many cards{isDeck ? ", the Steam Deck's included," : ""} and
+              does not mean a band is missing.
             </div>
           </PanelSectionRow>
         )}
@@ -1635,14 +1638,19 @@ function Content() {
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you.${
+          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only turn this on if your router has 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you. Turning it on or off reconnects WiFi for a few seconds.${
             supports6GHz
-              ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
+              ? status?.live?.six_ghz_offered || on6GHz
+                ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz. To stay on 6 GHz, use Force 6 GHz band below instead."
+                : " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
               : ""
           }`}
-          {...getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null)}
+          {...(bandOther && !on6GHz && !band5Error
+            ? otherNetworkBadge
+            : getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null))}
           checked={(s?.band_preference_enabled ?? false) && !on6GHz}
           disabled={isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz))}
+          working={working === "band_5ghz"}
           error={band5Error}
           notice={
             notices.band_5ghz ??
@@ -1651,6 +1659,10 @@ function Content() {
               : notices.band_preference ??
                 (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
                   ? IWD_PIN_NOTICE
+                  : bandOther
+                  ? OTHER_NETWORK_TEXT
+                  : onBg
+                  ? "This network is held to 2.4 GHz by an older setting, not 5 GHz. Turn this off, then on again, to use 5 GHz."
                   : status?.external?.band
                   ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
                   : undefined))
@@ -1658,8 +1670,13 @@ function Content() {
           onChange={(val: boolean) => {
             clearBandMessages();
             handleToggle("band_5ghz", () =>
-              // Never "6GHz": turning that off leaves it recorded as the band.
-              backend.setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")
+              // Turning it on always asks for 5 GHz, which is what the
+              // toggle says, even over a 2.4 GHz setting from an old
+              // version. Never "6GHz": turning that off leaves it recorded
+              // as the band.
+              val
+                ? backend.setBandPreference(true, "a")
+                : backend.setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")
             );
           }}
         />
@@ -1667,16 +1684,23 @@ function Content() {
           <InfoRow
             label="Force 6 GHz band"
             subtitle="Stay on 6 GHz where your router has it"
-            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
-            {...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null)}
+            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Turning it on or off reconnects WiFi. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
+            {...(bandOther && on6GHz && !band6Error
+              ? otherNetworkBadge
+              : getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null))}
             checked={on6GHz}
             disabled={isBusy || updating || (!connected && !on6GHz)}
+            working={working === "band_6ghz"}
             error={band6Error}
             notice={
               notices.band_6ghz ??
               (on6GHz
                 ? notices.band_preference ??
-                  (status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+                  (status?.live?.pins_inactive_iwd
+                    ? IWD_PIN_NOTICE
+                    : bandOther
+                      ? OTHER_NETWORK_TEXT
+                      : undefined)
                 : undefined)
             }
             onChange={(val: boolean) => {
@@ -1688,12 +1712,18 @@ function Content() {
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
-          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
-          {...getBadge("dns", status, errors.dns ?? null)}
+          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the WiFi network you set it on. Each change reconnects WiFi for a few seconds."
+          {...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
+            ? otherNetworkBadge
+            : getBadge("dns", status, errors.dns ?? null))}
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.dns_enabled)}
+          working={working === "dns"}
           error={errors.dns}
-          notice={notices.dns}
+          notice={
+            notices.dns ??
+            (status?.live?.dns_other_network && s?.dns_enabled ? OTHER_NETWORK_TEXT : undefined)
+          }
           onChange={(val: boolean) => {
             if (!val) resetDnsDraft();
             handleToggle("dns", () =>
@@ -1767,18 +1797,21 @@ function Content() {
         <InfoRow
           label="Disable IPv6"
           subtitle="Use IPv4 only on this network"
-          explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine."
-          {...getBadge("ipv6", status, errors.ipv6 ?? null)}
+          explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only turn this on if you have one of those problems. Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for a few seconds."
+          {...(status?.live?.ipv6_other_network && s?.ipv6_disabled && !errors.ipv6
+            ? otherNetworkBadge
+            : getBadge("ipv6", status, errors.ipv6 ?? null))}
           notice={
             notices.ipv6 ??
             (status?.external?.ipv6
-              ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
+              ? "IPv6 is already off on this connection, which is common for saved networks. Nothing to do unless something here needs IPv6. To turn IPv6 back on, turn this on, then off."
               : status?.live?.ipv6_other_network
-                ? "On for the network it was turned on for, not this one."
+                ? OTHER_NETWORK_TEXT
                 : undefined)
           }
           checked={s?.ipv6_disabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.ipv6_disabled)}
+          working={working === "ipv6"}
           error={errors.ipv6}
           onChange={(val: boolean) =>
             handleToggle("ipv6", () => backend.setIpv6(val))
@@ -1786,8 +1819,8 @@ function Content() {
         />
         <InfoRow
           label="Traffic shaping (CAKE)"
-          subtitle="Fair queuing and bufferbloat prevention"
-          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
+          subtitle="Fair queuing for traffic this device sends"
+          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection, so it does not fix lag that starts there. It does not limit your bandwidth. It is lost on reboot, and put back when WiFi connects if Auto-fix on wake is on."
           {...gatedBadge("cake", s?.cake_enabled)}
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.cake_enabled)}
@@ -1837,6 +1870,8 @@ function Content() {
         onForceReapply={handleForceReapply}
         onReset={handleResetSettings}
         resetError={errors.reset}
+        resetNotice={notices.reset}
+        workingText={working === "reset" ? WORKING_TEXT : applyingAll ? BATCH_WORKING_TEXT : null}
       />
 
       <UpdatesSection
@@ -1855,7 +1890,7 @@ function Content() {
       />
 
       <PanelFooter version={status?.version ?? "?"} />
-    </>
+    </DetailsContext.Provider>
   );
 }
 
