@@ -8,7 +8,7 @@ Include what you found, the plugin version, your device and OS, and the steps to
 
 ## Why it matters here
 
-The plugin's backend runs as root, as every Decky plugin backend does. It changes NetworkManager profiles, kernel settings and system files, and it reads a settings file that lives in a directory your desktop user can write to. A bug in how it handles that input can be a way to run something as root.
+The plugin's backend runs as root. Decky only does that for plugins that ask for it (the `root` flag in `plugin.json`), and this one does, because it changes NetworkManager profiles, kernel settings and system files. It also reads a settings file that lives in a directory your desktop user can write to. A bug in how it handles that input can be a way to run something as root.
 
 ## Signed releases
 
