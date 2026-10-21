@@ -8203,6 +8203,21 @@ class Plugin:
         return (self._find_stream([("game", "steamlaunch appid=")]) is not None
                 or self._stream_running(settings))
 
+    def _update_blocker(self, settings: dict) -> str | None:
+        """Why an update must wait, for the panel, or None.
+
+        Keep fixes on counts as a stream, since the user says one is on. It
+        is named when it is the only reason, because "close your game or
+        stream" said nothing to someone running neither.
+        """
+        if not self._game_or_stream_running(settings):
+            return None
+        if (os.path.isfile(STREAM_HOLD_FILE)
+                and self._find_stream([("game", "steamlaunch appid=")]) is None
+                and self._find_stream(self._stream_patterns(settings)) is None):
+            return "Keep fixes on is holding the streaming fixes on. Turn it off first, then update."
+        return "Close your game or stream first, then update."
+
     def _find_stream(self, patterns: list[tuple[str, str]]) -> dict | None:
         """The first running process whose command line has a pattern in it."""
         if not patterns:
@@ -8917,9 +8932,9 @@ class Plugin:
             # and takes the game down with it. So not during a game or a
             # stream; the update notice already waits for the same.
             settings = _load_settings()
-            if await asyncio.to_thread(self._game_or_stream_running, settings):
-                return {"success": False,
-                        "message": "Close your game or stream first, then update."}
+            blocked = await asyncio.to_thread(self._update_blocker, settings)
+            if blocked:
+                return {"success": False, "message": blocked}
             if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
                 decky.logger.error(f"Update refused: approved version {version!r} malformed")
                 return {"success": False, "message": "Check for updates again, then retry."}
@@ -8994,6 +9009,7 @@ class Plugin:
             # The script removes its own directory when it exits, so while
             # the directory exists an update is running.
             self._update_dir = script_dir
+            self._update_started_at = time.monotonic()
 
             decky.logger.info(f"Update to {label} initiated (channel={channel})")
             return {"success": True, "message": f"Updating to {label}...", "version": latest}
@@ -9041,8 +9057,14 @@ class Plugin:
     def _update_running(self) -> bool:
         if getattr(self, "_update_starting", False):
             return True
+        # Only within the script's time limit. A script killed outright
+        # (SIGKILL, once systemd gave up on its TERM) cannot remove its
+        # directory, and every update, backend switch, Reset and profile
+        # change was refused until Decky restarted.
         directory = getattr(self, "_update_dir", None)
-        if directory and os.path.isdir(directory):
+        started = getattr(self, "_update_started_at", None)
+        if (directory and os.path.isdir(directory)
+                and (started is None or time.monotonic() - started < UPDATE_STATE_MAX_AGE)):
             return True
         # After a reload this is a new backend that did not start the script,
         # which is still finishing. What the script reports covers that.

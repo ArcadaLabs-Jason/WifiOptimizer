@@ -3221,6 +3221,16 @@ u = StreamOn()
 r = asyncio.run(u.apply_update("0.19.0-beta"))
 ok(r.get("success") is False and u.checks == 0 and not u._update_running(),
    "nor during a stream")
+# Keep fixes on counts as a stream. Told to close a game or stream, someone
+# running neither had no idea what was stopping the update.
+_hold_was = os.path.exists(m.STREAM_HOLD_FILE)
+open(m.STREAM_HOLD_FILE, "w").write("1\n")
+try:
+    u = TwoUpdates(); r = asyncio.run(u.apply_update("0.19.0-beta"))
+    ok(r.get("success") is False and "Keep fixes on" in r.get("message", "") and u.checks == 0,
+       f"an update held back by Keep fixes on says that is the reason ({r.get('message')!r})")
+finally:
+    if not _hold_was: os.remove(m.STREAM_HOLD_FILE)
 ok(u._update_running() is False, "and the claim is released when it ends")
 
 class GenericStartFails(m.Plugin):
@@ -3399,6 +3409,16 @@ try:
     for done in ("done 0.19.0-beta", "failed 0.19.0-beta"):
         _state(done)
         ok(m.Plugin()._update_running() is False, f"a finished update is not running: {done}")
+    # The script's own directory, left behind by one killed outright, which
+    # cannot tidy up. It used to block updates, switches and Reset for good.
+    _state(None)
+    _ur = m.Plugin(); _ur._update_dir = tempfile.mkdtemp()
+    _ur._update_started_at = time.monotonic()
+    ok(_ur._update_running() is True, "an update started a moment ago is running while its directory is there")
+    _ur._update_started_at = time.monotonic() - m.UPDATE_STATE_MAX_AGE - 5
+    ok(_ur._update_running() is False,
+       "but a directory older than the script's time limit is one it could not remove, not an update")
+    os.rmdir(_ur._update_dir)
 
     _real_ver = m.decky.DECKY_PLUGIN_VERSION
     try:
