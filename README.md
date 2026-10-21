@@ -24,19 +24,19 @@ WiFi Optimizer fixes this from Game Mode. One tap, and it stays fixed.
 https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases/latest/download/wifi-optimizer.zip
 ```
 
-That link always points at the latest stable release. You can also download `wifi-optimizer.zip` from the [releases page](https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases) and use **Install Plugin from ZIP File** > **Browse** instead. The zip is listed in each release's signed checksums and has its own VirusTotal scan, so you can check it before installing ([SECURITY.md](SECURITY.md)). Decky shows its standard warning for plugins that aren't from its store; tap **Continue**, then **Install**. Installing the zip over an existing copy keeps your settings, but for updates the update button in the plugin is better: it checks the release signature before installing, and Decky's zip install doesn't.
+That link always points at the latest stable release. You can also download `wifi-optimizer.zip` from the [releases page](https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases) and use **Install Plugin from ZIP File** > **Browse** instead. The zip is listed in each release's signed checksums and has its own VirusTotal scan, so you can check it before installing ([SECURITY.md](SECURITY.md)). Decky shows its standard warning for plugins that aren't from its store; tap **Continue**, then **Install**. With a Decky Loader release from late 2024 or newer, installing the zip over an existing copy keeps your settings (some Decky builds from earlier in 2024 removed the plugin first, settings included). For updates, though, the update button in the plugin is better: it checks the release signature before installing, and Decky's zip install doesn't.
 
 **From Konsole.** Open Desktop Mode > Konsole and run:
 
 ```bash
-curl -sL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
+curl -fsSL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
 ```
 
 This requires a user password. Set one with `passwd` in Konsole if you haven't already. It keeps your settings if the plugin is already installed.
 
 Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
 
-**Updating:** The plugin checks for updates automatically when you open it, and from v0.24.0 on also twice a day in the background: when a new version comes out you get one notification (never during a game or a stream), and tapping it opens the plugin. You can turn that off with **Tell me about updates** in the Updates section. Nothing installs on its own. If an update is available, an update button appears at the top of the panel. Tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. The button won't start an update while a game or a stream is running; close it first. You can also update manually by running the install command above again. That always installs the latest stable release, so on the beta channel it can take you back to an older version.
+**Updating:** The plugin checks for updates automatically when you open it, and from v0.24.0 on also twice a day in the background: when a new version comes out you get one notification (never during a game or a stream), and tapping it opens the plugin. You can turn that off with **Tell me about updates** in the Updates section. Nothing installs on its own. If an update is available, an update button appears at the top of the panel. Tap it and the plugin updates. From v0.19.0-beta on it then reloads itself without restarting Steam; if Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. Earlier versions restart Decky, and with it Steam, every time. From v0.24.2 on, the button won't start an update while a game or a stream is running, or while **Keep fixes on** is on in streaming auto mode; close the game or stream, or turn Keep fixes on off, first. You can also update manually by running the install command above again. That always installs the latest stable release, so on the beta channel it can take you back to an older version.
 
 Releases are signed. From v0.21.0-beta on, before installing an update, the plugin checks the release's signature against the keys built into it and the download against the signed checksum, and installs nothing that doesn't match. Earlier versions install what they download. The install command doesn't check signatures: it downloads the latest stable release over HTTPS from GitHub, or the current main branch if it can't look up the release. [SECURITY.md](SECURITY.md) lists the keys and how to check a release yourself. The beta channel installs the newest release of either kind, beta or stable.
 
@@ -45,12 +45,13 @@ Releases are signed. From v0.21.0-beta on, before installing an update, the plug
 ## Getting started
 
 1. Open WiFi Optimizer from the Decky sidebar
-2. Tap **Optimize Safe**. This applies four optimizations that suit most setups (three when the WiFi backend is `iwd`, where the BSSID lock is left out):
-   - Disables WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
-   - Locks you to one access point (stops background scanning interruptions, but also stops roaming between access points, see below). If the lock is already on for another network, it is left there
-   - Enables auto-fix on wake (reapplies settings after sleep)
-   - Tunes network buffers (handles streaming traffic bursts)
-3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
+2. Two of the optimizations are already on from the moment the plugin is installed: **Prevent lag spikes** (WiFi power save and PCIe power states off) and **Auto-fix on wake**. Turn either off in the panel if you don't want it.
+3. Tap **Optimize Safe** to add the rest of the four that suit most setups. Between them they:
+   - Disable WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
+   - Lock you to one access point (stops background scanning interruptions, but also stops roaming between access points, see below). If the lock is already on for another network, it is left there. Under the `iwd` WiFi backend the lock is left out
+   - Enable auto-fix on wake (reapplies settings after sleep)
+   - Tune network buffers (handles streaming traffic bursts)
+4. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
 
 Want to go further? The remaining optimizations are available as individual toggles. Each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs, and **Show details** at the top of the panel opens all of them at once, for reading with a controller. Advanced options include forcing 5 GHz (or 6 GHz, where your setup supports it), custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
 
@@ -71,17 +72,18 @@ Want to go further? The remaining optimizations are available as individual togg
 |---|---|---|
 | Force 5 GHz band | Locks WiFi to 5 GHz to avoid Bluetooth interference on 2.4 GHz | No use on a 2.4 GHz only network, and keeps a 6 GHz capable device off 6 GHz. Refused when no 5 GHz access point for your network is in range. Paused while the `iwd` backend is in use, for the same reason as the access point lock. |
 | Force 6 GHz band | Locks WiFi to 6 GHz, the least crowded band, on routers with WiFi 6E or newer | Only shown on a 6 GHz capable card with NetworkManager 1.58 or newer (expected with SteamOS 3.9) and the `wpa_supplicant` backend. Needs WPA3: a network saved for WPA2 works from NetworkManager 1.58.1. Refused when no 6 GHz access point for your network is in range, and if the device can't connect on 6 GHz the band is put back as it was. 6 GHz reaches less far than 5 GHz; out of range, the pin is released after a minute like the others. |
-| Traffic shaping (CAKE) | Replaces the default queue for traffic your device sends with CAKE, for fair queuing and ACK filtering. It cannot fix lag that starts at your router or internet connection. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
-| Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
+| Traffic shaping (CAKE) | Replaces the default queue for traffic your device sends with CAKE, for fair queuing and ACK filtering. It cannot fix lag that starts at your router or internet connection. Does not limit bandwidth. | Replaces your system's default queue; resets on reboot |
+| Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers. It replaces the network's own DNS servers, including any it offers over IPv6, with IPv4 ones, so leave it off on the rare network that has no IPv4 at all. | Requires choosing a provider |
 | Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6. Most are fine. |
-| WiFi region | Sets the wireless regulatory domain, which decides the channels your device may use. The wrong region can hide 5 GHz and 6 GHz channels entirely. | Only offered on devices whose WiFi card does not carry its own region. Steam Deck cards do, so the panel reports the region in use and offers no control there. |
-| WiFi backend (iwd / wpa_supplicant) | Switches between `iwd` and `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. On SteamOS 3.8 this goes through the same system service as the setting in SteamOS Settings, so the two agree. Switching to `iwd` pauses the access point lock and Force 5 GHz. | Only shown when the system provides a way to switch; some networks (certain WPA3, enterprise setups) behave differently between the two |
+| Allow WPA2 here | Offered only when a stronger access point of your network offers just WPA2 while the network is saved as WPA3-only, so your device can't use it. Allowing it lets the device use that access point; ones that offer both keep using WPA3. | Only for an access point that is yours: anyone nearby can broadcast your network's name. Before NetworkManager 1.58.1 a network allowed WPA2 doesn't join an access point that offers only WPA3 by itself, so there it is only offered while no such access point is in view. Reset puts the network back to WPA3 only. |
+| WiFi region | Sets the wireless regulatory domain, which decides the channels your device may use. The wrong region can hide 5 GHz and 6 GHz channels entirely. | Only offered on devices whose WiFi card does not carry its own region. Some cards carry their own region, the Steam Deck OLED's among them; there the panel reports the region in use and offers no control. |
+| WiFi backend (iwd / wpa_supplicant) | Switches between `iwd` and `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. On SteamOS 3.8 this goes through the same system service as the setting in SteamOS Settings, so the two agree. Switching to `iwd` pauses the access point lock and the band preference. | Only shown when the system provides a way to switch; some networks (certain WPA3, enterprise setups) behave differently between the two |
 
 **Streaming auto mode**
 
 Off by default. When it's on, Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) apply only while a streaming app is running, and come off when it exits, so the rest of the time your device saves battery as it normally would. Background scanning, Force 5 GHz, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.
 
-It watches for Moonlight, GeForce NOW, Chiaki (PS Remote Play), Steam Remote Play, Steam Link, Greenlight (Xbox), Parsec and Xbox Cloud Gaming, each of which can be unticked, plus any process names you add. The top of the panel always says which state you're in. If a stream isn't picked up, turn on **Keep fixes on**, which holds the fixes on until you restart, or add the app's process name.
+It watches for Moonlight, GeForce NOW, Chiaki (PS Remote Play), Steam Remote Play, Steam Link, Greenlight (Xbox), Parsec and Xbox Cloud Gaming, each of which can be unticked, plus any process names you add. The top of the panel always says which state you're in. If a stream isn't picked up, turn on **Keep fixes on**, which holds the fixes on until you restart the device, or add the app's process name.
 
 Idea and first implementation by [bassobr](https://github.com/bassobr) ([#5](https://github.com/ArcadaLabs-Jason/WifiOptimizer/issues/5)).
 
@@ -93,10 +95,10 @@ Idea and first implementation by [bassobr](https://github.com/bassobr) ([#5](htt
 | Steam Deck OLED | WiFi 6E (QCA206X) | ath11k_pci | Full support |
 | Legion Go (all models) | WiFi 6E (MT7922) | mt7921e | Full support |
 | ROG Ally (all models) | WiFi 6E (MT7922) | mt7921e | Full support |
-| MSI Claw, AYANEO, GPD | WiFi 6 (RTL8852) or WiFi 7 (WCN7850) | rtw89, ath12k | Recognized; untested on hardware, reports welcome |
+| MSI Claw, AYANEO, GPD | Varies (often MediaTek MT7922 or Intel) | mt7921e, iwlwifi, rtw89, ath12k | Recognized; untested on hardware, reports welcome |
 | Other PC handhelds | Varies | iwlwifi, etc. | Detected automatically; driver-specific fixes applied when available |
 
-The plugin detects your WiFi hardware at startup and applies the right optimizations for your chip. Devices with unrecognized hardware still get universal optimizations (power save, buffer tuning, BSSID lock, etc.).
+The plugin detects your WiFi hardware at startup and applies the right optimizations for your chip. Devices with unrecognized hardware still get universal optimizations (power save, buffer tuning, the access point lock, etc.).
 
 ## How it works
 
@@ -116,23 +118,37 @@ seconds whether a streaming app is running.
 
 ## Uninstall
 
-**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. WiFi power save goes back on straight away (unless Steam's own WiFi power management setting has it off), the driver's power settings go back to what your system had, and a WiFi region chosen in the plugin is put back. Prevent lag spikes then stays off until you turn it on again. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. On SteamOS the WiFi backend choice (iwd vs wpa_supplicant) is Valve's own setting and is left as it is. On other systems, a backend chosen from the plugin goes back to the system's default from the next boot, and that backend's service is turned back on so WiFi still works. One thing is left in place: where a network is saved more than once, the plugin gives the copy you use a higher autoconnect priority so the same copy is picked every time, and that priority stays, since it does no harm. Uninstalling from Decky does the same.
+**Before uninstalling:** tap **Reset settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and removes the plugin's power save config files. WiFi power save goes back on straight away (unless Steam's own WiFi power management setting has it off), the driver's power settings go back to what your system had, and a WiFi region chosen in the plugin is put back. Prevent lag spikes then stays off until you turn it on again. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are taken off every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting; the connection in use keeps them until WiFi next connects. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. On SteamOS the WiFi backend choice (iwd vs wpa_supplicant) is Valve's own setting and is left as it is. On other systems, a backend chosen from the plugin goes back to the system's default from the next boot, and that backend's service is turned back on so WiFi still works. Your update channel and update notices are kept. Reset leaves Auto-fix on wake on, as on a fresh install, so its script stays installed, but with the other fixes off it changes nothing. One more thing is left in place: where a network is saved more than once, the plugin gives the copy you use a higher autoconnect priority so the same copy is picked every time, and that priority stays, since it does no harm. Uninstalling from Decky does the same as Reset, and also removes the auto-fix script.
 
-Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
+Disabling the plugin in Decky instead of uninstalling it stops it from applying its changes again, but does not undo the ones already made. Tap **Reset settings** first if you want them undone.
+
+Then uninstall from Decky: open Decky's settings, go to **Plugins**, select the **...** beside WiFi Optimizer and choose **Uninstall**. Or remove it by hand from a terminal in Desktop Mode:
 
 ```bash
 sudo rm -rf ~/homebrew/plugins/WiFi\ Optimizer
+sudo systemctl restart plugin_loader
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-wifi-optimizer
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
 sudo rm -f /etc/modprobe.d/99-wifi-optimizer.conf
 sudo nmcli general reload conf
-rm -rf ~/homebrew/settings/WiFi\ Optimizer
-sudo systemctl restart plugin_loader
+sudo rm -rf ~/homebrew/settings/WiFi\ Optimizer ~/homebrew/logs/WiFi\ Optimizer
 ```
+
+Decky is restarted straight after the plugin folder is removed, so the plugin is no longer running to write its settings or logs back. Restarting Decky also restarts Steam.
 
 Restart the device afterwards: WiFi power save, the driver's power settings and the PCIe power states go back to your system's own from the next boot.
 
 If you switched the WiFi backend from the plugin on a system other than SteamOS, switch it back in the plugin before removing it by hand, or leave `/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf` in place: removing that file alone leaves the other backend turned off.
+
+If you couldn't run Reset first (the panel wouldn't open, say), the access point lock, the band preference, custom DNS, the IPv6 setting and Allow WPA2 can still be on the networks they were set on. Forget each of those networks in Steam's WiFi settings and join it again, or run this once for each, with the network's saved name in place of `NAME`:
+
+```bash
+sudo nmcli connection modify "NAME" 802-11-wireless.bssid "" 802-11-wireless.band "" ipv4.ignore-auto-dns no ipv4.dns "" ipv6.ignore-auto-dns no ipv6.method auto
+```
+
+That command leaves Allow WPA2 as it is; forgetting and joining the network again resets that too.
+
+On SteamOS, a WiFi backend switch made from the plugin can also have copied its power save setting into SteamOS's own WiFi config. If Steam's WiFi power management setting reads off after removing the plugin by hand, turn it back on.
 
 ## Building from source
 

@@ -7738,5 +7738,72 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+
+# ---- QA pass 3, FRONT: panel and public docs (source checks; none reads dist) ----
+def _src(path):
+    try:
+        return open(path).read()
+    except OSError:
+        return ""
+def _between(text, start, end):
+    """text from start to the first end after it, or "" when start is missing."""
+    i = text.find(start)
+    if i < 0:
+        return ""
+    j = text.find(end, i + len(start))
+    return text[i:j if j >= 0 else len(text)]
+_F_IX = _src("src/index.tsx"); _F_UW = _src("src/updateWatch.ts"); _F_TY = _src("src/types.ts")
+_F_BT = _src("src/components/BackendToggleRow.tsx"); _F_SS = _src("src/components/StreamingSection.tsx")
+_F_US = _src("src/components/UpdatesSection.tsx"); _F_AS = _src("src/components/ActionsSection.tsx")
+_F_SG = _src("src/components/StatsGrid.tsx"); _F_TH = _src("src/theme.ts"); _F_PF = _src("src/components/PanelFooter.tsx")
+_F_RD = _src("README.md"); _F_SEC = _src("SECURITY.md"); _F_MAIN = _src("main.py")
+_F_ALL = "".join(_src(os.path.join(dp, f)) for dp, _dn, fs in os.walk("src") for f in fs)
+
+section("F21 the README's Reset paragraph is true")
+try:
+    _rp = _between(_F_RD, "**Before uninstalling:**", "\n\n")
+    ok("deletes the plugin's own config files" not in _rp and "until WiFi next connects" in _rp
+       and "Allow WPA2" in _rp and "auto-fix script" in _rp,
+       "no deleted config claim, the next-connect timing, Allow WPA2 and the auto-fix script")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F22 the README's manual uninstall works and says how to undo network changes")
+try:
+    _un = _between(_F_RD, "## Uninstall", "## Building from source")
+    ok(0 <= _un.find("sudo systemctl restart plugin_loader") < _un.find("homebrew/settings/WiFi")
+       and "homebrew/logs/WiFi" in _un, "Decky restarts before the settings and logs go, and the logs go too")
+    ok("go to **Plugins**" in _un and "ipv6.method auto" in _un and "Steam's WiFi power management" in _un,
+       "the Decky path, the network undo line and the power management note are there")
+    ok("Disabling the plugin in Decky" in _un, "and what disabling does (J3)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F23 the README's install and update claims hold for the versions they name")
+try:
+    ok("curl -fsSL" in _F_RD and "curl -sL" not in _F_RD, "the one-liner fails on an HTTP error")
+    _upd = _between(_F_RD, "**Updating:**", "\n\n")
+    ok("From v0.19.0-beta on" in _upd and "From v0.24.2 on" in _upd and "Keep fixes on" in _upd,
+       "reload and the game refusal are version-qualified, and Keep fixes on is named")
+    ok("from late 2024 or newer" in _F_RD, "the zip-over-install claim names the Decky it holds for")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F24 F25 the README's hardware and region rows")
+try:
+    ok("Varies (often MediaTek MT7922 or Intel)" in _F_RD and "WiFi 6 (RTL8852) or WiFi 7" not in _F_RD,
+       "other handhelds are not claimed to use one chip")
+    ok("the Steam Deck OLED's among them" in _F_RD and "Steam Deck cards do" not in _F_RD,
+       "the region row is true for the LCD too")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F26 SECURITY.md: who owns the plugin folder")
+try:
+    ok("3.1.10" in _F_SEC and "The plugin's own folder is owned by root, so only" not in _F_SEC,
+       "the ownership claim names the installs it holds for")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
