@@ -1510,25 +1510,19 @@ class Plugin:
         Every child gets _child_env(), so it loads the system's libraries
         rather than the ones bundled inside Decky. See _child_env for why
         this cannot be left to the commands that happen to need it.
+
+        Never waits longer than the timeout and a second. subprocess.run
+        kills a child that times out and then waits for it with no limit,
+        and a child stuck in the kernel (iw or tc behind a WiFi driver that
+        wedged on a bad wake) does not die from the kill. Called on the
+        event loop, that froze every call the panel makes, for good. Such a
+        child is left behind instead; Python reaps it if it ever exits.
         """
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 env=_child_env(),
             )
-            return {
-                "success": result.returncode == 0,
-                "stdout": result.stdout.strip(),
-                "stderr": result.stderr.strip(),
-                "returncode": result.returncode,
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": "Command timed out",
-                "returncode": -1,
-            }
         except FileNotFoundError:
             return {
                 "success": False,
@@ -1543,6 +1537,58 @@ class Plugin:
                 "stderr": str(e),
                 "returncode": -1,
             }
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return {
+                "success": proc.returncode == 0,
+                "stdout": stdout.strip(),
+                "stderr": stderr.strip(),
+                "returncode": proc.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            self._abandon(proc, cmd)
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": "Command timed out",
+                "returncode": -1,
+            }
+        except Exception as e:
+            self._abandon(proc, cmd)
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": str(e),
+                "returncode": -1,
+            }
+
+    @staticmethod
+    def _abandon(proc, cmd: list[str]):
+        """Kill a child that overran, give it a second, then stop waiting."""
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=1)
+            return
+        except Exception:
+            pass
+        # Still there after SIGKILL: stuck in the kernel. Our ends of its
+        # pipes are closed so they do not pile up, one per stuck call.
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except Exception:
+                pass
+        try:
+            decky.logger.error(
+                f"{os.path.basename(cmd[0])} did not exit after being killed; "
+                "left it behind rather than wait on it"
+            )
+        except Exception:
+            pass
 
     def _get_wifi_interface(self) -> str | None:
         # Reading sysfs saves an nmcli call on most polls, but only when the
@@ -3170,8 +3216,8 @@ class Plugin:
             # A collection that never returns would otherwise hold this
             # branch forever: the panel blank with nothing to say or, once a
             # pass has completed, frozen on its values as if all were well.
-            # subprocess.run waits again after killing a timed-out child, so
-            # a process stuck against a wedged driver can do exactly that.
+            # _run_cmd no longer waits on a child stuck against a wedged
+            # driver, but a pass made of many such calls still takes minutes.
             started = getattr(self, "_collect_started_at", 0.0)
             if started and (time.monotonic() - started) > 90:
                 self._log_throttled(

@@ -219,6 +219,56 @@ ok(not any(isinstance(n, ast.Attribute) and n.attr in ("system", "popen")
            and getattr(n.value, "id", "") == "os" for n in ast.walk(_tree)),
    "and nothing starts a process around it with os.system or os.popen")
 
+section("runtime: a command that will not die does not hold the plugin")
+try:
+    import subprocess as _sp3
+    # iw or tc behind a WiFi driver that wedged on a bad wake sit in the
+    # kernel, where SIGKILL does not reach them. subprocess.run kills a child
+    # that timed out and then waits for it with no limit, which on the event
+    # loop froze every call the panel makes. This child ignores the kill and
+    # only ever comes back from a wait that has a limit.
+    class _Stuck:
+        waits = []
+        def __init__(self, *a, **k):
+            self.args = a[0] if a else k.get("args"); self.returncode = None
+            self.pid = 4242; self.stdout = self.stderr = None
+        def _wait(self, kind, timeout):
+            _Stuck.waits.append((kind, timeout))
+            if timeout is None:
+                time.sleep(1.5)  # stands in for forever
+                return ("", "") if kind == "communicate" else 0
+            time.sleep(min(timeout, 0.05))
+            raise _sp3.TimeoutExpired(self.args, timeout)
+        def communicate(self, input=None, timeout=None): return self._wait("communicate", timeout)
+        def wait(self, timeout=None): return self._wait("wait", timeout)
+        def poll(self): return None
+        def kill(self): pass
+        def send_signal(self, sig): pass
+        def terminate(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): self.wait()
+    _real_popen3 = m.subprocess.Popen
+    try:
+        m.subprocess.Popen = _Stuck
+        _r3 = m.Plugin()._run_cmd(["/usr/bin/iw", "dev", "wlan0", "link"], timeout=1)
+    finally:
+        m.subprocess.Popen = _real_popen3
+    ok(not [w for w in _Stuck.waits if w[1] is None]
+       and _r3 == {"success": False, "stdout": "", "stderr": "Command timed out", "returncode": -1},
+       f"a child that survives its kill is left behind, never waited on without a limit ({_Stuck.waits})")
+    _p3 = m.Plugin()
+    ok(_p3._run_cmd(["/bin/sh", "-c", "echo out; echo err >&2; exit 3"])
+       == {"success": False, "stdout": "out", "stderr": "err", "returncode": 3},
+       "a real command's output and exit status come back as they always did")
+    _t3 = time.monotonic(); _r3 = _p3._run_cmd(["/bin/sleep", "5"], timeout=1)
+    ok(_r3["stderr"] == "Command timed out" and time.monotonic() - _t3 < 3,
+       "and a real one that overruns is killed at its timeout")
+    ok(_p3._run_cmd(["/nonexistent/wifiopt-x"])["stderr"] == "Command not found: /nonexistent/wifiopt-x",
+       "a missing command is still named")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("detection: which interface and which driver")
 class NmcliSays(m.Plugin):
     def __init__(self, devs):
