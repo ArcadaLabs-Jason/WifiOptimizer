@@ -3997,6 +3997,58 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("settings that cannot be saved: startup carries on, and the panel is told")
+try:
+    # A link in the user's directories is refused, which is one real way a
+    # save fails; a full or read-only disk is another.
+    _real = m.SETTINGS_FILE
+    _away = tempfile.mkdtemp(); _top = tempfile.mkdtemp()
+    os.symlink(_away, os.path.join(_top, "linked"))
+    class BootNoSave(Boot):
+        async def _startup_streaming(self, settings): self.calls.append("streaming")
+    try:
+        m.SETTINGS_FILE = os.path.join(_top, "linked", "settings.json")
+        b = BootNoSave("rtw88")
+        asyncio.run(_run_main(b))
+        ok("streaming" in b.calls,
+           f"startup goes on past a settings save that fails, to the streaming pickup and the rest ({b.calls})")
+        class Unsaved(m.Plugin):
+            def _collect_status(self):
+                return ({"success": True, "connected": False, "settings": {}, "live": {},
+                         "drift": {}, "external": {}}, {}, [])
+        ok(asyncio.run(Unsaved().get_status()).get("settings_unwritable") is True,
+           "and the status says the settings could not be saved")
+        class Ipv6NoSave(m.Plugin):
+            def _resolve_uuid(self, msg=None): return "dddddddd-0000-0000-0000-0000000000e1", None
+            def _nmcli_modify(self, u, k, v, timeout=5): return _ok()
+            def _hard_reconnect(self, uuid=None): return True
+        r = asyncio.run(Ipv6NoSave().set_ipv6(True))
+        ok(r.get("success") is False and r.get("error") == "settings_unwritable"
+           and "couldn't save" in r.get("message", "").lower(),
+           f"a change made but not saved says so, rather than that something went wrong ({r.get('message')!r})")
+    finally:
+        m.SETTINGS_FILE = _real
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    ok(asyncio.run(Unsaved().get_status()).get("settings_unwritable") is False,
+       "a save that lands clears it")
+
+    # Something rewriting profiles or the backend is in progress: said on
+    # every reply, the ones a busy poll hands back from cache included.
+    pc = Unsaved()
+    ok(asyncio.run(pc.get_status()).get("profile_change_in_flight") is False,
+       "nothing in progress reads as nothing in progress")
+    pc._profile_change_depth = 1
+    ok(asyncio.run(pc.get_status()).get("profile_change_in_flight") is True,
+       "a profile change in progress is reported")
+    pc._profile_change_depth = 0; pc._ensure_backend_switch_state()
+    pc._backend_switch["in_progress"] = True
+    pc._collect_depth = 1; pc._collect_started_at = time.monotonic()
+    ok(asyncio.run(pc.get_status()).get("profile_change_in_flight") is True,
+       "and so is a backend switch, on a reply taken from the last poll")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("system config files are written whole, and teardown undoes power save and region now")
 try:
     _d = tempfile.mkdtemp(); _f = os.path.join(_d, "conf.d", "99-x.conf")

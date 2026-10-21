@@ -995,7 +995,27 @@ def _diagnostics_path() -> str:
     return os.path.join(os.path.dirname(SETTINGS_FILE), "diagnostics.json")
 
 
+class SettingsSaveError(OSError):
+    """A settings save that did not land. An OSError, as the save raised
+    before, so every caller that handles one handles this."""
+
+
 def _save_settings(data: dict):
+    """Save the settings whole, or raise SettingsSaveError.
+
+    The outcome is kept for the status: a settings directory that is full,
+    read-only or not the user's any more otherwise fails every toggle with
+    nothing on the panel saying why.
+    """
+    try:
+        _write_settings(data)
+    except Exception as e:
+        _SETTINGS_STATE["save_failed"] = True
+        raise SettingsSaveError(f"settings not saved: {e}") from e
+    _SETTINGS_STATE["save_failed"] = False
+
+
+def _write_settings(data: dict):
     # The directory is the user's: everything below is relative to it as
     # opened by _open_dir_no_follow, which also creates it if missing.
     dfd = _open_dir_no_follow(os.path.dirname(SETTINGS_FILE), create=True)
@@ -2474,7 +2494,15 @@ class Plugin:
                 # toggle off, and NetworkManager would go on running it.
                 self._remove_dispatcher()
 
-            _save_settings(settings)
+            # Best effort. A settings directory that cannot be written (full,
+            # read-only, a link refused) used to end startup here, skipping
+            # the streaming pickup, the reapply after a reboot and the rest.
+            # These read the settings back from the file, so they go on with
+            # what it last held; the panel is told the save failed.
+            try:
+                _save_settings(settings)
+            except OSError as e:
+                self._log_throttled("settings_save", f"Startup could not save settings: {e}")
             # After the save: both read the settings from disk, and before it
             # they saw the un-migrated copy, which knows nothing of the pins
             # an older version left (and the unpin then latches for the boot).
@@ -2771,7 +2799,21 @@ class Plugin:
         traceback under the control the user just touched - and for every
         setter rather than the few nmcli failures where stderr is useful.
         Callers log the exception, so nothing is lost.
+
+        A save that failed is said as such. It mostly comes after the change
+        itself was made, so "something went wrong" left the user believing
+        nothing had happened while the panel, reading the old settings, put
+        the toggle back where it was.
         """
+        if isinstance(e, SettingsSaveError):
+            return {
+                "success": False,
+                "error": "settings_unwritable",
+                "message": (
+                    "Couldn't save the plugin's settings, so the panel may not "
+                    "match what is applied. Check the Decky log for details."
+                ),
+            }
         return {
             "success": False,
             "error": "unexpected",
@@ -3262,7 +3304,7 @@ class Plugin:
                     "Status collection has not returned in 90s; reporting a "
                     "read failure rather than leaving the panel empty",
                 )
-                return {
+                return self._with_activity({
                     "success": False,
                     "error": "unexpected",
                     "message": "Couldn't read WiFi status.",
@@ -3273,7 +3315,7 @@ class Plugin:
                     "live": {},
                     "drift": {},
                     "external": {},
-                }
+                })
 
             last = getattr(self, "_last_status", None)
             if last is not None:
@@ -3286,13 +3328,13 @@ class Plugin:
                 except Exception:
                     pass
                 self._report_settings_recovery(cached)
-                return cached
+                return self._with_activity(cached)
             # No previous result to hand back. Falling through here is what
             # the guard exists to prevent: the first collection of a cold boot
             # routinely outlives the poll interval, so every caller would
             # start its own. Report not-ready instead; the panel renders a
             # disconnected state correctly.
-            return {
+            return self._with_activity({
                 "success": True,
                 # Not the same as knowing it is disconnected. The panel holds
                 # its banners and live rows while this is set, because saying
@@ -3306,7 +3348,7 @@ class Plugin:
                 "live": {},
                 "drift": {},
                 "external": {},
-            }
+            })
 
         self._collect_depth = getattr(self, "_collect_depth", 0) + 1
         if self._collect_depth == 1:
@@ -3328,8 +3370,9 @@ class Plugin:
             except Exception as e:
                 # Never let reconciliation break a status read; the frontend
                 # has no useful response to an RPC error here and would just
-                # keep showing stale values with no signal.
-                decky.logger.error(f"status reconciliation error: {e}")
+                # keep showing stale values with no signal. Throttled: with
+                # settings that cannot be saved this fails on every poll.
+                self._log_throttled("status_actions", f"status reconciliation error: {e}")
 
         # The settings in `status` are the worker thread's snapshot, taken
         # before any of this ran, and the frontend renders every toggle
@@ -3347,6 +3390,22 @@ class Plugin:
 
         self._report_settings_recovery(status)
         self._last_status = status
+        return self._with_activity(status)
+
+    def _with_activity(self, status: dict) -> dict:
+        """status, with what the panel needs to know about work in progress.
+
+        settings_unwritable: the last settings save failed, so a toggle that
+        springs back is explained rather than looking ignored.
+        profile_change_in_flight: a change that rewrites profiles or the
+        backend is running, and the other profile controls would be refused.
+        Worked out on every reply, cached ones included, since both change
+        between polls.
+        """
+        status["settings_unwritable"] = bool(_SETTINGS_STATE["save_failed"])
+        status["profile_change_in_flight"] = (
+            self._profile_change_in_flight() or self._backend_switch_running()
+        )
         return status
 
     @staticmethod
@@ -5034,6 +5093,9 @@ class Plugin:
         # there is nothing a deadline here could catch that this does not.
         return getattr(self, "_profile_change_depth", 0) > 0
 
+    def _backend_switch_running(self) -> bool:
+        return bool((getattr(self, "_backend_switch", None) or {}).get("in_progress"))
+
     def _collect_backend_state(self, status: dict):
         """Whether the WiFi backend can be switched here, and which one is up.
 
@@ -6114,6 +6176,8 @@ class Plugin:
             }
         except Exception as e:
             decky.logger.error(f"set_auto_fix error: {e}")
+            if isinstance(e, SettingsSaveError):
+                return self._unexpected_response(e)
             return {
                 "success": False,
                 "error": "write_failed",
