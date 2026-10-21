@@ -6454,6 +6454,28 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("J5 CI runs on a release tag, never on a push to beta or main")
+# A push to beta is a release for plugins up to 0.20.0-beta on the beta
+# channel (they install the branch as it stands), and install.sh installs main
+# when GitHub's API does not answer. CI used to run only on those pushes, so
+# every release was out before it was checked or signed. CI now runs on a
+# pushed v* tag, on pull requests and by hand; the branches move to the tag
+# only after release.sh has published it.
+try:
+    _wf = open(".github/workflows/ci.yml").read()
+    _on = re.search(r"^on:\n((?:[ #].*\n|\n)*)", _wf, re.M)
+    _on = _on.group(1) if _on else ""
+    _push = re.search(r"^  push:\n((?:    .*\n)*)", _on, re.M)
+    _push = _push.group(1) if _push else ""
+    ok(re.search(r"^    tags: \[\s*'v\*'\s*\]\s*$", _push, re.M) is not None,
+       "CI runs when a v* tag is pushed")
+    ok("branches" not in _push, "and never on a push to a branch")
+    ok(re.search(r"^  workflow_dispatch:", _on, re.M) is not None, "it can also be run by hand")
+    ok(re.search(r"^  pull_request:", _on, re.M) is not None, "and on pull requests")
+    ok("release.sh" in _wf[:_wf.index("\non:")], "the workflow says why, next to its triggers")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("release signatures: checked strictly, and required for every update")
 try:
     import base64, hashlib
