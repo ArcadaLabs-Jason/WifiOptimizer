@@ -2696,8 +2696,18 @@ class Plugin:
                 found.group(0).split("ssid ", 1)[1]
                 for found in self._DIAG_SSID_LINE_RE.finditer(iw_dev.get("stdout", ""))
             )
+            # The report predates these parts, so one that fails is noted
+            # rather than costing the person the whole report.
+            try:
+                extras = await asyncio.to_thread(
+                    self._diagnostic_extras, info.get("driver", ""), iface
+                )
+            except Exception as e:
+                decky.logger.error(f"diagnostic extras error: {e}")
+                extras = {"extras_error": str(e)}
             return self._redact_diagnostics({
                 "success": True,
+                **extras,
                 "device_info": info,
                 "wifi_interface": iface,
                 "iw_dev": iw_dev.get("stdout", ""),
@@ -2716,6 +2726,114 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"get_diagnostic_info error: {e}")
             return {"success": False, "error": str(e)}
+
+    # The settings worth seeing in a report. Picked rather than dumped: the
+    # rest is profile ids and the band preference's network name.
+    _DIAG_SETTINGS = (
+        "power_save_disabled", "auto_fix_on_wake", "bssid_lock_enabled",
+        "band_preference_enabled", "band_preference", "dns_enabled",
+        "dns_provider", "ipv6_disabled", "buffer_tuning_enabled",
+        "cake_enabled", "streaming_mode_enabled", "update_channel",
+        "settings_version", "regdomain",
+    )
+    # Kernel lines about the WiFi driver, its PCIe link and suspend/resume.
+    _DIAG_KERNEL_RE = re.compile(
+        r"rtw88|rtw89|rtw_|ath11k|ath12k|mt79|iwlwifi|wlan\d|PM: |pcieport|AER"
+    )
+    _DIAG_KERNEL_LINES = 40
+    _DIAG_JOURNAL_HOST_RE = re.compile(r"^(\[\s*[\d.]+\]) \S+ kernel: ")
+
+    def _diagnostic_extras(self, driver: str, iface: str) -> dict:
+        """What a report needs beyond the device: versions, toggles, backend,
+        the driver's power state, and the kernel's account of the last wake.
+
+        The previous boot's kernel lines are included because the usual way
+        out of WiFi that never came back is a reboot, and the report is
+        copied after it. Each part is read on its own, so one that fails
+        does not take the rest of the report with it.
+        """
+        extras = {
+            "plugin_version": getattr(decky, "DECKY_PLUGIN_VERSION", ""),
+            "decky_version": getattr(decky, "DECKY_VERSION", ""),
+        }
+        try:
+            settings = _load_settings()
+            extras["settings"] = {k: settings.get(k) for k in self._DIAG_SETTINGS}
+        except Exception as e:
+            extras["settings"] = f"unreadable: {e}"
+        try:
+            extras["wifi_backend"] = self._get_current_backend() or "unknown"
+        except Exception as e:
+            extras["wifi_backend"] = f"unreadable: {e}"
+
+        def read(path: str) -> str:
+            try:
+                with open(path, "r") as f:
+                    return f.read().strip()
+            except FileNotFoundError:
+                return "missing"
+            except OSError as e:
+                return f"unreadable: {e.strerror}"
+
+        profile = DRIVER_PROFILES.get(driver, {})
+        extras["driver_params"] = {
+            path: read(path) for path in profile.get("sysfs_power_fixes", [])
+        }
+        extras["modprobe_conf"] = read(MODPROBE_CONF_PATH)
+        extras["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
+
+        pcie = {}
+        if IFACE_RE.match(iface or ""):
+            device = os.path.realpath(os.path.join(SYSFS_NET, iface, "device"))
+            for name in ("l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
+                         "l1_1_pcipm", "l1_2_pcipm"):
+                path = os.path.join(device, "link", name)
+                if os.path.exists(path):
+                    pcie[name] = read(path)
+            pcie["power_control"] = read(os.path.join(device, "power", "control"))
+            pcie["runtime_status"] = read(os.path.join(device, "power", "runtime_status"))
+        extras["pcie"] = pcie
+
+        rfkill = []
+        try:
+            for entry in sorted(os.listdir("/sys/class/rfkill")):
+                base = os.path.join("/sys/class/rfkill", entry)
+                rfkill.append(f"{read(os.path.join(base, 'type'))} "
+                              f"soft={read(os.path.join(base, 'soft'))} "
+                              f"hard={read(os.path.join(base, 'hard'))}")
+        except OSError:
+            pass
+        extras["rfkill"] = rfkill
+
+        # DEVICE,TYPE,STATE only: the CONNECTION column is the network's name.
+        devices = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"],
+            timeout=3,
+        )
+        extras["nm_devices"] = devices.get("stdout", "") or devices.get("stderr", "")
+
+        plugins_dir = os.path.dirname(getattr(decky, "DECKY_PLUGIN_DIR", "") or "")
+        try:
+            extras["decky_plugins"] = sorted(os.listdir(plugins_dir)) if plugins_dir else []
+        except OSError:
+            extras["decky_plugins"] = []
+
+        for key, boot in (("kernel_log_this_boot", "0"), ("kernel_log_previous_boot", "-1")):
+            log = self._run_cmd(
+                ["/usr/bin/journalctl", "-k", "-b", boot, "-o", "short-monotonic",
+                 "--no-pager"],
+                timeout=5,
+            )
+            if not log.get("success"):
+                extras[key] = [f"unavailable: {(log.get('stderr') or '')[:120]}"]
+                continue
+            # The hostname between the timestamp and "kernel:" can be a
+            # person's name, so only the timestamp and message are kept.
+            lines = [self._DIAG_JOURNAL_HOST_RE.sub(r"\1 ", line)
+                     for line in log.get("stdout", "").splitlines()
+                     if self._DIAG_KERNEL_RE.search(line)]
+            extras[key] = lines[-self._DIAG_KERNEL_LINES:]
+        return extras
 
     async def save_diagnostic_info(self) -> dict:
         """Write diagnostics to a file in the settings directory as a

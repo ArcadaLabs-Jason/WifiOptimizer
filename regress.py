@@ -4941,6 +4941,75 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("diagnostics: enough to read a WiFi that never came back after sleep")
+try:
+    _KLOG = ("[   12.345678] steamdeck-of-jane kernel: rtw88_8822ce 0000:01:00.0: failed to leave lps state\n"
+             "[   12.400000] steamdeck-of-jane kernel: usb 1-1: new device\n"
+             "[   13.000000] steamdeck-of-jane kernel: PM: suspend exit\n"
+             "[   13.100000] steamdeck-of-jane kernel: wlan0: authenticate with 62:e9:31:0d:1f:e7\n")
+    _seen = []
+
+    class WakeDiag(Diag):
+        async def get_device_info(self): return {"success": True, "driver": "rtw88"}
+        def _get_current_backend(self): return "wpa_supplicant"
+        def _run_cmd(self, cmd, timeout=5):
+            _seen.append(cmd)
+            if cmd[0] == "/usr/bin/journalctl":
+                if cmd[cmd.index("-b") + 1] == "-1":
+                    return {"success": False, "stdout": "", "stderr": "Data from the specified boot (-1) is not available", "returncode": 1}
+                return _ok(_KLOG)
+            if cmd[0] == "/usr/bin/nmcli": return _ok("wlan0:wifi:disconnected\nlo:loopback:unmanaged\n")
+            return Diag._run_cmd(self, cmd, timeout)
+
+    _real_settings = m.SETTINGS_FILE
+    try:
+        m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+        m._save_settings(dict(m.DEFAULT_SETTINGS, band_preference_enabled=True,
+                              band_preference_ssid="Smith Family 5G",
+                              power_save_disabled=True, update_channel="beta"))
+        _info = asyncio.run(WakeDiag().get_diagnostic_info())
+    finally:
+        m.SETTINGS_FILE = _real_settings
+    _flat = json.dumps(_info)
+    ok("plugin_version" in _info and "decky_version" in _info,
+       "the plugin's and Decky's versions are in the report")
+    ok(_info.get("settings", {}).get("power_save_disabled") is True
+       and _info["settings"].get("update_channel") == "beta"
+       and _info["settings"].get("band_preference_enabled") is True,
+       "so are the feature toggles")
+    ok("Smith Family" not in _flat and "band_preference_ssid" not in _flat,
+       "but not the network name the band preference is scoped to")
+    ok(_info.get("wifi_backend") == "wpa_supplicant", "and whether it is iwd or wpa_supplicant")
+    ok(set(_info.get("driver_params", {})) == {
+           "/sys/module/rtw88_core/parameters/disable_lps_deep",
+           "/sys/module/rtw88_pci/parameters/disable_aspm"},
+       "the driver's power parameters are read for the radio actually present")
+    ok("modprobe_conf" in _info and "pcie" in _info and "rfkill" in _info
+       and "decky_plugins" in _info and "dispatcher_installed" in _info,
+       "with the modprobe file, the PCIe link state, rfkill and the other Decky plugins")
+    _nm = [c for c in _seen if c[0] == "/usr/bin/nmcli"]
+    ok(_nm and "CONNECTION" not in " ".join(_nm[0]) and "wlan0:wifi:disconnected" in _info.get("nm_devices", ""),
+       "NetworkManager's device states are read without the column that names the network")
+    _this = _info.get("kernel_log_this_boot", [])
+    ok(len(_this) == 3 and not any("usb 1-1" in l for l in _this),
+       "the kernel log keeps the driver, wlan and suspend lines and drops the rest")
+    ok(_this and _this[0].startswith("[   12.345678] rtw88_8822ce") and "steamdeck-of-jane" not in _flat,
+       "with the timestamp kept and the hostname taken out")
+    ok(not re.search(r"(?i)62:e9:31", _flat) and any("<mac>" in l for l in _this),
+       "and the access point's address redacted like everywhere else")
+    ok(_info.get("kernel_log_previous_boot", [""])[0].startswith("unavailable:"),
+       "a previous boot the journal no longer has says so instead of failing the report")
+
+    class BrokenExtras(Diag):
+        def _diagnostic_extras(self, driver, iface): raise RuntimeError("boom")
+    _info = asyncio.run(BrokenExtras().get_diagnostic_info())
+    ok(_info.get("success") is True and _info.get("extras_error") == "boom"
+       and "6.11.11-valve24-2-neptune-611" in _info.get("kernel", ""),
+       "and if the new parts fail, the rest of the report still arrives")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("dispatcher: the same tuning as the plugin, and valid once filled in")
 try:
     _tmpl = open("defaults/dispatcher.sh.tmpl").read()
