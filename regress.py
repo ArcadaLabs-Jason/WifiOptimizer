@@ -6488,26 +6488,38 @@ tar() { : > "$FX/tar-ran"; command tar "$@"; }
 logger() { echo "$*" >> "$FX/log"; }
 sleep() { :; }
 systemctl() { echo "$*" >> "$FX/systemctl"; return 0; }
-export -f curl tar logger sleep systemctl
+pgrep() { [ -n "${PGREP_HOOK:-}" ] && eval "$PGREP_HOOK"; return "${PGREP_RC:-1}"; }
+export -f curl tar logger sleep systemctl pgrep
 exec /bin/bash "$0" "$@"
 '''
 
-    def _run_script(sha_args):
+    def _run_script(sha_args, installed=True, edits=(), env=()):
+        """installed: the plugin's directory still has its plugin.json, as
+        one Decky has not uninstalled does. edits: (old, new) changes to the
+        script's text. env: extra variables, for the pgrep stub."""
         for _f in ("curl-ran", "tar-ran", "log", "systemctl"):
             if os.path.exists(os.path.join(_fx, _f)): os.remove(os.path.join(_fx, _f))
         run_dir = tempfile.mkdtemp()
         self_dir = tempfile.mkdtemp(); plugin = tempfile.mkdtemp()
         open(os.path.join(plugin, "main.py"), "w").write("# old\n")
+        if installed:
+            open(os.path.join(plugin, "plugin.json"), "w").write("{}")
         script = os.path.join(self_dir, "update.sh")
-        open(script, "w").write(m.UPDATE_SCRIPT.replace("/run/wifi-optimizer", os.path.join(run_dir, "wo")))
+        text = m.UPDATE_SCRIPT.replace("/run/wifi-optimizer", os.path.join(run_dir, "wo"))
+        for old, new in edits:
+            text = text.replace(old, new)
+        open(script, "w").write(text)
         p = _sp.run(["/bin/bash", "-c", _STUBS, script, self_dir, plugin,
                      "https://example.invalid/wifi-optimizer-v9.9.9.tar.gz", "WifiOptimizer-9.9.9",
                      "v9.9.9", "9.9.9", *sha_args],
-                    capture_output=True, text=True, timeout=60, env={**os.environ, "FX": _fx})
+                    capture_output=True, text=True, timeout=60,
+                    env={**os.environ, "FX": _fx, "PLUGIN": plugin, **dict(env)})
         log = open(os.path.join(_fx, "log")).read() if os.path.exists(os.path.join(_fx, "log")) else ""
         state_file = os.path.join(run_dir, "wo", "update-state")
         state = open(state_file).read().strip() if os.path.exists(state_file) else ""
-        out = {"rc": p.returncode, "log": log, "state": state,
+        restarted = os.path.exists(os.path.join(_fx, "systemctl")) and \
+            "restart plugin_loader" in open(os.path.join(_fx, "systemctl")).read()
+        out = {"rc": p.returncode, "log": log, "state": state, "restarted": restarted,
                "curl": os.path.exists(os.path.join(_fx, "curl-ran")),
                "tar": os.path.exists(os.path.join(_fx, "tar-ran")),
                "main": open(os.path.join(plugin, "main.py")).read(),
@@ -6536,6 +6548,29 @@ exec /bin/bash "$0" "$@"
         ok(_o["rc"] != 0 and not _o["curl"] and not _o["tar"] and _o["main"] == "# old\n"
            and "no signed checksum" in _o["log"],
            f"a 7th argument that is {_what} is refused before any download ({_o['rc']}, {_o['log'][-80:]!r})")
+
+    # Uninstalled while it ran: Decky removed the plugin's directory.
+    _o = _run_script([_payload_sha], installed=False)
+    ok(_o["main"] == "# old\n" and not _o["restarted"]
+       and "Update stopped: the plugin was uninstalled" in _o["log"] and _o["state"] != "failed 9.9.9",
+       f"an update whose plugin was uninstalled installs nothing and restarts nothing ({_o['log'][-120:]!r})")
+    _o = _run_script([_payload_sha], env=[("PGREP_HOOK", 'rm -f "$PLUGIN/plugin.json"')])
+    ok(not _o["restarted"] and "Update stopped: the plugin was uninstalled" in _o["log"],
+       "and one uninstalled after its files went in does not restart Decky for it")
+    # A game still running at the script's own deadline: installed, and no
+    # restart that would end the game. The deadline is cut short for the test.
+    _o = _run_script([_payload_sha], edits=[("BUDGET=840", "BUDGET=2")], env=[("PGREP_RC", "0")])
+    ok(_o["rc"] != 0 and _o["main"] == "# new\n" and not _o["restarted"]
+       and _o["state"] == "failed 9.9.9" and "was still running, so Decky was not restarted" in _o["log"],
+       f"a game still running at the deadline leaves the update installed, says so, and restarts nothing "
+       f"({_o['rc']}, {_o['state']!r}, {_o['log'][-120:]!r})")
+    _o = _run_script([_payload_sha])
+    ok(_o["restarted"] and _o["state"] == "done 9.9.9", "with nothing running, Decky is restarted as before")
+    _bud = re.search(r"^BUDGET=(\d+)$", m.UPDATE_SCRIPT, re.M)
+    ok(bool(_bud) and int(_bud.group(1)) + 15 < m.UPDATE_STATE_MAX_AGE and '"$SECONDS" -lt "$BUDGET"' in m.UPDATE_SCRIPT,
+       "the script's own deadline, and the wait that ends on it, fall inside the time its systemd unit is given")
+    ok(all(_pt.replace(".", "\\.") in m.UPDATE_SCRIPT for _a, _l, _ps in m.STREAMING_APPS for _pt in _ps),
+       "and a game is not the only thing it waits for: the streaming apps the plugin knows by name count too")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

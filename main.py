@@ -1402,6 +1402,11 @@ EXPECTED="$6"
 EXPECTED_SHA="${7:-}"
 
 STATE=/run/wifi-optimizer/update-state
+# This script's own time limit, in seconds since it started. Inside the
+# RuntimeMaxSec its systemd unit is given (UPDATE_STATE_MAX_AGE in main.py,
+# 900), with room to finish, so the unit is never killed part way. Applied
+# just the same when it was started without systemd-run, which sets none.
+BUDGET=840
 TMP=""
 OWN_LOCK=0
 FINISHED=0
@@ -1474,6 +1479,15 @@ tar xzf "$TMP/update.tar.gz" -C "$TMP" --no-same-owner --no-same-permissions || 
 }
 SRC="$TMP/$SRC_NAME"
 
+# Uninstalled while this ran: Decky removed the plugin's directory, and
+# carrying on would put the plugin back, or restart Decky for nothing.
+uninstalled() {
+    [ -f "$PLUGIN_DIR/plugin.json" ] && return 1
+    logger -t wifi-optimizer "Update stopped: the plugin was uninstalled"
+    FINISHED=1
+    return 0
+}
+
 FILES="plugin.json main.py decky.pyi dist/index.js defaults/dispatcher.sh.tmpl package.json"
 for f in $FILES; do
     if [ ! -f "$SRC/$f" ]; then
@@ -1492,6 +1506,7 @@ fi
 # version whole. package.json goes last because it carries the version: if a
 # move fails, the files already moved stay new but the version reads old, so
 # the same update is offered again and completes the set.
+uninstalled && exit 0
 set_state installing
 mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults" || {
     logger -t wifi-optimizer "Update failed: could not create directories"
@@ -1532,17 +1547,26 @@ done
 set_state restarting
 # Restarting plugin_loader restarts Steam, which ends a game. The panel only
 # checked for one when the update started, and a download can take minutes,
-# so look again and wait for it (or a stream the plugin knows of) to end.
+# so look again and wait for it (or a stream) to end. A stream is one the
+# plugin has flagged, or one of the streaming apps it knows by name running
+# with auto mode off, when nothing flags it.
 playing() {
-    pgrep -if 'steamlaunch appid=' >/dev/null 2>&1 || [ -e /run/wifi-optimizer/streaming ]
+    pgrep -if 'steamlaunch appid=|__STREAM_PATTERNS__' >/dev/null 2>&1 ||
+        [ -e /run/wifi-optimizer/streaming ]
 }
 if playing; then
     logger -t wifi-optimizer "Update installed; waiting for the game or stream to end before restarting Decky"
-    for _ in $(seq 1 2880); do
-        playing || break
+    while playing && [ "$SECONDS" -lt "$BUDGET" ]; do
         sleep 15
     done
+    # Out of time. Restarting now would end the game, so the update stops
+    # here with the new files in place, to load at the next restart.
+    if playing; then
+        logger -t wifi-optimizer "Update to $LABEL installed, but a game or stream was still running, so Decky was not restarted. Restart the Deck to finish."
+        exit 1
+    fi
 fi
+uninstalled && exit 0
 if systemctl restart plugin_loader; then
     FINISHED=1
     set_state done
@@ -1552,6 +1576,18 @@ else
     exit 1
 fi
 """
+
+
+def _stream_process_pattern() -> str:
+    """The built-in streaming apps' patterns as one extended regex for the
+    update script's pgrep, each matched as plain text, as the plugin does."""
+    return "|".join(
+        re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", pattern)
+        for _app_id, _label, patterns in STREAMING_APPS for pattern in patterns
+    )
+
+
+UPDATE_SCRIPT = UPDATE_SCRIPT.replace("__STREAM_PATTERNS__", _stream_process_pattern())
 
 
 class Plugin:
