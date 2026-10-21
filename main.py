@@ -1792,6 +1792,32 @@ class Plugin:
     # entry on the event loop, so an unbounded list is an unbounded stall.
     _MAX_TRACKED_LOCK_UUIDS = 16
 
+    def _capped(self, known: list, prop: str) -> list:
+        """known held to the cap above, dropping the oldest profiles first.
+
+        Each one dropped has our change taken off it before it goes. Cut
+        from the list still carrying it, it was a profile nothing would ever
+        clear: Reset, uninstall and turning the feature off all work from
+        this list. One that will not clear stays, past the cap if need be.
+        Only reached when a list is already full, so it costs nothing on
+        the usual path.
+        """
+        known = list(known)
+        while len(known) > self._MAX_TRACKED_LOCK_UUIDS:
+            oldest = known[0]
+            if prop == "ipv4.dns":
+                cleared = self._clear_dns(oldest)
+            else:
+                done = self._nmcli_modify(
+                    oldest, prop, "auto" if prop == "ipv6.method" else "", timeout=2
+                )
+                cleared = done["success"] or "unknown connection" in (
+                    done.get("stderr") or "").lower()
+            if not cleared:
+                break
+            known.pop(0)
+        return known
+
     # How long the access point lock waits for an association before giving
     # up. Sized from a measured Deck OLED on wpa_supplicant, where a radio
     # cycle took 13-24 s to come back and the "NM says active, iw says
@@ -3835,9 +3861,9 @@ class Plugin:
             known = list(settings.get("band_preference_uuids", []))
             if uuid not in known:
                 known.append(uuid)
-                pending["band_preference_uuids"] = known[
-                    -self._MAX_TRACKED_LOCK_UUIDS:
-                ]
+                pending["band_preference_uuids"] = self._capped(
+                    known, "802-11-wireless.band"
+                )
         self._log_throttled(
             "band",
             f"Band drifted to {action['observed']!r} on {uuid}, "
@@ -4026,9 +4052,7 @@ class Plugin:
             pending["pins_owned"] = _with_pin(settings, "802-11-wireless.bssid")
             if uuid not in known:
                 known.append(uuid)
-            pending["bssid_lock_uuids"] = known[
-                -self._MAX_TRACKED_LOCK_UUIDS:
-            ]
+            pending["bssid_lock_uuids"] = self._capped(known, "802-11-wireless.bssid")
             status["live"]["bssid_lock"] = action["value"]
             status["drift"].pop("bssid_lock", None)
             self._log_throttled(
@@ -6796,7 +6820,7 @@ class Plugin:
         known = list(settings.get("bssid_lock_uuids", []))
         if uuid not in known:
             known.append(uuid)
-        settings["bssid_lock_uuids"] = known[-self._MAX_TRACKED_LOCK_UUIDS:]
+        settings["bssid_lock_uuids"] = self._capped(known, "802-11-wireless.bssid")
         _save_settings_with_timestamp(settings)
         if not await self._reconnect(uuid):
             return dict(self._RADIO_OFF_RESULT)
@@ -7289,9 +7313,9 @@ class Plugin:
                 known = list(settings.get("band_preference_uuids", []))
                 if uuid not in known:
                     known.append(uuid)
-                settings["band_preference_uuids"] = known[
-                    -self._MAX_TRACKED_LOCK_UUIDS:
-                ]
+                settings["band_preference_uuids"] = self._capped(
+                    known, "802-11-wireless.band"
+                )
                 # Only claim the network on a fresh enable. reapply_all calls
                 # this setter too, so rewriting it every time would move a
                 # preference set at home onto whatever network Force Reapply
@@ -7435,7 +7459,7 @@ class Plugin:
                 # Every other profile we wrote to, not just the one in use.
                 # One we cannot reach stays listed for the next attempt.
                 known = [u for u in known if not self._clear_dns(u)]
-            settings["dns_uuids"] = known[-self._MAX_TRACKED_LOCK_UUIDS:]
+            settings["dns_uuids"] = self._capped(known, "ipv4.dns")
             settings["dns_enabled"] = enabled
             settings["dns_provider"] = provider
             settings["dns_servers"] = servers
@@ -7487,7 +7511,7 @@ class Plugin:
                 # profile per network.
                 if uuid not in known:
                     known.append(uuid)
-                settings["ipv6_uuids"] = known[-self._MAX_TRACKED_LOCK_UUIDS:]
+                settings["ipv6_uuids"] = self._capped(known, "ipv6.method")
             else:
                 settings["ipv6_uuids"] = [u for u in known if u != uuid]
             _save_settings_with_timestamp(settings)

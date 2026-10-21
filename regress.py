@@ -1252,6 +1252,26 @@ st = asyncio.run(v.get_status())
 ok(not st.get("drift", {}).get("ipv6") and not st.get("external", {}).get("ipv6"),
    "nothing reported when the connection and the toggle agree")
 
+# The tracking lists have a cap. Cutting the oldest profile off one used to
+# leave it carrying our change with nothing that knew to undo it.
+_full = [f"aa0fd3f5-0000-0000-0000-0000000001{i:02d}" for i in range(m.Plugin._MAX_TRACKED_LOCK_UUIDS)]
+m._save_settings({**base_ap, "ipv6_disabled": True, "ipv6_uuids": list(_full)})
+v = V6(); asyncio.run(v.set_ipv6(True))
+_tracked = m._load_settings()["ipv6_uuids"]
+ok((_full[0], "ipv6.method", "auto") in v.mods and _full[0] not in _tracked
+   and len(_tracked) == m.Plugin._MAX_TRACKED_LOCK_UUIDS and U6 in _tracked,
+   "a profile that falls off a full tracking list has the change taken off it first")
+class V6Stuck(V6):
+    def _nmcli_modify(self, u, k, v, timeout=5):
+        self.mods.append((u, k, v))
+        if u == _full[0]:
+            return {"success": False, "stdout": "", "stderr": "permission denied", "returncode": 1}
+        return _ok()
+m._save_settings({**base_ap, "ipv6_disabled": True, "ipv6_uuids": list(_full)})
+v = V6Stuck(); asyncio.run(v.set_ipv6(True))
+ok(_full[0] in m._load_settings()["ipv6_uuids"],
+   "and one that will not take it off stays tracked, past the cap if need be")
+
 
 
 section("updates: which direction does this move me")
