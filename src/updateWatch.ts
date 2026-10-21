@@ -8,8 +8,9 @@ import type { UpdateProgress } from "./types";
 // install. Restarting plugin_loader instead restarts all of Steam, so the
 // update script only falls back to that when no reload happens.
 //
-// This lives at module level, not in the panel, because closing the Quick
-// Access menu unmounts the panel and the reload must still be asked for.
+// This lives at module level, not in the panel, because the panel cannot be
+// relied on while the Quick Access menu is closed (the page is hidden then,
+// and it may be unmounted) and the reload must still be asked for.
 //
 // It also keeps going in a copy of this module that Decky has dismounted.
 // An open Quick Access menu can go on showing that copy's panel after a
