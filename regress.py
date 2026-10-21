@@ -4522,7 +4522,7 @@ try:
     class Release(m.Plugin):
         merged = None
         def __init__(self): super().__init__(); self.cmds = []
-        def _merged_nm_backend(self): return self.merged
+        def _merged_nm_backend(self, *a, **k): return self.merged
         def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
     try:
         _d = tempfile.mkdtemp()
@@ -4531,8 +4531,8 @@ try:
         open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
         r = Release(); r._release_generic_backend_conf()
         ok(not os.path.exists(m.GENERIC_BACKEND_CONF)
-           and ["/usr/bin/systemctl", "enable", "wpa_supplicant"] in r.cmds
-           and ["/usr/bin/systemctl", "disable", "iwd"] in r.cmds,
+           and ["/usr/bin/systemctl", "enable", "--no-reload", "wpa_supplicant"] in r.cmds
+           and ["/usr/bin/systemctl", "disable", "--no-reload", "iwd"] in r.cmds,
            "removing our iwd setting turns wpa_supplicant back on for the next boot and iwd off")
         ok(not any(c[1] in ("stop", "restart", "start") or "--now" in c for c in r.cmds),
            "without stopping or restarting anything, so the connection in use carries on")
@@ -4543,8 +4543,8 @@ try:
            "when the system's own setting names the same backend, no service is touched")
         open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=wpa_supplicant\n")
         r = Release(); r._release_generic_backend_conf()
-        ok(["/usr/bin/systemctl", "enable", "iwd"] in r.cmds
-           and ["/usr/bin/systemctl", "disable", "wpa_supplicant"] in r.cmds,
+        ok(["/usr/bin/systemctl", "enable", "--no-reload", "iwd"] in r.cmds
+           and ["/usr/bin/systemctl", "disable", "--no-reload", "wpa_supplicant"] in r.cmds,
            "and when it names the other one, that one is turned back on")
         os.remove(m.BAZZITE_IWD_CONF)
         r = Release(); r.merged = "wpa_supplicant"; r._release_generic_backend_conf()
@@ -4566,7 +4566,8 @@ try:
                 return _ok()
         open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
         ro = ReleaseOrder(); ro._release_generic_backend_conf()
-        ok(ro.cmds == [(["enable", "wpa_supplicant"], True), (["disable", "iwd"], False)]
+        ok(ro.cmds == [(["enable", "--no-reload", "wpa_supplicant"], True),
+                       (["disable", "--no-reload", "iwd"], False)]
            and not os.path.exists(m.GENERIC_BACKEND_CONF),
            f"wpa_supplicant is enabled before our iwd setting goes, iwd disabled after ({ro.cmds})")
         open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
@@ -7880,6 +7881,158 @@ def _l_main(plugin):
     return asyncio.run(go())
 
 
+section("L7 a tool stuck in the kernel is not started again until it exits")
+try:
+    class _StuckProc:
+        spawned = 0
+        exited = False
+        def __init__(self, cmd, **kw):
+            _StuckProc.spawned += 1; self.stdout = None; self.stderr = None; self.pid = 4242424
+        def communicate(self, timeout=None):
+            raise m.subprocess.TimeoutExpired("iw", timeout)
+        def kill(self): pass
+        def poll(self): return 0 if _StuckProc.exited else None
+    _real_popen = m.subprocess.Popen
+    _logged7 = []
+    _real_info7, _real_err7 = m.decky.logger.info, m.decky.logger.error
+    m.subprocess.Popen = _StuckProc
+    m.decky.logger.info = lambda msg: _logged7.append(msg)
+    m.decky.logger.error = lambda msg: _logged7.append(msg)
+    try:
+        _p7 = m.Plugin()
+        _res7 = [_p7._run_cmd(["/usr/bin/iw", "dev", "wlan0", "link"], timeout=0.01) for _ in range(3)]
+        ok(_StuckProc.spawned == 1 and not any(r["success"] for r in _res7)
+           and "still stuck" in _res7[1]["stderr"],
+           f"three passes start iw once while the first is stuck ({_StuckProc.spawned} started)")
+        _iw_lines = [l for l in _logged7 if "iw" in l and "left it behind" in l]
+        ok(len(_iw_lines) == 1, f"and log it once ({_logged7})")
+        ok(getattr(_p7, "_stuck_tools", lambda: None)() == {"iw"}, "_stuck_tools names it")
+        _p7._run_cmd(["/usr/bin/tc", "qdisc", "show", "dev", "wlan0"], timeout=0.01)
+        ok(_StuckProc.spawned == 2, "another tool is not held back by it")
+        _StuckProc.exited = True
+        ok(getattr(_p7, "_stuck_tools", lambda: None)() == set(), "once they exit, nothing counts as stuck")
+        _p7._run_cmd(["/usr/bin/iw", "dev", "wlan0", "link"], timeout=0.01)
+        ok(_StuckProc.spawned == 3, "and iw runs again")
+        # A wrapper that exits while what it started keeps its output open
+        # (runuser, say) is not stuck, and is not said to be.
+        _logged7.clear()
+        _p7 = m.Plugin(); _p7._run_cmd(["/usr/bin/runuser", "-u", "deck", "true"], timeout=0.01)
+        ok(getattr(_p7, "_stuck_tools", lambda: None)() == set() and any("exited, but" in l for l in _logged7)
+           and not any("did not exit" in l for l in _logged7),
+           f"a wrapper that exited is not reported as stuck ({_logged7})")
+    finally:
+        m.subprocess.Popen = _real_popen
+        m.decky.logger.info, m.decky.logger.error = _real_info7, _real_err7
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L17 bounded waits on subprocesses run off the event loop")
+try:
+    _main_thread = _l_thr.main_thread()
+    _U17 = "dddddddd-0000-0000-0000-0000000000e7"
+    class _L17Assoc(m.Plugin):
+        def __init__(self): super().__init__(); self.on_loop = []
+        def _run_cmd(self, cmd, timeout=5):
+            self.on_loop.append(_l_thr.current_thread() is _main_thread)
+            return _ok("Connected to 02:00:00:00:00:71 (on wlan0)\n\tfreq: 5180\n")
+    _a17 = _L17Assoc(); asyncio.run(_a17._await_association("wlan0"))
+    ok(_a17.on_loop and not any(_a17.on_loop), f"waiting for an association reads the link off the loop ({_a17.on_loop})")
+
+    _no_sleep_17_real = asyncio.sleep
+    async def _no_sleep17(*_a, **_k): return None
+    class _L17Band(m.Plugin):
+        def __init__(self): super().__init__(); self.iw_on_loop = []
+        def _backend_is_iwd(self): return False
+        def _resolve_uuid(self, msg=None): return _U17, None
+        def _get_profile_ssid(self, uuid, timeout=5): return "Home"
+        def _band_unreachable(self, uuid, band): return None
+        def _profile_band(self, uuid): return ""
+        def _nmcli_modify(self, uuid, key, value, timeout=5): return _ok()
+        def _hard_reconnect(self, uuid=None): return True
+        def _get_wifi_interface(self): return "wlan0"
+        def _get_active_connection_uuid(self): return _U17
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[-1] == "link":
+                self.iw_on_loop.append(_l_thr.current_thread() is _main_thread)
+            return _ok("Connected to 02:00:00:00:00:72 (on wlan0)\n\tfreq: 5180\n")
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True})
+    asyncio.sleep = _no_sleep17
+    try:
+        _b17 = _L17Band(); asyncio.run(_b17.set_band_preference(True, "a"))
+    finally:
+        asyncio.sleep = _no_sleep_17_real
+    ok(_b17.iw_on_loop and not any(_b17.iw_on_loop),
+       f"re-locking after a band change reads the link off the loop ({_b17.iw_on_loop})")
+    ok(m._load_settings().get("bssid_lock_value") == "02:00:00:00:00:72",
+       "and records the access point it pinned")
+
+    class _L17Reapply(m.Plugin):
+        def __init__(self): super().__init__(); self.on_loop = []
+        def _note(self, what): self.on_loop.append((what, _l_thr.current_thread() is _main_thread))
+        def _get_active_connection_uuid(self): self._note("uuid"); return _U17
+        def _get_profile_ssid(self, uuid, timeout=5): self._note("ssid"); return "Home"
+        def _backend_is_iwd(self): self._note("iwd"); return False
+        def _lock_is_for_this_network(self, settings, uuid, ssid, timeout=5): self._note("lock"); return False
+    m._save_settings({**m.DEFAULT_SETTINGS, "auto_fix_on_wake": False, "power_save_disabled": False,
+                      "bssid_lock_enabled": True, "bssid_lock_connection_uuid": "x",
+                      "band_preference_enabled": True, "band_preference_ssid": "Other"})
+    _ra17 = _L17Reapply(); asyncio.run(_ra17.reapply_all())
+    ok({"uuid", "ssid", "iwd"} <= {k for k, _v in _ra17.on_loop}
+       and not any(v for _k, v in _ra17.on_loop),
+       f"Force Reapply reads the profile, network and backend off the loop ({_ra17.on_loop})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L19 uninstall finishes inside Decky's budget, and never sets our backend file aside")
+try:
+    class _SlowProc:
+        """Every command takes 3 s, unless given less."""
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd; self.stdout = None; self.stderr = None; self.killed = False
+            self.returncode = None; self.pid = 4242425
+        def communicate(self, timeout=None):
+            if self.killed:
+                self.returncode = -9; return "", ""
+            if timeout is not None and timeout < 3:
+                time.sleep(timeout); raise m.subprocess.TimeoutExpired(self.cmd, timeout)
+            time.sleep(3); self.returncode = 0; return "", ""
+        def kill(self): self.killed = True
+        def poll(self): return self.returncode
+    _d, _restore = _l_paths()
+    _real_popen19 = m.subprocess.Popen
+    _logged19 = []
+    _real_err19 = m.decky.logger.error
+    try:
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        _aside19 = []
+        class _L19(m.Plugin):
+            def _merged_nm_backend(self, *a, **k):
+                _aside19.append([f for f in os.listdir(os.path.dirname(m.GENERIC_BACKEND_CONF))
+                                 if "aside" in f])
+                return None
+            def _get_wifi_interface(self): return None
+            def _remove_dispatcher(self): return True
+        m.subprocess.Popen = _SlowProc
+        m.decky.logger.error = lambda msg: _logged19.append(msg)
+        _t19 = time.monotonic()
+        _L19()._teardown(time.monotonic() + 4.0)
+        _took19 = time.monotonic() - _t19
+    finally:
+        m.subprocess.Popen = _real_popen19
+        m.decky.logger.error = _real_err19
+        _restore()
+    ok(_took19 < 4.5, f"commands that take 3 s each do not carry uninstall past its budget ({_took19:.1f}s)")
+    ok(any("ran out of time before" in l for l in _logged19),
+       f"the steps it had no time for are logged as skipped ({_logged19[:3]})")
+    ok(_aside19 and not any(_aside19), f"our backend file is never renamed aside ({_aside19})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("L22 a settings file that cannot be read is kept, not overwritten")
 try:
     _d, _restore = _l_paths()
@@ -7922,6 +8075,20 @@ try:
     ok(m._clean_settings({**m.DEFAULT_SETTINGS, "update_channel": "Beta"})["update_channel"] == "stable"
        and m._clean_settings({**m.DEFAULT_SETTINGS, "update_channel": "beta"})["update_channel"] == "beta",
        "\"Beta\" loads as stable, \"beta\" as beta")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L25 uninstall removes a backend switch marker it cut off")
+try:
+    _d, _restore = _l_paths()
+    try:
+        open(m.BACKEND_SWITCH_MARKER, "w").write("wpa_supplicant iwd\n")
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        _LTear()._teardown(time.monotonic() + 4)
+        ok(not os.path.exists(m.BACKEND_SWITCH_MARKER), "a reinstall in the same boot finds no switch to settle")
+    finally:
+        _restore()
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

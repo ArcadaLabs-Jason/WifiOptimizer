@@ -613,6 +613,16 @@ def _with_pin(settings: dict, prop: str) -> list:
     return owned
 
 
+def _owned_kinds_left(owned: list, left: dict) -> list:
+    """The kinds of pin in owned that a profile still carries after a
+    clear-up, by the lists of profiles left. One taken off everywhere is no
+    longer ours: kept, a band or BSSID the user later set by hand was
+    cleared as a leftover of ours instead of reported as theirs."""
+    lists = {"802-11-wireless.bssid": "bssid_lock_uuids",
+             "802-11-wireless.band": "band_preference_uuids"}
+    return [prop for prop in owned if left.get(lists.get(prop, ""))]
+
+
 def _is_regular(mode: int) -> bool:
     """stat.S_ISREG without importing stat, which is kept off the list of
     modules this file relies on Decky's build to bundle."""
@@ -1814,7 +1824,12 @@ class Plugin:
 
     # ---- Helpers ----
 
-    def _run_cmd(self, cmd: list[str], timeout: int = 5) -> dict:
+    # Tools that talk to the WiFi driver. One stuck in the kernel behind a
+    # driver that wedged on a bad wake is left behind by _run_cmd, and every
+    # status pass used to start another, each as stuck as the first.
+    _STUCK_GUARDED = ("iw", "tc", "ip")
+
+    def _run_cmd(self, cmd: list[str], timeout: float = 5) -> dict:
         """Run a subprocess and return a result dict.
 
         Every child gets _child_env(), so it loads the system's libraries
@@ -1827,7 +1842,25 @@ class Plugin:
         wedged on a bad wake) does not die from the kill. Called on the
         event loop, that froze every call the panel makes, for good. Such a
         child is left behind instead; Python reaps it if it ever exits.
+        While one of iw, tc or ip is left behind that way, no other copy of
+        the same tool is started (see _stuck_tools).
+
+        Inside uninstall's time budget (_cmd_deadline, which _teardown sets)
+        the timeout is cut to what is left of it, and a call with too little
+        left is not started at all. Everything run then is uninstall's, or a
+        poll of a plugin about to be gone.
         """
+        name = os.path.basename(cmd[0])
+        deadline = getattr(self, "_cmd_deadline", None)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining < 0.5:
+                return {"success": False, "stdout": "",
+                        "stderr": "Skipped: out of time", "returncode": -1}
+            timeout = min(timeout, remaining)
+        if name in self._STUCK_GUARDED and name in self._stuck_tools():
+            return {"success": False, "stdout": "",
+                    "stderr": f"previous {name} is still stuck", "returncode": -1}
         cmd = [_tool(cmd[0]), *cmd[1:]]
         try:
             proc = subprocess.Popen(
@@ -1873,33 +1906,74 @@ class Plugin:
                 "returncode": -1,
             }
 
-    @staticmethod
-    def _abandon(proc, cmd: list[str]):
+    def _abandon(self, proc, cmd: list[str]):
         """Kill a child that overran, give it a second, then stop waiting."""
         try:
             proc.kill()
         except OSError:
             pass
+        wait = 1.0
+        deadline = getattr(self, "_cmd_deadline", None)
+        if deadline is not None:
+            wait = min(wait, max(0.1, deadline - time.monotonic()))
         try:
-            proc.communicate(timeout=1)
+            proc.communicate(timeout=wait)
             return
         except Exception:
             pass
-        # Still there after SIGKILL: stuck in the kernel. Our ends of its
-        # pipes are closed so they do not pile up, one per stuck call.
+        # Our ends of its pipes are closed so they do not pile up, one per
+        # stuck call.
         for pipe in (proc.stdout, proc.stderr):
             try:
                 if pipe:
                     pipe.close()
             except Exception:
                 pass
+        name = os.path.basename(cmd[0])
+        if proc.poll() is None:
+            # Still there after SIGKILL: stuck in the kernel. Kept, so no
+            # other copy of the tool is started until this one exits.
+            if name in self._STUCK_GUARDED:
+                self._abandoned_record().append((name, proc))
+            message = (f"{name} did not exit after being killed; left it behind, "
+                       f"and no other {name} runs until it exits"
+                       if name in self._STUCK_GUARDED else
+                       f"{name} did not exit after being killed; left it behind")
+        else:
+            # It exited, but something it started (runuser's child, say)
+            # still holds its output open.
+            message = (f"{name} exited, but something it started still holds its "
+                       "output; stopped waiting for it")
         try:
-            decky.logger.error(
-                f"{os.path.basename(cmd[0])} did not exit after being killed; "
-                "left it behind rather than wait on it"
-            )
+            self._log_throttled(f"abandon:{name}", message)
         except Exception:
             pass
+
+    def _stuck_tools(self) -> set:
+        """The tools (iw, tc, ip) with a child left behind that is still
+        running. Ones that have since exited are dropped from the record.
+
+        Worker threads and the event loop both use the record, so it is only
+        ever appended to or removed from one entry at a time, never rebuilt:
+        a rebuild could drop an entry another thread had just added.
+        """
+        record = self._abandoned_record()
+        stuck = set()
+        for entry in list(record):
+            name, proc = entry
+            if proc.poll() is None:
+                stuck.add(name)
+            else:
+                try:
+                    record.remove(entry)
+                except ValueError:
+                    pass
+        return stuck
+
+    def _abandoned_record(self) -> list:
+        """(tool, child) for every iw, tc or ip left behind stuck. Made with
+        setdefault, which two threads cannot both win."""
+        return self.__dict__.setdefault("_abandoned_procs", [])
 
     def _get_wifi_interface(self) -> str | None:
         # Reading sysfs saves an nmcli call on most polls, but only when the
@@ -2201,8 +2275,12 @@ class Plugin:
         found = re.search(r"^\s*wifi\.backend\s*=\s*(iwd|wpa_supplicant)\s*$", text, re.M)
         named = found.group(1) if found else None
         after = self._backend_without_ours() if named else None
+        # --no-reload: the change only matters at the next boot, and the
+        # daemon reload that enable and disable do by default can take
+        # seconds that an uninstall does not have.
         if named and after != named:
-            enabled = self._run_cmd(["/usr/bin/systemctl", "enable", after], timeout=15)
+            enabled = self._run_cmd(["/usr/bin/systemctl", "enable", "--no-reload", after],
+                                    timeout=15)
             if not enabled["success"]:
                 decky.logger.error(
                     f"Kept our backend setting ({named}): {after}, which NetworkManager "
@@ -2219,7 +2297,7 @@ class Plugin:
             return
         if not named or after == named:
             return
-        self._run_cmd(["/usr/bin/systemctl", "disable", named], timeout=15)
+        self._run_cmd(["/usr/bin/systemctl", "disable", "--no-reload", named], timeout=15)
         decky.logger.info(
             f"Removed our backend setting ({named}); NetworkManager uses {after} "
             f"from the next boot, so {after} is enabled and {named} disabled"
@@ -2228,28 +2306,37 @@ class Plugin:
     def _backend_without_ours(self) -> str:
         """The backend NetworkManager will use once our conf file is gone.
 
-        Asked of NetworkManager itself, with our file moved aside for the
-        moment it takes (it reads only names ending .conf), then put back:
-        the file only goes once the backend it leaves is ready.
+        Asked of NetworkManager itself, pointed at a scratch copy of its
+        conf.d that leaves our file out. Our file is never moved: moving it
+        aside for the moment the question took meant an uninstall killed in
+        that moment left it renamed, which NetworkManager ignores, and the
+        boot after that had no WiFi. Where NetworkManager cannot be asked,
+        the known files are read in its order without ours.
         """
-        aside = os.path.join(os.path.dirname(GENERIC_BACKEND_CONF),
-                             "." + os.path.basename(GENERIC_BACKEND_CONF) + ".aside")
+        conf_dir = os.path.dirname(GENERIC_BACKEND_CONF)
+        ours = os.path.basename(GENERIC_BACKEND_CONF)
+        found = None
+        scratch = None
         try:
-            os.replace(GENERIC_BACKEND_CONF, aside)
-        except OSError:
-            aside = None
-        try:
-            if aside:
-                return (self._merged_nm_backend()
-                        or self._configured_backend_from_files()
-                        or "wpa_supplicant")
-            return self._configured_backend_from_files(skip=GENERIC_BACKEND_CONF) or "wpa_supplicant"
+            # Root's own, made fresh, so nobody else can add to it.
+            scratch = tempfile.mkdtemp(prefix="wifi-optimizer-nmconf-")
+            for name in sorted(os.listdir(conf_dir)):
+                if name != ours and name.endswith(".conf"):
+                    os.symlink(os.path.join(conf_dir, name), os.path.join(scratch, name))
+            found = self._merged_nm_backend(config_dir=scratch)
+        except OSError as e:
+            decky.logger.info(f"Could not ask NetworkManager which backend it falls back to: {e}")
         finally:
-            if aside:
+            if scratch:
                 try:
-                    os.replace(aside, GENERIC_BACKEND_CONF)
-                except OSError as e:
-                    decky.logger.error(f"Could not put our backend setting back: {e}")
+                    for name in os.listdir(scratch):
+                        os.unlink(os.path.join(scratch, name))
+                    os.rmdir(scratch)
+                except OSError:
+                    pass
+        return (found
+                or self._configured_backend_from_files(skip=GENERIC_BACKEND_CONF)
+                or "wpa_supplicant")
 
     def _release_power_save(self, settings: dict | None = None, reload_conf: bool = False):
         """Undo Prevent lag spikes now, for Reset and uninstall.
@@ -3139,55 +3226,74 @@ class Plugin:
             decky.logger.error(f"_uninstall error: {e}")
 
     def _teardown(self, deadline: float):
-        """_uninstall's work, each step skipped once deadline has passed."""
-        settings = _load_settings()
+        """_uninstall's work, each step skipped once deadline has passed.
 
-        def step(what: str, undo, *args):
-            if time.monotonic() >= deadline:
-                decky.logger.error(f"_uninstall ran out of time before {what}")
-                return None
-            try:
-                return undo(*args)
-            except Exception as e:
-                decky.logger.error(f"_uninstall could not undo {what}: {e}")
-                return None
+        Checking the deadline between steps only stopped new ones: a step
+        already running went on past Decky's kill with commands given ten
+        or fifteen seconds each. So every command run here is held to what
+        is left of the budget, and one with too little left is not started.
+        """
+        self._cmd_deadline = deadline
+        try:
+            settings = _load_settings()
 
-        step("the backend setting", self._release_generic_backend_conf)
-        step("a running update", self._stop_update)
-        reloaded = step("the power save files", self._release_power_save_files, settings, False)
-        # A second left for the steps after it, which are quick.
-        left = step("the profile pins", self._clear_profile_pins, deadline - 1.0, settings) or {}
-        step("the dispatcher", self._remove_dispatcher)
-        step("power save", self._release_power_save, settings, bool(reloaded))
-        step("the region", self._release_regdomain, settings)
-        step("buffer tuning and CAKE", self._revert_queue_tuning, settings)
-        # The diagnostics file and a settings file set aside as unreadable
-        # are ours too, and nothing else would ever remove them.
-        users = [SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
-                 LEGACY_ENFORCED_FILE]
-        if any(left.values()):
-            # Pins that are still on profiles. A settings file naming only
-            # them lets a reinstall take them off; without it they are set
-            # by hand as far as anything can tell, for good.
-            try:
-                _save_settings({**left, "pins_owned": settings.get("pins_owned", [])})
-                users.remove(SETTINGS_FILE)
-                decky.logger.error(
-                    "_uninstall could not take every pin off; kept the settings "
-                    "file naming those profiles so a reinstall can"
-                )
-            except OSError as e:
-                decky.logger.error(f"_uninstall could not keep the unreleased pins: {e}")
-        for path in [*users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE,
-                     PCIE_BASELINE_FILE, UPDATE_STATE_FILE, UPDATE_LOCK_FILE]:
-            # One that cannot go (the settings directory is the user's,
-            # so anything can sit at these names) does not stop the rest.
-            try:
-                (_remove_no_follow if path in users else os.remove)(path)
-            except FileNotFoundError:
-                pass
-            except OSError as e:
-                decky.logger.error(f"_uninstall could not remove {path}: {e}")
+            def step(what: str, undo, *args):
+                if time.monotonic() >= deadline:
+                    decky.logger.error(f"_uninstall ran out of time before {what}")
+                    return None
+                try:
+                    return undo(*args)
+                except Exception as e:
+                    decky.logger.error(f"_uninstall could not undo {what}: {e}")
+                    return None
+
+            # A backend switch cut off by the uninstall leaves its marker, and a
+            # reinstall in the same boot would then reconcile a switch against a
+            # state this teardown has already changed, restarting NetworkManager
+            # as it loads. Finishing the switch here could take half a minute.
+            if os.path.lexists(BACKEND_SWITCH_MARKER):
+                step("the backend switch marker", self._set_backend_marker, None)
+                decky.logger.info("_uninstall cut a WiFi backend switch off part way; "
+                                  "a reinstall leaves the backend as it finds it")
+            step("the backend setting", self._release_generic_backend_conf)
+            step("a running update", self._stop_update)
+            reloaded = step("the power save files", self._release_power_save_files, settings, False)
+            # A second left for the steps after it, which are quick.
+            left = step("the profile pins", self._clear_profile_pins, deadline - 1.0, settings) or {}
+            step("the dispatcher", self._remove_dispatcher)
+            step("power save", self._release_power_save, settings, bool(reloaded))
+            step("the region", self._release_regdomain, settings)
+            step("buffer tuning and CAKE", self._revert_queue_tuning, settings)
+            # The diagnostics file and a settings file set aside as unreadable
+            # are ours too, and nothing else would ever remove them.
+            users = [SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
+                     LEGACY_ENFORCED_FILE]
+            if any(left.values()):
+                # Pins that are still on profiles. A settings file naming only
+                # them lets a reinstall take them off; without it they are set
+                # by hand as far as anything can tell, for good.
+                try:
+                    _save_settings({**left, "pins_owned": _owned_kinds_left(
+                        settings.get("pins_owned", []), left)})
+                    users.remove(SETTINGS_FILE)
+                    decky.logger.error(
+                        "_uninstall could not take every pin off; kept the settings "
+                        "file naming those profiles so a reinstall can"
+                    )
+                except OSError as e:
+                    decky.logger.error(f"_uninstall could not keep the unreleased pins: {e}")
+            for path in [*users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE,
+                         PCIE_BASELINE_FILE, UPDATE_STATE_FILE, UPDATE_LOCK_FILE]:
+                # One that cannot go (the settings directory is the user's,
+                # so anything can sit at these names) does not stop the rest.
+                try:
+                    (_remove_no_follow if path in users else os.remove)(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    decky.logger.error(f"_uninstall could not remove {path}: {e}")
+        finally:
+            self._cmd_deadline = None
 
     def _stop_update(self):
         """Stop an update still running when the plugin is uninstalled.
@@ -5120,7 +5226,11 @@ class Plugin:
         bssid = ""
         read_error = ""
         while True:
-            link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+            # Off the event loop, as each read can take its full timeout
+            # against a slow driver, every half second for the whole wait.
+            link_result = await asyncio.to_thread(
+                self._run_cmd, ["/usr/bin/iw", "dev", iface, "link"]
+            )
             if link_result["success"]:
                 read_error = ""
                 link_out = link_result.get("stdout", "")
@@ -5149,7 +5259,7 @@ class Plugin:
                     break
             if bssid or time.monotonic() >= deadline:
                 break
-            iface = self._get_wifi_interface() or iface
+            iface = await asyncio.to_thread(self._get_wifi_interface) or iface
             await asyncio.sleep(0.5)
         return {
             "iface": iface, "bssid": bssid,
@@ -7350,13 +7460,31 @@ class Plugin:
             )
 
     def _relock_after_band_change(self, uuid: str):
-        """Pin the access point NetworkManager chose on the new band.
+        """Pin the access point NetworkManager chose on the new band, and
+        record it. The async setters run the two halves apart (see
+        _relock_pin)."""
+        pinned = self._relock_pin(uuid)
+        if pinned:
+            self._record_relock(pinned)
+
+    def _record_relock(self, bssid: str):
+        """Record the address _relock_pin wrote. On the event loop: a save
+        from a worker thread races every setter's save there."""
+        settings = _load_settings()
+        settings["bssid_lock_value"] = bssid
+        _save_settings(settings)
+        decky.logger.info(f"Re-locked BSSID to {bssid} after band change")
+
+    def _relock_pin(self, uuid: str) -> str | None:
+        """Pin the access point NetworkManager chose on the new band, and
+        return its address, or None when nothing was pinned.
 
         Only while the lock is still on: the band setter awaits before this,
-        and the lock can have been turned off in between.
+        and the lock can have been turned off in between. Makes several
+        subprocess calls, so the setters run it in a worker thread.
         """
         if not _load_settings().get("bssid_lock_enabled"):
-            return
+            return None
         iface = self._get_wifi_interface()
         # The reconnect may have landed on a different profile - a
         # duplicate for the same network, which is the situation this
@@ -7364,53 +7492,49 @@ class Plugin:
         # we meant to change would write a foreign address, possibly on
         # the other band, into a profile that now demands this one.
         landed_on = self._get_active_connection_uuid()
-        if iface and landed_on == uuid:
-            link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
-            if not link_result["success"]:
-                # Not fatal - reconciliation re-points the lock on a
-                # later poll - but silence here left the lock enabled
-                # in settings and absent from the profile with nothing
-                # said about why.
-                decky.logger.error(
-                    f"Band change: could not read the link on {iface} "
-                    f"to restore the access point lock - "
-                    f"{(link_result.get('stderr', '') or '')[:200]}"
-                )
-            link_text = link_result.get("stdout", "")
-            seen_freq = ""
-            for line in link_text.split("\n"):
-                st = line.strip()
-                if st.startswith("freq:"):
-                    seen_freq = st.split(":", 1)[1].strip()
-            if self._band_conflicts(_load_settings(), seen_freq, None):
-                decky.logger.info(
-                    "Not re-locking after the band change: the radio is "
-                    "not on the band this network now requires"
-                )
-                link_text = ""
-            for line in link_text.split("\n"):
-                if "Connected to" in line:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        new_bssid = parts[2]
-                        relocked = self._nmcli_modify(
-                            uuid, "802-11-wireless.bssid", new_bssid
-                        )
-                        if relocked["success"]:
-                            settings = _load_settings()
-                            settings["bssid_lock_value"] = new_bssid
-                            _save_settings(settings)
-                            decky.logger.info(
-                                f"Re-locked BSSID to {new_bssid} after band change"
-                            )
-                        else:
-                            # Recording a lock that was not applied
-                            # would report it as present forever.
-                            decky.logger.error(
-                                f"Could not re-lock BSSID after band change: "
-                                f"{relocked.get('stderr', '')[:120]}"
-                            )
-                    break
+        if not iface or landed_on != uuid:
+            return None
+        link_result = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+        if not link_result["success"]:
+            # Not fatal - reconciliation re-points the lock on a
+            # later poll - but silence here left the lock enabled
+            # in settings and absent from the profile with nothing
+            # said about why.
+            decky.logger.error(
+                f"Band change: could not read the link on {iface} "
+                f"to restore the access point lock - "
+                f"{(link_result.get('stderr', '') or '')[:200]}"
+            )
+        link_text = link_result.get("stdout", "")
+        seen_freq = ""
+        for line in link_text.split("\n"):
+            st = line.strip()
+            if st.startswith("freq:"):
+                seen_freq = st.split(":", 1)[1].strip()
+        if self._band_conflicts(_load_settings(), seen_freq, None):
+            decky.logger.info(
+                "Not re-locking after the band change: the radio is "
+                "not on the band this network now requires"
+            )
+            link_text = ""
+        for line in link_text.split("\n"):
+            if "Connected to" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    new_bssid = parts[2]
+                    relocked = self._nmcli_modify(
+                        uuid, "802-11-wireless.bssid", new_bssid
+                    )
+                    if relocked["success"]:
+                        return new_bssid
+                    # Recording a lock that was not applied
+                    # would report it as present forever.
+                    decky.logger.error(
+                        f"Could not re-lock BSSID after band change: "
+                        f"{relocked.get('stderr', '')[:120]}"
+                    )
+                break
+        return None
 
     def _nm_version(self) -> tuple[int, int, int] | None:
         """NetworkManager's version as (major, minor, micro), None if unread.
@@ -7527,11 +7651,11 @@ class Plugin:
         be used for WPA3, and this is checked here rather than left for the
         stranded-pin release a minute later.
         """
-        iface = self._get_wifi_interface()
+        iface = await asyncio.to_thread(self._get_wifi_interface)
         seen = await self._await_association(iface) if iface else {"link": "", "error": "no interface"}
         frequency = self._parse_link(seen.get("link", "")).get("frequency", "")
         if (self._freq_band(frequency) == "6GHz"
-                and self._get_active_connection_uuid() == uuid):
+                and await asyncio.to_thread(self._get_active_connection_uuid) == uuid):
             return None
         decky.logger.error(
             f"Band '6GHz' on {uuid} did not connect on 6 GHz "
@@ -7552,7 +7676,9 @@ class Plugin:
             return dict(self._RADIO_OFF_RESULT)
         if had_lock:
             await asyncio.sleep(3)
-            self._relock_after_band_change(uuid)
+            pinned = await asyncio.to_thread(self._relock_pin, uuid)
+            if pinned:
+                self._record_relock(pinned)
         return {
             "success": False,
             "error": "band_unavailable",
@@ -7741,7 +7867,9 @@ class Plugin:
                 # BSSID back. Must not be time.sleep here: this is an async
                 # method, and a blocking sleep stalls the whole event loop.
                 await asyncio.sleep(3)
-                self._relock_after_band_change(uuid)
+                pinned = await asyncio.to_thread(self._relock_pin, uuid)
+                if pinned:
+                    self._record_relock(pinned)
 
             return {"success": True, "band": value, "reconnected": True}
         except Exception as e:
@@ -8317,14 +8445,15 @@ class Plugin:
                 if r.get("success"):
                     applied += 1
 
-            # Reconnecting (each does hard_reconnect)
-            here_uuid = self._get_active_connection_uuid() or ""
-            if self._backend_is_iwd():
+            # Reconnecting (each does hard_reconnect). What they depend on is
+            # read off the event loop first: each is a subprocess.
+            here_uuid, here_ssid, iwd = await asyncio.to_thread(self._reapply_context)
+            if iwd:
                 # Neither pin can be used under iwd; see _pins_for_backend.
                 settings = {**settings, "bssid_lock_enabled": False,
                             "band_preference_enabled": False}
-            if settings.get("bssid_lock_enabled") and not self._lock_is_for_this_network(
-                settings, here_uuid, self._get_profile_ssid(here_uuid)
+            if settings.get("bssid_lock_enabled") and not await asyncio.to_thread(
+                self._lock_is_for_this_network, settings, here_uuid, here_ssid
             ):
                 # The same reasoning as the band below: reapplying the lock
                 # here would pin the first access point of a network nobody
@@ -8346,9 +8475,9 @@ class Plugin:
                 # made elsewhere too; this skips quietly, as the path is
                 # programmatic.
                 scoped_to = settings.get("band_preference_ssid", "")
-                here = self._get_profile_ssid(
-                    self._get_active_connection_uuid() or ""
-                )
+                # Read again: the lock above reconnects, and can land on
+                # another copy of the network.
+                here = (await asyncio.to_thread(self._reapply_context, False))[1]
                 # An unknown scope is not permission. Everything else treats
                 # it as "do not enforce"; treating it as "go ahead" here would
                 # write the band into whatever network is active and reconnect
@@ -8372,7 +8501,7 @@ class Plugin:
             # whichever network happens to be active. An empty list is a
             # setting from before tracking existed; applying it once records
             # where it lives.
-            active_uuid = self._get_active_connection_uuid() or ""
+            active_uuid = (await asyncio.to_thread(self._reapply_context, False))[0]
 
             def elsewhere(list_key: str) -> bool:
                 tracked = settings.get(list_key, [])
@@ -8431,6 +8560,13 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"reapply_all error: {e}")
             return self._unexpected_response(e)
+
+    def _reapply_context(self, backend: bool = True) -> tuple:
+        """(active profile, its network, whether iwd is in use) for
+        reapply_all, read in a worker thread. backend=False skips the last,
+        answering False."""
+        uuid = self._get_active_connection_uuid() or ""
+        return uuid, self._get_profile_ssid(uuid), backend and self._backend_is_iwd()
 
     async def repair_drifted(self) -> dict:
         """Put back only the settings that are on and have stopped holding.
@@ -10046,13 +10182,20 @@ class Plugin:
         self._merged_backend_seen = (stamp, found)
         return found
 
-    def _merged_nm_backend(self) -> str | None:
+    def _merged_nm_backend(self, config_dir: str | None = None) -> str | None:
         """The backend NetworkManager's merged configuration names, from NM
-        itself, so the order conf.d files are read in is NM's own."""
+        itself, so the order conf.d files are read in is NM's own.
+
+        config_dir stands in for /etc/NetworkManager/conf.d, to ask what the
+        merge would be with a different set of files there.
+        """
         for binary in ("/usr/bin/NetworkManager", "/usr/sbin/NetworkManager"):
             if not os.path.isfile(binary):
                 continue
-            result = self._run_cmd([binary, "--print-config"], timeout=5)
+            args = [binary, "--print-config"]
+            if config_dir:
+                args.append(f"--config-dir={config_dir}")
+            result = self._run_cmd(args, timeout=5)
             if not result["success"]:
                 return None
             for line in result.get("stdout", "").split("\n"):
