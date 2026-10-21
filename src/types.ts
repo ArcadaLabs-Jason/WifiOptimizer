@@ -42,6 +42,10 @@ export interface LiveStatus {
   bssid_lock_other_network?: boolean;
   /** IPv6 is turned off for a different network, not this one. */
   ipv6_other_network?: boolean;
+  /** The band preference is on, but for a different network. */
+  band_other_network?: boolean;
+  /** Custom DNS is on, but not applied on this network. */
+  dns_other_network?: boolean;
   ip_address?: string;
   dns?: string;
   ipv6_method?: string;
@@ -102,6 +106,13 @@ export interface PluginStatus {
   // The settings file did not parse and was moved aside to
   // settings.json.corrupt. Reported until the panel acknowledges it.
   settings_recovered?: boolean;
+  // Sent with the duplicate profile notice: true only when the copy in use
+  // was actually given priority over the others.
+  duplicates_prioritized?: boolean;
+  // The last attempt to save the settings file failed.
+  settings_unwritable?: boolean;
+  // A lock, band, WPA2, DNS, IPv6, Reset or backend change is still running.
+  profile_change_in_flight?: boolean;
   last_applied?: number;
   error?: string;
   message?: string;
@@ -213,13 +224,13 @@ export type BadgeStatus =
 
 export const ERROR_MESSAGES: Record<string, string> = {
   no_wifi: "Not connected to WiFi. Connect first, then optimize.",
-  iw_failed: "Couldn't change WiFi setting. Try toggling WiFi off/on.",
-  nmcli_failed: "Couldn't update connection. Forget and reconnect to this network.",
-  write_failed: "Couldn't install auto-fix script. The filesystem may be locked.",
+  iw_failed: "Couldn't change a WiFi setting. Turn WiFi off and on, then try again.",
+  nmcli_failed: "Couldn't update this network's saved settings. Try again in a moment. If it keeps failing, restart the device.",
+  write_failed: "Couldn't install the auto-fix script. Restart the device, then try again.",
   // Shown while the backend reports settings_recovered.
   parse_error:
     "The settings file could not be read, so settings were reset to defaults. The old file was kept as settings.json.corrupt.",
-  unexpected: "Something went wrong. Check the Decky log for details.",
+  unexpected: "Something went wrong. Try again. If it keeps happening, use Copy diagnostics at the bottom of this panel and report it.",
 };
 
 export interface RegdomainPhy {

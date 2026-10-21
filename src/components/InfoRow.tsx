@@ -1,8 +1,18 @@
-import { useState } from "react";
+import { createContext, useContext, useState } from "react";
 import { PanelSectionRow, ToggleField } from "@decky/ui";
 import type { BadgeStatus } from "../types";
 import { StatusBadge } from "./StatusBadge";
 import { theme } from "../theme";
+
+// The panel's "Show details" toggle. The (i) next to each label only answers
+// a tap: it sits inside the toggle's label, where the D-pad cannot focus it
+// apart from the toggle itself. The toggle opens every explanation at once,
+// so they can be read with a controller too.
+export const DetailsContext = createContext(false);
+
+// Shown in place of the subtitle while a change that reconnects WiFi runs.
+// Those take from a few seconds to about a minute.
+export const WORKING_TEXT = "Working, WiFi will reconnect...";
 
 interface InfoRowProps {
   label: string;
@@ -16,6 +26,8 @@ interface InfoRowProps {
   // Something worth saying that is not a failure - a setter that did
   // something other than exactly what was asked, and succeeded.
   notice?: string | null;
+  // This row's change is running now.
+  working?: boolean;
   onChange: (val: boolean) => void;
   children?: React.ReactNode;
 }
@@ -30,11 +42,14 @@ export function InfoRow({
   disabled = false,
   error,
   notice,
+  working = false,
   onChange,
   children,
 }: InfoRowProps) {
   const showBadge = badge !== undefined && text !== undefined;
-  const [expanded, setExpanded] = useState(false);
+  const [tapped, setTapped] = useState(false);
+  const showAll = useContext(DetailsContext);
+  const expanded = tapped || showAll;
 
   return (
     <>
@@ -45,7 +60,7 @@ export function InfoRow({
               <span
                 onClick={(e: React.MouseEvent) => {
                   e.stopPropagation();
-                  setExpanded(!expanded);
+                  setTapped(!tapped);
                 }}
                 style={{
                   display: "inline-flex",
@@ -80,7 +95,11 @@ export function InfoRow({
                   <StatusBadge badge={badge!} text={text!} />
                 </span>
               )}
-              {error ? (
+              {working ? (
+                <span style={{ color: theme.info.text, fontSize: theme.fontSize.small }}>
+                  {WORKING_TEXT}
+                </span>
+              ) : error ? (
                 <span style={{ color: theme.error.text }}>{error}</span>
               ) : notice ? (
                 <span style={{ color: theme.info.text, fontSize: theme.fontSize.small }}>

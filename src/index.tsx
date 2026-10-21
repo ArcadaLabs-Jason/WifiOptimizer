@@ -32,10 +32,10 @@ import type {
   RegdomainInfo,
 } from "./types";
 import { ERROR_MESSAGES } from "./types";
-import { InfoRow } from "./components/InfoRow";
+import { InfoRow, DetailsContext, WORKING_TEXT } from "./components/InfoRow";
 import { StatsGrid } from "./components/StatsGrid";
 import { Banner } from "./components/Banner";
-import { BackendToggleRow } from "./components/BackendToggleRow";
+import { BackendToggleRow, backendResultText } from "./components/BackendToggleRow";
 import { UpdatesSection } from "./components/UpdatesSection";
 import { PanelHeader } from "./components/PanelHeader";
 import { PanelFooter } from "./components/PanelFooter";
@@ -75,8 +75,80 @@ const IWD_PIN_NOTICE =
 const BACKEND_POLL_MAX_FAILURES = 5;
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
+// Prevent lag spikes is saved as off, so it does not come back by itself.
 const RESET_CONFIRM_TEXT =
-  "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to. A WiFi region set here can stay in effect until the next reboot.";
+  "This puts every setting back to its default and turns off what the plugin applied. Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting and custom DNS are removed from the networks they were set on.";
+// Only where the plugin can choose the backend itself. On SteamOS that is
+// Valve's setting, and Reset leaves it alone.
+const RESET_BACKEND_TEXT =
+  " A WiFi backend chosen here goes back to the system default from the next boot.";
+// A backend call that never answers used to leave every control greyed out
+// until the panel was reloaded. The slowest changes take about a minute.
+const CALL_TIMEOUT_MS = 120 * 1000;
+// The refresh after a change is bounded too, for the same reason.
+const REFRESH_WAIT_MS = 15 * 1000;
+const NO_ANSWER_TEXT =
+  "No answer after 2 minutes. The change may still finish, so check this setting again in a moment. If WiFi doesn't come back, restart the device.";
+const UNREACHABLE_TEXT =
+  "Couldn't reach the plugin's backend. Wait a moment and try again. If it keeps happening, restart Steam.";
+// Optimize Safe, Fix now and Force Reapply reconnect only when the lock or a
+// network setting is among what they apply.
+const BATCH_WORKING_TEXT = "Working. WiFi may reconnect, and this can take up to a minute.";
+// For a failure that came with no message of its own.
+const GENERIC_FAIL_TEXT =
+  "That didn't work. Try again. If it keeps failing, use Copy diagnostics at the bottom of this panel and report it.";
+// A setting that is on, but for another network than this one.
+const OTHER_NETWORK_TEXT =
+  "On for another network, so it does nothing here. To use it here, turn it off, then on again.";
+// Drift keys, by the name the panel shows for the setting.
+const DRIFT_LABELS: Record<string, string> = {
+  power_save: "Prevent lag spikes",
+  bssid_lock: "Stop background scanning",
+  buffer_tuning: "Network buffer tuning",
+  band_preference: "The band preference",
+  dns: "Custom DNS",
+  ipv6: "Disable IPv6",
+  cake: "Traffic shaping (CAKE)",
+};
+
+class NoAnswer extends Error {}
+
+function withTimeout<T>(call: Promise<T>, ms: number = CALL_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const id = setTimeout(() => reject(new NoAnswer()), ms);
+    call.then(
+      (value) => {
+        clearTimeout(id);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(id);
+        reject(err);
+      },
+    );
+  });
+}
+
+// What a failed result says, without the raw command output some carry in
+// "detail". That text is for the log, and read as noise in the panel.
+function failureText(result: MethodResult): string {
+  if (result.detail) console.warn("WiFi Optimizer: failure detail", result.detail);
+  return result.message ?? ERROR_MESSAGES[result.error ?? ""] ?? GENERIC_FAIL_TEXT;
+}
+
+function isResult(value: unknown): value is MethodResult {
+  return !!value && typeof (value as MethodResult).success === "boolean";
+}
+
+// Kept across the panel closing and reopening, which can remount it.
+let detailsShown = false;
+let duplicatesDismissed = false;
+// The update script can stop after installing, when a game is still running
+// at its deadline, so a failed update may only need Steam restarted.
+const UPDATE_FAILED_TEXT =
+  "The update didn't finish. Close any game or stream, then restart Steam or try the update again.";
+const UPDATE_SLOW_TEXT =
+  "The update is taking too long. Restart Steam, then check the version at the bottom of this panel. If it didn't change, try the update again.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -118,7 +190,7 @@ function getBadge(
 // them: a region set to one that is not here is still shown, by its code.
 const REGION_UNMANAGED = "none";
 const REGION_OPTIONS = [
-  { data: "00", label: "World (00) - most restrictive" },
+  { data: "00", label: "World (00), most restrictive" },
   { data: "AR", label: "Argentina (AR)" },
   { data: "AU", label: "Australia (AU)" },
   { data: "AT", label: "Austria (AT)" },
@@ -232,8 +304,15 @@ function Content() {
   const [status, setStatus] = useState<PluginStatus | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [notices, setNotices] = useState<Record<string, string>>({});
-  const [isBusy, setIsBusy] = useState(false);
+  const [busyState, setIsBusy] = useState(false);
+  // The key of the change running now, for the text on its row.
+  const [working, setWorking] = useState<string | null>(null);
   const [applyingAll, setApplyingAll] = useState(false);
+  // The last status read failed, and when the first one is slow to come.
+  const [statusFailed, setStatusFailed] = useState(false);
+  const [slowLoad, setSlowLoad] = useState(false);
+  const [showDetails, setShowDetails] = useState(detailsShown);
+  const [dupDismissed, setDupDismissed] = useState(duplicatesDismissed);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeSafeResult | null>(null);
   const [regdomain, setRegdomainInfo] = useState<RegdomainInfo | null>(null);
 
@@ -270,8 +349,8 @@ function Content() {
   const [backendSwitch, setBackendSwitch] = useState<BackendSwitchStatus | null>(null);
 
   // --- Refs ---
-  // busyRef is the synchronous re-entrancy guard; isBusy (above) is the React
-  // state mirror so UI can respond. setBusy below writes both together.
+  // busyRef is the synchronous re-entrancy guard; busyState (above) is the
+  // React state mirror so UI can respond. setBusy below writes both together.
   const busyRef = useRef(false);
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
@@ -318,6 +397,7 @@ function Content() {
     try {
       const s = await backend.getStatus();
       if (seq !== statusSeqRef.current) return;
+      setStatusFailed(false);
       setStatus(s);
       if (s.settings) {
         // Only adopt a stored value that exists. Turning DNS off clears
@@ -337,8 +417,16 @@ function Content() {
       }
     } catch (e) {
       console.error("WiFi Optimizer: failed to get status", e);
+      if (seq === statusSeqRef.current) setStatusFailed(true);
     }
   }, []);
+
+  // The refresh at the end of a change, bounded so a backend that stopped
+  // answering cannot keep the panel busy.
+  const refreshAfterChange = useCallback(
+    () => withTimeout(refreshStatus(true), REFRESH_WAIT_MS).catch(() => {}),
+    [refreshStatus],
+  );
 
   const stopBackendPoll = () => {
     if (backendPollRef.current) {
@@ -437,6 +525,25 @@ function Content() {
     };
   }, [refreshStatus]);
 
+  // Say something while the first status is slow to come, rather than show
+  // an empty section with no sign that anything is happening.
+  const loaded = !!status && !status.initializing;
+  useEffect(() => {
+    if (loaded) return;
+    const id = setTimeout(() => setSlowLoad(true), 10 * 1000);
+    return () => clearTimeout(id);
+  }, [loaded]);
+
+  // A dismissed duplicate notice comes back the next time duplicates are
+  // found, not while the same ones are still reported.
+  const hasDuplicates = !!status?.external?.duplicate_profiles;
+  useEffect(() => {
+    if (loaded && !hasDuplicates) {
+      duplicatesDismissed = false;
+      setDupDismissed(false);
+    }
+  }, [loaded, hasDuplicates]);
+
   // One-time init: initial update check and resume backend polling if a switch
   // was already in flight when the panel opened.
   useEffect(() => {
@@ -482,7 +589,7 @@ function Content() {
         setUpdateProgress(progress);
         if (progress?.phase === "failed") {
           setUpdating(false);
-          setUpdateError("The update didn't finish. Try again, or check the plugin log.");
+          setUpdateError(UPDATE_FAILED_TEXT);
         } else if (progress?.phase === "done") {
           // Seen by a panel left open across the reload; the new copy of the
           // plugin is the one running now. Its offer to update is stale too,
@@ -506,9 +613,7 @@ function Content() {
     const id = setTimeout(() => {
       console.error("WiFi Optimizer: update didn't complete in time");
       setUpdating(false);
-      setUpdateError(
-        "Update didn't complete. Try again, or reinstall manually from Konsole."
-      );
+      setUpdateError(UPDATE_SLOW_TEXT);
     }, UPDATE_TIMEOUT_MS);
     return () => clearTimeout(id);
   }, [updating]);
@@ -610,6 +715,7 @@ function Content() {
   ): Promise<MethodResult | undefined> => {
     if (busyRef.current) return undefined;
     setBusy(true);
+    setWorking(key);
     setErrors((prev) => {
       const next = { ...prev };
       delete next[key];
@@ -624,7 +730,11 @@ function Content() {
 
     let outcome: MethodResult | undefined;
     try {
-      const result = await fn();
+      const answer = await withTimeout(fn());
+      // A reply without a success flag is not a result the panel can read.
+      const result: MethodResult = isResult(answer)
+        ? answer
+        : { success: false, message: GENERIC_FAIL_TEXT };
       outcome = result;
       // A setter can succeed and still have done something other than what
       // was asked - locking to the access point you were already on because
@@ -634,8 +744,7 @@ function Content() {
         setNotices((prev) => ({ ...prev, [key]: result.message as string }));
       }
       if (!result.success) {
-        const detail = result.detail ? ` (${result.detail})` : "";
-        const msg = (result.message ?? ERROR_MESSAGES[result.error ?? ""] ?? "Unknown error") + detail;
+        const msg = failureText(result);
         setErrors((prev) => ({ ...prev, [key]: msg }));
       }
       // Wait for WiFi to reconnect before refreshing status
@@ -645,15 +754,17 @@ function Content() {
     } catch (e) {
       // A call that throws (Decky restarting, the backend gone) used to
       // surface as an unhandled rejection with the toggle silently unchanged.
+      console.error(`WiFi Optimizer: ${key} call failed`, e);
       setErrors((prev) => ({
         ...prev,
-        [key]: `Couldn't reach the plugin's backend (${String(e)})`,
+        [key]: e instanceof NoAnswer ? NO_ANSWER_TEXT : UNREACHABLE_TEXT,
       }));
     } finally {
       // Refresh before clearing busy so toggles/badges don't briefly flip to
       // stale pre-operation values in the interim render. Refresh runs even on
       // unexpected errors to keep UI consistent with backend state.
-      await refreshStatus(true);
+      await refreshAfterChange();
+      setWorking(null);
       setBusy(false);
     }
     return outcome;
@@ -671,7 +782,10 @@ function Content() {
     setNotices({});
     setOptimizeResult(null);
     try {
-      const result = await fn();
+      const answer = await withTimeout(fn());
+      const result: OptimizeSafeResult = isResult(answer)
+        ? answer
+        : { success: false, total: 0, applied: 0, results: {}, message: GENERIC_FAIL_TEXT };
       setOptimizeResult(result);
       if (result.results) {
         // Successes can carry a message too, as they do for a single toggle:
@@ -680,9 +794,10 @@ function Content() {
         const newErrors: Record<string, string> = {};
         const newNotices: Record<string, string> = {};
         for (const [k, v] of Object.entries(result.results)) {
-          if (!v.success) {
-            const det = v.detail ? ` (${v.detail})` : "";
-            newErrors[k] = (v.message ?? ERROR_MESSAGES[v.error ?? ""] ?? "Failed") + det;
+          if (!isResult(v)) {
+            newErrors[k] = GENERIC_FAIL_TEXT;
+          } else if (!v.success) {
+            newErrors[k] = failureText(v);
           } else if (v.message) {
             newNotices[k] = v.message;
           }
@@ -698,12 +813,12 @@ function Content() {
       console.error("optimize error", e);
       setOptimizeResult({
         success: false, total: 0, applied: 0, results: {},
-        message: "Something went wrong. Check the Decky log for details.",
+        message: e instanceof NoAnswer ? NO_ANSWER_TEXT : UNREACHABLE_TEXT,
       });
     } finally {
       // Refresh before clearing applyingAll so button doesn't briefly flip to
       // "All good" from stale status. Refresh runs on errors too.
-      await refreshStatus(true);
+      await refreshAfterChange();
       setBusy(false);
       setApplyingAll(false);
     }
@@ -719,20 +834,35 @@ function Content() {
   const handleMoveLock = () =>
     handleToggle("move_bssid_lock", () => backend.moveBssidLock());
 
-  const handleDismissMoveError = () =>
+  const dismissError = (key: string) =>
     setErrors((prev) => {
       const next = { ...prev };
-      delete next.move_bssid_lock;
+      delete next[key];
       return next;
     });
+  const handleDismissMoveError = () => dismissError("move_bssid_lock");
+  const handleDismissWpa2Error = () => dismissError("allow_wpa2");
+
+  const handleDismissDuplicates = () => {
+    duplicatesDismissed = true;
+    setDupDismissed(true);
+  };
+
+  const handleShowDetails = (on: boolean) => {
+    detailsShown = on;
+    setShowDetails(on);
+  };
 
   // Reset asks first: see RESET_CONFIRM_TEXT.
   const handleResetSettings = () => {
     if (busyRef.current) return;
+    const distro = status?.settings?.distro_id ?? "";
+    const description =
+      RESET_CONFIRM_TEXT + (distro && distro !== "steamos" ? RESET_BACKEND_TEXT : "");
     showModal(
       <ConfirmModal
         strTitle="Reset WiFi Optimizer?"
-        strDescription={RESET_CONFIRM_TEXT}
+        strDescription={description}
         strOKButtonText="Reset"
         strCancelButtonText="Cancel"
         bDestructiveWarning={true}
@@ -744,20 +874,26 @@ function Content() {
   const runReset = async () => {
     if (busyRef.current) return;
     setBusy(true);
+    setWorking("reset");
     setOptimizeResult(null);
     setErrors({});
     setNotices({});
     resetDnsDraft();
     try {
-      const result = await backend.resetSettings();
-      if (!result.success) {
-        setErrors({ reset: result.message ?? "Couldn't reset settings." });
+      const result = await withTimeout(backend.resetSettings());
+      if (!isResult(result) || !result.success) {
+        setErrors({ reset: isResult(result) ? failureText(result) : GENERIC_FAIL_TEXT });
+      } else {
+        setNotices({ reset: "Done. Every setting is back to its default." });
       }
     } catch (e) {
       console.error("reset error", e);
-      setErrors({ reset: "Couldn't reset settings." });
+      setErrors({ reset: e instanceof NoAnswer ? NO_ANSWER_TEXT : UNREACHABLE_TEXT });
     } finally {
-      await refreshStatus(true);
+      await refreshAfterChange();
+      // The region is read once, not polled, and Reset can put it back.
+      refreshRegdomain();
+      setWorking(null);
       setBusy(false);
     }
   };
@@ -773,12 +909,31 @@ function Content() {
     await refreshStatus(true);
   };
 
-  const handleBackendToggle = async (on: boolean) => {
+  // The switch takes WiFi down for up to a minute, so it asks first, as
+  // Reset does.
+  const handleBackendToggle = (on: boolean) => {
+    if (busyRef.current) return;
+    const target = on ? "wpa_supplicant" : "iwd";
+    const paused =
+      !on && (status?.settings?.bssid_lock_enabled || status?.settings?.band_preference_enabled)
+        ? " Under iwd, Stop background scanning and the band preference are paused."
+        : "";
+    showModal(
+      <ConfirmModal
+        strTitle="Switch the WiFi backend?"
+        strDescription={`This switches to ${target}. WiFi disconnects while it switches, usually for less than a minute.${paused} If WiFi doesn't come back, switch back here or restart the device.`}
+        strOKButtonText="Switch"
+        strCancelButtonText="Cancel"
+        onOK={() => void runBackendSwitch(target)}
+      />,
+    );
+  };
+
+  const runBackendSwitch = async (target: string) => {
     // Re-entrancy guard: drop rapid clicks or clicks that land while another
     // operation is already running. Protects against duplicate backend calls
     // and the Force-Reapply/backend-switch overlap case.
     if (busyRef.current) return;
-    const target = on ? "wpa_supplicant" : "iwd";
     setBusy(true);
     setErrors((prev) => {
       const next = { ...prev };
@@ -792,7 +947,7 @@ function Content() {
       if (!res.accepted) {
         setErrors((prev) => ({
           ...prev,
-          wifi_backend: res.message ?? "Could not start backend switch",
+          wifi_backend: res.message ?? "Couldn't start the backend switch. Try again in a moment.",
         }));
         // Clear any stale result banner/inline from a prior switch so we don't
         // render old success + new error side-by-side.
@@ -813,7 +968,7 @@ function Content() {
       setBusy(false);
       setErrors((prev) => ({
         ...prev,
-        wifi_backend: "Failed to start backend switch",
+        wifi_backend: "Couldn't start the backend switch. Try again in a moment.",
       }));
       console.error("startBackendSwitch error", e);
     }
@@ -896,6 +1051,9 @@ function Content() {
     // Forced like the notify toggle. Unforced, it is skipped while another
     // operation holds the panel busy, and the dropdown shows the old channel.
     await refreshStatus(true);
+    // The answer for the old channel was dropped above. Ask again, or the
+    // panel offers nothing for the new channel until the next timed check.
+    await handleCheckForUpdate();
   };
 
   // Custom DNS draft handling
@@ -923,10 +1081,26 @@ function Content() {
   // A status marked initializing is the backend saying a collection is still
   // running and it has nothing to report yet, which is the same situation.
   if (!status || status.initializing) {
-    return <PanelSection title="WiFi Optimizer" />;
+    return (
+      <PanelSection title="WiFi Optimizer">
+        <PanelSectionRow>
+          <div style={{ fontSize: theme.fontSize.body, color: theme.text.secondary }}>
+            {statusFailed
+              ? "Couldn't reach the plugin. It keeps trying. If this stays, restart Steam."
+              : slowLoad
+                ? "Still reading WiFi status. This can take a while just after waking from sleep."
+                : "Loading WiFi status..."}
+          </div>
+        </PanelSectionRow>
+      </PanelSection>
+    );
   }
 
   const s = status?.settings;
+  // A change the backend is still making, which may have outlasted the
+  // panel's own wait for it. Every control waits for it too.
+  const changeRunning = !!status?.profile_change_in_flight;
+  const isBusy = busyState || changeRunning;
   const connected = status?.connected ?? false;
   const supportTier = status?.support_tier ?? 1;
   const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
@@ -950,6 +1124,20 @@ function Content() {
     setNotices(drop);
   };
   const isDeckLcd = s?.device_family === "deck_lcd";
+  const isDeck = isDeckLcd || s?.device_family === "deck_oled";
+  // The badge and line for a setting that is on for another network.
+  const otherNetworkBadge = { badge: "unknown" as const, text: "other network" };
+  const bandOther = !!status?.live?.band_other_network && !!s?.band_preference_enabled;
+  // A band of 2.4 GHz is only reachable by editing the settings file, or
+  // from an old version. Shown under the 5 GHz toggle, which is the one on.
+  const onBg = !!s?.band_preference_enabled && s?.band_preference === "bg";
+  // What has drifted, by name.
+  const driftNames = Object.keys(status?.drift ?? {}).map((k) => DRIFT_LABELS[k] ?? k);
+  // "Steam Deck OLED, WiFi 6E (QCA206X)", leaving out whichever part is unknown.
+  const deviceParts = [
+    s?.device_label && s.device_label !== "Unknown Device" ? s.device_label : "",
+    s?.chip_label && s.chip_label !== "unknown" ? s.chip_label : "",
+  ].filter(Boolean);
 
   // Streaming auto mode with no stream running: power save, buffer tuning
   // and CAKE are off on purpose. They read as paused, not as off or drifted.
@@ -981,19 +1169,42 @@ function Content() {
     !status?.drift?.buffer_tuning;
 
   return (
-    <>
+    <DetailsContext.Provider value={showDetails}>
       <PanelHeader
         driver={s?.driver ?? ""}
-        version={status?.version ?? "?"}
         lastApplied={s?.last_applied ?? 0}
         lastEnforced={status?.live?.last_enforced}
         streaming={status?.live}
-        deviceLabel={s?.device_label !== "Unknown Device"
-          ? `${s?.device_label} - ${s?.chip_label}`
-          : s?.chip_label && s.chip_label !== "unknown"
-            ? s.chip_label
-            : undefined}
+        deviceLabel={deviceParts.length ? deviceParts.join(", ") : undefined}
+        showDetails={showDetails}
+        onShowDetails={handleShowDetails}
       />
+
+      {/* A status read failed after the panel had loaded. What is shown is
+          the last status that came through. */}
+      {statusFailed && (
+        <Banner variant="warning">
+          Lost contact with the plugin, so this may be out of date. It keeps
+          trying. If this stays, restart Steam.
+        </Banner>
+      )}
+
+      {/* The settings file could not be saved. Changes then hold until the
+          plugin restarts, and the toggles still read as if they had stuck. */}
+      {status?.settings_unwritable && (
+        <Banner variant="warning">
+          The plugin couldn't save its settings, so changes may not last past
+          a restart. Check that the device has free storage space, then try
+          the change again.
+        </Banner>
+      )}
+
+      {changeRunning && !busyState && (
+        <Banner variant="info">
+          A WiFi change is still finishing. The controls come back when it is
+          done.
+        </Banner>
+      )}
 
       {/* Unknown hardware info */}
       {supportTier === 3 && (
@@ -1018,7 +1229,8 @@ function Content() {
         </PanelSection>
       )}
 
-      {/* Update available */}
+      {/* Update available. A refusal is said here too: the Updates section
+          is far down the panel, and pressing this showed nothing. */}
       {updateInfo?.update_available && !updating && (
         <PanelSection>
           <PanelSectionRow>
@@ -1028,6 +1240,13 @@ function Content() {
                 : `Update to v${updateInfo.latest_version}`}
             </ButtonItem>
           </PanelSectionRow>
+          {updateError && (
+            <PanelSectionRow>
+              <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>
+                {updateError}
+              </div>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       )}
 
@@ -1053,25 +1272,35 @@ function Content() {
           The old wording here told people to forget the network and rejoin.
           That throws away their settings and gambles on which security the
           new copy gets, when the actual problem is only that the copies rank
-          equally. Say what was done instead, and how to choose the other. */}
-      {status?.external?.duplicate_profiles && (
-        <Banner variant="warning" icon="⚠">
+          equally. Say what was done instead, and how to choose the other.
+          Priority is only claimed when the backend says it was written. */}
+      {hasDuplicates && !dupDismissed && (
+        <Banner variant="warning">
           This network is saved more than once with different security
           settings. Which copy is used decides which access points can be
-          reached, so the connection can look inconsistent. The copy in use
-          has been given priority, so the choice stays the same from now on.
-          To use the other one instead, connect with it once and it takes
-          priority.
+          reached, so the connection can look inconsistent.{" "}
+          {status?.duplicates_prioritized
+            ? "The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority."
+            : "Usually the copy used last is picked next time. If the connection keeps acting up, remove the extra copy in Desktop Mode's network settings."}
         </Banner>
+      )}
+      {hasDuplicates && !dupDismissed && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={handleDismissDuplicates}>
+              Dismiss
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
       )}
 
       {/* The router handed out an address another device already holds. WiFi
           reads as connected while nothing works, and without this the plugin
           is the obvious suspect. */}
       {status?.address_conflict && (
-        <Banner variant="warning" icon="⚠">
-          Another device on your network is using the same address as your
-          handheld ({status.address_conflict.ip}), so the connection may not work. That's
+        <Banner variant="warning">
+          Another device on your network is using the same address as this
+          one ({status.address_conflict.ip}), so the connection may not work. That's
           the router, not a WiFi setting. Restarting the router usually fixes it.
         </Banner>
       )}
@@ -1079,14 +1308,23 @@ function Content() {
       {/* The saved security is shutting the device out of a stronger access
           point on the same network. Without this the only symptom is the
           Deck preferring a distant access point for no visible reason. */}
-      {status?.wpa2_only_stronger && (
+      {/* Kept up for a failed attempt's message as well, as the lock's
+          banner below is: a finding that clears would take the reason away
+          with it. */}
+      {(status?.wpa2_only_stronger || errors.allow_wpa2) && (
         <Banner variant="info">
-          A stronger access point on this network (signal{" "}
-          {status.wpa2_only_stronger.signal} vs{" "}
-          {status.wpa2_only_stronger.current_signal}) only offers WPA2, and this
-          network is saved as WPA3-only, so this device can't use it. Access points
-          that offer WPA3 keep using it. Only allow this if that access point
-          is yours: anyone nearby can broadcast your network's name.
+          {status?.wpa2_only_stronger && (
+            <>
+              A stronger access point on this network (signal{" "}
+              {status.wpa2_only_stronger.signal} of 100, against{" "}
+              {status.wpa2_only_stronger.current_signal} for the one in use) only
+              offers WPA2, and this network is saved as WPA3-only, so this device
+              can't use it. Access points that offer WPA3 keep using it. Only
+              allow this if that access point is yours:
+              anyone nearby can broadcast your network's name. Allowing it
+              reconnects WiFi.
+            </>
+          )}
           {errors.allow_wpa2 && (
             <div style={{ color: theme.error.text }}>{errors.allow_wpa2}</div>
           )}
@@ -1097,7 +1335,16 @@ function Content() {
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleAllowWpa2}>
-              Allow WPA2 here
+              {working === "allow_wpa2" ? WORKING_TEXT : "Allow WPA2 here"}
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+      {errors.allow_wpa2 && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissWpa2Error}>
+              Dismiss
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
@@ -1111,12 +1358,13 @@ function Content() {
           with it. That message can be dismissed, and expires like the
           others. */}
       {(status?.lock_weaker || errors.move_bssid_lock) && (
-        <Banner variant="warning" icon="⚠">
+        <Banner variant="warning">
           {status?.lock_weaker && (
             <>
               The access point lock is holding you on a weaker access point
-              (signal {status.lock_weaker.current_signal}). A stronger one is in
-              range (signal {status.lock_weaker.signal}).
+              (signal {status.lock_weaker.current_signal} of 100). A stronger one is in
+              range (signal {status.lock_weaker.signal} of 100). Moving the lock
+              reconnects WiFi for a few seconds.
             </>
           )}
           {errors.move_bssid_lock && (
@@ -1129,7 +1377,7 @@ function Content() {
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleMoveLock}>
-              Move the lock
+              {working === "move_bssid_lock" ? WORKING_TEXT : "Move the lock"}
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
@@ -1144,11 +1392,16 @@ function Content() {
         </PanelSection>
       )}
 
+      {/* A successful move can still say something, such as staying put. */}
+      {notices.move_bssid_lock && (
+        <Banner variant="info">{notices.move_bssid_lock}</Banner>
+      )}
+
       {/* A setting we wrote was the likely reason the device could not
           connect, so it was released. Worth stating plainly: nothing the user
           did caused it, and the preference is not lost. */}
       {status?.external?.pin_released && (
-        <Banner variant="warning" icon="⚠">
+        <Banner variant="warning">
           WiFi could not connect for a while, so the locked access point or
           band preference was released to let it reconnect. The setting is
           still on and applies again to whichever access point works.
@@ -1157,10 +1410,10 @@ function Content() {
 
       {/* Drift alert */}
       {connected && !!s?.last_applied && driftCount > 0 && (
-        <Banner variant="warning" icon="⚠">
+        <Banner variant="warning">
           {driftCount > 1
-            ? `${driftCount} settings no longer match what you set.`
-            : "1 setting no longer matches what you set."}
+            ? `These settings no longer match what you set: ${driftNames.join(", ")}. Fix now puts them back.`
+            : `${driftNames[0]} no longer matches what you set. Fix now puts it back.`}
         </Banner>
       )}
       {connected && !!s?.last_applied && driftCount > 0 && (
@@ -1175,14 +1428,15 @@ function Content() {
 
       {/* Status read failed - say so rather than claiming disconnection */}
       {status?.success === false && (
-        <Banner variant="error" icon="⚠">
-          {status?.message ?? "Couldn't read WiFi status."}
+        <Banner variant="error">
+          {status?.message ?? "Couldn't read WiFi status."} The panel keeps
+          trying. If this stays, restart the device.
         </Banner>
       )}
 
       {/* Disconnected banner */}
       {status?.success !== false && !connected && (
-        <Banner variant="error" icon="✕">
+        <Banner variant="error">
           Not connected to WiFi. Connect first, then optimize.
         </Banner>
       )}
@@ -1193,20 +1447,9 @@ function Content() {
         // Treat reconnect timeout as a warning even when the backend-level
         // switch succeeded - the system is switched but WiFi didn't come back.
         const isWarning = !r.success || r.needs_reboot || r.reconnect_timed_out;
-        let text: string;
-        if (r.needs_reboot) {
-          text = `Backend switched to ${r.target}, but wlan0 didn't come back - reboot required`;
-        } else if (!r.success) {
-          text = r.message ?? "Backend switch failed";
-        } else {
-          const parts = [`Switched to ${r.backend}`];
-          if (r.recovery_performed) parts.push("wlan0 interface recreated");
-          if (r.reconnect_timed_out) parts.push("WiFi didn't reconnect");
-          text = parts.join(", ");
-        }
         return (
-          <Banner variant={isWarning ? "warning" : "success"} icon={isWarning ? "⚠" : "✓"}>
-            {text}
+          <Banner variant={isWarning ? "warning" : "success"}>
+            {backendResultText(r)}
           </Banner>
         );
       })()}
@@ -1217,8 +1460,8 @@ function Content() {
         // it read as "All applied".
         if (optimizeResult.success === false) {
           return (
-            <Banner variant="error" icon="⚠">
-              {optimizeResult.message ?? "Something went wrong."}
+            <Banner variant="error">
+              {optimizeResult.message ?? GENERIC_FAIL_TEXT}
             </Banner>
           );
         }
@@ -1234,7 +1477,7 @@ function Content() {
           <Banner variant={all ? "success" : "warning"}>
             {all
               ? "All applied"
-              : `${optimizeResult.applied}/${optimizeResult.total} applied`}
+              : `${optimizeResult.applied} of ${optimizeResult.total} applied. The settings marked failed below say why.`}
           </Banner>
         );
       })()}
@@ -1244,7 +1487,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected || applyingAll || isBusy}
+            disabled={!connected || applyingAll || isBusy || updating}
             onClick={handleOptimize}
           >
             {applyingAll
@@ -1254,6 +1497,13 @@ function Content() {
                 : "Optimize Safe"}
           </ButtonItem>
         </PanelSectionRow>
+        {applyingAll && (
+          <PanelSectionRow>
+            <div style={{ fontSize: theme.fontSize.small, color: theme.info.text }}>
+              {BATCH_WORKING_TEXT}
+            </div>
+          </PanelSectionRow>
+        )}
       </PanelSection>
 
       {/* Power & stability */}
@@ -1261,7 +1511,7 @@ function Content() {
         <InfoRow
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
-          explanation="The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal."
+          explanation="The OS saves WiFi power in several places: the wireless chip, the PCIe link between the chip and the CPU, and low power modes in the driver. These can cause latency spikes, packets sent in batches, and lower throughput during a long stream. This turns them off, so the WiFi hardware stays fully awake. It uses a little more battery."
           {...gatedBadge("power_save", s?.power_save_disabled)}
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
@@ -1273,18 +1523,21 @@ function Content() {
         />
         <InfoRow
           label="Stop background scanning"
-          subtitle="Pins one access point - disable to roam"
-          explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Pinning the connection to one access point stops these scans entirely. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock."
+          subtitle="Pins one access point. Turn off to roam."
+          explanation="While connected, your device scans now and then for a better access point. Each scan takes the radio off your channel for a moment, which can drop packets and make a game stream stutter. Pinning the connection to one access point turns off these roaming scans. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock. Turning it on or off reconnects WiFi for a few seconds."
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
-            ? { badge: "unknown" as const, text: "other network" }
+            ? otherNetworkBadge
             : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
           checked={s?.bssid_lock_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.bssid_lock_enabled)}
+          working={working === "bssid_lock"}
           error={errors.bssid_lock}
           notice={
             notices.bssid_lock ??
             (status?.live?.pins_inactive_iwd && s?.bssid_lock_enabled
               ? IWD_PIN_NOTICE
+              : status?.live?.bssid_lock_other_network && s?.bssid_lock_enabled
+              ? OTHER_NETWORK_TEXT
               : status?.external?.bssid_lock
               ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
               : undefined)
@@ -1295,7 +1548,7 @@ function Content() {
         />
         <InfoRow
           label="Auto-fix on wake"
-          subtitle="Reapplies settings after sleep (NM dispatcher)"
+          subtitle="Reapplies settings after sleep"
           explanation="The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
           {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
@@ -1309,7 +1562,7 @@ function Content() {
         <InfoRow
           label="Network buffer tuning"
           subtitle="Optimize UDP buffers and TX queue for streaming"
-          explanation="Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot."
+          explanation="Increases the kernel's network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when WiFi connects if Auto-fix on wake is on."
           {...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled)}
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
@@ -1376,8 +1629,8 @@ function Content() {
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
               WiFi region: {regdomain.governing || "unknown"}. This device's
               WiFi card sets its own region, so it cannot be changed here. That
-              is normal for many cards, the Steam Deck's included, and does not
-              mean a band is missing.
+              is normal for many cards{isDeck ? ", the Steam Deck's included," : ""} and
+              does not mean a band is missing.
             </div>
           </PanelSectionRow>
         )}
@@ -1386,14 +1639,19 @@ function Content() {
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you.${
+          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only turn this on if your router has 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you. Turning it on or off reconnects WiFi for a few seconds.${
             supports6GHz
-              ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
+              ? status?.live?.six_ghz_offered || on6GHz
+                ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz. To stay on 6 GHz, use Force 6 GHz band below instead."
+                : " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
               : ""
           }`}
-          {...getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null)}
+          {...(bandOther && !on6GHz && !band5Error
+            ? otherNetworkBadge
+            : getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null))}
           checked={(s?.band_preference_enabled ?? false) && !on6GHz}
           disabled={isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz))}
+          working={working === "band_5ghz"}
           error={band5Error}
           notice={
             notices.band_5ghz ??
@@ -1402,6 +1660,10 @@ function Content() {
               : notices.band_preference ??
                 (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
                   ? IWD_PIN_NOTICE
+                  : bandOther
+                  ? OTHER_NETWORK_TEXT
+                  : onBg
+                  ? "This network is held to 2.4 GHz by an older setting, not 5 GHz. Turn this off, then on again, to use 5 GHz."
                   : status?.external?.band
                   ? "This network is already limited to one band by a setting outside this plugin. Turn this on and off to clear it."
                   : undefined))
@@ -1409,8 +1671,13 @@ function Content() {
           onChange={(val: boolean) => {
             clearBandMessages();
             handleToggle("band_5ghz", () =>
-              // Never "6GHz": turning that off leaves it recorded as the band.
-              backend.setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")
+              // Turning it on always asks for 5 GHz, which is what the
+              // toggle says, even over a 2.4 GHz setting from an old
+              // version. Never "6GHz": turning that off leaves it recorded
+              // as the band.
+              val
+                ? backend.setBandPreference(true, "a")
+                : backend.setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a")
             );
           }}
         />
@@ -1418,16 +1685,23 @@ function Content() {
           <InfoRow
             label="Force 6 GHz band"
             subtitle="Stay on 6 GHz where your router has it"
-            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
-            {...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null)}
+            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Turning it on or off reconnects WiFi. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
+            {...(bandOther && on6GHz && !band6Error
+              ? otherNetworkBadge
+              : getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null))}
             checked={on6GHz}
             disabled={isBusy || updating || (!connected && !on6GHz)}
+            working={working === "band_6ghz"}
             error={band6Error}
             notice={
               notices.band_6ghz ??
               (on6GHz
                 ? notices.band_preference ??
-                  (status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+                  (status?.live?.pins_inactive_iwd
+                    ? IWD_PIN_NOTICE
+                    : bandOther
+                      ? OTHER_NETWORK_TEXT
+                      : undefined)
                 : undefined)
             }
             onChange={(val: boolean) => {
@@ -1439,12 +1713,18 @@ function Content() {
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
-          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network."
-          {...getBadge("dns", status, errors.dns ?? null)}
+          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the WiFi network you set it on. Each change reconnects WiFi for a few seconds."
+          {...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
+            ? otherNetworkBadge
+            : getBadge("dns", status, errors.dns ?? null))}
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.dns_enabled)}
+          working={working === "dns"}
           error={errors.dns}
-          notice={notices.dns}
+          notice={
+            notices.dns ??
+            (status?.live?.dns_other_network && s?.dns_enabled ? OTHER_NETWORK_TEXT : undefined)
+          }
           onChange={(val: boolean) => {
             if (!val) resetDnsDraft();
             handleToggle("dns", () =>
@@ -1518,18 +1798,21 @@ function Content() {
         <InfoRow
           label="Disable IPv6"
           subtitle="Use IPv4 only on this network"
-          explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only enable this if you're experiencing issues - most modern networks handle IPv6 fine."
-          {...getBadge("ipv6", status, errors.ipv6 ?? null)}
+          explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only turn this on if you have one of those problems. Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for a few seconds."
+          {...(status?.live?.ipv6_other_network && s?.ipv6_disabled && !errors.ipv6
+            ? otherNetworkBadge
+            : getBadge("ipv6", status, errors.ipv6 ?? null))}
           notice={
             notices.ipv6 ??
             (status?.external?.ipv6
-              ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
+              ? "IPv6 is already off on this connection, which is common for saved networks. Nothing to do unless something here needs IPv6. To turn IPv6 back on, turn this on, then off."
               : status?.live?.ipv6_other_network
-                ? "On for the network it was turned on for, not this one."
+                ? OTHER_NETWORK_TEXT
                 : undefined)
           }
           checked={s?.ipv6_disabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.ipv6_disabled)}
+          working={working === "ipv6"}
           error={errors.ipv6}
           onChange={(val: boolean) =>
             handleToggle("ipv6", () => backend.setIpv6(val))
@@ -1537,8 +1820,8 @@ function Content() {
         />
         <InfoRow
           label="Traffic shaping (CAKE)"
-          subtitle="Fair queuing and bufferbloat prevention"
-          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled."
+          subtitle="Fair queuing for traffic this device sends"
+          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection, so it does not fix lag that starts there. It does not limit your bandwidth. It is lost on reboot, and put back when WiFi connects if Auto-fix on wake is on."
           {...gatedBadge("cake", s?.cake_enabled)}
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.cake_enabled)}
@@ -1588,6 +1871,8 @@ function Content() {
         onForceReapply={handleForceReapply}
         onReset={handleResetSettings}
         resetError={errors.reset}
+        resetNotice={notices.reset}
+        workingText={working === "reset" ? WORKING_TEXT : applyingAll ? BATCH_WORKING_TEXT : null}
       />
 
       <UpdatesSection
@@ -1606,7 +1891,7 @@ function Content() {
       />
 
       <PanelFooter version={status?.version ?? "?"} />
-    </>
+    </DetailsContext.Provider>
   );
 }
 

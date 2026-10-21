@@ -4,9 +4,10 @@ import { theme } from "../theme";
 
 type BannerVariant = "success" | "warning" | "error" | "info";
 
+// No icon glyphs: the color says how serious it is, and the text says what
+// happened and what to do.
 interface BannerProps {
   variant: BannerVariant;
-  icon?: ReactNode;
   children: ReactNode;
 }
 
@@ -14,7 +15,7 @@ interface BannerProps {
 // (unknown hardware, drift alert, optimize result, backend switch
 // result, update errors, etc.). Each banner sits in its own
 // PanelSection so Decky's QAM can focus it with gamepad navigation.
-export function Banner({ variant, icon, children }: BannerProps) {
+export function Banner({ variant, children }: BannerProps) {
   const palette = theme[variant];
   return (
     <PanelSection>
@@ -34,9 +35,6 @@ export function Banner({ variant, icon, children }: BannerProps) {
             boxSizing: "border-box",
           }}
         >
-          {icon !== undefined && (
-            <span style={{ fontSize: theme.fontSize.icon }}>{icon}</span>
-          )}
           <span>{children}</span>
         </div>
       </PanelSectionRow>

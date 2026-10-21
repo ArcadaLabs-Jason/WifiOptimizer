@@ -1,24 +1,27 @@
-import { PanelSection, PanelSectionRow } from "@decky/ui";
+import { PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
 import { theme } from "../theme";
 import { timeAgo } from "../utils";
 import type { LiveStatus } from "../types";
 
 interface PanelHeaderProps {
   driver: string;
-  version: string;
   lastApplied: number;
   lastEnforced?: number;
   deviceLabel?: string;
   streaming?: LiveStatus;
+  // Every setting's explanation open at once, for reading with a controller.
+  showDetails: boolean;
+  onShowDetails: (on: boolean) => void;
 }
 
 export function PanelHeader({
   driver,
-  version,
   lastApplied,
   lastEnforced,
   deviceLabel,
   streaming,
+  showDetails,
+  onShowDetails,
 }: PanelHeaderProps) {
   const modelLabel = deviceLabel && deviceLabel !== "unknown"
     ? deviceLabel
@@ -66,10 +69,12 @@ export function PanelHeader({
         </PanelSectionRow>
       )}
       <PanelSectionRow>
-        <div style={rowStyle}>Version: {version}</div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div style={rowStyle}>Tap (i) on any toggle for details</div>
+        <ToggleField
+          label="Show details"
+          description="Explains every setting below. You can also tap (i) next to one."
+          checked={showDetails}
+          onChange={onShowDetails}
+        />
       </PanelSectionRow>
       <PanelSectionRow>
         <div style={rowStyle}>

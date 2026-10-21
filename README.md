@@ -2,7 +2,7 @@
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
-A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. Benefits any streaming over WiFi - Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki (PS Remote Play), and more.
+A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. It helps any streaming over WiFi: Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki (PS Remote Play), and more.
 
 **Supported devices:** Steam Deck (LCD and OLED), Legion Go, ROG Ally, and other PC handhelds. Works on SteamOS, Bazzite, and CachyOS.
 
@@ -10,7 +10,7 @@ A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause 
 
 ## The problem
 
-The OS resets WiFi settings after every system update and sleep/wake cycle. Power management gets re-enabled and network buffers reset to defaults. The result: latency spikes, connection drops, and degraded streaming quality - and the only fix is a trip to Desktop Mode.
+The OS resets WiFi settings after every system update and sleep/wake cycle. Power management gets re-enabled and network buffers reset to defaults. The result: latency spikes, connection drops, and degraded streaming quality, and the only fix is a trip to Desktop Mode.
 
 WiFi Optimizer fixes this from Game Mode. One tap, and it stays fixed.
 
@@ -32,11 +32,11 @@ That link always points at the latest stable release. You can also download `wif
 curl -sL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
 ```
 
-This requires a user password - set one with `passwd` in Konsole if you haven't already. It keeps your settings if the plugin is already installed.
+This requires a user password. Set one with `passwd` in Konsole if you haven't already. It keeps your settings if the plugin is already installed.
 
 Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
 
-**Updating:** The plugin checks for updates automatically when you open it, and from v0.24.0 on also twice a day in the background: when a new version comes out you get one notification (never during a game or a stream), and tapping it opens the plugin. You can turn that off with **Tell me about updates** in the Updates section. Nothing installs on its own. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. The button won't start an update while a game or a stream is running; close it first. You can also update manually by running the install command above again. That always installs the latest stable release, so on the beta channel it can take you back to an older version.
+**Updating:** The plugin checks for updates automatically when you open it, and from v0.24.0 on also twice a day in the background: when a new version comes out you get one notification (never during a game or a stream), and tapping it opens the plugin. You can turn that off with **Tell me about updates** in the Updates section. Nothing installs on its own. If an update is available, an update button appears at the top of the panel. Tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. The button won't start an update while a game or a stream is running; close it first. You can also update manually by running the install command above again. That always installs the latest stable release, so on the beta channel it can take you back to an older version.
 
 Releases are signed. From v0.21.0-beta on, before installing an update, the plugin checks the release's signature against the keys built into it and the download against the signed checksum, and installs nothing that doesn't match. Earlier versions install what they download. The install command doesn't check signatures: it downloads the latest stable release over HTTPS from GitHub, or the current main branch if it can't look up the release. [SECURITY.md](SECURITY.md) lists the keys and how to check a release yourself. The beta channel installs the newest release of either kind, beta or stable.
 
@@ -45,14 +45,14 @@ Releases are signed. From v0.21.0-beta on, before installing an update, the plug
 ## Getting started
 
 1. Open WiFi Optimizer from the Decky sidebar
-2. Tap **Optimize Safe** - this applies four optimizations that suit most setups (three when the WiFi backend is `iwd`, where the BSSID lock is left out):
+2. Tap **Optimize Safe**. This applies four optimizations that suit most setups (three when the WiFi backend is `iwd`, where the BSSID lock is left out):
    - Disables WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
    - Locks your BSSID (stops background scanning interruptions, but also stops roaming between access points, see below)
    - Enables auto-fix on wake (reapplies settings after sleep)
    - Tunes network buffers (handles streaming traffic bursts)
 3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
 
-Want to go further? The remaining optimizations are available as individual toggles - each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs. Advanced options include forcing 5 GHz (or 6 GHz, where your setup supports it), custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
+Want to go further? The remaining optimizations are available as individual toggles. Each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs, and **Show details** at the top of the panel opens all of them at once, for reading with a controller. Advanced options include forcing 5 GHz (or 6 GHz, where your setup supports it), custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
 
 ## All optimizations
 
@@ -62,7 +62,7 @@ Want to go further? The remaining optimizations are available as individual togg
 |---|---|
 | Prevent lag spikes | Disables WiFi power management and PCIe power states that cause packet batching, latency spikes, and throughput degradation during sustained streaming. |
 | Stop background scanning | Pins your connection to one access point so your device stops scanning for other networks every few minutes. On a mesh it pins the strongest access point your network offers rather than whichever one you happen to be on, preferring 5 GHz where the signal is equal, and stays put if the one you are on is already healthy. If the stronger one turns out not to accept the connection, the previous one is restored. After that the lock keeps you on that one access point, so if you carry your device somewhere a much stronger one is in range, the panel says so and **Move the lock** moves it. It never moves on its own, since moving reconnects. If the pinned access point later stops being reachable and the device has been offline for a minute, the pin is released so you can connect again, and reapplied to whichever access point works. It only applies to the network it was turned on for, so other networks you join are left alone. Disable it if you need to roam between access points. Needs the `wpa_supplicant` backend: under `iwd`, NetworkManager can't reconnect a network pinned this way, so the lock is paused, and its pins removed, while `iwd` is in use. |
-| Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects - works even if Decky isn't running |
+| Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects. Works even if Decky isn't running. |
 | Network buffer tuning | Increases kernel buffer sizes and TX queue length to handle bursty streaming traffic without dropping packets |
 
 **Manual opt-in (require configuration or have tradeoffs)**
@@ -71,9 +71,9 @@ Want to go further? The remaining optimizations are available as individual togg
 |---|---|---|
 | Force 5 GHz band | Locks WiFi to 5 GHz to avoid Bluetooth interference on 2.4 GHz | No use on a 2.4 GHz only network, and keeps a 6 GHz capable device off 6 GHz. Refused when no 5 GHz access point for your network is in range. Paused while the `iwd` backend is in use, for the same reason as the access point lock. |
 | Force 6 GHz band | Locks WiFi to 6 GHz, the least crowded band, on routers with WiFi 6E or newer | Only shown on a 6 GHz capable card with NetworkManager 1.58 or newer (expected with SteamOS 3.9) and the `wpa_supplicant` backend. Needs WPA3: a network saved for WPA2 works from NetworkManager 1.58.1. Refused when no 6 GHz access point for your network is in range, and if the device can't connect on 6 GHz the band is put back as it was. 6 GHz reaches less far than 5 GHz; out of range, the pin is released after a minute like the others. |
-| Traffic shaping (CAKE) | Replaces the default network queue with CAKE for fair queuing, bufferbloat prevention, and ACK filtering. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
+| Traffic shaping (CAKE) | Replaces the default queue for traffic your device sends with CAKE, for fair queuing and ACK filtering. It cannot fix lag that starts at your router or internet connection. Does not limit bandwidth. | Replaces your system's default qdisc; resets on reboot |
 | Custom DNS | Overrides your ISP's DNS with Cloudflare, Google, Quad9, or custom servers | Requires choosing a provider |
-| Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6 - most are fine |
+| Disable IPv6 | Forces all traffic through IPv4 | Only helps on networks with broken IPv6. Most are fine. |
 | WiFi region | Sets the wireless regulatory domain, which decides the channels your device may use. The wrong region can hide 5 GHz and 6 GHz channels entirely. | Only offered on devices whose WiFi card does not carry its own region. Steam Deck cards do, so the panel reports the region in use and offers no control there. |
 | WiFi backend (iwd / wpa_supplicant) | Switches between `iwd` and `wpa_supplicant`. Some devices are more stable with wpa_supplicant across sleep/wake and 5 GHz. On SteamOS 3.8 this goes through the same system service as the setting in SteamOS Settings, so the two agree. Switching to `iwd` pauses the access point lock and Force 5 GHz. | Only shown when the system provides a way to switch; some networks (certain WPA3, enterprise setups) behave differently between the two |
 
@@ -160,7 +160,7 @@ BSD 3-Clause. See [LICENSE](LICENSE).
 
 The built frontend (`dist/index.js`) includes code from these libraries, under their own licenses:
 
-- [@decky/api](https://github.com/SteamDeckHomebrew/loader-api) - LGPL-2.1
-- [react-icons](https://github.com/react-icons/react-icons) - MIT
+- [@decky/api](https://github.com/SteamDeckHomebrew/loader-api), LGPL-2.1
+- [react-icons](https://github.com/react-icons/react-icons), MIT
 
 The panel also uses [@decky/ui](https://github.com/SteamDeckHomebrew/decky-frontend-lib) (LGPL-2.1), which Decky Loader provides at runtime rather than this bundle, and [tslib](https://github.com/microsoft/tslib) (0BSD) is installed with the build tools, though none of it ends up in the bundle.
