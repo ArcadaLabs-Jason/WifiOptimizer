@@ -63,6 +63,8 @@ const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 // progress report took the "didn't complete" message straight back off.
 const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
+// How long a finished backend switch's result stays up.
+const BACKEND_RESULT_MS = 60 * 1000;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE =
   "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
@@ -504,6 +506,21 @@ function Content() {
       stop();
     };
   }, [runUpdateCheck]);
+
+  // A switch's result describes that switch, and was left up for as long as
+  // the panel stayed mounted, so "Switched to iwd" could still be showing
+  // after the backend was changed again from SteamOS. A reboot request is
+  // kept: it stays true until the reboot.
+  useEffect(() => {
+    const r = backendSwitch?.result;
+    if (!backendSwitch || backendSwitch.in_progress || !r || r.needs_reboot) return;
+    const shown = backendSwitch;
+    const id = setTimeout(
+      () => setBackendSwitch((prev) => (prev === shown ? null : prev)),
+      BACKEND_RESULT_MS,
+    );
+    return () => clearTimeout(id);
+  }, [backendSwitch]);
 
   // ---- User action handlers ----
   //
