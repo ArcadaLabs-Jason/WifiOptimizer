@@ -389,6 +389,13 @@ DEFAULT_SETTINGS = {
     # reach only the profile in use, so the network it was set on kept
     # public DNS (and ignored the router's) with the panel showing it off.
     "dns_uuids": [],
+    # Profiles Allow WPA2 here changed from WPA3 only (sae) to wpa-psk.
+    # Reset and uninstall put sae back on each of them; nothing else in the
+    # panel undoes it.
+    "wpa2_uuids": [],
+    # Profiles Reset or uninstall could not put back to WPA3 only. Retried a
+    # profile at a time by the status poll until each one takes.
+    "wpa2_restore_uuids": [],
     "ipv6_disabled": False,
     "ipv6_uuids": [],
     # Access points that accepted a scan but refused an association, and when.
@@ -468,6 +475,21 @@ def _sh_quote(value: str) -> str:
     if _SH_UNSAFE.search(value) is None:
         return value
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _display_ssid(ssid: str) -> str:
+    """A network name as nmcli's terse output gives it, unescaped for the
+    panel: it writes a colon in the name as \\: and a backslash as \\\\."""
+    out, escaped = [], False
+    for ch in ssid or "":
+        if escaped:
+            out.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _open_dir_no_follow(path: str, create: bool = False) -> int:
@@ -694,16 +716,28 @@ _ALWAYS_RUNNING = (
 
 def _parse_stream_patterns(text: str) -> tuple[list[str], list[str]]:
     """(kept, refused) from the user's process pattern field."""
+    kept, refused = _stream_pattern_verdicts(text)
+    return kept, [token for token, _why in refused]
+
+
+def _stream_pattern_verdicts(text: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """(kept, [(token, why)]) from the user's process pattern field, why
+    being "short", "long", "always" or "limit", so the panel can say which
+    rule each refused one broke rather than list every rule at once."""
     kept, refused = [], []
     for token in re.split(r"[\s,]+", (text or "").lower()):
         if not token or token in kept:
             continue
-        if (STREAM_PATTERN_MIN <= len(token) <= STREAM_PATTERN_MAX
-                and not any(token in line for line in _ALWAYS_RUNNING)
-                and len(kept) < STREAM_PATTERNS_MAX):
-            kept.append(token)
+        if len(token) < STREAM_PATTERN_MIN:
+            refused.append((token, "short"))
+        elif len(token) > STREAM_PATTERN_MAX:
+            refused.append((token, "long"))
+        elif any(token in line for line in _ALWAYS_RUNNING):
+            refused.append((token, "always"))
+        elif len(kept) >= STREAM_PATTERNS_MAX:
+            refused.append((token, "limit"))
         else:
-            refused.append(token)
+            kept.append(token)
     return kept, refused
 
 
@@ -1155,7 +1189,7 @@ def _clean_settings(data: dict) -> dict:
     # the one list whose entries were never checked was also the one the
     # cleanup refuses to act on without a record.
     for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids",
-                "dns_uuids"):
+                "dns_uuids", "wpa2_uuids", "wpa2_restore_uuids"):
         merged[key] = [
             u for u in merged.get(key, [])
             if isinstance(u, str) and UUID_RE.match(u)
@@ -2093,6 +2127,8 @@ class Plugin:
             oldest = known[0]
             if prop == "ipv4.dns":
                 cleared = self._clear_dns(oldest)
+            elif prop == "802-11-wireless-security.key-mgmt":
+                cleared = self._restore_wpa3_only(oldest)
             else:
                 done = self._nmcli_modify(
                     oldest, prop, "auto" if prop == "ipv6.method" else "", timeout=2
@@ -2378,8 +2414,14 @@ class Plugin:
         Valve's line goes before NetworkManager is told to read its config
         again. Reloaded first, it read our 2 still in Valve's file and kept
         power save off until the next reload.
+
+        Valve's line is only looked at while our file is there: only then
+        can a 2 in it be ours. Without one, a 2 is the user's own Steam
+        setting (WiFi power management off), and Reset followed by an
+        uninstall used to turn it back on.
         """
         changed = False
+        ours = os.path.lexists(NM_CONF_PATH)
         try:
             os.remove(NM_CONF_PATH)
             changed = True
@@ -2387,12 +2429,13 @@ class Plugin:
             pass
         except OSError as e:
             decky.logger.error(f"Undoing power save, our NetworkManager file: {e}")
-        try:
-            valve = self._valve_powersave()
-            self._release_valve_powersave(settings)
-            changed = changed or self._valve_powersave() != valve
-        except Exception as e:
-            decky.logger.error(f"Undoing power save, Valve's setting: {e}")
+        if ours:
+            try:
+                valve = self._valve_powersave()
+                self._release_valve_powersave(settings)
+                changed = changed or self._valve_powersave() != valve
+            except Exception as e:
+                decky.logger.error(f"Undoing power save, Valve's setting: {e}")
         try:
             os.remove(MODPROBE_CONF_PATH)
         except FileNotFoundError:
@@ -2402,6 +2445,14 @@ class Plugin:
         if changed and reload:
             self._reload_nm_conf()
         return changed
+
+    def _valve_powersave_record(self) -> str:
+        """Valve's wifi.powersave as valve_powersave_before records it: the
+        value, "" for none, "?" for anything NetworkManager does not define.
+        Recorded once nothing of ours is left in that file, so what it says
+        then is the user's own."""
+        found = self._valve_powersave()
+        return "" if found is None else found if found in _VALVE_POWERSAVE_VALUES else "?"
 
     def _release_regdomain(self, settings: dict | None = None):
         """Put back the wireless region from before the user chose one here.
@@ -2518,14 +2569,18 @@ class Plugin:
         """
         settings = settings if settings is not None else _load_settings()
         left: dict = {"bssid_lock_uuids": [], "band_preference_uuids": [],
-                      "ipv6_uuids": [], "dns_uuids": []}
+                      "ipv6_uuids": [], "dns_uuids": [], "wpa2_uuids": [],
+                      "wpa2_restore_uuids": []}
 
-        def budget(default: float) -> float | None:
-            """The timeout for the next call, or None when time is up."""
+        def budget(default: float, calls: int = 1) -> float | None:
+            """The timeout for each of the next calls, or None when there is
+            not time for all of them."""
             if deadline is None:
                 return default
             remaining = deadline - time.monotonic()
-            return min(default, remaining) if remaining >= 0.5 else None
+            if remaining < 0.5 * calls:
+                return None
+            return min(default, remaining / calls)
 
         def cleared(result: dict) -> bool:
             # A profile that no longer exists has nothing left to undo.
@@ -2536,6 +2591,13 @@ class Plugin:
         current = settings.get("bssid_lock_connection_uuid", "")
         if current and current not in uuids:
             uuids.append(current)
+        last = settings.get("last_connection_uuid", "")
+        # The profile last in use too, once this install has written a BSSID
+        # pin: the lock follows whichever copy of a network is in use, and
+        # the band sweep below and the iwd unpin already cover it.
+        if (last and last not in uuids
+                and "802-11-wireless.bssid" in settings.get("pins_owned", [])):
+            uuids.append(last)
         # Unconditional. Gating on the toggle skipped exactly the profiles
         # left behind by turning it OFF, which is when they are stranded.
         for uuid in uuids:
@@ -2550,7 +2612,6 @@ class Plugin:
             )
             if not cleared(result):
                 left["bssid_lock_uuids"].append(uuid)
-        last = settings.get("last_connection_uuid", "")
         band_uuids = list(settings.get("band_preference_uuids", []))
         # The profiles beyond the recorded list only if a band pin was ever
         # ours: otherwise a band set by hand would be wiped by Reset.
@@ -2571,22 +2632,70 @@ class Plugin:
                 left["ipv6_uuids"].append(uuid)
         # And DNS, which no reset or uninstall used to touch at all: the
         # profile kept public servers and ignored the router's afterwards.
+        # Budgeted as the three calls it makes, not one: given one call's
+        # slot, the later ones ran past the deadline.
         for uuid in dict.fromkeys(u for u in settings.get("dns_uuids", []) if u):
-            timeout = budget(2)
+            timeout = budget(2, calls=3)
             if timeout is None or not self._clear_dns(uuid, timeout=timeout):
                 left["dns_uuids"].append(uuid)
+        # And WPA3 only, where Allow WPA2 here widened a profile: nothing
+        # after teardown would know to put it back. One that cannot be put
+        # back now is retried by the status poll.
+        wpa2 = list(settings.get("wpa2_uuids", [])) + list(settings.get("wpa2_restore_uuids", []))
+        for uuid in dict.fromkeys(u for u in wpa2 if u):
+            timeout = budget(2, calls=2)
+            if timeout is None or not self._restore_wpa3_only(uuid, timeout=timeout):
+                left["wpa2_restore_uuids"].append(uuid)
         return left
+
+    def _restore_wpa3_only(self, uuid: str, timeout: float = 2) -> bool:
+        """Put a profile Allow WPA2 here widened back to WPA3 only (sae).
+
+        Only while it still says wpa-psk, the value written there: a profile
+        whose security has been changed some other way since is the user's
+        to keep. True when done, when there is nothing to undo, or when the
+        profile no longer exists.
+        """
+        result = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-f", "802-11-wireless-security.key-mgmt",
+             "con", "show", "uuid", uuid],
+            timeout=timeout,
+        )
+        if "unknown connection" in (result.get("stderr") or "").lower():
+            return True
+        if not result["success"]:
+            return False
+        _, sep, value = result.get("stdout", "").partition(":")
+        if not sep or value.strip() != "wpa-psk":
+            return True
+        done = self._nmcli_modify(uuid, "802-11-wireless-security.key-mgmt", "sae",
+                                  timeout=timeout)
+        return done["success"] or "unknown connection" in (done.get("stderr") or "").lower()
 
     def _clear_dns(self, uuid: str, timeout: float = 2) -> bool:
         """Give a profile back its automatic DNS. True when done, or when the
-        profile no longer exists and there is nothing left to undo."""
-        results = [
-            self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no", timeout=timeout),
+        profile no longer exists and there is nothing left to undo.
+
+        The router's DNS is let back in before our servers come out, and
+        nothing more is tried once that fails: the servers left in place
+        then still resolve. Cleared regardless, as before, a profile ended
+        up ignoring the router's DNS with no servers of its own, which
+        reconnects with no resolvers at all. IPv6's automatic DNS comes back
+        too, as custom DNS turns it off alongside IPv4's.
+        """
+        def gone(result: dict) -> bool:
+            return "unknown connection" in (result.get("stderr") or "").lower()
+
+        first = self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no", timeout=timeout)
+        if gone(first):
+            return True
+        if not first["success"]:
+            return False
+        rest = [
+            self._nmcli_modify(uuid, "ipv6.ignore-auto-dns", "no", timeout=timeout),
             self._nmcli_modify(uuid, "ipv4.dns", "", timeout=timeout),
         ]
-        gone = any("unknown connection" in (r.get("stderr") or "").lower()
-                   for r in results)
-        return gone or all(r["success"] for r in results)
+        return any(gone(r) for r in rest) or all(r["success"] for r in rest)
 
     # What a profile setter answers while another is still mid-change. Two at
     # once interleave their radio cycles and pin writes on one profile.
@@ -2595,6 +2704,21 @@ class Plugin:
         "error": "busy",
         "message": "Another WiFi change is still in progress. Try again in a moment.",
     }
+
+    def _busy_result(self) -> dict:
+        """_BUSY_RESULT, saying what it is waiting for.
+
+        _profile_change_refused also refuses while an update installs and
+        while the WiFi backend switches, and the panel shows no WiFi change
+        running in either case, so "another WiFi change" sent people
+        looking for one that was not there.
+        """
+        result = dict(self._BUSY_RESULT)
+        if self._update_running():
+            result["message"] = "An update is being installed. Try again once it finishes."
+        elif self._backend_switch_running():
+            result["message"] = "Wait for the WiFi backend switch to finish, then try again."
+        return result
 
     _RADIO_OFF_RESULT = {
         "success": False,
@@ -3058,7 +3182,35 @@ class Plugin:
             # an older version left (and the unpin then latches for the boot).
             self._heal_orphaned_iwd_conf()
             await self._unpin_if_iwd()
-            await self._startup_streaming(_load_settings())
+
+            # Prevent lag spikes off, but the files that hold power save off
+            # past a reboot still there: a Reset or a toggle-off cut short
+            # by a reload, or the plugin stopped part way. Nothing else
+            # looks at them with the setting off, so they would hold power
+            # save off for good under a toggle that reads off. Auto mode is
+            # left to _startup_streaming, which drops them its own way.
+            current = _load_settings()
+            if not current.get("power_save_disabled") and not current.get(
+                    "streaming_mode_enabled"):
+                try:
+                    if await asyncio.to_thread(self._release_power_save_files, current):
+                        decky.logger.info(
+                            "Prevent lag spikes is off; removed the power save files "
+                            "a change cut short had left"
+                        )
+                except Exception as e:
+                    decky.logger.error(f"Startup power save file check failed: {e}")
+
+            # On its own: a step in it that fails (a settings save, say) used
+            # to end startup here, skipping the startup apply below, the
+            # band scope adoption and the backend check, and leaving auto
+            # mode on with no watch for the rest of the session.
+            try:
+                await self._startup_streaming(_load_settings())
+            except Exception as e:
+                decky.logger.error(f"Startup streaming pickup failed: {e}")
+            if _load_settings().get("streaming_mode_enabled"):
+                self._start_streaming_watch()
 
             # Apply volatile settings that may have been lost on reboot.
             # The dispatcher handles reconnects, but on a fresh boot WiFi
@@ -3066,32 +3218,32 @@ class Plugin:
             # Order: buffer tuning first (sets txqueuelen), then CAKE
             # (overrides txqueuelen to 256), then power_save last (sticks
             # after any reconnects the dispatcher might trigger).
-            iface = self._get_wifi_interface()
-            if iface and self._volatile_gate_open(_load_settings()):
-                if settings.get("buffer_tuning_enabled"):
+            # Decided from the settings as they are now, not as read at the
+            # top: a Reset or a toggle turned off during the awaits since
+            # then would otherwise be applied again and saved back on.
+            iface = await asyncio.to_thread(self._get_wifi_interface)
+            fresh = _load_settings()
+            if iface and self._volatile_gate_open(fresh):
+                if fresh.get("buffer_tuning_enabled"):
                     try:
                         await self.set_buffer_tuning(True)
                     except Exception as e:
                         decky.logger.error(f"Startup buffer tuning failed: {e}")
-                if settings.get("cake_enabled"):
+                if fresh.get("cake_enabled"):
                     try:
                         await self.set_cake(True)
                     except Exception as e:
                         decky.logger.error(f"Startup CAKE apply failed: {e}")
-                if settings.get("power_save_disabled"):
+                if fresh.get("power_save_disabled"):
                     try:
                         await self.set_power_save(True)
                     except Exception as e:
                         decky.logger.error(f"Startup power save failed: {e}")
-                if any(settings.get(k) for k in (
+                if any(fresh.get(k) for k in (
                     "buffer_tuning_enabled", "cake_enabled", "power_save_disabled"
                 )):
-                    self._record_reapplied(settings.get("last_applied", 0))
+                    self._record_reapplied(fresh.get("last_applied", 0))
 
-            # Sanity check: does the conf-declared backend match what's actually
-            # running? Divergence would indicate a previous switch got interrupted
-            # (plugin_loader crash, external tool, etc.). Log only; user can
-            # re-toggle to resolve.
             # Someone upgrading has a band preference with no record of which
             # network it belongs to. Treating that as unscoped would keep
             # enforcing it everywhere, which is what stranded profiles in the
@@ -3104,45 +3256,42 @@ class Plugin:
             if settings.get("band_preference_enabled") and not settings.get(
                 "band_preference_ssid"
             ):
-                adopted = self._get_profile_ssid(
-                    settings.get("last_connection_uuid", "")
-                ) or self._get_profile_ssid(
-                    self._get_active_connection_uuid() or ""
-                )
-                if adopted:
-                    settings["band_preference_ssid"] = adopted
-                    _save_settings(settings)
-                    decky.logger.info(
-                        "Band preference scoped to the current network on upgrade"
-                    )
-                else:
-                    # Leaving it enabled with no network attached is the state
-                    # that lets it be applied to the wrong one. Turn it off so
-                    # the toggle tells the truth; one tap re-enables it against
-                    # whatever network the user is actually on.
-                    settings["band_preference_enabled"] = False
-                    _save_settings(settings)
-                    decky.logger.info(
-                        "Band preference disabled: could not establish which "
-                        "network it belongs to"
-                    )
+                adopted = await asyncio.to_thread(self._current_network_name, settings)
+                # Read again after that wait, so nothing saved during it is
+                # undone, and only acted on if it still needs it.
+                settings = _load_settings()
+                if settings.get("band_preference_enabled") and not settings.get(
+                        "band_preference_ssid"):
+                    if adopted:
+                        settings["band_preference_ssid"] = adopted
+                        message = "Band preference scoped to the current network on upgrade"
+                    else:
+                        # Leaving it enabled with no network attached is the
+                        # state that lets it be applied to the wrong one. Turn
+                        # it off so the toggle tells the truth; one tap
+                        # re-enables it against whatever network the user is
+                        # actually on.
+                        settings["band_preference_enabled"] = False
+                        message = ("Band preference disabled: could not establish which "
+                                   "network it belongs to")
+                    # Best effort, like the save above: the rest of startup
+                    # does not depend on it, and the next start tries again.
+                    try:
+                        _save_settings(settings)
+                        decky.logger.info(message)
+                    except OSError as e:
+                        self._log_throttled("settings_save",
+                                            f"Startup could not save settings: {e}")
 
+            # Sanity check: does the conf-declared backend match what's actually
+            # running? Divergence would indicate a previous switch got interrupted
+            # (plugin_loader crash, external tool, etc.). Log only; user can
+            # re-toggle to resolve.
             # Warm the steamos-manager probe here, off the polling path, so
             # the collector never has to fork or memoise from its thread.
             backend_method = await asyncio.to_thread(self._get_backend_method)
             if backend_method != "none":
-                conf_backend = self._get_current_backend()
-                if conf_backend:
-                    active = self._run_cmd(
-                        ["/usr/bin/systemctl", "is-active", conf_backend], timeout=3
-                    )
-                    state = (active.get("stdout") or "").strip()
-                    if state and state != "active":
-                        decky.logger.error(
-                            f"Backend inconsistency: conf says '{conf_backend}' "
-                            f"but systemd reports '{state}'. Likely an interrupted "
-                            f"backend switch - user can retry via the UI."
-                        )
+                await asyncio.to_thread(self._log_backend_inconsistency)
 
             decky.logger.info(
                 f"WiFi Optimizer ready: device={info.get('device_label')}, "
@@ -3152,6 +3301,32 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"WiFi Optimizer _main error: {e}")
         self._stranded_task = asyncio.create_task(self._stranded_watch())
+
+    def _current_network_name(self, settings: dict) -> str | None:
+        """The network the last profile in use, or the one in use now,
+        belongs to, for adopting a band preference saved without one."""
+        return self._get_profile_ssid(
+            settings.get("last_connection_uuid", "")
+        ) or self._get_profile_ssid(
+            self._get_active_connection_uuid() or ""
+        )
+
+    def _log_backend_inconsistency(self):
+        """Log when the backend the config names is not the one running.
+        Runs in a worker thread: both questions are subprocesses."""
+        conf_backend = self._get_current_backend()
+        if not conf_backend:
+            return
+        active = self._run_cmd(
+            ["/usr/bin/systemctl", "is-active", conf_backend], timeout=3
+        )
+        state = (active.get("stdout") or "").strip()
+        if state and state != "active":
+            decky.logger.error(
+                f"Backend inconsistency: conf says '{conf_backend}' "
+                f"but systemd reports '{state}'. Likely an interrupted "
+                f"backend switch - user can retry via the UI."
+            )
 
     _SETTINGS_VERSION = 2
 
@@ -3457,11 +3632,10 @@ class Plugin:
         """Standard error dict for the catch-all exception handler in every
         setter. Callers log the error separately with the setter name.
 
-        The exception text is NOT returned. The panel appends `detail` to
-        `message` when it is present, so putting it there would print the
-        traceback under the control the user just touched - and for every
-        setter rather than the few nmcli failures where stderr is useful.
-        Callers log the exception, so nothing is lost.
+        The exception text is NOT returned. The panel shows `message` as it
+        is, so this is the one thing the user reads, and a traceback under
+        the control they just touched helps nobody. Callers log the
+        exception, so nothing is lost.
 
         A save that failed is said as such. It mostly comes after the change
         itself was made, so "something went wrong" left the user believing
@@ -4245,6 +4419,8 @@ class Plugin:
                 self._apply_pin_cleanup(action, settings, status, pending)
             elif kind == "bssid_repoint":
                 self._apply_bssid_repoint(action, settings, status, pending)
+            elif kind in ("dns_cleanup", "wpa2_restore"):
+                self._apply_leftover_cleanup(action, settings, pending)
 
         if pending:
             settings.update(pending)
@@ -4321,6 +4497,11 @@ class Plugin:
             return
         if settings.get("band_preference") != action["value"]:
             status["drift"].pop("band_preference", None)
+            return
+        # A setter mid-change on this profile, or a backend switch: a switch
+        # to iwd clears the band first, and writing it back before the new
+        # backend is in force leaves a pin NetworkManager cannot use there.
+        if self._profile_change_in_flight() or self._backend_switch_running():
             return
         if self._reassert_exhausted("band"):
             return
@@ -4482,6 +4663,45 @@ class Plugin:
             if rest:
                 pending[list_key] = rest + [uuid]
 
+    def _apply_leftover_cleanup(self, action: dict, settings: dict, pending: dict):
+        """Undo custom DNS, or Allow WPA2 here, on one profile Reset,
+        uninstall or the DNS toggle could not reach at the time.
+
+        Both used to be recorded as left for a retry that nothing made. One
+        profile per poll, with a short timeout and the reassertion cooldown,
+        since this runs on the event loop. Returning early leaves the action
+        undone and the next poll free to propose it again.
+        """
+        uuid = action["uuid"]
+        kind = action["kind"]
+        list_key = "dns_uuids" if kind == "dns_cleanup" else "wpa2_restore_uuids"
+        tracked = pending.get(list_key, settings.get(list_key, []))
+        if uuid not in tracked:
+            return
+        # DNS turned back on meanwhile: the list is the live one again.
+        if kind == "dns_cleanup" and settings.get("dns_enabled"):
+            return
+        if self._profile_change_in_flight() or self._backend_switch_running():
+            return
+        if self._reassert_exhausted(kind):
+            return
+        if kind == "dns_cleanup":
+            done = self._clear_dns(uuid, timeout=2)
+        else:
+            done = self._restore_wpa3_only(uuid, timeout=2)
+        self._record_reassert(kind, done)
+        rest = [u for u in tracked if u != uuid]
+        if done:
+            pending[list_key] = rest
+            self._log_throttled(
+                kind,
+                f"Gave {uuid} its automatic DNS back" if kind == "dns_cleanup"
+                else f"Put {uuid} back to WPA3 only",
+            )
+        elif rest:
+            # To the back, so one that keeps failing does not hold up the rest.
+            pending[list_key] = rest + [uuid]
+
     def _apply_bssid_repoint(self, action: dict, settings: dict, status: dict,
                              pending: dict):
         """Move the address pin to the profile NetworkManager is actually using.
@@ -4508,7 +4728,9 @@ class Plugin:
         # which stops it associating at all. The lock setter holds
         # this too, because it waits for an association across an
         # await and this is the write that would race it.
-        if self._profile_change_in_flight():
+        # Nor during a backend switch, which clears this pin before a
+        # switch to iwd, for the reason _apply_band gives.
+        if self._profile_change_in_flight() or self._backend_switch_running():
             return
         if self._reassert_exhausted("bssid_repoint"):
             return
@@ -4697,6 +4919,14 @@ class Plugin:
                     "property": prop, "list_key": list_key,
                     "off_value": off_value,
                 })
+        # Custom DNS off with profiles still listed: ones Reset, uninstall or
+        # the toggle could not give their automatic DNS back.
+        if not settings.get("dns_enabled"):
+            for stale_uuid in settings.get("dns_uuids", [])[:1]:
+                out.append({"kind": "dns_cleanup", "uuid": stale_uuid})
+        # And profiles Reset or uninstall could not put back to WPA3 only.
+        for stale_uuid in settings.get("wpa2_restore_uuids", [])[:1]:
+            out.append({"kind": "wpa2_restore", "uuid": stale_uuid})
         return out
 
     def _propose_active_pin_cleanup(
@@ -5469,7 +5699,13 @@ class Plugin:
                 [: self._MAX_TRACKED_AP_FAILURES]
             )
         settings["ap_move_failures"] = failures
-        _save_settings_with_timestamp(settings)
+        # Best effort. It is called just before a failed lock move is rolled
+        # back, and a save that raised skipped the rollback, leaving the
+        # profile pinned to the access point that had just refused us.
+        try:
+            _save_settings_with_timestamp(settings)
+        except OSError as e:
+            self._log_throttled("ap_failure_save", f"Could not record the access point failure: {e}")
 
     def _sampled_access_points(
         self, iface: str, ssid: str
@@ -5754,7 +5990,8 @@ class Plugin:
     _NEEDS_WPA_SUPPLICANT = (
         "needs the wpa_supplicant WiFi backend. Under iwd, NetworkManager "
         "cannot bring up a network pinned this way, so it would ask for the "
-        "password instead of connecting."
+        "password instead of connecting. Switch to wpa_supplicant in Advanced "
+        "to use it."
     )
 
     def _backend_is_iwd(self) -> bool:
@@ -6101,7 +6338,8 @@ class Plugin:
         if not want:
             return
         result = self._run_cmd(
-            ["/usr/bin/nmcli", "-t", "-f", "ipv4.dns,ipv4.ignore-auto-dns",
+            ["/usr/bin/nmcli", "-t", "-f",
+             "ipv4.dns,ipv4.ignore-auto-dns,ipv6.ignore-auto-dns",
              "con", "show", "uuid", uuid],
             timeout=timeout,
         )
@@ -6118,6 +6356,11 @@ class Plugin:
         # terse output escapes any colon with a backslash.
         have = fields["ipv4.dns"].replace("\\", "").replace(",", " ").split()
         if not set(want) <= set(have) or fields["ipv4.ignore-auto-dns"] != "yes":
+            status["drift"]["dns"] = True
+        # The router's IPv6 DNS let back in is drift too: on a dual-stack
+        # network it is used alongside ours. A profile set before custom DNS
+        # covered IPv6 shows here once, and Fix now brings it up to date.
+        if fields.get("ipv6.ignore-auto-dns", "yes") != "yes":
             status["drift"]["dns"] = True
 
     def _recheck_security_reach(self, uuid: str, iface: str, ssid: str,
@@ -6189,6 +6432,15 @@ class Plugin:
             and self._ap_accepts(ap[3], "wpa-psk")
         ]
         usable = [ap for ap in aps if self._ap_accepts(ap[3], "sae")]
+        # Before NetworkManager 1.58.1 a wpa-psk profile cannot connect on
+        # its own to an access point that offers WPA3 only. Allowing WPA2
+        # where one is in sight trades it for the WPA2 one: the device would
+        # then only ever join that. The version is the one _main read, as
+        # this runs in the status worker; not read yet counts as too old.
+        version = getattr(self, "_nm_version_seen", None)
+        if not version or version < NM_6GHZ_WPA_PSK:
+            if any(not self._ap_accepts(ap[3], "wpa-psk") for ap in usable):
+                return None
         here = next(
             (ap[1] for ap in usable if ap[0] == current_bssid.upper()),
             usable[0][1] if usable else None,
@@ -6346,11 +6598,11 @@ class Plugin:
         connect afterwards it is put back as it was.
         """
         if self._profile_change_refused():
-            return dict(self._BUSY_RESULT)
+            return self._busy_result()
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         held = True
         try:
-            uuid, err = self._resolve_uuid("Connect to WiFi first")
+            uuid, err = self._resolve_uuid("Connect to WiFi first.")
             if err:
                 return err
             if self._profile_key_mgmt(uuid) != "sae":
@@ -6392,16 +6644,36 @@ class Plugin:
             decky.logger.info(f"Allowed WPA2 alongside WPA3 on {uuid}")
             self._wpa2_blocked = None
             self._reach_checked_at = 0.0
+            # Recorded, so Reset and uninstall can put WPA3 only back: nothing
+            # else in the panel undoes this. Saved before the lock below, which
+            # reads and saves the settings itself.
+            settings = _load_settings()
+            known = [u for u in settings.get("wpa2_uuids", []) if u != uuid] + [uuid]
+            settings["wpa2_uuids"] = self._capped(known, "802-11-wireless-security.key-mgmt")
+            settings["wpa2_restore_uuids"] = [
+                u for u in settings.get("wpa2_restore_uuids", []) if u != uuid
+            ]
+            _save_settings(settings)
+            result = {"success": True, "reconnected": True}
             # The lock picks its access point from those the profile can join,
             # so with the stronger one now eligible, let it choose again.
-            if _load_settings().get("bssid_lock_enabled"):
+            if settings.get("bssid_lock_enabled"):
                 # Hand the guard to the lock setter rather than hold it
                 # across the call, or it refuses as busy. Nothing awaits
                 # between the release and the setter taking it.
                 self._profile_change_depth = max(0, self._profile_change_depth - 1)
                 held = False
-                await self.set_bssid_lock(True)
-            return {"success": True, "reconnected": True}
+                relocked = await self.set_bssid_lock(True)
+                if not relocked.get("success"):
+                    # WPA2 is allowed, which is what was asked; but the lock is
+                    # still on the access point it held, and the notice that
+                    # led here is gone, so say so.
+                    result["message"] = (
+                        "WPA2 is allowed here now, but the access point lock "
+                        "couldn't move, so it stayed where it was. Turn the lock "
+                        "off and on to choose again."
+                    )
+            return result
         except Exception as e:
             decky.logger.error(f"allow_wpa2 error: {e}")
             return self._unexpected_response(e)
@@ -6624,6 +6896,14 @@ class Plugin:
             [],
         )
 
+    def _power_save_drifted(self, settings: dict, ps_result: dict, ps_off: bool) -> bool:
+        """Whether power save is on where the setting has it off. Only from
+        an answer: a command that could not run (no iw on this system, or one
+        still stuck) says nothing about power save, and reporting drift for
+        it offered a Fix now that cannot fix it."""
+        return bool(settings.get("power_save_disabled") and ps_result.get("success")
+                    and not ps_off and self._volatile_gate_open(settings))
+
     def _collect_status(self) -> tuple[dict, dict, list]:
         # Short timeout for the queries that take one. Note this does not
         # bound the whole collection: the interface and connection lookups,
@@ -6709,8 +6989,7 @@ class Plugin:
             )
             ps_off = "Power save: off" in ps_result.get("stdout", "")
             status["live"]["power_save_off"] = ps_off
-            if (settings.get("power_save_disabled") and not ps_off
-                    and self._volatile_gate_open(settings)):
+            if self._power_save_drifted(settings, ps_result, ps_off):
                 status["drift"]["power_save"] = True
 
             # Link info
@@ -6831,99 +7110,144 @@ class Plugin:
         # From the panel. Anything but a real True counts as False, so a
         # stray value is never saved as is.
         disabled = disabled is True
-        try:
-            if disabled and self._paused_by_streaming():
-                return self._record_paused("power_save_disabled")
-            # Auto mode keeps power save to the session: nothing persistent.
-            auto = bool(_load_settings().get("streaming_mode_enabled"))
-            # Off is saved before anything comes off. The dispatcher and the
-            # startup apply both act on the setting, so a reconnect landing
-            # part way through put back what was being taken off, and the
-            # fixes stayed on under a toggle that read off.
-            was_on = False
-            if not disabled:
-                settings = _load_settings()
-                was_on = bool(settings.get("power_save_disabled"))
-                if was_on:
-                    settings["power_save_disabled"] = False
-                    _save_settings(settings)
-
-            iface = self._get_wifi_interface()
-
-            # Apply immediately if connected - verify before saving
-            if iface:
-                state = "off" if disabled else "on"
-                result = self._run_cmd(
-                    ["/usr/bin/iw", "dev", iface, "set", "power_save", state]
-                )
-                if not result["success"]:
+        # One at a time. Turning it on awaits NetworkManager's reload, and an
+        # off that finished during that wait was undone when the on path
+        # went on to apply the fixes and save the setting on.
+        async with self._power_save_guard():
+            try:
+                if disabled and self._paused_by_streaming():
+                    return self._record_paused("power_save_disabled")
+                # Turning it off can rewrite Valve's NetworkManager file, which a
+                # backend switch rewrites too.
+                if not disabled and self._backend_switch_running():
+                    return self._busy_result()
+                # Auto mode keeps power save to the session: nothing persistent.
+                auto = bool(_load_settings().get("streaming_mode_enabled"))
+                # Off is saved before anything comes off. The dispatcher and the
+                # startup apply both act on the setting, so a reconnect landing
+                # part way through put back what was being taken off, and the
+                # fixes stayed on under a toggle that read off.
+                was_on = False
+                if not disabled:
+                    settings = _load_settings()
+                    was_on = bool(settings.get("power_save_disabled"))
                     if was_on:
-                        # Nothing was taken off, so it is still on.
-                        settings = _load_settings()
-                        settings["power_save_disabled"] = True
+                        settings["power_save_disabled"] = False
                         _save_settings(settings)
-                    self._log_detail("set_power_save", result["stderr"])
-                    return {
-                        "success": False,
-                        "error": "iw_failed",
-                        "message": "Couldn't change WiFi power save. Turn WiFi off and on, then try again.",
-                        "detail": result["stderr"],
-                    }
+                # Whether our NetworkManager file is there to be removed. Only
+                # while it is can a 2 in Valve's file be ours.
+                ours = os.path.lexists(NM_CONF_PATH)
 
-            # Write or remove NM config (persistent layer)
-            before = _load_settings().get("valve_powersave_before")
-            if disabled and not auto:
-                # What Valve's file said before we first took power save
-                # over, so stopping can put it back. "" records "nothing".
-                if not os.path.exists(NM_CONF_PATH):
-                    found = self._valve_powersave()
-                    before = (
-                        "" if found is None
-                        else found if found in _VALVE_POWERSAVE_VALUES else "?"
+                iface = self._get_wifi_interface()
+
+                # Apply immediately if connected - verify before saving. Turned
+                # back on only where Steam's own WiFi power management setting
+                # does not have it off, as Reset and the end of a stream do.
+                iw_missing = False
+                if iface and (disabled or not self._valve_keeps_power_save_off(
+                        _load_settings(), ours)):
+                    state = "off" if disabled else "on"
+                    result = self._run_cmd(
+                        ["/usr/bin/iw", "dev", iface, "set", "power_save", state]
                     )
-                # NetworkManager keeps the config it read at startup, and
-                # turns power save back on at the next reconnect until it is
-                # told to read it again.
-                if _write_system_conf(NM_CONF_PATH, "[connection]\nwifi.powersave = 2\n"):
-                    await asyncio.to_thread(self._reload_nm_conf)
-            elif not disabled:
-                # Only our own file can have put our value into Valve's. With
-                # none to remove (always so in streaming auto mode, which never
-                # writes it), a 2 there is the user's own Steam setting, and
-                # releasing it at the end of every stream turned it back on.
-                try:
-                    os.remove(NM_CONF_PATH)
-                    self._reload_nm_conf()
-                    self._release_valve_powersave(_load_settings())
-                    before = "?"
-                except FileNotFoundError:
-                    pass
+                    if (not result["success"]
+                            and result.get("stderr", "").startswith("Command not found")):
+                        # No iw on this system (one CachyOS install had none).
+                        # Nothing can change power save now, but the rest of the
+                        # setting still applies, and asking the user to cycle
+                        # WiFi would not bring iw back.
+                        iw_missing = True
+                        decky.logger.error("set_power_save: iw is not installed")
+                    elif not result["success"]:
+                        if was_on:
+                            # Nothing was taken off, so it is still on.
+                            settings = _load_settings()
+                            settings["power_save_disabled"] = True
+                            _save_settings(settings)
+                        self._log_detail("set_power_save", result["stderr"])
+                        return {
+                            "success": False,
+                            "error": "iw_failed",
+                            "message": "Couldn't change WiFi power save. Turn WiFi off and on, then try again.",
+                            "detail": result["stderr"],
+                        }
 
-            # Only when auto mode is putting the fixes on from off. Any other
-            # call finds them already on, and would record our own values.
-            record_all = auto and getattr(self, "_gate_opening", False)
-            self._apply_driver_fixes(disabled, persist=not auto, record_all=record_all)
-            not_applied = self._apply_pcie_aspm_fix(disabled, record_all=record_all)
+                # Write or remove NM config (persistent layer)
+                before = _load_settings().get("valve_powersave_before")
+                if disabled and not auto:
+                    # What Valve's file said before we first took power save
+                    # over, so stopping can put it back. "" records "nothing".
+                    if not os.path.exists(NM_CONF_PATH):
+                        before = self._valve_powersave_record()
+                    # NetworkManager keeps the config it read at startup, and
+                    # turns power save back on at the next reconnect until it is
+                    # told to read it again.
+                    if _write_system_conf(NM_CONF_PATH, "[connection]\nwifi.powersave = 2\n"):
+                        await asyncio.to_thread(self._reload_nm_conf)
+                elif not disabled and ours:
+                    # Only our own file can have put our value into Valve's. With
+                    # none to remove (always so in streaming auto mode, which never
+                    # writes it), a 2 there is the user's own Steam setting, and
+                    # releasing it at the end of every stream turned it back on.
+                    # Valve's line is put back before NetworkManager rereads its
+                    # config, once, off the event loop: reloaded first, it read
+                    # our 2 still there and kept power save off.
+                    await asyncio.to_thread(self._release_power_save_files, _load_settings())
+                    # Nothing of ours is left in Valve's file, so what it says
+                    # now is the user's own. Recorded as such: a "?" here took a
+                    # 2 the user later set in Steam for ours, and Reset then
+                    # turned their setting back on.
+                    before = self._valve_powersave_record()
 
-            # Save settings only after success
-            settings = _load_settings()
-            settings["power_save_disabled"] = disabled
-            settings["valve_powersave_before"] = before
-            _save_settings_with_timestamp(settings)
+                # Only when auto mode is putting the fixes on from off. Any other
+                # call finds them already on, and would record our own values.
+                record_all = auto and getattr(self, "_gate_opening", False)
+                self._apply_driver_fixes(disabled, persist=not auto, record_all=record_all)
+                not_applied = self._apply_pcie_aspm_fix(disabled, record_all=record_all)
 
-            result = {"success": True, "power_save_off": disabled}
-            if not_applied:
-                # WiFi power save itself is off, which is most of the benefit,
-                # but the toggle also promises the PCIe power states and some
-                # did not take. Say which rather than claim all of it.
-                result["message"] = (
-                    "WiFi power save is off, but some PCIe power states could "
-                    f"not be disabled: {', '.join(not_applied)}."
-                )
-            return result
-        except Exception as e:
-            decky.logger.error(f"set_power_save error: {e}")
-            return self._unexpected_response(e)
+                # Save settings only after success
+                settings = _load_settings()
+                settings["power_save_disabled"] = disabled
+                settings["valve_powersave_before"] = before
+                _save_settings_with_timestamp(settings)
+
+                result = {"success": True, "power_save_off": disabled}
+                notes = []
+                if iw_missing:
+                    notes.append(
+                        "The iw tool is missing on this system, so WiFi power save "
+                        "can't be changed. The other fixes are "
+                        + ("on." if disabled else "off.")
+                    )
+                if not_applied:
+                    # WiFi power save itself is off, which is most of the benefit,
+                    # but the toggle also promises the PCIe power states and some
+                    # did not take. Said without their names, which mean nothing
+                    # to the reader; _apply_pcie_aspm_fix logs them.
+                    notes.append(
+                        "Some PCIe power saving couldn't be turned off; the rest "
+                        "is applied. Nothing to do."
+                    )
+                if notes:
+                    result["message"] = " ".join(notes)
+                return result
+            except Exception as e:
+                decky.logger.error(f"set_power_save error: {e}")
+                return self._unexpected_response(e)
+
+    def _power_save_guard(self) -> asyncio.Lock:
+        """Held for the whole of set_power_save, which never calls itself."""
+        if getattr(self, "_power_save_lock", None) is None:
+            self._power_save_lock = asyncio.Lock()
+        return self._power_save_lock
+
+    def _valve_keeps_power_save_off(self, settings: dict, ours: bool) -> bool:
+        """Whether Valve's file holds power save off by the user's choice
+        (Steam's WiFi power management off), once ours is released: a 2
+        there is theirs unless our file is in place and they had none."""
+        if self._valve_powersave() != "2":
+            return False
+        return not ours or settings.get("valve_powersave_before") == "2"
 
     async def set_auto_fix(self, enabled: bool) -> dict:
         # From the panel. Anything but a real True counts as False, so a
@@ -7034,6 +7358,12 @@ class Plugin:
         previous_uuid = settings.get("bssid_lock_connection_uuid", "")
         if previous_uuid and previous_uuid != uuid and previous_uuid not in stale_uuids:
             stale_uuids.append(previous_uuid)
+        # The profile last in use too, once this install has written a BSSID
+        # pin, as Reset and uninstall sweep it.
+        last = settings.get("last_connection_uuid", "")
+        if (last and last != uuid and last not in stale_uuids
+                and "802-11-wireless.bssid" in settings.get("pins_owned", [])):
+            stale_uuids.append(last)
         unresolved = []
         for stale_uuid in stale_uuids:
             stale = self._nmcli_modify(
@@ -7138,7 +7468,8 @@ class Plugin:
                 return {
                     "success": False,
                     "error": "nmcli_failed",
-                    "message": "Couldn't read the WiFi link.",
+                    "message": ("Couldn't read the WiFi link. Try again in a moment. "
+                                "If it keeps failing, restart the device."),
                     "detail": detail,
                 }, iface, bssid, link_out
             link_out = link_result.get("stdout", "")
@@ -7172,7 +7503,7 @@ class Plugin:
         # setter where previously none could - and the one it would run is
         # exactly the re-point that writes a BSSID to this profile.
         if self._profile_change_refused():
-            return dict(self._BUSY_RESULT)
+            return self._busy_result()
         self._profile_change_depth = getattr(
             self, "_profile_change_depth", 0
         ) + 1
@@ -7252,7 +7583,8 @@ class Plugin:
                 return {
                     "success": False,
                     "error": "nmcli_failed",
-                    "message": "Couldn't read the WiFi link.",
+                    "message": ("Couldn't read the WiFi link. Try again in a moment. "
+                                "If it keeps failing, restart the device."),
                     "detail": read_error,
                 }
             decky.logger.info(
@@ -7428,7 +7760,7 @@ class Plugin:
         the same way if that one will not have us.
         """
         if self._profile_change_refused():
-            return dict(self._BUSY_RESULT)
+            return self._busy_result()
         self._profile_change_depth = getattr(
             self, "_profile_change_depth", 0
         ) + 1
@@ -7702,7 +8034,7 @@ class Plugin:
         # that deadline and it failed open in exactly the circumstance
         # where reassociation is slowest and the race most likely.
         if self._profile_change_refused():
-            return dict(self._BUSY_RESULT)
+            return self._busy_result()
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
 
@@ -7717,7 +8049,7 @@ class Plugin:
                         "message": "The band preference " + self._NEEDS_WPA_SUPPLICANT}
 
             uuid, err = self._resolve_uuid(
-                "Connect to WiFi first to set band preference" if enabled else None
+                "Connect to WiFi first to set band preference." if enabled else None
             )
             if err:
                 return err
@@ -7747,7 +8079,7 @@ class Plugin:
                         "success": False,
                         "error": "band_scoped_elsewhere",
                         "message": (
-                            f"The band preference is set for {scoped_to}. "
+                            f"The band preference is set for {_display_ssid(scoped_to)}. "
                             "Turn it off first to set one here."
                         ),
                     }
@@ -7889,12 +8221,12 @@ class Plugin:
         # A profile change like the lock and the band: it writes the profile
         # and reconnects, and two at once interleave their radio cycles.
         if self._profile_change_refused():
-            return dict(self._BUSY_RESULT)
+            return self._busy_result()
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
 
             uuid, err = self._resolve_uuid(
-                "Connect to WiFi first to set DNS" if enabled else None
+                "Connect to WiFi first to set DNS." if enabled else None
             )
             if err:
                 return err
@@ -7932,6 +8264,7 @@ class Plugin:
                     }
 
                 previous = self._read_profile_field(uuid, "ipv4.dns")
+                previous_v6 = self._read_profile_field(uuid, "ipv6.ignore-auto-dns")
                 result = self._nmcli_modify(uuid, "ipv4.dns", servers)
                 if not result["success"]:
                     self._log_detail("set_dns", result["stderr"])
@@ -7955,14 +8288,29 @@ class Plugin:
                         "message": "Couldn't switch this network to these DNS servers. Try again in a moment.",
                         "detail": result2["stderr"],
                     }
+                # And the router's IPv6 DNS: on a dual-stack network it was
+                # used alongside these servers, so the override was only half
+                # one. Undone the same way if it does not take.
+                result3 = self._nmcli_modify(uuid, "ipv6.ignore-auto-dns", "yes")
+                if not result3["success"]:
+                    self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
+                    self._nmcli_modify(uuid, "ipv4.dns", previous.replace(",", " "))
+                    if previous_v6 in ("yes", "no"):
+                        self._nmcli_modify(uuid, "ipv6.ignore-auto-dns", previous_v6)
+                    self._log_detail("set_dns", result3["stderr"])
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't switch this network to these DNS servers. Try again in a moment.",
+                        "detail": result3["stderr"],
+                    }
             else:
-                # The provider is reset alongside the servers. Leaving it on
-                # custom with nothing stored is a dead end: the panel only
-                # renders the provider dropdown and the servers field while
-                # DNS is on, and turning it on with an empty custom list is
-                # refused - so after a reload there is no way back except
-                # resetting every setting.
-                provider = "cloudflare"
+                # The provider and its servers are kept, so turning DNS back
+                # on applies the same ones, rather than Cloudflare (and two
+                # reconnects) before a Pi-hole user can pick Custom again.
+                # Custom with nothing stored was the dead end that used to
+                # reset them here; keeping the servers avoids it, and
+                # _clean_settings still repairs one saved by an older version.
                 # Order matters and both results matter. Clearing the servers
                 # first and then failing to re-enable the automatic ones
                 # leaves a profile that ignores DHCP DNS and has none of its
@@ -7977,6 +8325,18 @@ class Plugin:
                         "message": "Couldn't give this network its router's DNS back. Try again in a moment.",
                         "detail": restored["stderr"],
                     }
+                # The router's IPv6 DNS back too. Its failure leaves IPv4's
+                # automatic DNS working, so it is reported but nothing is
+                # put back.
+                restored_v6 = self._nmcli_modify(uuid, "ipv6.ignore-auto-dns", "no")
+                if not restored_v6["success"]:
+                    self._log_detail("set_dns", restored_v6["stderr"])
+                    return {
+                        "success": False,
+                        "error": "nmcli_failed",
+                        "message": "Couldn't give this network its router's DNS back. Try again in a moment.",
+                        "detail": restored_v6["stderr"],
+                    }
                 cleared = self._nmcli_modify(uuid, "ipv4.dns", "")
                 if not cleared["success"]:
                     self._log_detail("set_dns", cleared["stderr"])
@@ -7986,7 +8346,6 @@ class Plugin:
                         "message": "Couldn't clear the custom DNS servers. Try again in a moment.",
                         "detail": cleared["stderr"],
                     }
-                servers = ""
 
             settings = _load_settings()
             known = [u for u in settings.get("dns_uuids", []) if u != uuid]
@@ -7998,8 +8357,9 @@ class Plugin:
                 known = [u for u in known if not self._clear_dns(u)]
             settings["dns_uuids"] = self._capped(known, "ipv4.dns")
             settings["dns_enabled"] = enabled
-            settings["dns_provider"] = provider
-            settings["dns_servers"] = servers
+            if enabled:
+                settings["dns_provider"] = provider
+                settings["dns_servers"] = servers
             _save_settings_with_timestamp(settings)
 
             if not await self._reconnect(uuid):
@@ -8018,12 +8378,12 @@ class Plugin:
         # stray value is never saved as is.
         disabled = disabled is True
         if self._profile_change_refused():
-            return dict(self._BUSY_RESULT)
+            return self._busy_result()
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
 
             uuid, err = self._resolve_uuid(
-                "Connect to WiFi first to disable IPv6" if disabled else None
+                "Connect to WiFi first to disable IPv6." if disabled else None
             )
             if err:
                 return err
@@ -8206,9 +8566,11 @@ class Plugin:
             if failed_keys:
                 # Some took and some did not. The status poll only checks one
                 # of them, so without saying so here a partial apply looks
-                # exactly like a full one.
-                names = ", ".join(k.rsplit(".", 1)[-1] for k in failed_keys)
-                result["message"] = f"Applied, except: {names}."
+                # exactly like a full one. Their names are in the log above,
+                # one line each; to the reader they mean nothing.
+                result["message"] = (
+                    "Most buffer settings applied; a few weren't accepted by the system."
+                )
             return result
         except Exception as e:
             decky.logger.error(f"set_buffer_tuning error: {e}")
@@ -8279,7 +8641,8 @@ class Plugin:
                         return {
                             "success": False,
                             "error": "unexpected",
-                            "message": "Couldn't remove CAKE.",
+                            "message": ("Couldn't remove CAKE. Try again in a moment. "
+                                        "If it keeps failing, restart the device."),
                             "detail": removal.get("stderr", ""),
                         }
                 # Restore txqueuelen based on whether buffer tuning is active
@@ -8320,9 +8683,21 @@ class Plugin:
                 applied += 1
 
             # Under iwd the lock would only stop NetworkManager reconnecting,
-            # so Optimize Safe leaves it out rather than report it failed.
+            # so Optimize Safe leaves it out rather than report it failed,
+            # and says so: left out silently, the panel read "All applied".
             if await asyncio.to_thread(self._backend_is_iwd):
                 total -= 1
+                results["bssid_lock"] = {
+                    "success": True,
+                    "message": ("Left out: the access point lock needs the "
+                                "wpa_supplicant backend (Advanced)."),
+                }
+            elif await asyncio.to_thread(self._lock_holding):
+                # Already on and holding on this network. Turning it on again
+                # rewrote the pin and cycled the radio for nothing, and its
+                # fresh scan could move the lock to another access point.
+                results["bssid_lock"] = {"success": True}
+                applied += 1
             elif await asyncio.to_thread(self._lock_held_elsewhere):
                 # Turning it on again here would move the lock off the
                 # network it was set on, which nobody asked Optimize to do.
@@ -8351,11 +8726,34 @@ class Plugin:
                 "total": total,
                 "applied": applied,
                 "results": results,
-                "reconnected": True,
+                # Only the lock reconnects, and only when it was turned on.
+                "reconnected": any(bool(r.get("reconnected")) for r in results.values()),
             }
         except Exception as e:
             decky.logger.error(f"optimize_safe error: {e}")
             return self._unexpected_response(e)
+
+    def _lock_holding(self) -> bool:
+        """Whether the access point lock is on, for this network, written to
+        the profile in use, and holding: the device is on the access point
+        it pins. Several subprocesses, so called in a worker thread."""
+        settings = _load_settings()
+        value = settings.get("bssid_lock_value", "").upper()
+        if not settings.get("bssid_lock_enabled") or not value:
+            return False
+        uuid = self._get_active_connection_uuid()
+        iface = self._get_wifi_interface()
+        if not uuid or not iface or not IFACE_RE.match(iface):
+            return False
+        if not self._lock_is_for_this_network(settings, uuid, self._get_profile_ssid(uuid)):
+            return False
+        pinned = self._read_profile_field(uuid, "802-11-wireless.bssid").replace("\\", "")
+        if pinned.upper() != value:
+            return False
+        link = self._run_cmd(["/usr/bin/iw", "dev", iface, "link"])
+        if not link["success"]:
+            return False
+        return self._parse_link(link.get("stdout", "")).get("connected_bssid", "").upper() == value
 
     def _record_reapplied(self, last_changed: int):
         """Put back "Last changed" after a re-application, and stamp it as one.
@@ -8369,7 +8767,13 @@ class Plugin:
         settings = _load_settings()
         if settings.get("last_applied", 0) != last_changed:
             settings["last_applied"] = last_changed
-            _save_settings(settings)
+            # Best effort: only the panel's "Last changed" depends on it, and
+            # a save that raised ended startup and the streaming pass that
+            # called this, with nothing after it run.
+            try:
+                _save_settings(settings)
+            except OSError as e:
+                self._log_throttled("settings_save", f"Could not save settings: {e}")
         try:
             os.makedirs(os.path.dirname(ENFORCED_FILE), mode=0o755, exist_ok=True)
         except OSError:
@@ -8637,7 +9041,7 @@ class Plugin:
         # An update reloads the plugin when it finishes, which would cut a
         # reset off part way; a backend switch restarts NetworkManager under it.
         if self._profile_change_refused():
-            return dict(self._BUSY_RESULT)
+            return self._busy_result()
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
             # And no streaming pass may put the fixes back while they come
@@ -8668,12 +9072,25 @@ class Plugin:
         # they are taken off below.
         info = await self.get_device_info()
         fresh = copy.deepcopy(DEFAULT_SETTINGS)
+        # Current, so the next load does not run the migrations again.
+        fresh["settings_version"] = self._SETTINGS_VERSION
         fresh["model"] = info.get("model", "unknown")
-        fresh["driver"] = info.get("driver", "unknown")
         fresh["device_family"] = info.get("device_family", "unknown")
         fresh["device_label"] = info.get("device_label", "Unknown Device")
-        fresh["chip_label"] = info.get("chip_label", "unknown")
-        fresh["supports_6ghz"] = info.get("supports_6ghz", False)
+        # The radio can be missing (WiFi down after a bad wake, the state
+        # Reset is often pressed in). Startup keeps the driver it knew rather
+        # than record "unknown", and so does Reset: "unknown" leaves the
+        # driver's fixes on below, stops the dispatcher applying them, and
+        # has the panel call the hardware unknown.
+        if info.get("driver", "unknown") != "unknown" or before.get("driver") in (
+                None, "", "unknown"):
+            fresh["driver"] = info.get("driver", "unknown")
+            fresh["chip_label"] = info.get("chip_label", "unknown")
+            fresh["supports_6ghz"] = info.get("supports_6ghz", False)
+        else:
+            fresh["driver"] = before.get("driver", "unknown")
+            fresh["chip_label"] = before.get("chip_label", "unknown")
+            fresh["supports_6ghz"] = before.get("supports_6ghz", False)
         distro = self._detect_distro()
         fresh["distro_id"] = distro["id"]
         fresh["distro_name"] = distro["name"]
@@ -8683,18 +9100,48 @@ class Plugin:
         # that would bring back a notice they have seen, about a file that
         # has not changed.
         fresh["corrupt_acknowledged"] = before.get("corrupt_acknowledged", [])
+        # Update preferences are not WiFi settings. Reset used to put a beta
+        # tester back on Stable without a word, and bring back a notice they
+        # had turned off, announcing a version already announced.
+        for key in ("update_channel", "update_notify", "update_notified_version"):
+            fresh[key] = copy.deepcopy(before.get(key, DEFAULT_SETTINGS[key]))
         fresh["power_save_disabled"] = False
         fresh["pins_owned"] = list(before.get("pins_owned", []))
-        for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids", "dns_uuids"):
+        for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids", "dns_uuids",
+                    "wpa2_uuids", "wpa2_restore_uuids"):
             fresh[key] = list(before.get(key, []))
         _save_settings(fresh)
 
-        left = await asyncio.to_thread(
-            self._clear_profile_pins, time.monotonic() + self._RESET_PIN_BUDGET, before
+        # Each step is tried whatever the one before it did, as uninstall's
+        # are: one that raised used to end Reset there, with the defaults
+        # already saved and everything after it (the backend setting, the
+        # dispatcher, the record of pins left) never reached.
+        not_undone = []
+
+        async def undo(what: str, work, *args, default=None):
+            try:
+                return await asyncio.to_thread(work, *args)
+            except Exception as e:
+                decky.logger.error(f"Reset could not undo {what}: {e}")
+                not_undone.append(what)
+                return default
+
+        # Power save first, as uninstall orders it: the files that hold it
+        # off past a reboot are what last longest, and a Reset cut off
+        # during the pins, which can take half a minute, left them in force
+        # under a toggle already saved off.
+        await undo("power save", self._release_power_save, before)
+        # Nothing known taken off if that step failed outright: every list
+        # stays tracked, for the leftover cleanup or another Reset.
+        tracked = {key: list(before.get(key, [])) for key in (
+            "bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids", "dns_uuids",
+            "wpa2_uuids", "wpa2_restore_uuids")}
+        left = await undo(
+            "the profile pins", self._clear_profile_pins,
+            time.monotonic() + self._RESET_PIN_BUDGET, before, default=tracked,
         )
-        await asyncio.to_thread(self._release_power_save, before)
-        await asyncio.to_thread(self._release_regdomain, before)
-        await asyncio.to_thread(self._revert_queue_tuning, before)
+        await undo("the region", self._release_regdomain, before)
+        await undo("buffer tuning and CAKE", self._revert_queue_tuning, before)
         try:
             _remove_no_follow(LEGACY_ENFORCED_FILE)
         except FileNotFoundError:
@@ -8713,7 +9160,7 @@ class Plugin:
             pass
         except OSError as e:
             decky.logger.error(f"reset_settings could not remove diagnostics: {e}")
-        await asyncio.to_thread(self._release_generic_backend_conf)
+        await undo("the backend setting", self._release_generic_backend_conf)
         # A pin released before the reset is not news after it.
         self._pin_released_at = 0
         self._released_at = {}
@@ -8730,6 +9177,12 @@ class Plugin:
         settings = _load_settings()
         settings.update(left)
         settings["auto_fix_on_wake"] = installed
+        # Only the kinds still on some profile stay ours (_owned_kinds_left).
+        settings["pins_owned"] = _owned_kinds_left(settings.get("pins_owned", []), left)
+        # What Valve's file says now that nothing of ours is in it is the
+        # user's own setting, and is recorded as such. The "?" the defaults
+        # carry let a later uninstall take the user's 2 for ours.
+        settings["valve_powersave_before"] = self._valve_powersave_record()
         _save_settings(settings)
         if any(left.values()):
             decky.logger.info(
@@ -8738,7 +9191,16 @@ class Plugin:
             )
 
         decky.logger.info("Settings reset to defaults")
-        return {"success": True, "message": "Settings reset to defaults"}
+        if not_undone:
+            # The settings are the defaults now, but something they described
+            # is still in place; the log says what.
+            return {
+                "success": False,
+                "error": "partial",
+                "message": ("Settings are reset, but some changes couldn't be undone. "
+                            "Try Reset again. If it keeps happening, restart the device."),
+            }
+        return {"success": True, "message": "Settings reset to defaults."}
 
     # ---- Streaming auto mode ----
     #
@@ -8840,25 +9302,49 @@ class Plugin:
                 pass
 
     def _revert_volatile_fixes(self, settings: dict):
-        """Take power save, buffer tuning and CAKE off, keeping them chosen."""
-        if settings.get("power_save_disabled"):
+        """Take power save, buffer tuning and CAKE off, keeping them chosen.
+
+        Every step is tried whatever the one before it did, as
+        _release_power_save does: a driver parameter that would not take
+        (a read-only file, an I/O error) used to leave buffer tuning and
+        CAKE on after the stream, with the fixes already flagged off.
+        """
+        def radio_power_save_on():
             iface = self._get_wifi_interface()
             # A 2 in Valve's file is Steam's own Wi-Fi power management
             # switched off; power save then stays off because the user said.
             if iface and self._valve_powersave() != "2":
                 self._run_cmd(["/usr/bin/iw", "dev", iface, "set", "power_save", "on"])
-            self._apply_driver_fixes(False)
-            self._apply_pcie_aspm_fix(False)
-        self._revert_queue_tuning(settings)
+
+        steps = []
+        if settings.get("power_save_disabled"):
+            steps += [("radio power save", radio_power_save_on),
+                      ("driver fixes", lambda: self._apply_driver_fixes(False)),
+                      ("PCIe power states", lambda: self._apply_pcie_aspm_fix(False))]
+        steps.append(("buffer tuning and CAKE", lambda: self._revert_queue_tuning(settings)))
+        for what, undo in steps:
+            try:
+                undo()
+            except Exception as e:
+                decky.logger.error(f"Streaming auto mode, taking off {what}: {e}")
 
     async def _stream_pass(self, settle: bool = False):
         """Look for a stream, and apply or take off the fixes if that changed.
 
         settle skips the wait before taking them off, for when the panel
         knows something just exited or the user changed what is watched.
+
+        The search runs before the guard is taken. It reads every process's
+        command line, and a read of one stuck in the kernel never returns:
+        held across it, the guard kept Reset and the auto mode toggle
+        waiting for good.
         """
+        settings = _load_settings()
+        if not settings.get("streaming_mode_enabled"):
+            return
+        found = await asyncio.to_thread(self._find_stream, self._stream_patterns(settings))
         async with self._stream_guard():
-            await self._stream_pass_locked(settle)
+            await self._stream_pass_locked(settle, found)
 
     def _stream_guard(self) -> asyncio.Lock:
         """Held for every change to whether the fixes are on, so a pass and a
@@ -8867,15 +9353,13 @@ class Plugin:
             self._stream_lock = asyncio.Lock()
         return self._stream_lock
 
-    async def _stream_pass_locked(self, settle: bool = False):
-        settings = _load_settings()
-        if not settings.get("streaming_mode_enabled"):
-            return
-        found = await asyncio.to_thread(self._find_stream, self._stream_patterns(settings))
-        # Looked at again after the wait. Everything that turns auto mode
-        # off takes the stream guard this pass holds, so it cannot have
-        # changed, but a pass that went on regardless would put the fixes
-        # back under settings that no longer have auto mode at all.
+    async def _stream_pass_locked(self, settle: bool = False, found: dict | None = None):
+        """_stream_pass's work, with the guard held. found is the stream the
+        search (made before the guard was taken) found running, or None."""
+        # Looked at again now the guard is held. Everything that turns auto
+        # mode off takes the guard, but the search ran before this pass had
+        # it, and a pass that went on regardless would put the fixes back
+        # under settings that no longer have auto mode at all.
         settings = _load_settings()
         if not settings.get("streaming_mode_enabled"):
             return
@@ -8943,29 +9427,28 @@ class Plugin:
         found = await asyncio.to_thread(self._remove_persistent_power_save)
         settings = _load_settings()
         settings["valve_powersave_before"] = found
-        _save_settings(settings)
+        # Best effort: the record is worked out again from the file the next
+        # time. A save that raised here ended startup's streaming pickup and
+        # the auto mode toggle before either started the watch.
+        try:
+            _save_settings(settings)
+        except OSError as e:
+            self._log_throttled("settings_save", f"Could not save the power save record: {e}")
 
     def _remove_persistent_power_save(self) -> str:
         """_drop_persistent_power_save's file work. Returns what to record as
         Valve's power save value from before."""
-        had_conf = os.path.exists(NM_CONF_PATH)
-        for path in (NM_CONF_PATH, MODPROBE_CONF_PATH):
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-        settings = _load_settings()
-        if had_conf:
-            self._reload_nm_conf()
-            # Only while our file existed can a 2 in Valve's be ours. On a
-            # load with none, it is the user's Steam setting and stays.
-            self._release_valve_powersave(settings)
+        # Ours and the modprobe options removed, Valve's line put back (only
+        # while our file was there to be removed: without it a 2 there is the
+        # user's Steam setting), and NetworkManager told to reread its config
+        # once, after Valve's line. Reloaded before it, it read our 2 still
+        # there and kept power save off until the next reload.
+        self._release_power_save_files(_load_settings())
         # With our file gone nothing of ours can reach Valve's any more, so
         # what it says now is the user's own (Steam's Wi-Fi power management
         # setting). Recorded, so a later Reset or uninstall leaves it alone
         # rather than taking an unrecorded 2 for ours.
-        found = self._valve_powersave()
-        return "" if found is None else found if found in _VALVE_POWERSAVE_VALUES else "?"
+        return self._valve_powersave_record()
 
     def _reload_nm_conf(self):
         """Have NetworkManager read its config files again.
@@ -9013,9 +9496,18 @@ class Plugin:
         # From the panel. Anything but a real True counts as False, so a
         # stray value is never saved as is.
         enabled = enabled is True
+        saved = False
         try:
-            if self._profile_change_in_flight() or self._update_running():
-                return dict(self._BUSY_RESULT)
+            # And not while the backend switches: it rewrites Valve's
+            # NetworkManager file, which this reads and writes too.
+            if self._profile_change_refused():
+                return self._busy_result()
+            # Searched before the guard is taken, for the reason _stream_pass
+            # gives: a search that never returns must not hold it.
+            found = None
+            if enabled:
+                found = await asyncio.to_thread(
+                    self._find_stream, self._stream_patterns(_load_settings()))
             # Taken first, so a pass already applying or taking off the fixes
             # (in a worker thread, which cancelling would not stop) finishes
             # before this changes anything. The watch then ends on its own.
@@ -9023,13 +9515,14 @@ class Plugin:
                 settings = _load_settings()
                 settings["streaming_mode_enabled"] = bool(enabled)
                 _save_settings_with_timestamp(settings)
+                saved = True
                 if enabled:
                     await self._drop_persistent_power_save()
                     # Until now the fixes applied all the time, so they are
                     # on. A settled pass takes them off unless a stream runs.
                     self._set_stream_flag(True)
                     self._stream_misses = 0
-                    await self._stream_pass_locked(settle=True)
+                    await self._stream_pass_locked(True, found)
                 else:
                     for path in (STREAM_FLAG_FILE, STREAM_HOLD_FILE):
                         self._set_stream_flag(False, path)
@@ -9042,6 +9535,10 @@ class Plugin:
             return {"success": True, "streaming_mode": bool(enabled)}
         except Exception as e:
             decky.logger.error(f"set_streaming_mode error: {e}")
+            # Saved on, so the watch runs whatever failed after the save:
+            # without it auto mode reads on and never follows a stream.
+            if enabled and saved:
+                self._start_streaming_watch()
             return self._unexpected_response(e)
 
     async def set_streaming_hold(self, held: bool) -> dict:
@@ -9082,22 +9579,35 @@ class Plugin:
         """Save the user's own process patterns, refusing ones that would
         match something always running."""
         try:
-            kept, refused = _parse_stream_patterns(str(text)[:512])
+            kept, refused = _stream_pattern_verdicts(str(text)[:512])
             settings = _load_settings()
             settings["streaming_custom_patterns"] = " ".join(kept)
             _save_settings(settings)
             await self._stream_pass(settle=True)
             result = {"success": True, "patterns": " ".join(kept)}
             if refused:
-                result["message"] = (
-                    f"Left out: {' '.join(refused)}. Patterns need at least "
-                    f"{STREAM_PATTERN_MIN} characters and must not match "
-                    "something that is always running, like Steam."
-                )
+                result["message"] = self._stream_refusal_message(refused)
             return result
         except Exception as e:
             decky.logger.error(f"set_streaming_patterns error: {e}")
             return self._unexpected_response(e)
+
+    @staticmethod
+    def _stream_refusal_message(refused: list[tuple[str, str]]) -> str:
+        """What the panel says about the names it left out, with the reason
+        each one broke rather than every rule at once."""
+        reasons = {
+            "short": f"too short, use at least {STREAM_PATTERN_MIN} characters",
+            "long": f"too long, use at most {STREAM_PATTERN_MAX} characters",
+            "always": "matches something that is always running, like Steam",
+            "limit": f"only {STREAM_PATTERNS_MAX} names are kept",
+        }
+        parts = []
+        for why, text in reasons.items():
+            names = [t if len(t) <= 24 else t[:21] + "..." for t, w in refused if w == why]
+            if names:
+                parts.append(f"{', '.join(names)} ({text})")
+        return "Left out: " + "; ".join(parts) + "."
 
     def _streaming_app_list(self) -> list[dict]:
         """The known apps, for the panel's list."""
@@ -10316,12 +10826,19 @@ class Plugin:
             if section != "[connection]":
                 out.append("[connection]")
             out.append(f"wifi.powersave={value}")
-        tmp = WIFI_BACKEND_CONF + ".wifiopt-new"
+        # A name of its own in the same directory, so two writers (a backend
+        # switch and a toggle) cannot rename each other's half-written file.
+        tmp = os.path.join(os.path.dirname(WIFI_BACKEND_CONF),
+                           f".{os.path.basename(WIFI_BACKEND_CONF)}.{os.urandom(6).hex()}.tmp")
         try:
-            with open(tmp, "w") as f:
+            with open(tmp, "x") as f:
                 f.write("\n".join(out) + "\n")
             os.replace(tmp, WIFI_BACKEND_CONF)
         except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             decky.logger.error(f"Could not restore Valve's power save setting: {e}")
             return False
         decky.logger.info(f"Valve's wifi.powersave put back to {value or 'unset'}")
