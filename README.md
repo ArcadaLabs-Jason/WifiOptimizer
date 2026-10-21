@@ -116,6 +116,28 @@ keeping the device offline; and the update check twice a day, unless **Tell me
 about updates** is off. In streaming auto mode the plugin also checks every few
 seconds whether a streaming app is running.
 
+## Send report
+
+**Send report to the developer**, next to **Copy diagnostics** at the bottom of
+the panel, sends the same report that Copy diagnostics copies: your device and
+WiFi driver, the plugin's settings, and the WiFi parts of the system log from
+this boot and the one before, with network names and addresses already taken
+out. Nothing is sent until you have seen it: the panel shows you the whole
+report first, and it only goes if you confirm with **Send**. It goes to the
+developer and nowhere else, and is kept for 90 days. You get a reference like
+WO-7K2M9Q back; quote it if you post about the problem.
+
+With no connection, the report is saved where only root can read it
+(`/var/lib/wifi-optimizer`) and sent once WiFi is back. Only one waits at a
+time, a newer one replaces it, and one still waiting after two weeks is
+dropped. Uninstalling removes it.
+
+If the last time your device woke from sleep WiFi never came back (the
+previous boot's log shows the wake, errors from the WiFi driver, and no
+reconnection after it), the panel says so once and offers to send a report.
+Only that it happened and when are shown; the log itself goes nowhere unless
+you send a report.
+
 ## Uninstall
 
 **Before uninstalling:** tap **Reset settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and removes the plugin's power save config files. WiFi power save goes back on straight away (unless Steam's own WiFi power management setting has it off), the driver's power settings go back to what your system had, and a WiFi region chosen in the plugin is put back. Prevent lag spikes then stays off until you turn it on again. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are taken off every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting; the connection in use keeps them until WiFi next connects. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. On SteamOS the WiFi backend choice (iwd vs wpa_supplicant) is Valve's own setting and is left as it is. On other systems, a backend chosen from the plugin goes back to the system's default from the next boot, and that backend's service is turned back on so WiFi still works. Your update channel and update notices are kept. Reset leaves Auto-fix on wake on, as on a fresh install, so its script stays installed, but with the other fixes off it changes nothing. One more thing is left in place: where a network is saved more than once, the plugin gives the copy you use a higher autoconnect priority so the same copy is picked every time, and that priority stays, since it does no harm. Uninstalling from Decky does the same as Reset, and also removes the auto-fix script.

@@ -3,6 +3,7 @@ import { theme } from "../theme";
 import * as backend from "../backend";
 import { useState } from "react";
 import { withTimeout } from "../utils";
+import { SendReportRow } from "./SendReport";
 
 const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
 
@@ -108,6 +109,7 @@ export function PanelFooter({ version }: PanelFooterProps) {
           </div>
         </PanelSectionRow>
       )}
+      <SendReportRow />
       <PanelSectionRow>
         <ButtonItem
           layout="below"

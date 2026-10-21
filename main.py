@@ -1957,6 +1957,298 @@ def _stream_process_pattern(patterns: list[str]) -> str:
     )
 
 
+# ---- Send report to the developer ----
+
+# Where Send report posts. Empty turns the feature off: the panel shows no
+# button, nothing is read for the wake notice and nothing is ever sent.
+REPORT_URL = ""
+# https only, and nothing curl or a log line could read as more than a URL.
+_REPORT_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9._~/-]*\Z")
+
+# The receiving end refuses a report over 96 KiB and a request over 128 KiB.
+# A report is measured here as compact JSON with every non-ASCII character
+# escaped, which is never smaller than the receiver's own measure of it.
+REPORT_MAX_BYTES = 80 * 1024
+# The log sections of the diagnostics. When a report is too large these go
+# first, biggest first, and the report says which went.
+REPORT_LOG_KEYS = (
+    "kernel_log_previous_boot", "kernel_log_this_boot", "network_log_previous_boot",
+    "plugin_log_previous_boot", "plugin_log_this_boot",
+)
+# Never dropped to make room: without them a report says nothing.
+REPORT_KEEP_KEYS = ("success", "plugin_version", "device_info", "left_out")
+# What the receiving end answers with. Checked before it is shown or kept.
+REPORT_REF_RE = re.compile(r"^WO-[0-9A-HJKMNP-TV-Z]{6}\Z")
+
+# A report the user said to send that could not go yet. A report about WiFi
+# that did not come back after sleep is most often sent after the reboot
+# that fixed it, so it is kept on disk rather than in /run, in a directory
+# only root can open. Never beside the settings: that directory belongs to
+# the desktop user.
+REPORT_DIR = "/var/lib/wifi-optimizer"
+REPORT_PENDING_NAME = "pending-report.json"
+# The reference of a waiting report that went while the panel was closed,
+# kept until the panel has shown it.
+REPORT_SENT_NAME = "sent-report-ref"
+# The wake (its time) whose notice the user dismissed.
+REPORT_WAKE_SEEN_NAME = "wake-notice-seen"
+# A waiting report this old is dropped unsent: the problem it describes is
+# long gone, and the person may well have forgotten agreeing to it.
+REPORT_PENDING_MAX_AGE = 14 * 24 * 3600
+# Seconds before a waiting report is tried again, by how the last try ended.
+# Offline is checked against NetworkManager first, which costs one nmcli.
+REPORT_RETRY_AFTER = {
+    "offline": 120, "unavailable": 900, "unexpected": 1800, "rate_limited": 3600,
+}
+
+# The wake-failure notice. One read of the previous boot's kernel and
+# NetworkManager log, bounded in lines and time.
+WAKE_JOURNAL_MAX = "10000"
+# How long the boot went on after the wake with no WiFi. Shorter, and it may
+# simply have been switched off straight after waking.
+WAKE_MIN_SECONDS = 30
+# "1712345678.123456 kernel: PM: suspend exit" with -o short-unix and
+# --no-hostname. A host column, if a journalctl prints one anyway, is skipped.
+_WAKE_LINE_RE = re.compile(r"^([0-9]{9,11})(?:\.[0-9]+)? (?:\S+ )?(kernel|NetworkManager\[[0-9]+\]): (.*)$")
+# mac80211 says this once the radio has joined an access point.
+_WAKE_KERNEL_UP_RE = re.compile(r"^wl[\w.-]*: associated\b")
+# NetworkManager saying a WiFi device came up, for drivers that do their own
+# association and so print nothing above. WiFi interfaces are named wl*.
+_WAKE_NM_UP_RE = re.compile(r"device \(wl[\w.-]*\): state change: \S+ -> activated\b")
+# Messages from the WiFi drivers this plugin knows, and mac80211's own.
+_WAKE_DRIVER_RE = re.compile(r"^(?:rtw\w*|ath1[0-2]k\w*|mt7\w*|iwlwifi|brcmfmac\w*|ieee80211 phy[0-9]+)[ :]")
+_WAKE_ERROR_RE = re.compile(
+    r"(?i)\b(?:fail(?:ed|ure|s)?|error|timeout|timed out|crash(?:ed)?|unable|"
+    r"not respond(?:ing)?|no response|halt(?:ed)?|restart)\b"
+)
+
+
+def _report_url() -> str:
+    """REPORT_URL when it is one the plugin will send to, otherwise ""."""
+    url = REPORT_URL if isinstance(REPORT_URL, str) else ""
+    return url if _REPORT_URL_RE.match(url) else ""
+
+
+def _report_dir_fd(create: bool = False) -> int:
+    """A descriptor for REPORT_DIR, refused unless it is the plugin's alone.
+
+    Walked without links like the settings directory. Made 0700 when it is
+    not, so nobody else can read a report or put anything in its place, and
+    refused outright if someone else owns it. The caller closes it.
+    """
+    fd = _open_dir_no_follow(REPORT_DIR, create=create)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise PermissionError(f"{REPORT_DIR} belongs to someone else")
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _write_report_file(name: str, data: str) -> bool:
+    """Replace REPORT_DIR/name in one step with a file only root can read.
+
+    A new file each time, opened without following links, then renamed over
+    the old one, so a reader sees the old report or the new, never half.
+    """
+    try:
+        dfd = _report_dir_fd(create=True)
+    except OSError as e:
+        decky.logger.error(f"Report: {REPORT_DIR} cannot be used: {e}")
+        return False
+    tmp = name + ".tmp"
+    try:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                     dir_fd=dfd)
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return True
+    except OSError as e:
+        decky.logger.error(f"Report: could not write {name}: {e}")
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(dfd)
+
+
+def _read_report_file(name: str, limit: int) -> tuple:
+    """(text, modification time) of REPORT_DIR/name, or (None, 0).
+
+    Only a regular file no larger than limit, read without following a link.
+    """
+    try:
+        dfd = _report_dir_fd()
+    except OSError:
+        return None, 0
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        os.close(dfd)
+        return None, 0
+    try:
+        st = os.fstat(fd)
+        if not _is_regular(st.st_mode) or st.st_size > limit:
+            return None, 0
+        chunks, total = [], 0
+        while total <= limit:
+            chunk = os.read(fd, limit + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            return None, 0
+        return b"".join(chunks).decode("utf-8", "replace"), st.st_mtime
+    except OSError:
+        return None, 0
+    finally:
+        os.close(fd)
+        os.close(dfd)
+
+
+def _remove_report_file(name: str) -> bool:
+    """Remove REPORT_DIR/name. True when it is gone, or was never there."""
+    try:
+        dfd = _report_dir_fd()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        os.unlink(name, dir_fd=dfd)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        decky.logger.error(f"Report: could not remove {name}: {e}")
+        return False
+    finally:
+        os.close(dfd)
+
+
+def _forget_reports():
+    """Remove REPORT_DIR and what is in it, for uninstalling."""
+    for name in (REPORT_PENDING_NAME, REPORT_PENDING_NAME + ".tmp", REPORT_SENT_NAME,
+                 REPORT_SENT_NAME + ".tmp", REPORT_WAKE_SEEN_NAME,
+                 REPORT_WAKE_SEEN_NAME + ".tmp"):
+        _remove_report_file(name)
+    try:
+        os.rmdir(REPORT_DIR)
+    except OSError:
+        pass
+
+
+def _report_payload(info: dict, version: str):
+    """(payload, body) for diagnostics, or None if it cannot be made to fit.
+
+    payload is {"plugin_version", "report"} as the receiving end takes it,
+    and body is the exact text sent. The report is the diagnostics as they
+    are, unless they are too large: then the log sections go, biggest first,
+    then whatever else is biggest, and "left_out" in the report names them.
+    """
+    report = dict(info)
+    dropped = []
+
+    def size(value) -> int:
+        return len(json.dumps(value, separators=(",", ":")))
+
+    while size(report) > REPORT_MAX_BYTES:
+        candidates = ([k for k in REPORT_LOG_KEYS if k in report]
+                      or [k for k in report if k not in REPORT_KEEP_KEYS])
+        if not candidates:
+            return None
+        biggest = max(candidates, key=lambda k: size(report[k]))
+        del report[biggest]
+        dropped.append(biggest)
+        report["left_out"] = ("Too large to send, so these were left out: "
+                              + ", ".join(dropped))
+    payload = {"plugin_version": version, "report": report}
+    return payload, json.dumps(payload, separators=(",", ":"))
+
+
+def _pending_body_valid(body: str) -> bool:
+    """A waiting report read back from disk is one this plugin made."""
+    if len(body) > REPORT_MAX_BYTES + 1024:
+        return False
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False
+    version = data.get("plugin_version") if isinstance(data, dict) else None
+    return (isinstance(version, str) and len(version) <= 64
+            and bool(VERSION_RE.match(version))
+            and isinstance(data.get("report"), dict))
+
+
+def _wake_failure_at(text: str) -> int:
+    """When the last wake of a boot left WiFi down, from that boot's log.
+
+    text is the kernel and NetworkManager lines of the boot as journalctl
+    -o short-unix prints them. Returns the wake's time (Unix seconds), or 0.
+    All of these must hold, so an ordinary boot never qualifies:
+      - the kernel logged a wake ("PM: suspend exit");
+      - WiFi had come up earlier in the boot, before that sleep;
+      - it never came up after the wake (no "<wl*>: associated" from the
+        kernel and no wl* device "-> activated" from NetworkManager);
+      - the WiFi driver logged an error after the wake;
+      - the boot went on for WAKE_MIN_SECONDS or more after the wake.
+    Only the last wake counts. Lines that do not parse are ignored.
+    """
+    events = []
+    last_time = 0
+    for raw in text.splitlines():
+        found = _WAKE_LINE_RE.match(raw)
+        if not found:
+            continue
+        stamp, who, message = int(found.group(1)), found.group(2), found.group(3)
+        last_time = max(last_time, stamp)
+        kind = None
+        if who == "kernel":
+            if message.startswith("PM: suspend exit"):
+                kind = "wake"
+            elif message.startswith("PM: suspend entry"):
+                kind = "sleep"
+            elif _WAKE_KERNEL_UP_RE.match(message):
+                kind = "up"
+            elif _WAKE_DRIVER_RE.match(message) and _WAKE_ERROR_RE.search(message):
+                kind = "error"
+        elif _WAKE_NM_UP_RE.search(message):
+            kind = "up"
+        if kind:
+            events.append((kind, stamp))
+    wakes = [i for i, (kind, _t) in enumerate(events) if kind == "wake"]
+    if not wakes:
+        return 0
+    wake = wakes[-1]
+    woke_at = events[wake][1]
+    sleeps = [i for i in range(wake) if events[i][0] == "sleep"]
+    before = events[:sleeps[-1]] if sleeps else events[:wake]
+    after = events[wake + 1:]
+    if not any(kind == "up" for kind, _t in before):
+        return 0
+    if any(kind == "up" for kind, _t in after):
+        return 0
+    if not any(kind == "error" for kind, _t in after):
+        return 0
+    if last_time - woke_at < WAKE_MIN_SECONDS:
+        return 0
+    return woke_at
+
+
 class Plugin:
     """Root plugin instance. Decky exposes every async method here as a
     callable from the frontend. Synchronous helpers prefixed with `_` are
@@ -3595,6 +3887,7 @@ class Plugin:
             step("power save", self._release_power_save, settings, bool(reloaded))
             step("the region", self._release_regdomain, settings)
             step("buffer tuning and CAKE", self._revert_queue_tuning, settings)
+            step("a report waiting to be sent", _forget_reports)
             # The diagnostics file and a settings file set aside as unreadable
             # are ours too, and nothing else would ever remove them.
             users = [SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
@@ -5235,6 +5528,7 @@ class Plugin:
                 await self._stranded_watch_once()
             except Exception as e:
                 decky.logger.error(f"stranded watch error: {e}")
+            await self._send_pending_report_if_due()
 
     async def _stranded_watch_once(self):
         await self._unpin_if_iwd()
@@ -11836,3 +12130,307 @@ class Plugin:
                 },
                 "message": "Couldn't read the backend switch status. Try again in a moment.",
             }
+
+    # ---- Send report to the developer ----
+    #
+    # The panel shows the user exactly what would be sent (preview_report),
+    # and only what they saw is sent (send_report). A report that cannot go
+    # yet is kept, one at a time, and sent from the background watch once
+    # WiFi is back. Nothing here runs while REPORT_URL is empty.
+
+    _REPORT_MESSAGES = {
+        "disabled": "Sending reports isn't available in this version. Use Copy diagnostics instead.",
+        "collect_failed": "Couldn't put the report together. Try again in a moment.",
+        "too_large": "The report is too large to send. Use Copy diagnostics and post it on GitHub instead.",
+        "stale": "That report is out of date. Tap Send report again to see the current one.",
+        "queued": "No connection. It will be sent when WiFi is back.",
+        "queued_busy": "The report service is busy. Your report is saved and will be sent later.",
+        "queued_limited": "Too many reports from this network for now. Your report is saved and will be sent later.",
+        "not_kept": "Couldn't send the report, and it couldn't be saved to send later. Try again when WiFi is back.",
+        "refused": "The report wasn't accepted, so it was not sent. Use Copy diagnostics and post it on GitHub instead.",
+        "unexpected": "Couldn't send the report. Try again later, or use Copy diagnostics and post it on GitHub.",
+    }
+
+    def _report_guard(self) -> asyncio.Lock:
+        """Held while a report is sent, so the panel and the background
+        retry never send the same waiting report twice."""
+        if getattr(self, "_report_lock", None) is None:
+            self._report_lock = asyncio.Lock()
+        return self._report_lock
+
+    def _post_report(self, path: str) -> dict:
+        """POST the file at path to REPORT_URL. {"kind": ..., "ref": ...}.
+
+        kind is "sent" (with ref), "refused" or "too_large" (never tried
+        again), or "offline", "unavailable", "rate_limited" or "unexpected"
+        (kept and tried later). The body goes to curl as a file, never on
+        its command line. curl as for the update check: system curl through
+        _run_cmd, https only, bounded in time and in what it reads back.
+        -q first so no curlrc can add a proxy or headers, and no redirect is
+        followed, so the report never goes anywhere but REPORT_URL.
+        """
+        url = _report_url()
+        if not url:
+            return {"kind": "refused", "ref": ""}
+        result = self._run_cmd(
+            [
+                "/usr/bin/curl", "-q", "-sS", "--proto", "=https", "--tlsv1.2",
+                "--connect-timeout", "5", "--max-time", "20", "--max-filesize", "4096",
+                "-H", "Content-Type: application/json",
+                "--data-binary", "@" + path, "-w", "\n%{http_code}", url,
+            ],
+            25,
+        )
+        if not result.get("success"):
+            # No answer at all: no network, no DNS, a portal's certificate.
+            self._log_throttled(
+                "report_send", f"Report: not sent, rc={result.get('returncode')}: "
+                f"{(result.get('stderr') or '')[:160]}")
+            return {"kind": "offline", "ref": ""}
+        answer, _sep, code = (result.get("stdout") or "").rpartition("\n")
+        code = code.strip()
+        try:
+            data = json.loads(answer) if answer.strip() else None
+        except ValueError:
+            data = None
+        ref = data.get("ref") if isinstance(data, dict) else None
+        if (code == "200" and isinstance(data, dict) and data.get("ok") is True
+                and isinstance(ref, str) and REPORT_REF_RE.match(ref)):
+            return {"kind": "sent", "ref": ref}
+        decky.logger.error(f"Report: not accepted, http={code[:8]!r}")
+        if code == "413":
+            return {"kind": "too_large", "ref": ""}
+        if code == "429":
+            return {"kind": "rate_limited", "ref": ""}
+        if code == "408" or code.startswith("5"):
+            return {"kind": "unavailable", "ref": ""}
+        if code.startswith("4"):
+            return {"kind": "refused", "ref": ""}
+        return {"kind": "unexpected", "ref": ""}
+
+    def _post_report_body(self, body: str) -> dict:
+        """_post_report for a body that could not be kept in REPORT_DIR,
+        from a file in a private temporary directory of its own."""
+        directory = tempfile.mkdtemp(prefix="wifi-optimizer-report-")
+        path = os.path.join(directory, "report.json")
+        try:
+            os.chmod(directory, 0o700)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(body)
+            return self._post_report(path)
+        except OSError as e:
+            decky.logger.error(f"Report: could not stage the report: {e}")
+            return {"kind": "unexpected", "ref": ""}
+        finally:
+            for leftover, remove in ((path, os.remove), (directory, os.rmdir)):
+                try:
+                    remove(leftover)
+                except OSError:
+                    pass
+
+    def _send_pending_locked(self) -> str:
+        """Try the waiting report once. Returns how it ended, "" if none.
+
+        Sent: removed, and its reference kept for the panel. Refused:
+        removed, never retried. Anything else: left for the next try.
+        """
+        body, mtime = _read_report_file(REPORT_PENDING_NAME, REPORT_MAX_BYTES + 1024)
+        if body is None:
+            return ""
+        if not _pending_body_valid(body):
+            decky.logger.error("Report: dropped a waiting report that is not one of ours")
+            _remove_report_file(REPORT_PENDING_NAME)
+            return ""
+        if time.time() - mtime > REPORT_PENDING_MAX_AGE:
+            decky.logger.info("Report: dropped a waiting report older than two weeks")
+            _remove_report_file(REPORT_PENDING_NAME)
+            return ""
+        outcome = self._post_report(os.path.join(REPORT_DIR, REPORT_PENDING_NAME))
+        kind = outcome["kind"]
+        if kind == "sent":
+            _remove_report_file(REPORT_PENDING_NAME)
+            _write_report_file(REPORT_SENT_NAME, outcome["ref"])
+            decky.logger.info(f"Report: the waiting report was sent as {outcome['ref']}")
+        elif kind in ("refused", "too_large"):
+            _remove_report_file(REPORT_PENDING_NAME)
+            decky.logger.error(f"Report: the waiting report was refused ({kind}); dropped")
+        return kind
+
+    async def _send_pending_report_if_due(self):
+        """Send a waiting report once WiFi is back. From the background watch.
+
+        Costs nothing while REPORT_URL is empty, a stat at most every two
+        minutes otherwise, and one nmcli call when a report is waiting.
+        """
+        try:
+            if not _report_url():
+                return
+            now = time.monotonic()
+            if now < getattr(self, "_report_retry_at", 0.0):
+                return
+            self._report_retry_at = now + REPORT_RETRY_AFTER["offline"]
+            if not os.path.exists(os.path.join(REPORT_DIR, REPORT_PENDING_NAME)):
+                return
+            state, _radio = await asyncio.to_thread(self._nm_general_state)
+            if not (state or "").startswith("connected"):
+                return
+            async with self._report_guard():
+                kind = await asyncio.to_thread(self._send_pending_locked)
+            if kind in REPORT_RETRY_AFTER:
+                self._report_retry_at = time.monotonic() + REPORT_RETRY_AFTER[kind]
+        except Exception as e:
+            self._log_throttled("report_retry", f"Report: waiting report not tried: {e}")
+
+    async def preview_report(self) -> dict:
+        """Exactly what Send report would send, for the panel to show.
+
+        {"success", "id", "payload"}: payload is the request body as data;
+        id names it for send_report, which sends only a report it matches.
+        """
+        if not _report_url():
+            return {"success": False, "enabled": False, "error": "disabled",
+                    "message": self._REPORT_MESSAGES["disabled"]}
+        try:
+            info = await self.get_diagnostic_info()
+            version = getattr(decky, "DECKY_PLUGIN_VERSION", "")
+            if (not isinstance(info, dict) or info.get("success") is False
+                    or not isinstance(version, str) or not VERSION_RE.match(version)):
+                return {"success": False, "enabled": True, "error": "collect_failed",
+                        "message": self._REPORT_MESSAGES["collect_failed"]}
+            made = _report_payload(info, version)
+            if made is None:
+                return {"success": False, "enabled": True, "error": "too_large",
+                        "message": self._REPORT_MESSAGES["too_large"]}
+            payload, body = made
+            report_id = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            self._report_preview = (report_id, body)
+            return {"success": True, "enabled": True, "id": report_id, "payload": payload}
+        except Exception as e:
+            decky.logger.error(f"preview_report error: {e}")
+            return {"success": False, "enabled": True, "error": "collect_failed",
+                    "message": self._REPORT_MESSAGES["collect_failed"]}
+
+    async def send_report(self, report_id: str = "") -> dict:
+        """Send the report preview_report last showed, the user having said so.
+
+        status: "sent" (with ref), "queued" (kept, sent when WiFi is back) or
+        "failed". The report is kept before it is sent, replacing any other
+        waiting one, so a send cut short still goes later.
+        """
+        if not _report_url():
+            return {"success": False, "status": "failed", "error": "disabled",
+                    "message": self._REPORT_MESSAGES["disabled"]}
+        preview = getattr(self, "_report_preview", None)
+        if not preview or not isinstance(report_id, str) or report_id != preview[0]:
+            return {"success": False, "status": "failed", "error": "stale",
+                    "message": self._REPORT_MESSAGES["stale"]}
+        body = preview[1]
+        try:
+            async with self._report_guard():
+                kept = await asyncio.to_thread(_write_report_file, REPORT_PENDING_NAME, body)
+                if kept:
+                    outcome = await asyncio.to_thread(
+                        self._post_report, os.path.join(REPORT_DIR, REPORT_PENDING_NAME))
+                else:
+                    outcome = await asyncio.to_thread(self._post_report_body, body)
+                kind = outcome["kind"]
+                if kind in ("sent", "refused", "too_large") and kept:
+                    await asyncio.to_thread(_remove_report_file, REPORT_PENDING_NAME)
+        except Exception as e:
+            decky.logger.error(f"send_report error: {e}")
+            return {"success": False, "status": "failed", "error": "unexpected",
+                    "message": self._REPORT_MESSAGES["unexpected"]}
+        if kind == "sent":
+            self._report_preview = None
+            decky.logger.info(f"Report: sent as {outcome['ref']}")
+            return {"success": True, "status": "sent", "ref": outcome["ref"],
+                    "message": f"Report sent. Reference {outcome['ref']}. "
+                               "Quote it if you post about this."}
+        if kind in ("refused", "too_large"):
+            return {"success": False, "status": "failed", "error": kind,
+                    "message": self._REPORT_MESSAGES[kind]}
+        if not kept:
+            return {"success": False, "status": "failed", "error": "not_kept",
+                    "message": self._REPORT_MESSAGES["not_kept"]}
+        self._report_retry_at = time.monotonic() + REPORT_RETRY_AFTER.get(kind, 1800)
+        self._report_preview = None
+        message = {"offline": "queued", "unavailable": "queued_busy",
+                   "rate_limited": "queued_limited"}.get(kind, "queued_busy")
+        return {"success": True, "status": "queued", "error": kind,
+                "message": self._REPORT_MESSAGES[message]}
+
+    def _read_wake_failure(self) -> int:
+        """_wake_failure_at for the previous boot, from one bounded read."""
+        log = self._run_cmd(
+            ["/usr/bin/journalctl", "-b", "-1", "--no-hostname", "-o", "short-unix",
+             "--no-pager", "-n", WAKE_JOURNAL_MAX,
+             "_TRANSPORT=kernel", "+", "_SYSTEMD_UNIT=NetworkManager.service"],
+            timeout=8,
+        )
+        if not log.get("success"):
+            return 0
+        return _wake_failure_at(log.get("stdout", ""))
+
+    async def _wake_failure_stamp(self) -> int:
+        """The previous boot's failed wake, worked out once per plugin load:
+        the previous boot cannot change while this one runs."""
+        if getattr(self, "_wake_lock", None) is None:
+            self._wake_lock = asyncio.Lock()
+        async with self._wake_lock:
+            if getattr(self, "_wake_stamp", None) is None:
+                try:
+                    self._wake_stamp = await asyncio.to_thread(self._read_wake_failure)
+                except Exception as e:
+                    decky.logger.error(f"wake check error: {e}")
+                    self._wake_stamp = 0
+                if self._wake_stamp:
+                    decky.logger.info("Report: the previous boot's last wake left WiFi down")
+            return self._wake_stamp
+
+    async def get_report_state(self) -> dict:
+        """What the panel needs for Send report and the wake notice.
+
+        enabled: REPORT_URL is set; with it off everything else is empty and
+        nothing is read. pending: a report is waiting to be sent. sent_ref:
+        the reference of a waiting report that has since gone, until the
+        panel dismisses it. wake_failure and wake_failure_at: the previous
+        boot's last wake left WiFi down, and when; nothing else from the log
+        reaches the panel.
+        """
+        state = {"success": True, "enabled": False, "pending": False, "sent_ref": "",
+                 "wake_failure": False, "wake_failure_at": 0}
+        if not _report_url():
+            return state
+        state["enabled"] = True
+        try:
+            state["pending"] = os.path.exists(os.path.join(REPORT_DIR, REPORT_PENDING_NAME))
+            ref, _mtime = await asyncio.to_thread(_read_report_file, REPORT_SENT_NAME, 64)
+            ref = (ref or "").strip()
+            state["sent_ref"] = ref if REPORT_REF_RE.match(ref) else ""
+            stamp = await self._wake_failure_stamp()
+            if stamp:
+                seen, _mtime = await asyncio.to_thread(
+                    _read_report_file, REPORT_WAKE_SEEN_NAME, 32)
+                if (seen or "").strip() != str(stamp):
+                    state["wake_failure"] = True
+                    state["wake_failure_at"] = int(stamp)
+        except Exception as e:
+            decky.logger.error(f"get_report_state error: {e}")
+        return state
+
+    async def dismiss_report_notice(self, kind: str = "") -> dict:
+        """The panel has shown a notice: "wake" or "sent". Stop reporting it."""
+        try:
+            if kind == "wake":
+                stamp = getattr(self, "_wake_stamp", None) or 0
+                if stamp and not await asyncio.to_thread(
+                        _write_report_file, REPORT_WAKE_SEEN_NAME, str(int(stamp))):
+                    return {"success": False, "error": "write_failed"}
+                return {"success": True}
+            if kind == "sent":
+                return {"success": await asyncio.to_thread(_remove_report_file, REPORT_SENT_NAME)}
+            return {"success": False, "error": "unknown"}
+        except Exception as e:
+            decky.logger.error(f"dismiss_report_notice error: {e}")
+            return {"success": False, "error": "unexpected"}

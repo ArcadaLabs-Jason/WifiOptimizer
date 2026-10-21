@@ -37,8 +37,10 @@ const EXPLANATION =
 // "Switched to".
 export function backendResultText(r: BackendSwitchResult): string {
   if (!r.success) {
+    // The backend's own words say whether the switch itself took; this
+    // fallback is true either way.
     if (r.needs_reboot) {
-      return "The switch didn't finish and the WiFi card didn't come back. Restart the device.";
+      return r.message ?? "WiFi didn't come back after the backend switch. Restart the device.";
     }
     return r.message ?? "The backend switch didn't work. If WiFi doesn't come back, restart the device.";
   }
