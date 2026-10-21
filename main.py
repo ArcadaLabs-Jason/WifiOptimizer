@@ -843,17 +843,29 @@ def _load_settings() -> dict:
                          os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dfd)
         finally:
             os.close(dfd)
-        with os.fdopen(fd, "rb") as f:
-            read_stat = os.fstat(f.fileno())
+        # Checked before os.fdopen, which raises on a directory without
+        # closing the descriptor. Root reads this on every poll, so a
+        # directory planted at the name leaked one each time until the
+        # plugin ran out and every open failed.
+        try:
+            read_stat = os.fstat(fd)
             if not _is_regular(read_stat.st_mode):
                 raise ValueError("settings file is not a regular file")
+            f = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
             raw = f.read(65536)
             if f.read(1):
                 raise ValueError("settings file too large")
+    except FileNotFoundError:
+        return _default_settings()
     except Exception:
-        # Missing, not a regular file, too large or unreadable. Nothing was
-        # parsed, so there is nothing to keep: defaults stand in as always,
-        # and whatever sits at the path is left where it is.
+        # Not a regular file, too large or unreadable. Nothing was parsed,
+        # so there is nothing to keep: defaults stand in as always, and
+        # whatever sits at the path is left where it is.
+        _SETTINGS_STATE["read_failed"] = True
         return copy.deepcopy(DEFAULT_SETTINGS)
     try:
         data = json.loads(raw)
@@ -861,11 +873,36 @@ def _load_settings() -> dict:
             raise ValueError("settings file does not hold a JSON object")
     except (ValueError, RecursionError) as e:
         _set_aside_corrupt_settings(read_stat, e)
-        return copy.deepcopy(DEFAULT_SETTINGS)
+        return _default_settings()
     try:
-        return _clean_settings(data)
+        settings = _clean_settings(data)
     except Exception:
+        _SETTINGS_STATE["read_failed"] = True
         return copy.deepcopy(DEFAULT_SETTINGS)
+    _SETTINGS_STATE["read_failed"] = False
+    return settings
+
+
+# What the last settings read and save came to, for the status the panel
+# shows and for the streaming watch. read_failed: the file is there but the
+# defaults had to stand in for it. save_failed: the last save did not land.
+_SETTINGS_STATE = {"read_failed": False, "save_failed": False}
+
+
+def _default_settings() -> dict:
+    """The defaults, for a settings file that is missing.
+
+    After a file was set aside as unreadable, the pins this install wrote
+    are still on the profiles, and the record that they were ours went with
+    the file. A band or BSSID pin nobody owns is left alone as set by hand,
+    so nothing would ever clear them. Both kinds are taken as ours instead,
+    which is what an install that has a .corrupt file to show has done.
+    """
+    _SETTINGS_STATE["read_failed"] = False
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
+    if _corrupt_settings_identity() is not None:
+        settings["pins_owned"] = ["802-11-wireless.bssid", "802-11-wireless.band"]
+    return settings
 
 
 def _clean_settings(data: dict) -> dict:

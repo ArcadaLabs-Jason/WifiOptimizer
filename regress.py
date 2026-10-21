@@ -4974,7 +4974,14 @@ try:
         _corrupt = m.SETTINGS_FILE + ".corrupt"
         _bad = '{"dns_uuids": ["aaaaaaaa-0000-0000-0000-0000000000a6"], "dns_enabled": tru'
         open(m.SETTINGS_FILE, "w").write(_bad)
-        ok(m._load_settings() == m.DEFAULT_SETTINGS, "a settings file that does not parse loads as defaults")
+        _loaded = m._load_settings()
+        ok({**_loaded, "pins_owned": []} == m.DEFAULT_SETTINGS,
+           "a settings file that does not parse loads as defaults")
+        # The record of which pins were ours went with the file, and a pin
+        # nobody owns is left alone as set by hand, so nothing would clear one.
+        ok(sorted(_loaded["pins_owned"]) == ["802-11-wireless.band", "802-11-wireless.bssid"]
+           and sorted(m._load_settings()["pins_owned"]) == ["802-11-wireless.band", "802-11-wireless.bssid"],
+           "except that the band and BSSID pins count as ours, on that load and the ones after it")
         ok(os.path.isfile(_corrupt) and open(_corrupt).read() == _bad,
            "and is kept, unchanged, as settings.json.corrupt")
         ok(not os.path.exists(m.SETTINGS_FILE),
@@ -4989,8 +4996,23 @@ try:
            "valid JSON that is not an object is set aside too, replacing the older copy")
         # Conditions that may pass, or were never the user's data: nothing moves.
         os.remove(_corrupt)
+        ok(m._load_settings() == m.DEFAULT_SETTINGS and not os.path.exists(_corrupt),
+           "a missing settings file sets nothing aside, and with nothing kept the defaults are plain")
+        # A directory at the name: os.fdopen raises on one without closing
+        # the descriptor, and root reads the settings on every poll.
+        os.mkdir(m.SETTINGS_FILE)
+        def _open_fds():
+            _fd_dir = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+            return len(os.listdir(_fd_dir))
         m._load_settings()
-        ok(not os.path.exists(_corrupt), "a missing settings file sets nothing aside")
+        _fds_before = _open_fds()
+        for _ in range(50):
+            _dir_read = m._load_settings()
+        ok(_open_fds() <= _fds_before and _dir_read == m.DEFAULT_SETTINGS
+           and os.path.isdir(m.SETTINGS_FILE) and not os.path.exists(_corrupt),
+           f"a directory at the settings path loads as defaults without leaking a descriptor each read "
+           f"({_fds_before} open before, {_open_fds()} after 50 reads)")
+        os.rmdir(m.SETTINGS_FILE)
         os.mkfifo(m.SETTINGS_FILE)
         m._load_settings()
         ok(os.path.exists(m.SETTINGS_FILE) and not os.path.exists(_corrupt),
