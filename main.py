@@ -44,10 +44,41 @@ except ImportError:
 _LOG_MAC_RE = re.compile(
     r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){4}([0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2})(?![0-9A-Fa-f])"
 )
+# IP addresses go whole: GitHub names the network's public address in a rate
+# limit refusal, and a private one says nothing a report needs. Neither edge
+# may run on into more digits, but a full stop after the address is still the
+# end of it ("for 10.0.0.1."), and five numbers in a row are not an address.
+_IPV4_RE = re.compile(
+    r"(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d|\.\d)"
+)
+# Either the full eight groups or a form shortened with "::". Requiring one
+# of the two keeps times and channel lists, which also have colons, out of it.
+_IPV6_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:"
+    r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
+    r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::"
+    r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?"
+    r")(?![0-9A-Fa-f:])"
+)
+# A home directory names the desktop account, which on Bazzite and CachyOS is
+# the person's own login. Paths reach the log in error messages.
+_HOME_RE = re.compile(r"(?:/var)?/home/[^/\s'\"),:;]+")
+
+
+def _mask_home(text: str) -> str:
+    """text with the desktop user's home directory written as ~."""
+    home = (getattr(decky, "DECKY_USER_HOME", "") or "").rstrip("/")
+    if len(home) > 1 and home.startswith("/") and not _HOME_RE.fullmatch(home):
+        text = text.replace(home, "~")
+    return _HOME_RE.sub("~", text)
 
 
 def _mask_addresses(text: str) -> str:
-    return _LOG_MAC_RE.sub(lambda m: "xx:xx:xx:xx:" + m.group(1), text)
+    text = _LOG_MAC_RE.sub(lambda m: "xx:xx:xx:xx:" + m.group(1), text)
+    text = _IPV4_RE.sub("<ip>", text)
+    text = _IPV6_RE.sub(lambda m: m.group(0) if m.group(0) == "::" else "<ip>", text)
+    return _mask_home(text)
 
 
 # Any object with a filter method works as a logging filter, so the logging
@@ -69,6 +100,8 @@ if hasattr(decky.logger, "addFilter"):
 
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 SYSFS_NET = "/sys/class/net"
+# Every wireless radio (wiphy), whether or not it has an interface.
+SYSFS_IEEE80211 = "/sys/class/ieee80211"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
 # Where modprobe looks for options, in its order of precedence.
@@ -98,6 +131,12 @@ HOLO_NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-holo-defaults.conf"
 GENERIC_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf"
 BAZZITE_IWD_CONF = "/etc/NetworkManager/conf.d/iwd.conf"
 
+# chip_label names the family a driver serves, not one chip, and
+# supports_6ghz is only the fallback for when the card cannot be asked
+# (get_device_info asks `iw phy` first). A driver that also runs cards with
+# no 6 GHz radio says False there: offering a band the card lacks pins the
+# profile to a network it cannot join, while hiding it costs nothing until
+# the card answers.
 DRIVER_PROFILES = {
     "rtw88": {
         "chip_label": "WiFi 5 (RTL8822CE)",
@@ -118,8 +157,10 @@ DRIVER_PROFILES = {
         "modprobe_options": [],
     },
     "rtw89": {
-        "chip_label": "WiFi 6 (RTL8852)",
-        "supports_6ghz": True,
+        # RTL8851BE, RTL8852AE/BE/CE and the WiFi 7 RTL8922AE; only some
+        # of them have 6 GHz.
+        "chip_label": "Realtek RTL885x/RTL8922",
+        "supports_6ghz": False,
         "sysfs_power_fixes": [
             "/sys/module/rtw89_pci/parameters/disable_aspm_l1",
             "/sys/module/rtw89_pci/parameters/disable_aspm_l1ss",
@@ -136,8 +177,10 @@ DRIVER_PROFILES = {
         "modprobe_options": [],
     },
     "mt7921e": {
-        "chip_label": "WiFi 6E (MT7922)",
-        "supports_6ghz": True,
+        # The 6E MT7922 (ROG Ally, Legion Go), and also the MT7921 and
+        # MT7902, which have no 6 GHz.
+        "chip_label": "MediaTek MT792x",
+        "supports_6ghz": False,
         "sysfs_power_fixes": [
             "/sys/module/mt7921e/parameters/disable_aspm",
         ],
@@ -146,8 +189,9 @@ DRIVER_PROFILES = {
         ],
     },
     "iwlwifi": {
+        # Every Intel card since 2013, the AX200 and AX201 without 6 GHz.
         "chip_label": "Intel WiFi",
-        "supports_6ghz": True,
+        "supports_6ghz": False,
         "sysfs_power_fixes": [],
         # iwlmvm and iwlmld are separate modules from iwlwifi, so the modules
         # it may configure are listed rather than inferred from the driver
@@ -184,6 +228,16 @@ DMI_SUBSTRING_DEVICES = [
     ("GPD", {"family": "gpd", "label": "GPD Device"}),
     ("G1618", {"family": "gpd_win", "label": "GPD WIN Device"}),
 ]
+
+# AYANEO and GPD put their brand in the DMI vendor, and on many models only
+# the model in the product name ("AIR Plus"), so the vendor is matched as
+# well, after the product name has had its say.
+DMI_VENDOR_DEVICES = [
+    ("AYANEO", {"family": "ayaneo", "label": "AYANEO Device"}),
+    ("AYADEVICE", {"family": "ayaneo", "label": "AYANEO Device"}),
+    ("GPD", {"family": "gpd", "label": "GPD Device"}),
+]
+DMI_DIR = "/sys/devices/virtual/dmi/id"
 
 try:
     SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
@@ -777,11 +831,27 @@ def _read_pcie_baseline() -> dict:
 
 
 def _save_pcie_baseline(baseline: dict):
+    """Write the baseline beside its name and rename it over, so the file
+    is never missing. The dispatcher records the system's values once a boot,
+    when it finds no file: removing it before writing a new one gave a
+    dispatcher run in between the chance to record our own values as the
+    system's. Anything such a run recorded meanwhile is kept, since it was
+    read before either of us wrote."""
     try:
         os.makedirs(os.path.dirname(PCIE_BASELINE_FILE), mode=0o755, exist_ok=True)
     except OSError:
         pass
-    _write_no_follow(PCIE_BASELINE_FILE, json.dumps(baseline))
+    merged = {**baseline, **_read_pcie_baseline()}
+    tmp = PCIE_BASELINE_FILE + ".plugin"
+    if not _write_no_follow(tmp, json.dumps(merged)):
+        return
+    try:
+        os.replace(tmp, PCIE_BASELINE_FILE)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _boot_time() -> int | None:
@@ -2252,12 +2322,14 @@ class Plugin:
             return "wpa_supplicant"
         return None
 
-    def _configured_backend_from_files(self, skip: str | None = None) -> str | None:
+    def _configured_backend_from_files(self, skip: str | None = None,
+                                       only: str | None = None) -> str | None:
         """The backend the known conf files name, highest priority first.
 
         NetworkManager reads conf.d in name order and the later file wins, so
         Bazzite's iwd.conf outranks our 99-wifi-optimizer-backend.conf, which
         outranks Valve's 99-valve-wifi-backend.conf; /usr/lib defaults last.
+        only: read just that one of them.
         """
         for path in (
             BAZZITE_IWD_CONF,
@@ -2266,7 +2338,7 @@ class Plugin:
             NM_DEFAULT_CONF,
             HOLO_NM_DEFAULT_CONF,
         ):
-            if path == skip:
+            if path == skip or (only is not None and path != only):
                 continue
             try:
                 with open(path, "r") as f:
@@ -2283,6 +2355,16 @@ class Plugin:
                 continue
             except Exception:
                 continue
+        return None
+
+    def _file_naming_backend(self, backend: str) -> str | None:
+        """The highest-priority known conf file, other than ours, that names
+        backend, or None."""
+        for path in (BAZZITE_IWD_CONF, WIFI_BACKEND_CONF, NM_DEFAULT_CONF,
+                     HOLO_NM_DEFAULT_CONF):
+            if self._configured_backend_from_files(
+                    skip=GENERIC_BACKEND_CONF, only=path) == backend:
+                return path
         return None
 
     def _release_generic_backend_conf(self):
@@ -2492,7 +2574,8 @@ class Plugin:
             return "The system didn't respond in time. Try again in a moment."
         if "network is unreachable" in d or "connection refused" in d:
             return "Network problem during the switch. Check WiFi and try again."
-        return "The WiFi backend switch didn't take effect."
+        return ("The WiFi backend switch didn't take effect. Restart the device, "
+                "then try again.")
 
     def _require_wifi(self) -> tuple:
         iface = self._get_wifi_interface()
@@ -2882,8 +2965,10 @@ class Plugin:
         """
         not_applied = []
         try:
-            # Discover WiFi PCI device path dynamically
-            iface = self._get_wifi_interface()
+            # Discover WiFi PCI device path dynamically: the card the driver
+            # fixes are for, not a second radio NetworkManager may list first
+            # (a USB adapter, whose power/control is no PCIe link of ours).
+            iface = self._driver_interface() or self._get_wifi_interface()
             if not iface or not IFACE_RE.match(iface):
                 return not_applied
             device_link = os.path.realpath(os.path.join(SYSFS_NET, iface, "device"))
@@ -2995,8 +3080,13 @@ class Plugin:
         return recorded
 
     def _wifi_associated(self) -> bool:
-        """Whether the WiFi interface is up and associated with a network."""
-        iface = self._get_wifi_interface()
+        """Whether the radio the driver fixes are for is up and associated.
+
+        That is the netdev bound to the settings' driver. With a second radio
+        (a USB adapter) the first one NetworkManager lists can be the other,
+        and its link said nothing about whether this driver's card idles.
+        """
+        iface = self._driver_interface() or self._get_wifi_interface()
         if not iface or not IFACE_RE.match(iface):
             return False
         try:
@@ -3004,6 +3094,36 @@ class Plugin:
                 return f.read(16).strip() == "up"
         except OSError:
             return False
+
+    @staticmethod
+    def _module_profile(module: str) -> str:
+        """The DRIVER_PROFILES key a kernel module belongs to, or the module
+        itself (rtw88_8822ce is rtw88), as _detect_wifi_driver names it."""
+        if module in DRIVER_PROFILES:
+            return module
+        return next((key for key in DRIVER_PROFILES if module.startswith(key)), module)
+
+    def _driver_interface(self) -> str | None:
+        """The wireless netdev whose driver is the one in the settings, or
+        None when no single one is (or the driver is not known)."""
+        driver = _load_settings().get("driver", "")
+        if driver not in DRIVER_PROFILES:
+            return None
+        try:
+            names = sorted(os.listdir(SYSFS_NET))
+        except OSError:
+            return None
+        found = []
+        for name in names:
+            if not IFACE_RE.match(name) or not os.path.exists(
+                    os.path.join(SYSFS_NET, name, "phy80211")):
+                continue
+            module = os.path.join(SYSFS_NET, name, "device", "driver", "module")
+            if not os.path.exists(module):
+                continue
+            if self._module_profile(os.path.basename(os.path.realpath(module))) == driver:
+                found.append(name)
+        return found[0] if len(found) == 1 else None
 
     def _install_dispatcher(self) -> bool:
         try:
@@ -3497,9 +3617,10 @@ class Plugin:
     # ---- Hardware detection ----
 
     def _detect_device_family(self) -> tuple[str, str, str]:
-        """Read DMI product_name and return (raw_product, family_id, display_label)."""
+        """Read DMI product_name (and sys_vendor) and return
+        (raw_product, family_id, display_label)."""
         try:
-            with open("/sys/devices/virtual/dmi/id/product_name", "r") as f:
+            with open(os.path.join(DMI_DIR, "product_name"), "r") as f:
                 product = f.read().strip()
         except Exception:
             return ("unknown", "unknown", "Unknown Device")
@@ -3510,6 +3631,15 @@ class Plugin:
 
         for prefix, info in DMI_SUBSTRING_DEVICES:
             if product.startswith(prefix):
+                return (product, info["family"], info["label"])
+
+        try:
+            with open(os.path.join(DMI_DIR, "sys_vendor"), "r") as f:
+                vendor = f.read(256).strip()
+        except Exception:
+            vendor = ""
+        for prefix, info in DMI_VENDOR_DEVICES:
+            if vendor.upper().startswith(prefix):
                 return (product, info["family"], info["label"])
 
         return (product, "unknown", "Unknown Device")
@@ -3523,13 +3653,7 @@ class Plugin:
             return "unknown"
         try:
             driver_path = os.path.realpath(os.path.join(SYSFS_NET, iface, "device", "driver", "module"))
-            module = os.path.basename(driver_path)
-            if module in DRIVER_PROFILES:
-                return module
-            for key in DRIVER_PROFILES:
-                if module.startswith(key):
-                    return key
-            return module
+            return self._module_profile(os.path.basename(driver_path))
         except Exception:
             return "unknown"
 
@@ -3575,15 +3699,21 @@ class Plugin:
 
     async def get_device_info(self) -> dict:
         try:
-            product, device_family, device_label = self._detect_device_family()
-            driver = self._detect_wifi_driver()
+            # Off the event loop: the interface lookup can ask nmcli and the
+            # 6 GHz question runs `iw phy`, which waits out its timeout behind
+            # a wedged driver, and every call the panel makes would wait too.
+            def detect():
+                return (self._detect_device_family(), self._detect_wifi_driver(),
+                        self._radio_has_6ghz())
+
+            (product, device_family, device_label), driver, supports_6ghz = \
+                await asyncio.to_thread(detect)
             profile = DRIVER_PROFILES.get(driver, {})
 
             chip_label = profile.get("chip_label", "unknown")
             # The card itself says, where it can be asked: one driver serves
             # chips with and without 6 GHz (mt7921e drives both the MT7921
             # and the 6E MT7922; iwlwifi every Intel card since 2013).
-            supports_6ghz = self._radio_has_6ghz()
             if supports_6ghz is None:
                 supports_6ghz = profile.get("supports_6ghz", False)
 
@@ -3736,7 +3866,8 @@ class Plugin:
             if not info.get("readable"):
                 return {
                     "success": False, "error": "unreadable",
-                    "message": "Couldn't read the current wireless region.",
+                    "message": ("Couldn't read the current wireless region. Try again "
+                                "in a moment. If it keeps failing, restart the device."),
                 }
             settings = _load_settings()
             previous = settings.get("regdomain_previous", "")
@@ -3760,7 +3891,8 @@ class Plugin:
                 self._log_detail("set_regdomain", (applied.get("stderr") or "")[:200])
                 return {
                     "success": False, "error": "iw_failed",
-                    "message": "Couldn't set the wireless region.",
+                    "message": ("Couldn't set the wireless region. Try again in a "
+                                "moment. If it keeps failing, restart the device."),
                     "detail": (applied.get("stderr") or "")[:200],
                 }
             # Re-read: anything saved while iw ran would otherwise be undone
@@ -3770,6 +3902,14 @@ class Plugin:
             settings["regdomain"] = country
             _save_settings(settings)
             after = await asyncio.to_thread(self._regdomain_info)
+            # The kernel applies a region request from a queue of its own, so
+            # a read straight after can still show the old one. Give it a
+            # moment before saying the card did not follow.
+            for _ in range(2):
+                if not country or after.get("self_managed") or after.get("governing") == country:
+                    break
+                await asyncio.sleep(0.5)
+                after = await asyncio.to_thread(self._regdomain_info)
             result = {
                 "success": True,
                 "regdomain": country,
@@ -3777,14 +3917,28 @@ class Plugin:
                 "self_managed": after.get("self_managed", False),
                 "changeable": after.get("changeable", False),
             }
+            # The Steam Deck is named only on one: the panel shows this on
+            # every device the plugin runs on.
+            on_deck = settings.get("device_family") in ("deck_lcd", "deck_oled")
+            normal = ("That is normal on many handhelds, the Steam Deck included, "
+                      if on_deck else "That is normal on many handhelds, ")
+            governing = after.get("governing", "") or "unknown"
             if after.get("self_managed"):
                 result["message"] = (
                     "This device's WiFi carries its own region "
-                    f"({after.get('governing', 'unknown')}) and ignores this "
+                    f"({governing}) and ignores this "
                     "setting, so the channels available to you have not "
-                    "changed. That is normal on many handhelds, the Steam Deck "
-                    "included, and does not "
-                    "mean a band is missing."
+                    "changed. " + normal + "and does not mean a band is missing."
+                )
+            elif country and after.get("readable") and after.get("governing") != country:
+                # Not self-managed, and still not on the chosen region: a card
+                # that follows the region it was built for (some read one from
+                # the chip itself) can turn the request down, and the
+                # selector would otherwise show a region the radio is not on.
+                result["message"] = (
+                    f"The WiFi card stayed on its own region ({governing}) instead "
+                    f"of {country}, so the channels available to you may not have "
+                    "changed. " + normal + "and nothing else needs doing."
                 )
             decky.logger.info(
                 f"regdomain set to {target!r}: governing="
@@ -3805,20 +3959,9 @@ class Plugin:
         r"(?<![0-9A-Fa-f-])(?<![0-9A-Fa-f]:)(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}"
         r"(?![0-9A-Fa-f-])(?![:-][0-9A-Fa-f]{2}(?![0-9A-Za-z]))"
     )
-    _DIAG_IPV4_RE = re.compile(
-        r"(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
-        r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])"
-    )
-    # Either the full eight groups or a form shortened with "::". Requiring
-    # one of the two keeps times and channel lists, which also have colons,
-    # out of it.
-    _DIAG_IPV6_RE = re.compile(
-        r"(?<![0-9A-Fa-f:])(?:"
-        r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
-        r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::"
-        r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?"
-        r")(?![0-9A-Fa-f:])"
-    )
+    # The same patterns the plugin log is masked with (see _IPV4_RE).
+    _DIAG_IPV4_RE = _IPV4_RE
+    _DIAG_IPV6_RE = _IPV6_RE
 
     @classmethod
     def _redact_diagnostics(cls, value, ssids: tuple = ()):
@@ -3847,19 +3990,31 @@ class Plugin:
         # IPv4 first: an IPv4-mapped address (::ffff:192.168.1.5) would
         # otherwise lose only its first octet to the IPv6 pattern.
         text = cls._DIAG_IPV4_RE.sub("<ip>", text)
-        return cls._DIAG_IPV6_RE.sub(
+        text = cls._DIAG_IPV6_RE.sub(
             lambda m: m.group(0) if m.group(0) == "::" else "<ip>", text
         )
+        # Error text carries paths, and a home directory names the account.
+        return _mask_home(text)
 
     async def get_diagnostic_info(self) -> dict:
         """Collect system info for remote debugging. Sanitized: no passwords,
         and no network names or addresses (see _redact_diagnostics)."""
         try:
             info = await self.get_device_info()
-            iface = self._get_wifi_interface() or "none"
-            iw_dev = self._run_cmd(["/usr/bin/iw", "dev"], timeout=3)
-            iw_reg = self._run_cmd(["/usr/bin/iw", "reg", "get"], timeout=3)
-            uname = self._run_cmd(["/usr/bin/uname", "-r"], timeout=3)
+
+            def basics():
+                # One trip off the event loop for all four: iw waits up to
+                # its timeout behind a wedged driver, which is exactly when
+                # someone copies a report, and every other call the panel
+                # makes would wait with it.
+                return (
+                    self._get_wifi_interface() or "none",
+                    self._run_cmd(["/usr/bin/iw", "dev"], timeout=3),
+                    self._run_cmd(["/usr/bin/iw", "reg", "get"], timeout=3),
+                    self._run_cmd(["/usr/bin/uname", "-r"], timeout=3),
+                )
+
+            iface, iw_dev, iw_reg, uname = await asyncio.to_thread(basics)
             os_release = ""
             try:
                 with open("/etc/os-release", "r") as f:
@@ -3871,6 +4026,9 @@ class Plugin:
                 found.group(0).split("ssid ", 1)[1]
                 for found in self._DIAG_SSID_LINE_RE.finditer(iw_dev.get("stdout", ""))
             )
+            # The extras redact the service logs with these too, before their
+            # own quote rules run (see _diag_service_lines).
+            self._diag_ssids = ssids
             # The report predates these parts, so one that fails is noted
             # rather than costing the person the whole report.
             try:
@@ -3937,6 +4095,18 @@ class Plugin:
     # Anything else (systemd's "Hostname set to ..." also lands in -k) is left out.
     _DIAG_KERNEL_LINE_RE = re.compile(r"^(\[\s*[\d.]+\]) kernel: (.*)$")
 
+    # A call trace frame: " func+0x1c/0x40 [module]", " ? func+...", or a
+    # context marker such as <TASK>, <IRQ> and their closing forms. The kernel
+    # indents frames by a space; the symbol form is also accepted in case a
+    # journal ever stores the line without it.
+    _DIAG_FRAME_RE = re.compile(
+        r"^(?:[ ?<]|[\w.$]+\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+)"
+    )
+
+    @classmethod
+    def _diag_is_frame(cls, message: str) -> bool:
+        return bool(message) and bool(cls._DIAG_FRAME_RE.match(message))
+
     @classmethod
     def _diag_kernel_lines(cls, text: str, terms: str) -> list:
         """The lines of one boot's kernel log worth reading for a WiFi problem.
@@ -3963,12 +4133,21 @@ class Plugin:
             if message.startswith("Call Trace:"):
                 frames = 0
             elif frames is not None:
-                if "---[ end trace" in message:
+                # Only a WARN or an oops ends its trace with "end trace". A
+                # hung task, a soft lockup, an RCU stall or dump_stack() (what
+                # a wedged rtw88 tends to print) stops at </TASK> or with no
+                # marker at all, so the first line that is not a frame ends
+                # it too, and is read like any other line. Waiting for the
+                # marker used to swallow the rest of the boot: the suspend
+                # and every driver error after the trace.
+                if "---[ end trace" in message or message.strip() == "</TASK>":
                     frames = None
-                else:
+                elif cls._diag_is_frame(message):
                     frames += 1
                     if frames > cls._DIAG_TRACE_FRAMES:
                         continue
+                else:
+                    frames = None
             if message.startswith("Modules linked in:"):
                 continue
             if not wanted.search(message) or cls._DIAG_CHATTER_RE.search(message):
@@ -3997,22 +4176,122 @@ class Plugin:
 
     # NetworkManager, iwd and wpa_supplicant name the network in quotes and
     # after "ssid"/"SSID". Anything quoted goes, since a profile name is often
-    # a person's own wording.
-    _DIAG_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+    # a person's own wording. A name can hold a quote of its own (Jason's
+    # Home), so a quoted value ends only at a quote followed by a space, a
+    # bracket or punctuation, or the end of the line, and starts only at a
+    # quote that does not follow a letter: a name cut at its apostrophe left
+    # the rest of it in the report.
+    _DIAG_QUOTED_RE = re.compile(
+        r"(?<!\w)'.*?'(?=[\s),:;.\]]|$)|(?<!\w)\".*?\"(?=[\s),:;.\]]|$)"
+    )
+    # An opening quote still standing after that has lost its end (a line cut
+    # short): everything after it goes.
+    _DIAG_OPEN_QUOTE_RE = re.compile(r"(?<!\w)['\"].*$")
+    # NetworkManager's own fixed words are quoted too, and they are what says
+    # why a connection failed: (reason 'no-secrets', sys-iface-state: 'managed').
+    _DIAG_NM_WORD_KEY_RE = re.compile(r"(?:\breason |\bsys-iface-state: |\bmanaged-type: )$")
+    _DIAG_NM_WORD_RE = re.compile(r"[a-z0-9-]+")
     _DIAG_SSID_WORD_RE = re.compile(r"(?i)(ssid[=: ]+)\S+")
     _DIAG_SERVICE_LINES = 40
+    # Where a boot that ended in a reboot starts shutting the services down,
+    # and where one of them starts again (a backend switch restarts them
+    # mid-boot, which is not the end of it).
+    _DIAG_SHUTDOWN_RE = re.compile(r"caught SIGTERM|shutting down|: Stopping ")
+    _DIAG_SERVICE_START_RE = re.compile(
+        r"NetworkManager \(version|: Starting |: Started |Successfully initialized wpa_supplicant"
+    )
+    # The lines that say what happened to a connection, kept ahead of routine
+    # ones when there are too many.
+    _DIAG_SERVICE_EVENT_RE = re.compile(
+        r"(?i)state change|fail|error|<warn>|CTRL-EVENT|disconnect|deauth|timed? ?out|reason"
+    )
 
     @classmethod
-    def _diag_service_lines(cls, text: str, limit: int) -> list:
-        """The last lines of a service log, each bounded, network names out."""
+    def _diag_service_lines(cls, text: str, limit: int, names: tuple = (),
+                            events_first: bool = False) -> list:
+        """The last lines of a service log, each bounded, network names out.
+
+        names are the network names known on this device (saved profiles and
+        the SSIDs in view), replaced wherever they appear before anything
+        else is, so a name with a quote in it goes whole. events_first: for
+        the network services' log, see _diag_pick_service_lines.
+        """
+        known = sorted({n for n in names if isinstance(n, str) and len(n) >= 3},
+                       key=len, reverse=True)
+        named = [re.compile(r"(?<![A-Za-z0-9])" + re.escape(n) + r"(?![A-Za-z0-9])")
+                 for n in known]
         lines = []
         for raw in text.splitlines():
-            line = cls._DIAG_QUOTED_RE.sub("<name>", raw)
+            line = raw
+            for pattern in named:
+                line = pattern.sub("<name>", line)
+
+            kept = []
+
+            def quoted(found, line=line):
+                value = found.group(0)[1:-1]
+                if (cls._DIAG_NM_WORD_KEY_RE.search(line[:found.start()])
+                        and cls._DIAG_NM_WORD_RE.fullmatch(value)):
+                    # Held aside so the pass below does not read its opening
+                    # quote as one that lost its end.
+                    kept.append(found.group(0))
+                    return f"\x00{len(kept) - 1}\x00"
+                return "<name>"
+
+            line = cls._DIAG_QUOTED_RE.sub(quoted, line)
+            line = cls._DIAG_OPEN_QUOTE_RE.sub("<name>", line)
+            line = re.sub(r"\x00(\d+)\x00", lambda found: kept[int(found.group(1))], line)
             line = cls._DIAG_SSID_WORD_RE.sub(r"\1<ssid>", line)
             lines.append(line[:cls._DIAG_LINE_MAX])
+        if events_first:
+            return cls._diag_pick_service_lines(lines, limit)
         if len(lines) > limit:
             return [f"({len(lines) - limit} earlier lines left out)"] + lines[-limit:]
         return lines
+
+    @classmethod
+    def _diag_pick_service_lines(cls, lines: list, limit: int) -> list:
+        """The network services' lines worth reading, at most limit of them.
+
+        A boot that ended in a reboot ends in the shutdown, and its last
+        lines were all a report showed. So the shutdown is left out, and of
+        what comes before it the lines about connections (state changes,
+        failures, supplicant events) are kept ahead of routine ones.
+        """
+        out = []
+        last_start = max((i for i, line in enumerate(lines)
+                          if cls._DIAG_SERVICE_START_RE.search(line)), default=-1)
+        stop = next((i for i, line in enumerate(lines)
+                     if i > last_start and cls._DIAG_SHUTDOWN_RE.search(line)), None)
+        if stop is not None:
+            lines, dropped = lines[:stop], len(lines) - stop
+        else:
+            dropped = 0
+        if len(lines) > limit:
+            events = [i for i, line in enumerate(lines)
+                      if cls._DIAG_SERVICE_EVENT_RE.search(line)]
+            keep = set(events[-limit:])
+            for i in range(len(lines) - 1, -1, -1):
+                if len(keep) >= limit:
+                    break
+                keep.add(i)
+            out.append(f"({len(lines) - len(keep)} earlier or routine lines left out)")
+            lines = [lines[i] for i in sorted(keep)]
+        out += lines
+        if dropped:
+            out.append(f"({dropped} lines of the shutdown left out)")
+        return out
+
+    # The dispatcher's marker for the driver parameters as they were when the
+    # driver loaded (defaults/dispatcher.sh.tmpl).
+    _DIAG_AT_LOAD = "driver parameters at load:"
+    _DIAG_PARAMS_NOTE = (
+        "Each value is the module parameter as it reads now. The driver acts on it "
+        "at its own moment: rtw88's disable_aspm at each PCIe power change, its "
+        "disable_lps_deep when the interface next starts, rtw89's at probe and "
+        "resume, mt7921e's only at probe. So a Y written after that is not yet in "
+        "force; plugin_load_values_* say what the driver loaded with."
+    )
 
     def _diagnostic_extras(self, driver: str, iface: str) -> dict:
         """What a report needs beyond the device: versions, toggles, backend,
@@ -4033,7 +4312,13 @@ class Plugin:
         except Exception as e:
             extras["settings"] = f"unreadable: {e}"
         try:
-            extras["wifi_backend"] = self._get_current_backend() or "unknown"
+            # The one running now, and the one configured for the next boot
+            # when that differs (see _backend_in_use).
+            configured = self._get_current_backend()
+            in_use = self._backend_in_use(configured)
+            extras["wifi_backend"] = in_use or "unknown"
+            if configured and in_use and configured != in_use:
+                extras["wifi_backend_next"] = configured
         except Exception as e:
             extras["wifi_backend"] = f"unreadable: {e}"
 
@@ -4057,19 +4342,26 @@ class Plugin:
         extras["driver_params"] = {
             path: read(path) for path in profile.get("sysfs_power_fixes", [])
         }
+        if extras["driver_params"]:
+            # What the file says is not always what the driver is doing:
+            # each one reads its parameter at its own moment.
+            extras["driver_params_note"] = self._DIAG_PARAMS_NOTE
         extras["modprobe_conf"] = read(MODPROBE_CONF_PATH)
         # Options in that file only take effect when the driver loads, so
-        # whether it predates this boot says if they are in force from the
-        # start or were only written into sysfs later.
+        # whether it predates THIS boot says if they were in force from its
+        # start. It says nothing about the boot before, the one a report is
+        # usually about: for that, see plugin_load_values_previous_boot.
         try:
-            with open("/proc/stat", "r") as f:
-                boot = next(int(line.split()[1]) for line in f
-                            if line.startswith("btime "))
-            extras["modprobe_conf_before_boot"] = (
-                os.stat(MODPROBE_CONF_PATH).st_mtime < boot
+            mtime = os.stat(MODPROBE_CONF_PATH).st_mtime
+            extras["modprobe_conf_modified"] = time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC", time.gmtime(mtime))
+            boot = _boot_time()
+            extras["modprobe_conf_before_this_boot"] = (
+                None if boot is None else mtime < boot
             )
-        except (OSError, StopIteration, ValueError, IndexError):
-            extras["modprobe_conf_before_boot"] = None
+        except OSError:
+            extras["modprobe_conf_modified"] = None
+            extras["modprobe_conf_before_this_boot"] = None
         extras["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
 
         pcie = {}
@@ -4080,14 +4372,20 @@ class Plugin:
                 path = os.path.join(device, "link", name)
                 if os.path.exists(path):
                     pcie[name] = read(path)
+            # Clock PM is the one PCIe power feature the fixes leave on, so
+            # it is read too, with the device's power state (D0 is awake).
+            clkpm = os.path.join(device, "link", "clkpm")
+            if os.path.exists(clkpm):
+                pcie["clkpm"] = read(clkpm)
+            pcie["power_state"] = read(os.path.join(device, "power_state"))
             pcie["power_control"] = read(os.path.join(device, "power", "control"))
             pcie["runtime_status"] = read(os.path.join(device, "power", "runtime_status"))
         extras["pcie"] = pcie
 
         rfkill = []
         try:
-            for entry in sorted(os.listdir("/sys/class/rfkill")):
-                base = os.path.join("/sys/class/rfkill", entry)
+            for entry in sorted(os.listdir(self.RFKILL_DIR)):
+                base = os.path.join(self.RFKILL_DIR, entry)
                 rfkill.append(f"{read(os.path.join(base, 'type'))} "
                               f"soft={read(os.path.join(base, 'soft'))} "
                               f"hard={read(os.path.join(base, 'hard'))}")
@@ -4104,6 +4402,22 @@ class Plugin:
             timeout=3,
         )
         extras["nm_devices"] = devices.get("stdout", "") or devices.get("stderr", "")
+
+        # Every network name this device knows, for the service logs below:
+        # replaced whole, before the rules for quoted text, so a name with a
+        # quote of its own cannot leave half of itself behind.
+        names = list(getattr(self, "_diag_ssids", ()) or ())
+        saved = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-e", "no", "-f", "NAME", "connection", "show"],
+            timeout=3,
+        )
+        if saved.get("success"):
+            names += [n for n in saved.get("stdout", "").split("\n") if n.strip()]
+        try:
+            names.append(_load_settings().get("band_preference_ssid", "") or "")
+        except Exception:
+            pass
+        names = tuple(names)
 
         # The plugins directory sits in the desktop user's home, so it is
         # listed through the same no-follow walk as the settings directory.
@@ -4126,19 +4440,36 @@ class Plugin:
         extras["mem_sleep"] = read("/sys/power/mem_sleep")
         journal = ["/usr/bin/journalctl", "--no-hostname", "-o", "short-monotonic",
                    "--no-pager"]
-        for key, boot in (("plugin_log_this_boot", "0"), ("plugin_log_previous_boot", "-1")):
+        for key, boot in (("this_boot", "0"), ("previous_boot", "-1")):
             log = self._run_cmd(journal + ["-b", boot, "-t", "wifi-optimizer", "-n", "200"],
                                 timeout=5)
-            extras[key] = (self._diag_service_lines(log.get("stdout", ""), 30)
-                           if log.get("success")
-                           else [f"unavailable: {(log.get('stderr') or '')[:120]}"])
+            extras["plugin_log_" + key] = (
+                self._diag_service_lines(log.get("stdout", ""), 30, names)
+                if log.get("success")
+                else [f"unavailable: {(log.get('stderr') or '')[:120]}"])
+            # The dispatcher's first run of a boot notes the driver parameters
+            # as the driver loaded them, which is whether the fixes were in
+            # force for that whole boot. Later lines read Y because the
+            # dispatcher wrote it, and after a few wakes the first line has
+            # left the tail above, so it is looked for on its own.
+            found = self._run_cmd(
+                journal + ["-b", boot, "-t", "wifi-optimizer", "--grep",
+                           self._DIAG_AT_LOAD, "-n", "5"],
+                timeout=5,
+            )
+            source = found if found.get("success") else log
+            extras["plugin_load_values_" + key] = [
+                line for line in self._diag_service_lines(source.get("stdout", ""), 200, names)
+                if self._DIAG_AT_LOAD in line
+            ][-3:] or ["none logged"]
         log = self._run_cmd(
             journal + ["-b", "-1", "-u", "NetworkManager", "-u", "iwd", "-u", "wpa_supplicant",
                        "-n", "2000"],
             timeout=5,
         )
         extras["network_log_previous_boot"] = (
-            self._diag_service_lines(log.get("stdout", ""), self._DIAG_SERVICE_LINES)
+            self._diag_service_lines(log.get("stdout", ""), self._DIAG_SERVICE_LINES,
+                                     names, events_first=True)
             if log.get("success")
             else [f"unavailable: {(log.get('stderr') or '')[:120]}"]
         )
@@ -5995,7 +6326,38 @@ class Plugin:
     )
 
     def _backend_is_iwd(self) -> bool:
-        return self._get_current_backend() == "iwd"
+        return self._backend_in_use() == "iwd"
+
+    def _backend_in_use(self, configured: str | None = None) -> str | None:
+        """The WiFi backend running now: 'iwd', 'wpa_supplicant' or None.
+
+        On SteamOS the configured one, as before. Elsewhere a change of
+        backend only lands at the next boot after Reset or an uninstall (our
+        file goes, the old backend keeps running), so the configuration can
+        name one that is not running. There the service decides: when exactly
+        one of the two is active, that one is in use. Reading the config
+        instead wrote pins under a live iwd and refused the lock under a live
+        wpa_supplicant. configured: _get_current_backend(), when the caller
+        already has it.
+        """
+        if configured is None:
+            configured = self._get_current_backend()
+        try:
+            if _load_settings().get("distro_id") == "steamos":
+                return configured
+        except Exception:
+            return configured
+        return self._running_backend() or configured
+
+    def _running_backend(self) -> str | None:
+        """The one of iwd and wpa_supplicant whose service is active, when
+        exactly one is; None when neither or both are, or it cannot tell."""
+        active = [
+            name for name in ("iwd", "wpa_supplicant")
+            if (self._run_cmd(["/usr/bin/systemctl", "is-active", name], timeout=3)
+                .get("stdout") or "").strip() == "active"
+        ]
+        return active[0] if len(active) == 1 else None
 
     def _pins_for_backend(self, settings: dict, status: dict) -> dict:
         """The settings this pass acts on, with both pins off under iwd.
@@ -6108,7 +6470,13 @@ class Plugin:
         )
         status["live"]["backend_tool_available"] = backend_available
         if backend_available:
-            status["live"]["wifi_backend"] = self._get_current_backend() or ""
+            configured = self._get_current_backend()
+            in_use = self._backend_in_use(configured)
+            status["live"]["wifi_backend"] = in_use or ""
+            # The one NetworkManager is set to start at the next boot, when
+            # that is not the one running (contract C5).
+            if configured and in_use and configured != in_use:
+                status["live"]["wifi_backend_next"] = configured
 
     def _propose_precedence(self, settings: dict, uuid: str,
                             pending: dict, actions: list):
@@ -6263,8 +6631,22 @@ class Plugin:
         self._address_conflict = None
         if not ip:
             return
+        # A clash logged before the device took the address it holds now was
+        # about an earlier lease: after the router was put right and the
+        # device moved off the address and back, the warning stayed up for up
+        # to ten minutes. So the window starts when the address last changed,
+        # as this process saw it. Not for the first address it sees: that one
+        # was usually taken at boot, before the plugin loaded, which is
+        # exactly when a clash is logged.
+        seen = getattr(self, "_conflict_ip_seen", None)
+        if seen is None or seen[0] != ip:
+            seen = (ip, None if seen is None else time.time())
+            self._conflict_ip_seen = seen
+        since = "-10min"
+        if seen[1] is not None and seen[1] > time.time() - 600:
+            since = f"@{int(seen[1])}"
         log = self._run_cmd(
-            ["/usr/bin/journalctl", "-u", "NetworkManager", "--since", "-10min",
+            ["/usr/bin/journalctl", "-u", "NetworkManager", "--since", since,
              "-o", "cat", "--no-pager"],
             timeout=5,
         )
@@ -6861,6 +7243,67 @@ class Plugin:
                 channel = line
         return channel
 
+    # Where the kernel lists radio switches: each has a type, and soft and hard
+    # block flags.
+    RFKILL_DIR = "/sys/class/rfkill"
+
+    def _report_not_connected(self, status: dict, iface: str | None, timeout: int):
+        """The status's live part when WiFi is not connected: whether the
+        dispatcher is installed, and why there is no connection, so a dead or
+        missing card is not told to connect first (contract C1)."""
+        status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
+        status["live"]["wifi_state"] = self._wifi_state(iface, timeout)
+
+    def _wifi_state(self, iface: str | None, timeout: int = 2) -> str:
+        """Why WiFi is not connected, for the panel (contract C1).
+
+        "not_responding" when an earlier iw is still stuck in the driver,
+        "no_device" with no wireless interface, "radio_off" when WiFi is
+        turned off (NetworkManager's radio or an rfkill block), "unavailable"
+        when NetworkManager lists the card as unavailable, and "disconnected"
+        otherwise. Uses only nmcli and sysfs: an iw run into a wedged driver is
+        what would get stuck.
+        """
+        if "iw" in getattr(self, "_stuck_tools", lambda: set())():
+            return "not_responding"
+        if not iface:
+            return "no_device"
+        _state, radio = self._nm_general_state()
+        if radio == "disabled" or self._wifi_rfkill_blocked():
+            return "radio_off"
+        devices = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-e", "no", "-f", "DEVICE,TYPE,STATE",
+             "device", "status"],
+            timeout=timeout,
+        )
+        for line in (devices.get("stdout") or "").splitlines() if devices.get("success") else []:
+            parts = line.split(":")
+            if len(parts) >= 3 and parts[0] == iface and parts[1] == "wifi":
+                if parts[2].startswith("unavailable"):
+                    return "unavailable"
+                break
+        return "disconnected"
+
+    def _wifi_rfkill_blocked(self) -> bool:
+        """Whether a WiFi radio switch is blocked, by software or by hardware."""
+        try:
+            entries = os.listdir(self.RFKILL_DIR)
+        except OSError:
+            return False
+        for entry in entries:
+            base = os.path.join(self.RFKILL_DIR, entry)
+
+            def flag(name: str) -> str:
+                try:
+                    with open(os.path.join(base, name), "r") as f:
+                        return f.read(16).strip()
+                except OSError:
+                    return ""
+
+            if flag("type") == "wlan" and "1" in (flag("soft"), flag("hard")):
+                return True
+        return False
+
     def _status_read_failed(self) -> tuple[dict, dict, list]:
         """What to answer when the status read itself fell over.
 
@@ -6960,9 +7403,7 @@ class Plugin:
                 status["external"]["pin_released"] = True
 
             if not connected:
-                status["live"]["dispatcher_installed"] = os.path.isfile(
-                    DISPATCHER_PATH
-                )
+                self._report_not_connected(status, iface, T)
                 return status, pending, actions
 
             self._propose_precedence(settings, uuid, pending, actions)
@@ -9794,7 +10235,10 @@ class Plugin:
                 result = await self._github_api(f"{RELEASES_API}/latest")
 
             if not result["success"] or not result["stdout"]:
-                decky.logger.error(f"Update check: curl failed - rc={result.get('returncode')}, stderr={result.get('stderr', '')[:200]}")
+                decky.logger.error(
+                    f"Update check: curl failed - rc={result.get('returncode')}, "
+                    f"stderr={_mask_addresses(result.get('stderr', '')[:200])}"
+                )
                 return {
                     "success": False,
                     "current_version": current,
@@ -9825,12 +10269,17 @@ class Plugin:
                 }
 
             if not latest:
-                # GitHub explains a refusal (a rate limit) in "message". Its
-                # wording is logged as is but never shown: it is English for
-                # developers, and a rate limit names the network's address.
+                # GitHub explains a refusal (a rate limit) in "message". It is
+                # never shown, being English for developers, and only its kind
+                # is logged: a rate limit names the network's public address,
+                # and people post this log in public threads.
                 raw = data.get("message") if isinstance(data, dict) else None
                 raw = raw if isinstance(raw, str) else ""
-                decky.logger.error(f"Update check: no version - {raw[:200] or 'none given'}")
+                if "rate limit" in raw.lower():
+                    kind = "rate limit"
+                else:
+                    kind = "other: " + (_mask_addresses(raw[:200]) or "none given")
+                decky.logger.error(f"Update check: no version - {kind}")
                 if "rate limit" in raw.lower():
                     msg = ("GitHub is limiting update checks from this network "
                            "for now. Try again in an hour.")
@@ -10224,14 +10673,16 @@ class Plugin:
     async def _backend_switch_worker(self, target: str):
         """Background task that switches the WiFi backend with phase transitions.
 
-        Invokes the privileged helper directly (at /usr/bin/steamos-polkit-helpers/…)
-        to bypass pkexec, which fails from a rootful systemd context with no polkit
-        agent. The helper handles wlan0 recovery on ath11k devices internally; we parse its
-        output to report whether recovery fired.
+        Invokes the privileged helper directly (BACKEND_HELPER, under
+        /usr/bin/steamos-polkit-helpers or holo-polkit-helpers) to bypass
+        pkexec, which fails from a rootful systemd context with no polkit
+        agent. The helper tries to recreate a missing wlan0 itself, on phy0
+        only; we parse its output to report whether that fired, then check
+        for an interface whatever the driver, since stopping iwd removes it on
+        every radio but rtw88, and recover it ourselves when the helper could
+        not.
         """
         try:
-            settings = _load_settings()
-            has_wlan0_quirk = settings.get("driver") == "ath11k_pci"
             other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
 
             # Phase: switching - write config then restart services.
@@ -10276,31 +10727,16 @@ class Plugin:
             rs_stdout = restart_result.get("stdout", "")
             rs_stderr = restart_result.get("stderr", "")
             recovery_performed = "missing wlan0" in rs_stdout
-            needs_reboot = "wlan0 could not be created" in rs_stderr
 
-            await asyncio.sleep(1)
-            if has_wlan0_quirk and target == "wpa_supplicant":
-                iface_check = await asyncio.to_thread(self._get_wifi_interface)
-                # Absence is the failure, not the name. An interface that came
-                # back as wlpXsY is working, and treating that as a failure
-                # tells the user to reboot a system that is fine.
-                if not iface_check:
-                    needs_reboot = True
-
-            # The helper reports "wlan0 could not be created" by name, but an
-            # interface that came back as wlpXsY is working. Check before
-            # acting on that claim, the same way the quirk branch above does.
-            if needs_reboot and await asyncio.to_thread(self._get_wifi_interface):
-                needs_reboot = False
-
-            # The helper's own recovery only knows about phy0. Try again with
-            # the real phy before making the user reboot.
-            if needs_reboot:
-                if await asyncio.to_thread(self._recover_wlan0):
-                    await asyncio.sleep(2)
-                    if await asyncio.to_thread(self._get_wifi_interface):
-                        needs_reboot = False
-                        recovery_performed = True
+            # Absence is the failure, not the name, and on every driver. The
+            # helper says "wlan0 could not be created" by name, but an
+            # interface that came back as wlpXsY is working; and the helper's
+            # own recovery only knows phy0, so under wpa_supplicant a missing
+            # one is recreated on the real phy before anyone is told to
+            # reboot. Under iwd, which makes its own, it is waited for.
+            iface, recovered = await self._settle_interface(target)
+            recovery_performed = recovery_performed or recovered
+            needs_reboot = not iface
 
             # Phase: reconnecting. Poll nmcli at 1-second cadence for up to 15s
             # to confirm WiFi actually comes back. 15s is generous for typical
@@ -10399,7 +10835,7 @@ class Plugin:
         even though wlan0 is gone.
         """
         try:
-            phys = os.listdir("/sys/class/ieee80211")
+            phys = os.listdir(SYSFS_IEEE80211)
         except Exception:
             return False
         if not phys:
@@ -10410,7 +10846,7 @@ class Plugin:
             # is a genuine mess, and the caller reaches here whenever the
             # interface is merely named something other than wlan0.
             try:
-                return bool(os.listdir(f"/sys/class/ieee80211/{phy}/device/net"))
+                return bool(os.listdir(os.path.join(SYSFS_IEEE80211, phy, "device", "net")))
             except Exception:
                 return False
 
@@ -10422,7 +10858,7 @@ class Plugin:
             # Steam Deck LCD - and the preference silently degraded to
             # alphabetical order.
             for probe in ("device/driver/module", "device/driver"):
-                path = f"/sys/class/ieee80211/{phy}/{probe}"
+                path = os.path.join(SYSFS_IEEE80211, phy, probe)
                 # realpath does not raise on a missing path, it just returns
                 # the normalised name - which would hand back the literal
                 # "module" and then match nothing.
@@ -10495,7 +10931,9 @@ class Plugin:
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
-                    "message": "Couldn't reach the SteamOS settings service.",
+                    "message": ("Couldn't reach the SteamOS settings service. Try "
+                                "again in a moment. If it keeps failing, restart "
+                                "the device."),
                 }
                 return
 
@@ -10597,7 +11035,8 @@ class Plugin:
                     "reconnect_timed_out": reconnect_timed_out,
                     "message": (
                         f"Expected {target} but the system reports "
-                        f"{final_backend or 'no backend'}. A reboot may help."
+                        f"{final_backend or 'no backend'}. Restart the device, "
+                        f"then try the switch again."
                     ),
                 }
 
@@ -10877,11 +11316,17 @@ class Plugin:
         except OSError as e:
             decky.logger.error(f"restoring backend conf: {e}")
 
-    def _restore_generic_backend(self, backend: str):
+    def _restore_generic_backend(self, backend: str) -> tuple:
         """Point NM back at a backend and start it, after a failed switch.
 
         The one we tried is stopped and disabled first: left enabled, both
         start at the next boot and fight over the interface.
+
+        Returns (whether there is a WiFi interface afterwards, whether we
+        recreated it). Stopping iwd destroys the interface on every radio but
+        rtw88 (it owns the netdev on drivers outside its default-interface
+        list), and wpa_supplicant never makes one, so putting wpa_supplicant
+        back left no WiFi at all until a reboot.
         """
         tried = "iwd" if backend == "wpa_supplicant" else "wpa_supplicant"
         self._run_cmd(["/usr/bin/systemctl", "disable", "--now", tried], timeout=15)
@@ -10893,6 +11338,35 @@ class Plugin:
                     ["/usr/bin/systemctl", "start", backend],
                     ["/usr/bin/systemctl", "restart", "NetworkManager"]):
             self._run_cmd(cmd, timeout=15)
+        return self._interface_after_restart(backend)
+
+    # How long _interface_after_restart gives a restart to settle, then (iwd
+    # only) how many more seconds it waits for iwd's own interface. The same
+    # as _settle_interface, for callers already off the event loop.
+    _SETTLE_SECONDS = 2
+    _IWD_INTERFACE_WAIT = 8
+
+    def _interface_after_restart(self, backend: str | None) -> tuple:
+        """(whether there is a WiFi interface, whether we recreated it) once a
+        backend restart settles. Blocking: for worker threads only. Under
+        wpa_supplicant a missing interface is recreated; under iwd it is
+        waited for, since iwd makes its own (see _settle_interface)."""
+        if self._get_wifi_interface():
+            return True, False
+        time.sleep(self._SETTLE_SECONDS)
+        if self._get_wifi_interface():
+            return True, False
+        if backend == "iwd":
+            for _ in range(self._IWD_INTERFACE_WAIT):
+                time.sleep(1)
+                if self._get_wifi_interface():
+                    return True, False
+            return False, False
+        if not self._recover_wlan0():
+            return False, False
+        time.sleep(self._SETTLE_SECONDS)
+        present = bool(self._get_wifi_interface())
+        return present, present
 
     async def _generic_backend_switch_worker(self, target: str):
         """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
@@ -10925,14 +11399,22 @@ class Plugin:
             merged = await asyncio.to_thread(self._merged_nm_backend)
             if merged is not None and merged != target:
                 self._put_back_backend_conf(before)
+                # Name the file when it is one we know (Bazzite's iwd.conf),
+                # so there is something to act on.
+                where = await asyncio.to_thread(self._file_naming_backend, merged)
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
                     "backend": merged,
                     "target": target,
                     "message": (
-                        f"Another NetworkManager setting on this system keeps "
-                        f"{merged} in force, so nothing was changed."
+                        f"Another NetworkManager setting on this system "
+                        + (f"({where}) " if where else "")
+                        + f"keeps {merged} in force, so nothing was changed. "
+                        + ("To switch, remove or change that setting first."
+                           if where else
+                           "To switch, find the file in /etc/NetworkManager/conf.d "
+                           "that sets wifi.backend and change it first.")
                     ),
                 }
                 return
@@ -10968,14 +11450,18 @@ class Plugin:
                 # Going on would leave NetworkManager pointed at a backend
                 # that is not running and the other one stopped: no WiFi.
                 # Put the previous one back first.
-                await asyncio.to_thread(self._restore_generic_backend, other)
+                present, recovered = await asyncio.to_thread(
+                    self._restore_generic_backend, other)
                 detail = started.get("stderr", "")[:200]
                 self._backend_switch["phase"] = "failed"
                 self._log_detail("_generic_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
-                    "message": f"{target} would not start, so {other} was kept.",
+                    "recovery_performed": recovered,
+                    "needs_reboot": not present,
+                    "message": (f"{target} would not start, so {other} was kept. "
+                                + self._after_restore_text(present)),
                     "detail": detail,
                 }
                 return
@@ -10989,75 +11475,40 @@ class Plugin:
                 # The old backend is stopped and disabled by now, and
                 # NetworkManager may not be running at all. Put the previous
                 # one back, as when the new one would not start.
-                await asyncio.to_thread(self._restore_generic_backend, other)
+                present, recovered = await asyncio.to_thread(
+                    self._restore_generic_backend, other)
                 detail = restart.get("stderr", "")[:200]
                 self._backend_switch["phase"] = "failed"
                 self._log_detail("_generic_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
+                    "recovery_performed": recovered,
+                    "needs_reboot": not present,
                     "message": self._friendly_backend_error(detail),
                     "detail": detail,
                 }
                 return
 
-            # Phase: reconnecting
+            # Phase: reconnecting. The interface first: stopping iwd destroys
+            # it on every radio but rtw88 (iwd owns the netdev on drivers
+            # outside its default-interface list: ath11k, mt7921e, iwlwifi,
+            # rtw89), and wpa_supplicant never makes one. Waiting for a
+            # reconnection without it timed out and then reported success,
+            # on a device with no WiFi until a reboot.
             self._backend_switch["phase"] = "reconnecting"
+            iface, recovery_performed = await self._settle_interface(target)
             reconnect_timed_out = True
-            for _ in range(15):
+            for _ in range(15 if iface else 0):
                 await asyncio.sleep(1)
-                iface = await asyncio.to_thread(self._get_wifi_interface)
-                if iface:
+                if await asyncio.to_thread(self._get_wifi_interface):
                     uuid = await asyncio.to_thread(self._get_active_connection_uuid)
                     if uuid:
                         reconnect_timed_out = False
                         break
 
-            # Judged from what is running, not from the file just written:
-            # reading that back always agreed with itself. Another file in
-            # conf.d can still win (Bazzite's iwd.conf sorts after ours), and
-            # the service can fail after starting. Allow a few seconds for a
-            # service that is still coming up.
-            final_backend = None
-            for _ in range(5):
-                final_backend = await asyncio.to_thread(self._effective_generic_backend)
-                if final_backend == target:
-                    break
-                await asyncio.sleep(1)
-
-            if final_backend == target:
-                self._backend_switch["phase"] = "done"
-                self._backend_switch["result"] = {
-                    "success": True,
-                    "backend": final_backend,
-                    "target": target,
-                    "recovery_performed": False,
-                    "needs_reboot": False,
-                    "reconnect_timed_out": reconnect_timed_out,
-                }
-            else:
-                # Put the previous backend back rather than leave a half
-                # switch: the new one is not in force and the old one is
-                # stopped and disabled.
-                await asyncio.to_thread(self._restore_generic_backend, other)
-                self._backend_switch["phase"] = "failed"
-                self._backend_switch["result"] = {
-                    "success": False,
-                    "backend": final_backend,
-                    "target": target,
-                    "recovery_performed": False,
-                    "needs_reboot": False,
-                    "reconnect_timed_out": reconnect_timed_out,
-                    "message": (
-                        f"{target} did not take over, so {other} was put back. "
-                        f"A reboot may help."
-                    ),
-                }
-
-            decky.logger.info(
-                f"generic backend switch: target={target}, final={final_backend}, "
-                f"reconnect_timed_out={reconnect_timed_out}"
-            )
+            await self._judge_generic_switch(target, other, bool(iface),
+                                             recovery_performed, reconnect_timed_out)
         except asyncio.CancelledError:
             # Ended part way, so the marker stays for the next load.
             cancelled = True
@@ -11082,6 +11533,77 @@ class Plugin:
             if not cancelled:
                 self._set_backend_marker(None)
             self._backend_switch["in_progress"] = False
+
+    async def _judge_generic_switch(self, target: str, other: str, iface: bool,
+                                    recovery_performed: bool, reconnect_timed_out: bool):
+        """The end of a generic switch: whether it took, and the result.
+
+        Judged from what is running, not from the file just written: reading
+        that back always agreed with itself. Another file in conf.d can still
+        win (Bazzite's iwd.conf sorts after ours), and the service can fail
+        after starting. Allow a few seconds for a service that is still
+        coming up. iface: whether the WiFi interface came back.
+        """
+        final_backend = None
+        for _ in range(5):
+            final_backend = await asyncio.to_thread(self._effective_generic_backend)
+            if final_backend == target:
+                break
+            await asyncio.sleep(1)
+
+        if final_backend == target and iface:
+            self._backend_switch["phase"] = "done"
+            self._backend_switch["result"] = {
+                "success": True,
+                "backend": final_backend,
+                "target": target,
+                "recovery_performed": recovery_performed,
+                "needs_reboot": False,
+                "reconnect_timed_out": reconnect_timed_out,
+            }
+        elif final_backend == target:
+            # Switched, but no interface could be had: the radio comes
+            # back with the next boot.
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "backend": final_backend,
+                "target": target,
+                "recovery_performed": recovery_performed,
+                "needs_reboot": True,
+                "reconnect_timed_out": reconnect_timed_out,
+                "message": "The WiFi backend was switched, but WiFi didn't come back. Restart the device.",
+            }
+        else:
+            # Put the previous backend back rather than leave a half
+            # switch: the new one is not in force and the old one is
+            # stopped and disabled.
+            present, recovered = await asyncio.to_thread(
+                self._restore_generic_backend, other)
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "backend": final_backend,
+                "target": target,
+                "recovery_performed": recovery_performed or recovered,
+                "needs_reboot": not present,
+                "reconnect_timed_out": reconnect_timed_out,
+                "message": (f"{target} did not take over, so {other} was put back. "
+                            + self._after_restore_text(present)),
+            }
+
+        decky.logger.info(
+            f"generic backend switch: target={target}, final={final_backend}, "
+            f"iface={iface}, recovery={recovery_performed}, "
+            f"reconnect_timed_out={reconnect_timed_out}"
+        )
+
+    @staticmethod
+    def _after_restore_text(present: bool) -> str:
+        """What to do once the previous backend was put back."""
+        if present:
+            return "Restart the device, then try the switch again."
+        return "WiFi didn't come back. Restart the device."
 
     def _set_backend_marker(self, text: str | None):
         """Write, or with None remove, the marker of a switch under way."""
@@ -11131,10 +11653,11 @@ class Plugin:
                 f"so {other} is left disabled"
             )
         else:
-            self._restore_generic_backend(other)
+            present, _recovered = self._restore_generic_backend(other)
             decky.logger.info(
                 f"A backend switch to {target} was cut off part way and had not "
                 f"taken; put {other} back"
+                + ("" if present else ", but no WiFi interface came back; a reboot brings it back")
             )
 
     async def start_backend_switch(self, backend: str) -> dict:
@@ -11235,9 +11758,13 @@ class Plugin:
         finally:
             # Anything that returned without starting a worker gives the
             # reservation back, or every later switch reads "in progress".
+            # Without the previous switch's result: a panel that saw the
+            # reservation took it for a switch under way, and then showed
+            # that old result as this one's.
             if reserved and not launched and previous is not None:
                 self._backend_switch.clear()
                 self._backend_switch.update(previous)
+                self._backend_switch["result"] = None
 
     async def get_backend_switch_status(self) -> dict:
         """Return current phase and, when terminal, the final result."""
@@ -11265,7 +11792,7 @@ class Plugin:
                 "result": {
                     "success": False,
                     "target": "",
-                    "message": "Couldn't read the backend switch status.",
+                    "message": "Couldn't read the backend switch status. Try again in a moment.",
                 },
-                "message": "Couldn't read the backend switch status.",
+                "message": "Couldn't read the backend switch status. Try again in a moment.",
             }
