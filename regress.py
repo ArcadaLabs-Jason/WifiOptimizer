@@ -3123,6 +3123,35 @@ async def refused_mid_check():
     return held
 ok(asyncio.run(refused_mid_check()) is True,
    "a refused request does not release the claim of the one still running")
+
+# The fallback at the end of an update restarts plugin_loader, which restarts
+# Steam, so an update is not started during a game or a stream.
+_saved_proc = m.PROC_DIR
+try:
+    m.PROC_DIR = tempfile.mkdtemp()
+    os.mkdir(os.path.join(m.PROC_DIR, "4242"))
+    open(os.path.join(m.PROC_DIR, "4242", "cmdline"), "wb").write(
+        b"/home/deck/.local/share/Steam/ubuntu12_32/reaper\0SteamLaunch\0AppId=1091500\0--\0game.exe\0")
+    open(os.path.join(m.PROC_DIR, "4242", "comm"), "wb").write(b"reaper\n")
+    u = TwoUpdates()
+    r = asyncio.run(u.apply_update("0.19.0-beta"))
+    ok(r.get("success") is False and "game" in r.get("message", "") and u.checks == 0
+       and not u._update_running(),
+       f"no update while a game runs, said why, and the claim is given back ({r.get('message')!r})")
+    os.remove(os.path.join(m.PROC_DIR, "4242", "cmdline"))
+    open(os.path.join(m.PROC_DIR, "4242", "cmdline"), "wb").write(
+        b"/home/deck/.local/share/Steam/ubuntu12_32/steam\0-gamepadui\0")
+    u = TwoUpdates()
+    asyncio.run(u.apply_update("0.19.0-beta"))
+    ok(u.checks == 1, "Steam on its own is not a game")
+finally:
+    m.PROC_DIR = _saved_proc
+class StreamOn(TwoUpdates):
+    def _stream_running(self, settings): return True
+u = StreamOn()
+r = asyncio.run(u.apply_update("0.19.0-beta"))
+ok(r.get("success") is False and u.checks == 0 and not u._update_running(),
+   "nor during a stream")
 ok(u._update_running() is False, "and the claim is released when it ends")
 
 class GenericStartFails(m.Plugin):

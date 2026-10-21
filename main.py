@@ -7288,6 +7288,15 @@ class Plugin:
         out.extend((pattern, pattern) for pattern in kept)
         return out
 
+    def _game_or_stream_running(self, settings: dict) -> bool:
+        """Whether Steam is running a game, or a game stream looks to be on.
+
+        Steam starts every game through its SteamLaunch wrapper, whose
+        command line carries the game's AppId; Steam itself never does.
+        """
+        return (self._find_stream([("game", "steamlaunch appid=")]) is not None
+                or self._stream_running(settings))
+
     def _find_stream(self, patterns: list[tuple[str, str]]) -> dict | None:
         """The first running process whose command line has a pattern in it."""
         if not patterns:
@@ -7962,6 +7971,15 @@ class Plugin:
             # check above while the version lookup runs.
             self._update_starting = True
             claimed = True
+            # An update normally reloads only this plugin, which a running
+            # game never notices. If that reload does not answer, the script
+            # falls back to restarting plugin_loader, which restarts Steam
+            # and takes the game down with it. So not during a game or a
+            # stream; the update notice already waits for the same.
+            settings = _load_settings()
+            if await asyncio.to_thread(self._game_or_stream_running, settings):
+                return {"success": False,
+                        "message": "Close your game or stream first, then update."}
             if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
                 decky.logger.error(f"Update refused: approved version {version!r} malformed")
                 return {"success": False, "message": "Check for updates again, then retry."}
