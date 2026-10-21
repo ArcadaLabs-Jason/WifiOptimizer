@@ -1320,8 +1320,9 @@ function Content() {
               {status.wpa2_only_stronger.current_signal} for the one in use) only
               offers WPA2, and this network is saved as WPA3-only, so this device
               can't use it. Access points that offer WPA3 keep using it. Only
-              allow this if that access point is yours: anyone nearby can
-              broadcast your network's name. Allowing it reconnects WiFi.
+              allow this if that access point is yours:
+              anyone nearby can broadcast your network's name. Allowing it
+              reconnects WiFi.
             </>
           )}
           {errors.allow_wpa2 && (
