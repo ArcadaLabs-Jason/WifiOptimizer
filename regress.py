@@ -5388,6 +5388,14 @@ try:
     finally:
         m.TRUSTED_RELEASE_KEYS = _real_keys
 
+    # Releases from 0.24.3 list the Decky zip beside the tarball. Every
+    # installed updater reads this file, so a second line must stay normal.
+    _two = (b"a" * 64 + b"  wifi-optimizer-v0.24.3.tar.gz\n"
+            + b"b" * 64 + b"  wifi-optimizer.zip\n")
+    ok(m._parse_sha256sums(_two) == {"wifi-optimizer-v0.24.3.tar.gz": "a" * 64,
+                                     "wifi-optimizer.zip": "b" * 64},
+       "a checksum list with the tarball and the zip parses, each by its name")
+
     # Used, and only where it should be: the updater, through _signed_release.
     _vtree = ast.parse(open("main.py").read())
     _vfuncs = {"verify_release_manifest", "_minisign_verify", "_parse_minisig", "_parse_minisign_key",

@@ -16,13 +16,23 @@ WiFi Optimizer fixes this from Game Mode. One tap, and it stays fixed.
 
 ## Install / Update
 
-[Decky Loader](https://decky.xyz/) must be installed first. Then open Desktop Mode > Konsole and run:
+[Decky Loader](https://decky.xyz/) must be installed first. Then pick one:
+
+**From Decky, no Desktop Mode needed.** In Decky's settings, under **General**, turn on **Developer mode**. Then open the **Developer** tab, enter this under **Install Plugin from URL** and tap **Install**:
+
+```
+https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases/latest/download/wifi-optimizer.zip
+```
+
+That link always points at the latest stable release. You can also download `wifi-optimizer.zip` from the [releases page](https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases) and use **Install Plugin from ZIP File** > **Browse** instead. The zip is listed in each release's signed checksums and has its own VirusTotal scan, so you can check it before installing ([SECURITY.md](SECURITY.md)). If WiFi Optimizer is already installed, Decky removes it first, which resets its settings, so for updates use the update button in the plugin instead.
+
+**From Konsole.** Open Desktop Mode > Konsole and run:
 
 ```bash
 curl -sL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
 ```
 
-This requires a user password - set one with `passwd` in Konsole if you haven't already.
+This requires a user password - set one with `passwd` in Konsole if you haven't already. It keeps your settings if the plugin is already installed.
 
 Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
 

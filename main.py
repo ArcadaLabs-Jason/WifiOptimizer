@@ -1246,7 +1246,9 @@ def verify_release_manifest(sums_bytes: bytes, minisig_text: str,
 
 # Where releases are looked up and downloaded. Every release, beta or stable,
 # carries the same three files: the source tarball, SHA256SUMS listing its
-# checksum, and SHA256SUMS.minisig signing that list.
+# checksum, and SHA256SUMS.minisig signing that list. From 0.24.3 there is
+# also wifi-optimizer.zip, for installing from Decky; SHA256SUMS lists it too,
+# and the updater only ever looks up the tarball's line.
 RELEASES_API = "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases"
 RELEASE_DOWNLOAD = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases/download"
 # A page of releases, notes included, is tens of kilobytes. Anything past

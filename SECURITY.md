@@ -12,11 +12,11 @@ The plugin's backend runs as root, as every Decky plugin backend does. It change
 
 ## Signed releases
 
-From v0.21.0-beta on, every release, stable and beta, carries three files: the source tarball `wifi-optimizer-v<version>.tar.gz`, a `SHA256SUMS` file listing its checksum, and `SHA256SUMS.minisig`, a [minisign](https://jedisct1.github.io/minisign/) signature of that list. The signature's trusted comment names the release, `wifi-optimizer v<version>`.
+From v0.21.0-beta on, every release, stable and beta, carries the source tarball `wifi-optimizer-v<version>.tar.gz`, a `SHA256SUMS` file listing its checksum, and `SHA256SUMS.minisig`, a [minisign](https://jedisct1.github.io/minisign/) signature of that list. The signature's trusted comment names the release, `wifi-optimizer v<version>`. From v0.24.3 on, releases also carry `wifi-optimizer.zip`, the plugin packaged for Decky's Install Plugin from ZIP or URL, and `SHA256SUMS` lists it too.
 
 The in-app updater checks the signature against the keys below, which are built into the plugin, and checks that the comment names the version it is installing. It then checks the downloaded tarball against the signed checksum before unpacking it. If any of that fails, nothing is installed. A release without these files is not installed either. This checking starts with v0.21.0-beta. Earlier versions install what they download without checking, including the update that brings in v0.21.0-beta.
 
-The install script (`install.sh`) does not check signatures. It downloads the release over HTTPS from GitHub. If you want to check a release before installing it, use the steps below.
+The install script (`install.sh`) does not check signatures. It downloads the release over HTTPS from GitHub. Decky's Install Plugin from ZIP or URL doesn't check them either. If you want to check a release before installing it, use the steps below.
 
 Release key, id `FE0DCD913B7044FA`:
 
@@ -32,14 +32,14 @@ RWRD+69SF7mzDbaCBVP3Pj5/5sOngkf/rVfOxCocbSTf+H8OP115i+8g
 
 The release key signs releases. The rescue key is kept apart from the release key, and is only used to sign a release that replaces the release key if that key is ever lost or leaked.
 
-To check a release by hand, download the three files into one directory and run:
+To check a release by hand, download `SHA256SUMS`, `SHA256SUMS.minisig` and the file you want (the tarball or the zip) into one directory and run:
 
 ```bash
 minisign -Vm SHA256SUMS -P RWT6RHA7kc0N/vvpQCVTRBrSXNZpv7hBFPZpSRX9m5v55Mrl15BB1heh
-sha256sum -c SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-The first should print the trusted comment with the version you downloaded, and the second should report the tarball as OK. A release signed with the rescue key verifies with the rescue key instead: use `-P RWRD+69SF7mzDbaCBVP3Pj5/5sOngkf/rVfOxCocbSTf+H8OP115i+8g`.
+The first should print the trusted comment with the version you downloaded, and the second should report the file you downloaded as OK. A release signed with the rescue key verifies with the rescue key instead: use `-P RWRD+69SF7mzDbaCBVP3Pj5/5sOngkf/rVfOxCocbSTf+H8OP115i+8g`.
 
 ## In scope
 
