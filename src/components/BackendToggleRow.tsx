@@ -10,8 +10,8 @@ import { theme } from "../theme";
 
 const PHASE_TEXT: Record<BackendSwitchPhase, string> = {
   idle: "",
-  switching: "Switching backend…",
-  reconnecting: "Reconnecting…",
+  switching: "Switching backend...",
+  reconnecting: "Reconnecting...",
   done: "",
   failed: "",
 };
@@ -59,13 +59,13 @@ export function BackendToggleRow({
     : isWpa;
 
   const phaseText = switching
-    ? PHASE_TEXT[backendSwitch!.phase] || "Working…"
+    ? PHASE_TEXT[backendSwitch!.phase] || "Working..."
     : null;
 
   const badge: { badge: BadgeStatus; text: string } = error
     ? { badge: "error", text: "failed" }
     : switching
-      ? { badge: "unknown", text: "…" }
+      ? { badge: "unknown", text: "switching" }
       : isWpa
         ? { badge: "active", text: "wpa_supplicant" }
         : currentBackend === "iwd"
@@ -110,7 +110,7 @@ export function BackendToggleRow({
                 padding: "2px 0",
               }}
             >
-              {timedOut ? "⚠" : "✓"} {parts.join(" · ")}
+              {timedOut ? "⚠" : "✓"} {parts.join(", ")}
             </div>
           </PanelSectionRow>
         );

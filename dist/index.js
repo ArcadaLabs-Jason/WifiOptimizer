@@ -342,8 +342,8 @@ function Banner({ variant, icon, children }) {
 
 const PHASE_TEXT = {
     idle: "",
-    switching: "Switching backend…",
-    reconnecting: "Reconnecting…",
+    switching: "Switching backend...",
+    reconnecting: "Reconnecting...",
     done: "",
     failed: "",
 };
@@ -372,12 +372,12 @@ function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
         ? backendSwitch.target === "wpa_supplicant"
         : isWpa;
     const phaseText = switching
-        ? PHASE_TEXT[backendSwitch.phase] || "Working…"
+        ? PHASE_TEXT[backendSwitch.phase] || "Working..."
         : null;
     const badge = error
         ? { badge: "error", text: "failed" }
         : switching
-            ? { badge: "unknown", text: "…" }
+            ? { badge: "unknown", text: "switching" }
             : isWpa
                 ? { badge: "active", text: "wpa_supplicant" }
                 : currentBackend === "iwd"
@@ -404,7 +404,7 @@ function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
                         fontSize: theme.fontSize.small,
                         color: timedOut ? theme.warning.text : theme.success.text,
                         padding: "2px 0",
-                    }, children: [timedOut ? "⚠" : "✓", " ", parts.join(" · ")] }) }));
+                    }, children: [timedOut ? "⚠" : "✓", " ", parts.join(", ")] }) }));
         })() }));
 }
 
@@ -490,6 +490,10 @@ function PanelFooter({ version }) {
         setDiagState("copying");
         try {
             const info = await getDiagnosticInfo();
+            // A collection that failed comes back as a result, not a throw, and
+            // copying it said "Copied to clipboard" over an error message.
+            if (info?.success === false)
+                throw new Error(String(info.error ?? "diagnostics failed"));
             const text = JSON.stringify(info, null, 2);
             try {
                 await navigator.clipboard.writeText(text);
@@ -579,10 +583,10 @@ function StreamingSection({ settings, live, disabled, error, notice, onToggle, }
     }
     return (SP_JSX.jsxs(DFL.PanelSection, { title: "Streaming auto mode", children: [SP_JSX.jsx(InfoRow, { label: "Only fix while streaming", subtitle: enabled
                     ? "Fixes apply while a streaming app runs"
-                    : "Off: enabled fixes apply all the time", explanation: "Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream. If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.", checked: enabled, disabled: disabled, error: error, notice: notice, onChange: (val) => onToggle("streaming", () => setStreamingMode(val)) }), enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+                    : "Off: enabled fixes apply all the time", explanation: "Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream. If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.", checked: enabled, disabled: disabled, error: error, notice: notice, onChange: (val) => onToggle("streaming", () => setStreamingMode(val)) }), enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.body,
                                 color: active ? theme.success.text : theme.info.text,
-                            }, children: [active ? "● " : "○ ", stateText] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Keep fixes on", description: "For a stream that is not detected. Lasts until you restart.", checked: held, disabled: disabled, onChange: (val) => onToggle("streaming", () => setStreamingHold(val)) }) }), apps.map((a) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: a.label, checked: a.watched, disabled: disabled, onChange: (val) => toggleApp(a.id, val) }) }, a.id))), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Other process names (space-separated)", value: patterns, onChange: (e) => {
+                            }, children: stateText }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Keep fixes on", description: "For a stream that is not detected. Lasts until you restart.", checked: held, disabled: disabled, onChange: (val) => onToggle("streaming", () => setStreamingHold(val)) }) }), apps.map((a) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: a.label, checked: a.watched, disabled: disabled, onChange: (val) => toggleApp(a.id, val) }) }, a.id))), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Other process names (space-separated)", value: patterns, onChange: (e) => {
                                 setPatternsDirty(true);
                                 setPatterns(e.target.value);
                             } }) }), patternsDirty && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: savePatterns, children: "Save process names" }) }))] }))] }));
@@ -839,12 +843,18 @@ const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 // progress report took the "didn't complete" message straight back off.
 const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
+// How long a finished backend switch's result stays up.
+const BACKEND_RESULT_MS = 60 * 1000;
+// How long an error or notice under a control stays up. They used to last
+// until that control was used again, so a failure from an hour ago still
+// read as the current state.
+const MESSAGE_TTL_MS = 2 * 60 * 1000;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE = "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
-const RESET_CONFIRM_TEXT = "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
+const RESET_CONFIRM_TEXT = "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to. A WiFi region set here can stay in effect until the next reboot.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -876,32 +886,58 @@ function getBadge(driftKey, status, errorKey) {
     return null;
 }
 // Regions the selector offers. A regulatory domain is a legal constraint on
-// transmit power and which channels may be used, so this is a deliberate
-// short list of ISO country codes rather than free text.
+// transmit power and which channels may be used, so this is a list of ISO
+// country codes rather than free text. It is the common ones, not all of
+// them: a region set to one that is not here is still shown, by its code.
+const REGION_UNMANAGED = "none";
 const REGION_OPTIONS = [
     { data: "00", label: "World (00) - most restrictive" },
-    { data: "US", label: "United States (US)" },
+    { data: "AR", label: "Argentina (AR)" },
+    { data: "AU", label: "Australia (AU)" },
+    { data: "AT", label: "Austria (AT)" },
+    { data: "BE", label: "Belgium (BE)" },
+    { data: "BR", label: "Brazil (BR)" },
     { data: "CA", label: "Canada (CA)" },
-    { data: "GB", label: "United Kingdom (GB)" },
-    { data: "IE", label: "Ireland (IE)" },
-    { data: "DE", label: "Germany (DE)" },
-    { data: "FR", label: "France (FR)" },
-    { data: "ES", label: "Spain (ES)" },
-    { data: "IT", label: "Italy (IT)" },
-    { data: "NL", label: "Netherlands (NL)" },
-    { data: "SE", label: "Sweden (SE)" },
-    { data: "NO", label: "Norway (NO)" },
+    { data: "CL", label: "Chile (CL)" },
+    { data: "CN", label: "China (CN)" },
+    { data: "CO", label: "Colombia (CO)" },
+    { data: "CZ", label: "Czechia (CZ)" },
     { data: "DK", label: "Denmark (DK)" },
     { data: "FI", label: "Finland (FI)" },
+    { data: "FR", label: "France (FR)" },
+    { data: "DE", label: "Germany (DE)" },
+    { data: "GR", label: "Greece (GR)" },
+    { data: "HK", label: "Hong Kong (HK)" },
+    { data: "HU", label: "Hungary (HU)" },
+    { data: "IN", label: "India (IN)" },
+    { data: "ID", label: "Indonesia (ID)" },
+    { data: "IE", label: "Ireland (IE)" },
+    { data: "IL", label: "Israel (IL)" },
+    { data: "IT", label: "Italy (IT)" },
+    { data: "JP", label: "Japan (JP)" },
+    { data: "MY", label: "Malaysia (MY)" },
+    { data: "MX", label: "Mexico (MX)" },
+    { data: "NL", label: "Netherlands (NL)" },
+    { data: "NZ", label: "New Zealand (NZ)" },
+    { data: "NO", label: "Norway (NO)" },
+    { data: "PH", label: "Philippines (PH)" },
     { data: "PL", label: "Poland (PL)" },
     { data: "PT", label: "Portugal (PT)" },
-    { data: "AU", label: "Australia (AU)" },
-    { data: "NZ", label: "New Zealand (NZ)" },
-    { data: "JP", label: "Japan (JP)" },
+    { data: "RO", label: "Romania (RO)" },
+    { data: "SA", label: "Saudi Arabia (SA)" },
+    { data: "SG", label: "Singapore (SG)" },
+    { data: "ZA", label: "South Africa (ZA)" },
     { data: "KR", label: "South Korea (KR)" },
-    { data: "BR", label: "Brazil (BR)" },
-    { data: "MX", label: "Mexico (MX)" },
-    { data: "IN", label: "India (IN)" },
+    { data: "ES", label: "Spain (ES)" },
+    { data: "SE", label: "Sweden (SE)" },
+    { data: "CH", label: "Switzerland (CH)" },
+    { data: "TW", label: "Taiwan (TW)" },
+    { data: "TH", label: "Thailand (TH)" },
+    { data: "TR", label: "Turkey (TR)" },
+    { data: "UA", label: "Ukraine (UA)" },
+    { data: "AE", label: "United Arab Emirates (AE)" },
+    { data: "GB", label: "United Kingdom (GB)" },
+    { data: "US", label: "United States (US)" },
 ];
 const DNS_OPTIONS = [
     { data: "cloudflare", label: "Cloudflare (1.1.1.1)" },
@@ -987,6 +1023,9 @@ function Content() {
     const backendPollRef = SP_REACT.useRef(null);
     const prevConnectedRef = SP_REACT.useRef(null);
     const lastUpdateCheckAtRef = SP_REACT.useRef(0);
+    // Bumped when the update channel changes, so a check that was already
+    // running for the old channel cannot put its answer back up.
+    const updateCheckSeqRef = SP_REACT.useRef(0);
     const statusSeqRef = SP_REACT.useRef(0);
     const setBusy = SP_REACT.useCallback((val) => {
         busyRef.current = val;
@@ -1001,7 +1040,13 @@ function Content() {
             return;
         }
         lastUpdateCheckAtRef.current = now;
-        checkForUpdate().then(setUpdateInfo).catch(() => { });
+        const seq = updateCheckSeqRef.current;
+        checkForUpdate()
+            .then((info) => {
+            if (seq === updateCheckSeqRef.current)
+                setUpdateInfo(info);
+        })
+            .catch(() => { });
     }, []);
     const refreshStatus = SP_REACT.useCallback(async (force = false) => {
         // Background interval ticks defer while a user operation is in flight;
@@ -1070,7 +1115,7 @@ function Content() {
                     // A worker stuck on a wedged driver never reports back. Release
                     // the panel rather than keep every control disabled forever.
                     if (s.started_at && Date.now() / 1000 - s.started_at > BACKEND_SWITCH_MAX_S) {
-                        await giveUp("The backend switch is taking too long. Restart the Deck if WiFi does not come back.");
+                        await giveUp("The backend switch is taking too long. Restart the device if WiFi does not come back.");
                         return;
                     }
                     // Mid-switch: update so the subtitle can show the current phase.
@@ -1245,6 +1290,57 @@ function Content() {
             stop();
         };
     }, [runUpdateCheck]);
+    // A switch's result describes that switch, and was left up for as long as
+    // the panel stayed mounted, so "Switched to iwd" could still be showing
+    // after the backend was changed again from SteamOS. A reboot request is
+    // kept: it stays true until the reboot.
+    SP_REACT.useEffect(() => {
+        const r = backendSwitch?.result;
+        if (!backendSwitch || backendSwitch.in_progress || !r || r.needs_reboot)
+            return;
+        const shown = backendSwitch;
+        const id = setTimeout(() => setBackendSwitch((prev) => (prev === shown ? null : prev)), BACKEND_RESULT_MS);
+        return () => clearTimeout(id);
+    }, [backendSwitch]);
+    // Expire each error and notice MESSAGE_TTL_MS after it first appeared. A
+    // message set again with the same text keeps its time; one that changed,
+    // or went and came back, starts over.
+    const messageSeenRef = SP_REACT.useRef({});
+    SP_REACT.useEffect(() => {
+        const now = Date.now();
+        const seen = {};
+        const shown = [
+            ...Object.entries(errors).map(([k, v]) => [`e:${k}`, v]),
+            ...Object.entries(notices).map(([k, v]) => [`n:${k}`, v]),
+        ];
+        for (const [key, text] of shown) {
+            const before = messageSeenRef.current[key];
+            seen[key] = before && before.text === text ? before : { text, at: now };
+        }
+        messageSeenRef.current = seen;
+        const times = Object.values(seen).map((m) => m.at);
+        if (!times.length)
+            return;
+        const id = setTimeout(() => {
+            // A second of slack, so a timer that fires a little early still
+            // clears the message it was set for.
+            const due = Date.now() + 1000 - MESSAGE_TTL_MS;
+            const expire = (prefix) => (prev) => {
+                const stale = Object.keys(prev).filter((k) => {
+                    const m = messageSeenRef.current[prefix + k];
+                    return m && m.text === prev[k] && m.at <= due;
+                });
+                if (!stale.length)
+                    return prev;
+                const next = { ...prev };
+                stale.forEach((k) => delete next[k]);
+                return next;
+            };
+            setErrors(expire("e:"));
+            setNotices(expire("n:"));
+        }, Math.max(0, Math.min(...times) + MESSAGE_TTL_MS - now));
+        return () => clearTimeout(id);
+    }, [errors, notices]);
     // ---- User action handlers ----
     //
     // Generic toggle handler used by every setter toggle (power_save, BSSID,
@@ -1319,14 +1415,22 @@ function Content() {
             const result = await fn();
             setOptimizeResult(result);
             if (result.results) {
+                // Successes can carry a message too, as they do for a single toggle:
+                // a lock that stayed on the access point you were already on, or a
+                // fix kept for the next stream. Dropping those here hid the reason.
                 const newErrors = {};
+                const newNotices = {};
                 for (const [k, v] of Object.entries(result.results)) {
                     if (!v.success) {
                         const det = v.detail ? ` (${v.detail})` : "";
                         newErrors[k] = (v.message ?? ERROR_MESSAGES[v.error ?? ""] ?? "Failed") + det;
                     }
+                    else if (v.message) {
+                        newNotices[k] = v.message;
+                    }
                 }
                 setErrors(newErrors);
+                setNotices(newNotices);
             }
             // optimize_safe contains BSSID lock which reconnects
             if (result.reconnected) {
@@ -1353,6 +1457,11 @@ function Content() {
     const handleForceReapply = () => runBatch(() => reapplyAll());
     const handleAllowWpa2 = () => handleToggle("allow_wpa2", () => allowWpa2());
     const handleMoveLock = () => handleToggle("move_bssid_lock", () => moveBssidLock());
+    const handleDismissMoveError = () => setErrors((prev) => {
+        const next = { ...prev };
+        delete next.move_bssid_lock;
+        return next;
+    });
     // Reset asks first: see RESET_CONFIRM_TEXT.
     const handleResetSettings = () => {
         if (busyRef.current)
@@ -1473,9 +1582,11 @@ function Content() {
         setCheckingUpdate(true);
         setUpdateError(null);
         lastUpdateCheckAtRef.current = Date.now();
+        const seq = updateCheckSeqRef.current;
         try {
             const result = await checkForUpdate();
-            setUpdateInfo(result);
+            if (seq === updateCheckSeqRef.current)
+                setUpdateInfo(result);
         }
         catch {
             // refreshStatus has its own catch; no need to log here
@@ -1504,6 +1615,7 @@ function Content() {
                 setUpdateError(result.message ?? "Couldn't change the update channel.");
                 return;
             }
+            updateCheckSeqRef.current += 1;
             setUpdateError(null);
             setUpdateInfo(null);
         }
@@ -1512,7 +1624,9 @@ function Content() {
             setUpdateError("Couldn't change the update channel.");
             return;
         }
-        await refreshStatus();
+        // Forced like the notify toggle. Unforced, it is skipped while another
+        // operation holds the panel busy, and the dropdown shows the old channel.
+        await refreshStatus(true);
     };
     // Custom DNS draft handling
     const resetDnsDraft = () => {
@@ -1521,11 +1635,17 @@ function Content() {
         setCustomDnsInput(status?.settings?.dns_provider === "custom" ? status.settings.dns_servers : "");
     };
     const applyCustomDns = async () => {
-        const result = await handleToggle("dns", () => setDns(true, "custom", customDnsInput.trim()));
-        if (result?.success) {
-            dnsDirtyRef.current = false;
+        const result = await handleToggle("dns", async () => {
+            const r = await setDns(true, "custom", customDnsInput.trim());
+            // Before the refresh that follows, so it adopts the servers as the
+            // backend saved them. Cleared after it, Apply and Cancel stayed up
+            // until the next poll whenever the saved form differed from the typed.
+            if (r.success)
+                dnsDirtyRef.current = false;
+            return r;
+        });
+        if (result?.success)
             setDnsCustomOpen(false);
-        }
     };
     // Don't render content until first status arrives (prevents disconnect flash).
     // A status marked initializing is the backend saying a collection is still
@@ -1563,16 +1683,20 @@ function Content() {
     const gatedBadge = (key, on) => streamingIdle && on && !errors[key]
         ? { badge: "paused", text: "paused" }
         : getBadge(key, status, errors[key] ?? null);
+    // Under iwd Optimize Safe leaves the lock out, so it is not one of the
+    // things to wait for there, or "All good" never came.
+    const lockSafe = status?.live?.wifi_backend === "iwd" ||
+        (s?.bssid_lock_enabled &&
+            !status?.drift?.bssid_lock &&
+            // The lock can be enabled but belong to a different network, in which
+            // case nothing has drifted and it is also doing nothing here. Without
+            // this, the panel reports all clear while one of the four is inert.
+            !status?.live?.bssid_lock_other_network);
     // Check if all safe optimizations are already active
     const allSafeActive = connected &&
         (status?.live?.power_save_off || (streamingIdle && s?.power_save_disabled)) &&
         !status?.drift?.power_save &&
-        s?.bssid_lock_enabled &&
-        !status?.drift?.bssid_lock &&
-        // The lock can be enabled but belong to a different network, in which
-        // case nothing has drifted and it is also doing nothing here. Without
-        // this, the panel reports all clear while one of the four is inert.
-        !status?.live?.bssid_lock_other_network &&
+        lockSafe &&
         status?.live?.dispatcher_installed &&
         (status?.live?.buffer_tuning_applied || (streamingIdle && s?.buffer_tuning_enabled)) &&
         !status?.drift?.buffer_tuning;
@@ -1582,7 +1706,7 @@ function Content() {
                         ? s.chip_label
                         : undefined }), supportTier === 3 && (SP_JSX.jsx(Banner, { variant: "info", children: "Unknown WiFi hardware detected. Some optimizations may not apply." })), status?.settings_recovered && (SP_JSX.jsx(Banner, { variant: "warning", children: ERROR_MESSAGES.parse_error })), status?.settings_recovered && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleDismissRecovered, children: "Dismiss" }) }) })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleApplyUpdate, children: updateInfo.is_downgrade
                             ? `Go back to v${updateInfo.latest_version}`
-                            : `Update to v${updateInfo.latest_version}` }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText(updateProgress) }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), status?.external?.duplicate_profiles && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent. The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority." })), status?.address_conflict && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Another device on your network is using the same address as the Deck (", status.address_conflict.ip, "), so the connection may not work. That's the router, not a WiFi setting. Restarting the router usually fixes it."] })), status?.wpa2_only_stronger && (SP_JSX.jsxs(Banner, { variant: "info", children: ["A stronger access point on this network (signal", " ", status.wpa2_only_stronger.signal, " vs", " ", status.wpa2_only_stronger.current_signal, ") only offers WPA2, and this network is saved as WPA3-only, so the Deck can't use it. Access points that offer WPA3 keep using it. Only allow this if that access point is yours: anyone nearby can broadcast your network's name.", errors.allow_wpa2 && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.allow_wpa2 }))] })), status?.wpa2_only_stronger && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleAllowWpa2, children: "Allow WPA2 here" }) }) })), (status?.lock_weaker || errors.move_bssid_lock) && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [status?.lock_weaker && (SP_JSX.jsxs(SP_JSX.Fragment, { children: ["The access point lock is holding you on a weaker access point (signal ", status.lock_weaker.current_signal, "). A stronger one is in range (signal ", status.lock_weaker.signal, ")."] })), errors.move_bssid_lock && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.move_bssid_lock }))] })), status?.lock_weaker && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleMoveLock, children: "Move the lock" }) }) })), status?.external?.pin_released && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "WiFi could not connect for a while, so the locked access point or band preference was released to let it reconnect. The setting is still on and applies again to whichever access point works." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: driftCount > 1
+                            : `Update to v${updateInfo.latest_version}` }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText(updateProgress) }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), status?.external?.duplicate_profiles && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent. The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority." })), status?.address_conflict && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Another device on your network is using the same address as your handheld (", status.address_conflict.ip, "), so the connection may not work. That's the router, not a WiFi setting. Restarting the router usually fixes it."] })), status?.wpa2_only_stronger && (SP_JSX.jsxs(Banner, { variant: "info", children: ["A stronger access point on this network (signal", " ", status.wpa2_only_stronger.signal, " vs", " ", status.wpa2_only_stronger.current_signal, ") only offers WPA2, and this network is saved as WPA3-only, so this device can't use it. Access points that offer WPA3 keep using it. Only allow this if that access point is yours: anyone nearby can broadcast your network's name.", errors.allow_wpa2 && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.allow_wpa2 }))] })), status?.wpa2_only_stronger && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleAllowWpa2, children: "Allow WPA2 here" }) }) })), (status?.lock_weaker || errors.move_bssid_lock) && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [status?.lock_weaker && (SP_JSX.jsxs(SP_JSX.Fragment, { children: ["The access point lock is holding you on a weaker access point (signal ", status.lock_weaker.current_signal, "). A stronger one is in range (signal ", status.lock_weaker.signal, ")."] })), errors.move_bssid_lock && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.move_bssid_lock }))] })), status?.lock_weaker && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleMoveLock, children: "Move the lock" }) }) })), errors.move_bssid_lock && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleDismissMoveError, children: "Dismiss" }) }) })), status?.external?.pin_released && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "WiFi could not connect for a while, so the locked access point or band preference was released to let it reconnect. The setting is still on and applies again to whichever access point works." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: driftCount > 1
                     ? `${driftCount} settings no longer match what you set.`
                     : "1 setting no longer matches what you set." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleRepairDrift, children: "Fix now" }) }) })), status?.success === false && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u26A0", children: status?.message ?? "Couldn't read WiFi status." })), status?.success !== false && !connected && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "Not connected to WiFi. Connect first, then optimize." })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
                 const r = backendSwitch.result;
@@ -1599,10 +1723,10 @@ function Content() {
                 else {
                     const parts = [`Switched to ${r.backend}`];
                     if (r.recovery_performed)
-                        parts.push("recreated wlan0 interface");
+                        parts.push("wlan0 interface recreated");
                     if (r.reconnect_timed_out)
                         parts.push("WiFi didn't reconnect");
-                    text = parts.join(" · ");
+                    text = parts.join(", ");
                 }
                 return (SP_JSX.jsx(Banner, { variant: isWarning ? "warning" : "success", icon: isWarning ? "⚠" : "✓", children: text }));
             })(), optimizeResult && (() => {
@@ -1622,19 +1746,36 @@ function Content() {
                             ? "Applying..."
                             : allSafeActive
                                 ? "All good"
-                                : "Optimize Safe" }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Power & stability", children: [SP_JSX.jsx(InfoRow, { label: "Prevent lag spikes", subtitle: "Disables WiFi power save and PCIe power states", explanation: "The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal.", ...gatedBadge("power_save", s?.power_save_disabled), checked: s?.power_save_disabled ?? false, disabled: isBusy || updating, error: errors.power_save, onChange: (val) => handleToggle("power_save", () => setPowerSave(val)) }), SP_JSX.jsx(InfoRow, { label: "Stop background scanning", subtitle: "Locks to current AP - disable to switch networks or roam", explanation: "Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point.", ...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
+                                : "Optimize Safe" }) }) }), SP_JSX.jsxs(DFL.PanelSection, { title: "Power & stability", children: [SP_JSX.jsx(InfoRow, { label: "Prevent lag spikes", subtitle: "Disables WiFi power save and PCIe power states", explanation: "The OS enables WiFi power saving at multiple levels - the wireless chip, the PCIe bus connecting it to the CPU, and driver-level low power modes. These cause latency spikes, packet batching, and throughput degradation during sustained streaming. This toggle disables all of them, keeping the WiFi hardware fully awake. Battery impact is minimal.", ...gatedBadge("power_save", s?.power_save_disabled), checked: s?.power_save_disabled ?? false, disabled: isBusy || updating, error: errors.power_save, notice: notices.power_save, onChange: (val) => handleToggle("power_save", () => setPowerSave(val)) }), SP_JSX.jsx(InfoRow, { label: "Stop background scanning", subtitle: "Pins one access point - disable to roam", explanation: "Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Pinning the connection to one access point stops these scans entirely. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock.", ...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
                             ? { badge: "unknown", text: "other network" }
                             : getBadge("bssid_lock", status, errors.bssid_lock ?? null)), checked: s?.bssid_lock_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.bssid_lock_enabled), error: errors.bssid_lock, notice: notices.bssid_lock ??
                             (status?.live?.pins_inactive_iwd && s?.bssid_lock_enabled
                                 ? IWD_PIN_NOTICE
                                 : status?.external?.bssid_lock
                                     ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
-                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: REGION_OPTIONS, selectedOption: regdomain.setting || regdomain.governing || "00", disabled: isBusy || updating, onChange: (option) => {
-                                void handleToggle("regdomain", () => setRegdomain(option.data)).then(refreshRegdomain);
+                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, notice: notices.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, notice: notices.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: [
+                                // Not set by the plugin. Labelled with the region in use.
+                                {
+                                    data: REGION_UNMANAGED,
+                                    label: `Not managed (${regdomain.governing || "unknown"})`,
+                                },
+                                ...REGION_OPTIONS,
+                                ...(regdomain.setting &&
+                                    !REGION_OPTIONS.some((o) => o.data === regdomain.setting)
+                                    ? [{ data: regdomain.setting, label: regdomain.setting }]
+                                    : []),
+                            ], selectedOption: regdomain.setting || REGION_UNMANAGED, disabled: isBusy || updating, onChange: (option) => {
+                                const unmanaged = option.data === REGION_UNMANAGED;
+                                // "" puts back the region from before the plugin set one,
+                                // or World when there was none, so it is only sent to stop
+                                // managing a region the plugin did set.
+                                if (unmanaged && !regdomain.setting)
+                                    return;
+                                void handleToggle("regdomain", () => setRegdomain(unmanaged ? "" : option.data)).then(refreshRegdomain);
                             } }) })), (errors.regdomain || notices.regdomain) && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.tiny,
                                 color: errors.regdomain ? theme.error.text : theme.text.tertiary,
-                            }, children: errors.regdomain ?? notices.regdomain }) })), regdomain?.readable && !regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", opacity: 0.8, padding: "4px 0" }, children: ["WiFi region: ", regdomain.governing || "unknown", ". This device's WiFi card sets its own region, so it cannot be changed here. That is normal on the Steam Deck and does not mean a band is missing."] }) })), SP_JSX.jsx(InfoRow, { label: "Force 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""}. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.${supports6GHz
+                            }, children: errors.regdomain ?? notices.regdomain }) })), regdomain?.readable && !regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "12px", opacity: 0.8, padding: "4px 0" }, children: ["WiFi region: ", regdomain.governing || "unknown", ". This device's WiFi card sets its own region, so it cannot be changed here. That is normal for many cards, the Steam Deck's included, and does not mean a band is missing."] }) })), SP_JSX.jsx(InfoRow, { label: "Force 5 GHz band", subtitle: "Avoid 2.4 GHz Bluetooth interference", explanation: `Bluetooth operates on the 2.4 GHz band${isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""}. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you.${supports6GHz
                             ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
                             : ""}`, ...getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null), checked: (s?.band_preference_enabled ?? false) && !on6GHz, disabled: isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz)), error: band5Error, notice: notices.band_5ghz ??
                             (on6GHz
@@ -1649,11 +1790,14 @@ function Content() {
                             handleToggle("band_5ghz", () => 
                             // Never "6GHz": turning that off leaves it recorded as the band.
                             setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a"));
-                        } }), (status?.live?.six_ghz_offered || on6GHz) && (SP_JSX.jsx(InfoRow, { label: "Force 6 GHz band", subtitle: "Stay on 6 GHz where your router has it", explanation: "6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect.", ...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null), checked: on6GHz, disabled: isBusy || updating || (!connected && !on6GHz), error: band6Error, notice: notices.band_6ghz ??
-                            (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined), onChange: (val) => {
+                        } }), (status?.live?.six_ghz_offered || on6GHz) && (SP_JSX.jsx(InfoRow, { label: "Force 6 GHz band", subtitle: "Stay on 6 GHz where your router has it", explanation: "6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect.", ...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null), checked: on6GHz, disabled: isBusy || updating || (!connected && !on6GHz), error: band6Error, notice: notices.band_6ghz ??
+                            (on6GHz
+                                ? notices.band_preference ??
+                                    (status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+                                : undefined), onChange: (val) => {
                             clearBandMessages();
                             handleToggle("band_6ghz", () => setBandPreference(val, "6GHz"));
-                        } })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
+                        } })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, notice: notices.dns, onChange: (val) => {
                             if (!val)
                                 resetDnsDraft();
                             handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput));
@@ -1674,7 +1818,7 @@ function Content() {
                                 ? "IPv6 is already off on this connection. SteamOS often saves networks that way."
                                 : status?.live?.ipv6_other_network
                                     ? "On for the network it was turned on for, not this one."
-                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...gatedBadge("cake", s?.cake_enabled), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsx(StreamingSection, { settings: s, live: status?.live, disabled: isBusy || updating, error: errors.streaming, notice: notices.streaming, onToggle: handleToggle }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy || updating, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, notify: s?.update_notify ?? true, onNotifyChange: handleNotifyChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
+                                    : undefined), checked: s?.ipv6_disabled ?? false, disabled: isBusy || updating || (!connected && !s?.ipv6_disabled), error: errors.ipv6, onChange: (val) => handleToggle("ipv6", () => setIpv6(val)) }), SP_JSX.jsx(InfoRow, { label: "Traffic shaping (CAKE)", subtitle: "Fair queuing and bufferbloat prevention", explanation: "Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection. Does not limit your bandwidth. Resets on reboot and is reapplied automatically if auto-fix on wake is enabled.", ...gatedBadge("cake", s?.cake_enabled), checked: s?.cake_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.cake_enabled), error: errors.cake, notice: notices.cake, onChange: (val) => handleToggle("cake", () => setCake(val)) }), status?.live?.backend_tool_available && (SP_JSX.jsx(BackendToggleRow, { status: status, backendSwitch: backendSwitch, error: errors.wifi_backend, isBusy: isBusy || updating, onToggle: handleBackendToggle }))] }), SP_JSX.jsx(StreamingSection, { settings: s, live: status?.live, disabled: isBusy || updating, error: errors.streaming, notice: notices.streaming, onToggle: handleToggle }), SP_JSX.jsxs(DFL.PanelSection, { title: "Live status", children: [connected && status?.live?.ip_address && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: theme.fontSize.tiny, color: theme.text.tertiary }, children: ["IP: ", status.live.ip_address] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(StatsGrid, { live: status?.live ?? {}, connected: connected }) })] }), SP_JSX.jsx(ActionsSection, { connected: connected, isBusy: isBusy || updating, onForceReapply: handleForceReapply, onReset: handleResetSettings, resetError: errors.reset }), SP_JSX.jsx(UpdatesSection, { channel: s?.update_channel ?? "stable", updating: updating, updatingText: updatingText(updateProgress), checkingUpdate: checkingUpdate, updateInfo: updateInfo, updateError: updateError, onChannelChange: handleChannelChange, notify: s?.update_notify ?? true, onNotifyChange: handleNotifyChange, onApply: handleApplyUpdate, onCheck: handleCheckForUpdate, busy: isBusy }), SP_JSX.jsx(PanelFooter, { version: status?.version ?? "?" })] }));
 }
 var index = definePlugin(() => {
     let gameLifetimeUnsub = null;

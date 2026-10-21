@@ -22,6 +22,9 @@ export function PanelFooter({ version }: PanelFooterProps) {
     setDiagState("copying");
     try {
       const info = await backend.getDiagnosticInfo();
+      // A collection that failed comes back as a result, not a throw, and
+      // copying it said "Copied to clipboard" over an error message.
+      if (info?.success === false) throw new Error(String(info.error ?? "diagnostics failed"));
       const text = JSON.stringify(info, null, 2);
       try {
         await navigator.clipboard.writeText(text);

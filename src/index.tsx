@@ -63,6 +63,12 @@ const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
 // progress report took the "didn't complete" message straight back off.
 const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
+// How long a finished backend switch's result stays up.
+const BACKEND_RESULT_MS = 60 * 1000;
+// How long an error or notice under a control stays up. They used to last
+// until that control was used again, so a failure from an hour ago still
+// read as the current state.
+const MESSAGE_TTL_MS = 2 * 60 * 1000;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE =
   "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
@@ -70,7 +76,7 @@ const BACKEND_POLL_MAX_FAILURES = 5;
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
 const RESET_CONFIRM_TEXT =
-  "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to.";
+  "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to. A WiFi region set here can stay in effect until the next reboot.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -107,32 +113,58 @@ function getBadge(
 }
 
 // Regions the selector offers. A regulatory domain is a legal constraint on
-// transmit power and which channels may be used, so this is a deliberate
-// short list of ISO country codes rather than free text.
+// transmit power and which channels may be used, so this is a list of ISO
+// country codes rather than free text. It is the common ones, not all of
+// them: a region set to one that is not here is still shown, by its code.
+const REGION_UNMANAGED = "none";
 const REGION_OPTIONS = [
   { data: "00", label: "World (00) - most restrictive" },
-  { data: "US", label: "United States (US)" },
+  { data: "AR", label: "Argentina (AR)" },
+  { data: "AU", label: "Australia (AU)" },
+  { data: "AT", label: "Austria (AT)" },
+  { data: "BE", label: "Belgium (BE)" },
+  { data: "BR", label: "Brazil (BR)" },
   { data: "CA", label: "Canada (CA)" },
-  { data: "GB", label: "United Kingdom (GB)" },
-  { data: "IE", label: "Ireland (IE)" },
-  { data: "DE", label: "Germany (DE)" },
-  { data: "FR", label: "France (FR)" },
-  { data: "ES", label: "Spain (ES)" },
-  { data: "IT", label: "Italy (IT)" },
-  { data: "NL", label: "Netherlands (NL)" },
-  { data: "SE", label: "Sweden (SE)" },
-  { data: "NO", label: "Norway (NO)" },
+  { data: "CL", label: "Chile (CL)" },
+  { data: "CN", label: "China (CN)" },
+  { data: "CO", label: "Colombia (CO)" },
+  { data: "CZ", label: "Czechia (CZ)" },
   { data: "DK", label: "Denmark (DK)" },
   { data: "FI", label: "Finland (FI)" },
+  { data: "FR", label: "France (FR)" },
+  { data: "DE", label: "Germany (DE)" },
+  { data: "GR", label: "Greece (GR)" },
+  { data: "HK", label: "Hong Kong (HK)" },
+  { data: "HU", label: "Hungary (HU)" },
+  { data: "IN", label: "India (IN)" },
+  { data: "ID", label: "Indonesia (ID)" },
+  { data: "IE", label: "Ireland (IE)" },
+  { data: "IL", label: "Israel (IL)" },
+  { data: "IT", label: "Italy (IT)" },
+  { data: "JP", label: "Japan (JP)" },
+  { data: "MY", label: "Malaysia (MY)" },
+  { data: "MX", label: "Mexico (MX)" },
+  { data: "NL", label: "Netherlands (NL)" },
+  { data: "NZ", label: "New Zealand (NZ)" },
+  { data: "NO", label: "Norway (NO)" },
+  { data: "PH", label: "Philippines (PH)" },
   { data: "PL", label: "Poland (PL)" },
   { data: "PT", label: "Portugal (PT)" },
-  { data: "AU", label: "Australia (AU)" },
-  { data: "NZ", label: "New Zealand (NZ)" },
-  { data: "JP", label: "Japan (JP)" },
+  { data: "RO", label: "Romania (RO)" },
+  { data: "SA", label: "Saudi Arabia (SA)" },
+  { data: "SG", label: "Singapore (SG)" },
+  { data: "ZA", label: "South Africa (ZA)" },
   { data: "KR", label: "South Korea (KR)" },
-  { data: "BR", label: "Brazil (BR)" },
-  { data: "MX", label: "Mexico (MX)" },
-  { data: "IN", label: "India (IN)" },
+  { data: "ES", label: "Spain (ES)" },
+  { data: "SE", label: "Sweden (SE)" },
+  { data: "CH", label: "Switzerland (CH)" },
+  { data: "TW", label: "Taiwan (TW)" },
+  { data: "TH", label: "Thailand (TH)" },
+  { data: "TR", label: "Turkey (TR)" },
+  { data: "UA", label: "Ukraine (UA)" },
+  { data: "AE", label: "United Arab Emirates (AE)" },
+  { data: "GB", label: "United Kingdom (GB)" },
+  { data: "US", label: "United States (US)" },
 ];
 
 const DNS_OPTIONS = [
@@ -244,6 +276,9 @@ function Content() {
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
   const lastUpdateCheckAtRef = useRef<number>(0);
+  // Bumped when the update channel changes, so a check that was already
+  // running for the old channel cannot put its answer back up.
+  const updateCheckSeqRef = useRef(0);
   const statusSeqRef = useRef(0);
 
   const setBusy = useCallback((val: boolean) => {
@@ -260,7 +295,13 @@ function Content() {
       return;
     }
     lastUpdateCheckAtRef.current = now;
-    backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
+    const seq = updateCheckSeqRef.current;
+    backend
+      .checkForUpdate()
+      .then((info) => {
+        if (seq === updateCheckSeqRef.current) setUpdateInfo(info);
+      })
+      .catch(() => {});
   }, []);
 
   const refreshStatus = useCallback(async (force: boolean = false) => {
@@ -330,7 +371,7 @@ function Content() {
           // A worker stuck on a wedged driver never reports back. Release
           // the panel rather than keep every control disabled forever.
           if (s.started_at && Date.now() / 1000 - s.started_at > BACKEND_SWITCH_MAX_S) {
-            await giveUp("The backend switch is taking too long. Restart the Deck if WiFi does not come back.");
+            await giveUp("The backend switch is taking too long. Restart the device if WiFi does not come back.");
             return;
           }
           // Mid-switch: update so the subtitle can show the current phase.
@@ -505,6 +546,59 @@ function Content() {
     };
   }, [runUpdateCheck]);
 
+  // A switch's result describes that switch, and was left up for as long as
+  // the panel stayed mounted, so "Switched to iwd" could still be showing
+  // after the backend was changed again from SteamOS. A reboot request is
+  // kept: it stays true until the reboot.
+  useEffect(() => {
+    const r = backendSwitch?.result;
+    if (!backendSwitch || backendSwitch.in_progress || !r || r.needs_reboot) return;
+    const shown = backendSwitch;
+    const id = setTimeout(
+      () => setBackendSwitch((prev) => (prev === shown ? null : prev)),
+      BACKEND_RESULT_MS,
+    );
+    return () => clearTimeout(id);
+  }, [backendSwitch]);
+
+  // Expire each error and notice MESSAGE_TTL_MS after it first appeared. A
+  // message set again with the same text keeps its time; one that changed,
+  // or went and came back, starts over.
+  const messageSeenRef = useRef<Record<string, { text: string; at: number }>>({});
+  useEffect(() => {
+    const now = Date.now();
+    const seen: Record<string, { text: string; at: number }> = {};
+    const shown = [
+      ...Object.entries(errors).map(([k, v]) => [`e:${k}`, v] as const),
+      ...Object.entries(notices).map(([k, v]) => [`n:${k}`, v] as const),
+    ];
+    for (const [key, text] of shown) {
+      const before = messageSeenRef.current[key];
+      seen[key] = before && before.text === text ? before : { text, at: now };
+    }
+    messageSeenRef.current = seen;
+    const times = Object.values(seen).map((m) => m.at);
+    if (!times.length) return;
+    const id = setTimeout(() => {
+      // A second of slack, so a timer that fires a little early still
+      // clears the message it was set for.
+      const due = Date.now() + 1000 - MESSAGE_TTL_MS;
+      const expire = (prefix: string) => (prev: Record<string, string>) => {
+        const stale = Object.keys(prev).filter((k) => {
+          const m = messageSeenRef.current[prefix + k];
+          return m && m.text === prev[k] && m.at <= due;
+        });
+        if (!stale.length) return prev;
+        const next = { ...prev };
+        stale.forEach((k) => delete next[k]);
+        return next;
+      };
+      setErrors(expire("e:"));
+      setNotices(expire("n:"));
+    }, Math.max(0, Math.min(...times) + MESSAGE_TTL_MS - now));
+    return () => clearTimeout(id);
+  }, [errors, notices]);
+
   // ---- User action handlers ----
   //
   // Generic toggle handler used by every setter toggle (power_save, BSSID,
@@ -580,14 +674,21 @@ function Content() {
       const result = await fn();
       setOptimizeResult(result);
       if (result.results) {
+        // Successes can carry a message too, as they do for a single toggle:
+        // a lock that stayed on the access point you were already on, or a
+        // fix kept for the next stream. Dropping those here hid the reason.
         const newErrors: Record<string, string> = {};
+        const newNotices: Record<string, string> = {};
         for (const [k, v] of Object.entries(result.results)) {
           if (!v.success) {
             const det = v.detail ? ` (${v.detail})` : "";
             newErrors[k] = (v.message ?? ERROR_MESSAGES[v.error ?? ""] ?? "Failed") + det;
+          } else if (v.message) {
+            newNotices[k] = v.message;
           }
         }
         setErrors(newErrors);
+        setNotices(newNotices);
       }
       // optimize_safe contains BSSID lock which reconnects
       if (result.reconnected) {
@@ -617,6 +718,13 @@ function Content() {
 
   const handleMoveLock = () =>
     handleToggle("move_bssid_lock", () => backend.moveBssidLock());
+
+  const handleDismissMoveError = () =>
+    setErrors((prev) => {
+      const next = { ...prev };
+      delete next.move_bssid_lock;
+      return next;
+    });
 
   // Reset asks first: see RESET_CONFIRM_TEXT.
   const handleResetSettings = () => {
@@ -745,9 +853,10 @@ function Content() {
     setCheckingUpdate(true);
     setUpdateError(null);
     lastUpdateCheckAtRef.current = Date.now();
+    const seq = updateCheckSeqRef.current;
     try {
       const result = await backend.checkForUpdate();
-      setUpdateInfo(result);
+      if (seq === updateCheckSeqRef.current) setUpdateInfo(result);
     } catch {
       // refreshStatus has its own catch; no need to log here
     }
@@ -776,6 +885,7 @@ function Content() {
         setUpdateError(result.message ?? "Couldn't change the update channel.");
         return;
       }
+      updateCheckSeqRef.current += 1;
       setUpdateError(null);
       setUpdateInfo(null);
     } catch (e) {
@@ -783,7 +893,9 @@ function Content() {
       setUpdateError("Couldn't change the update channel.");
       return;
     }
-    await refreshStatus();
+    // Forced like the notify toggle. Unforced, it is skipped while another
+    // operation holds the panel busy, and the dropdown shows the old channel.
+    await refreshStatus(true);
   };
 
   // Custom DNS draft handling
@@ -796,13 +908,15 @@ function Content() {
   };
 
   const applyCustomDns = async () => {
-    const result = await handleToggle("dns", () =>
-      backend.setDns(true, "custom", customDnsInput.trim())
-    );
-    if (result?.success) {
-      dnsDirtyRef.current = false;
-      setDnsCustomOpen(false);
-    }
+    const result = await handleToggle("dns", async () => {
+      const r = await backend.setDns(true, "custom", customDnsInput.trim());
+      // Before the refresh that follows, so it adopts the servers as the
+      // backend saved them. Cleared after it, Apply and Cancel stayed up
+      // until the next poll whenever the saved form differed from the typed.
+      if (r.success) dnsDirtyRef.current = false;
+      return r;
+    });
+    if (result?.success) setDnsCustomOpen(false);
   };
 
   // Don't render content until first status arrives (prevents disconnect flash).
@@ -845,17 +959,23 @@ function Content() {
       ? { badge: "paused" as const, text: "paused" }
       : getBadge(key, status, errors[key] ?? null);
 
+  // Under iwd Optimize Safe leaves the lock out, so it is not one of the
+  // things to wait for there, or "All good" never came.
+  const lockSafe =
+    status?.live?.wifi_backend === "iwd" ||
+    (s?.bssid_lock_enabled &&
+      !status?.drift?.bssid_lock &&
+      // The lock can be enabled but belong to a different network, in which
+      // case nothing has drifted and it is also doing nothing here. Without
+      // this, the panel reports all clear while one of the four is inert.
+      !status?.live?.bssid_lock_other_network);
+
   // Check if all safe optimizations are already active
   const allSafeActive =
     connected &&
     (status?.live?.power_save_off || (streamingIdle && s?.power_save_disabled)) &&
     !status?.drift?.power_save &&
-    s?.bssid_lock_enabled &&
-    !status?.drift?.bssid_lock &&
-    // The lock can be enabled but belong to a different network, in which
-    // case nothing has drifted and it is also doing nothing here. Without
-    // this, the panel reports all clear while one of the four is inert.
-    !status?.live?.bssid_lock_other_network &&
+    lockSafe &&
     status?.live?.dispatcher_installed &&
     (status?.live?.buffer_tuning_applied || (streamingIdle && s?.buffer_tuning_enabled)) &&
     !status?.drift?.buffer_tuning;
@@ -950,8 +1070,8 @@ function Content() {
           is the obvious suspect. */}
       {status?.address_conflict && (
         <Banner variant="warning" icon="⚠">
-          Another device on your network is using the same address as the Deck
-          ({status.address_conflict.ip}), so the connection may not work. That's
+          Another device on your network is using the same address as your
+          handheld ({status.address_conflict.ip}), so the connection may not work. That's
           the router, not a WiFi setting. Restarting the router usually fixes it.
         </Banner>
       )}
@@ -964,7 +1084,7 @@ function Content() {
           A stronger access point on this network (signal{" "}
           {status.wpa2_only_stronger.signal} vs{" "}
           {status.wpa2_only_stronger.current_signal}) only offers WPA2, and this
-          network is saved as WPA3-only, so the Deck can't use it. Access points
+          network is saved as WPA3-only, so this device can't use it. Access points
           that offer WPA3 keep using it. Only allow this if that access point
           is yours: anyone nearby can broadcast your network's name.
           {errors.allow_wpa2 && (
@@ -988,7 +1108,8 @@ function Content() {
           range. Moving reconnects, so it is offered rather than done. The
           banner also stays up for a failed move's message, because a failed
           move clears the finding and would otherwise take the reason away
-          with it. */}
+          with it. That message can be dismissed, and expires like the
+          others. */}
       {(status?.lock_weaker || errors.move_bssid_lock) && (
         <Banner variant="warning" icon="⚠">
           {status?.lock_weaker && (
@@ -1009,6 +1130,15 @@ function Content() {
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleMoveLock}>
               Move the lock
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+      {errors.move_bssid_lock && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissMoveError}>
+              Dismiss
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
@@ -1070,9 +1200,9 @@ function Content() {
           text = r.message ?? "Backend switch failed";
         } else {
           const parts = [`Switched to ${r.backend}`];
-          if (r.recovery_performed) parts.push("recreated wlan0 interface");
+          if (r.recovery_performed) parts.push("wlan0 interface recreated");
           if (r.reconnect_timed_out) parts.push("WiFi didn't reconnect");
-          text = parts.join(" · ");
+          text = parts.join(", ");
         }
         return (
           <Banner variant={isWarning ? "warning" : "success"} icon={isWarning ? "⚠" : "✓"}>
@@ -1136,14 +1266,15 @@ function Content() {
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
           error={errors.power_save}
+          notice={notices.power_save}
           onChange={(val: boolean) =>
             handleToggle("power_save", () => backend.setPowerSave(val))
           }
         />
         <InfoRow
           label="Stop background scanning"
-          subtitle="Locks to current AP - disable to switch networks or roam"
-          explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
+          subtitle="Pins one access point - disable to roam"
+          explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Pinning the connection to one access point stops these scans entirely. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock."
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
             ? { badge: "unknown" as const, text: "other network" }
             : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
@@ -1170,6 +1301,7 @@ function Content() {
           checked={s?.auto_fix_on_wake ?? false}
           disabled={isBusy || updating}
           error={errors.auto_fix}
+          notice={notices.auto_fix}
           onChange={(val: boolean) =>
             handleToggle("auto_fix", () => backend.setAutoFix(val))
           }
@@ -1182,6 +1314,7 @@ function Content() {
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
           error={errors.buffer_tuning}
+          notice={notices.buffer_tuning}
           onChange={(val: boolean) =>
             handleToggle("buffer_tuning", () => backend.setBufferTuning(val))
           }
@@ -1199,12 +1332,28 @@ function Content() {
             <DropdownItem
               label="WiFi region"
               description="Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely."
-              rgOptions={REGION_OPTIONS}
-              selectedOption={regdomain.setting || regdomain.governing || "00"}
+              rgOptions={[
+                // Not set by the plugin. Labelled with the region in use.
+                {
+                  data: REGION_UNMANAGED,
+                  label: `Not managed (${regdomain.governing || "unknown"})`,
+                },
+                ...REGION_OPTIONS,
+                ...(regdomain.setting &&
+                !REGION_OPTIONS.some((o) => o.data === regdomain.setting)
+                  ? [{ data: regdomain.setting, label: regdomain.setting }]
+                  : []),
+              ]}
+              selectedOption={regdomain.setting || REGION_UNMANAGED}
               disabled={isBusy || updating}
               onChange={(option: { data: string }) => {
+                const unmanaged = option.data === REGION_UNMANAGED;
+                // "" puts back the region from before the plugin set one,
+                // or World when there was none, so it is only sent to stop
+                // managing a region the plugin did set.
+                if (unmanaged && !regdomain.setting) return;
                 void handleToggle("regdomain", () =>
-                  backend.setRegdomain(option.data)
+                  backend.setRegdomain(unmanaged ? "" : option.data)
                 ).then(refreshRegdomain);
               }}
             />
@@ -1227,7 +1376,8 @@ function Content() {
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
               WiFi region: {regdomain.governing || "unknown"}. This device's
               WiFi card sets its own region, so it cannot be changed here. That
-              is normal on the Steam Deck and does not mean a band is missing.
+              is normal for many cards, the Steam Deck's included, and does not
+              mean a band is missing.
             </div>
           </PanelSectionRow>
         )}
@@ -1236,7 +1386,7 @@ function Content() {
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.${
+          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you.${
             supports6GHz
               ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
               : ""
@@ -1268,14 +1418,17 @@ function Content() {
           <InfoRow
             label="Force 6 GHz band"
             subtitle="Stay on 6 GHz where your router has it"
-            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
+            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
             {...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null)}
             checked={on6GHz}
             disabled={isBusy || updating || (!connected && !on6GHz)}
             error={band6Error}
             notice={
               notices.band_6ghz ??
-              (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+              (on6GHz
+                ? notices.band_preference ??
+                  (status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+                : undefined)
             }
             onChange={(val: boolean) => {
               clearBandMessages();
@@ -1291,6 +1444,7 @@ function Content() {
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.dns_enabled)}
           error={errors.dns}
+          notice={notices.dns}
           onChange={(val: boolean) => {
             if (!val) resetDnsDraft();
             handleToggle("dns", () =>
@@ -1389,6 +1543,7 @@ function Content() {
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.cake_enabled)}
           error={errors.cake}
+          notice={notices.cake}
           onChange={(val: boolean) =>
             handleToggle("cake", () => backend.setCake(val))
           }
