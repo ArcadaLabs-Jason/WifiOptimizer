@@ -2629,8 +2629,11 @@ class Plugin:
     # these into public issues, and an SSID next to an access point's address
     # is enough to place someone on a map through the public WiFi databases.
     _DIAG_SSID_LINE_RE = re.compile(r"^([ \t]*ssid ).*$", re.MULTILINE)
+    # The edges only refuse a longer run of octets, so an address followed by
+    # ":" and a word ("AA:..:FF:bluetooth" in nmcli's output) is still caught.
     _DIAG_MAC_RE = re.compile(
-        r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:-])"
+        r"(?<![0-9A-Fa-f-])(?<![0-9A-Fa-f]:)(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}"
+        r"(?![0-9A-Fa-f-])(?![:-][0-9A-Fa-f]{2}(?![0-9A-Za-z]))"
     )
     _DIAG_IPV4_RE = re.compile(
         r"(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
@@ -2671,10 +2674,12 @@ class Plugin:
             if len(ssid) >= 4:
                 text = text.replace(ssid, "<ssid>")
         text = cls._DIAG_MAC_RE.sub("<mac>", text)
-        text = cls._DIAG_IPV6_RE.sub(
+        # IPv4 first: an IPv4-mapped address (::ffff:192.168.1.5) would
+        # otherwise lose only its first octet to the IPv6 pattern.
+        text = cls._DIAG_IPV4_RE.sub("<ip>", text)
+        return cls._DIAG_IPV6_RE.sub(
             lambda m: m.group(0) if m.group(0) == "::" else "<ip>", text
         )
-        return cls._DIAG_IPV4_RE.sub("<ip>", text)
 
     async def get_diagnostic_info(self) -> dict:
         """Collect system info for remote debugging. Sanitized: no passwords,
@@ -2725,7 +2730,7 @@ class Plugin:
             }, ssids)
         except Exception as e:
             decky.logger.error(f"get_diagnostic_info error: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": self._redact_diagnostics(str(e))}
 
     # The settings worth seeing in a report. Picked rather than dumped: the
     # rest is profile ids and the band preference's network name.
@@ -2737,11 +2742,70 @@ class Plugin:
         "settings_version", "regdomain",
     )
     # Kernel lines about the WiFi driver, its PCIe link and suspend/resume.
-    _DIAG_KERNEL_RE = re.compile(
-        r"rtw88|rtw89|rtw_|ath11k|ath12k|mt79|iwlwifi|wlan\d|PM: |pcieport|AER"
+    # The interface and driver actually present are added at call time, so a
+    # wlp1s0 or a driver missing from this list is covered too.
+    _DIAG_KERNEL_TERMS = (
+        r"rtw88|rtw89|rtw_|ath1[012]k|mt7\d|iwlwifi|brcmfmac|wlan\d|"
+        r"ieee80211 phy\d|cfg80211|PM: |ACPI: PM|pcieport|AER"
     )
-    _DIAG_KERNEL_LINES = 40
-    _DIAG_JOURNAL_HOST_RE = re.compile(r"^(\[\s*[\d.]+\]) \S+ kernel: ")
+    # Connection chatter: on a healthy boot it is most of what matches, and it
+    # pushed the suspend lines out of the report on Jason's own Deck.
+    _DIAG_CHATTER_RE = re.compile(
+        r": (?:authenticate with|send auth to|authenticated|associate with|"
+        r"RX AssocResp|associated|deauthenticating from|disassociated from|"
+        r"Limiting TX power|aborting authentication|authentication with)"
+    )
+    _DIAG_KERNEL_LINES = 50
+    # How much of a boot's kernel log is read. Bounds memory and time when a
+    # driver has been logging errors for days.
+    _DIAG_JOURNAL_MAX = "5000"
+    # With --no-hostname a kernel record reads "[  12.345678] kernel: msg".
+    # Anything else (systemd's "Hostname set to ..." also lands in -k) is left out.
+    _DIAG_KERNEL_LINE_RE = re.compile(r"^(\[\s*[\d.]+\]) kernel: (.*)$")
+
+    @classmethod
+    def _diag_kernel_lines(cls, text: str, terms: str) -> list:
+        """The lines of one boot's kernel log worth reading for a WiFi problem.
+
+        Repeats are folded into a count, since a wedged driver logs the same
+        error thousands of times, and connection chatter is dropped. If what
+        is left is still too long, it keeps the stretch from the last suspend
+        onwards (where a failed wake shows) plus the very end of the boot.
+        """
+        wanted = re.compile(terms)
+        lines, last_key, repeats = [], None, 0
+        for raw in text.splitlines():
+            found = cls._DIAG_KERNEL_LINE_RE.match(raw)
+            if not found:
+                continue
+            stamp, message = found.groups()
+            if not wanted.search(message) or cls._DIAG_CHATTER_RE.search(message):
+                continue
+            key = re.sub(r"\d+", "#", message)
+            if key == last_key:
+                repeats += 1
+                continue
+            if repeats:
+                lines.append(f"(repeated {repeats} more times)")
+            lines.append(f"{stamp} {message}")
+            last_key, repeats = key, 0
+        if repeats:
+            lines.append(f"(repeated {repeats} more times)")
+        cap = cls._DIAG_KERNEL_LINES
+        if len(lines) <= cap:
+            return lines
+        starts = [i for i, line in enumerate(lines) if "PM: suspend entry" in line]
+        if not starts:
+            return [f"({len(lines) - cap} earlier lines left out)"] + lines[-cap:]
+        head = lines[starts[-1]:starts[-1] + cap - 10]
+        tail_from = max(starts[-1] + len(head), len(lines) - 10)
+        out = []
+        if starts[-1]:
+            out.append(f"({starts[-1]} earlier lines left out)")
+        out += head
+        if tail_from > starts[-1] + len(head):
+            out.append(f"({tail_from - starts[-1] - len(head)} lines left out)")
+        return out + lines[tail_from:]
 
     def _diagnostic_extras(self, driver: str, iface: str) -> dict:
         """What a report needs beyond the device: versions, toggles, backend,
@@ -2775,15 +2839,34 @@ class Plugin:
             except OSError as e:
                 return f"unreadable: {e.strerror}"
 
+        # With the radio gone after a bad wake there may be no interface to
+        # detect the driver from, so the one recorded at load stands in.
+        if driver not in DRIVER_PROFILES:
+            try:
+                driver = _load_settings().get("driver", "") or driver
+            except Exception:
+                pass
         profile = DRIVER_PROFILES.get(driver, {})
         extras["driver_params"] = {
             path: read(path) for path in profile.get("sysfs_power_fixes", [])
         }
         extras["modprobe_conf"] = read(MODPROBE_CONF_PATH)
+        # Options in that file only take effect when the driver loads, so
+        # whether it predates this boot says if they are in force from the
+        # start or were only written into sysfs later.
+        try:
+            with open("/proc/stat", "r") as f:
+                boot = next(int(line.split()[1]) for line in f
+                            if line.startswith("btime "))
+            extras["modprobe_conf_before_boot"] = (
+                os.stat(MODPROBE_CONF_PATH).st_mtime < boot
+            )
+        except (OSError, StopIteration, ValueError, IndexError):
+            extras["modprobe_conf_before_boot"] = None
         extras["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
 
         pcie = {}
-        if IFACE_RE.match(iface or ""):
+        if iface and iface != "none" and IFACE_RE.match(iface):
             device = os.path.realpath(os.path.join(SYSFS_NET, iface, "device"))
             for name in ("l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
                          "l1_1_pcipm", "l1_2_pcipm"):
@@ -2806,33 +2889,44 @@ class Plugin:
         extras["rfkill"] = rfkill
 
         # DEVICE,TYPE,STATE only: the CONNECTION column is the network's name.
+        # "-e no" because terse mode otherwise escapes the colons in a device
+        # named by its address (a paired phone), which the redaction would miss.
         devices = self._run_cmd(
-            ["/usr/bin/nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"],
+            ["/usr/bin/nmcli", "-t", "-e", "no", "-f", "DEVICE,TYPE,STATE",
+             "device", "status"],
             timeout=3,
         )
         extras["nm_devices"] = devices.get("stdout", "") or devices.get("stderr", "")
 
+        # The plugins directory sits in the desktop user's home, so it is
+        # listed through the same no-follow walk as the settings directory.
         plugins_dir = os.path.dirname(getattr(decky, "DECKY_PLUGIN_DIR", "") or "")
-        try:
-            extras["decky_plugins"] = sorted(os.listdir(plugins_dir)) if plugins_dir else []
-        except OSError:
-            extras["decky_plugins"] = []
+        extras["decky_plugins"] = []
+        if plugins_dir:
+            try:
+                dfd = _open_dir_no_follow(plugins_dir)
+                try:
+                    extras["decky_plugins"] = sorted(os.listdir(dfd))
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
 
+        terms = self._DIAG_KERNEL_TERMS
+        for name in (iface, driver):
+            if name and name not in ("none", "unknown"):
+                terms += "|" + re.escape(name)
         for key, boot in (("kernel_log_this_boot", "0"), ("kernel_log_previous_boot", "-1")):
+            # --no-hostname: the hostname can be a person's name.
             log = self._run_cmd(
-                ["/usr/bin/journalctl", "-k", "-b", boot, "-o", "short-monotonic",
-                 "--no-pager"],
+                ["/usr/bin/journalctl", "-k", "-b", boot, "--no-hostname",
+                 "-o", "short-monotonic", "-n", self._DIAG_JOURNAL_MAX, "--no-pager"],
                 timeout=5,
             )
             if not log.get("success"):
                 extras[key] = [f"unavailable: {(log.get('stderr') or '')[:120]}"]
                 continue
-            # The hostname between the timestamp and "kernel:" can be a
-            # person's name, so only the timestamp and message are kept.
-            lines = [self._DIAG_JOURNAL_HOST_RE.sub(r"\1 ", line)
-                     for line in log.get("stdout", "").splitlines()
-                     if self._DIAG_KERNEL_RE.search(line)]
-            extras[key] = lines[-self._DIAG_KERNEL_LINES:]
+            extras[key] = self._diag_kernel_lines(log.get("stdout", ""), terms)
         return extras
 
     async def save_diagnostic_info(self) -> dict:

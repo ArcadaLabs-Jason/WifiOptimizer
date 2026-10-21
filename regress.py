@@ -4943,10 +4943,31 @@ except Exception as _e:
 
 section("diagnostics: enough to read a WiFi that never came back after sleep")
 try:
-    _KLOG = ("[   12.345678] steamdeck-of-jane kernel: rtw88_8822ce 0000:01:00.0: failed to leave lps state\n"
-             "[   12.400000] steamdeck-of-jane kernel: usb 1-1: new device\n"
-             "[   13.000000] steamdeck-of-jane kernel: PM: suspend exit\n"
-             "[   13.100000] steamdeck-of-jane kernel: wlan0: authenticate with 62:e9:31:0d:1f:e7\n")
+    def _journal(lines, host):
+        # What journalctl -k prints: with --no-hostname the host column is gone.
+        out = []
+        for stamp, ident, msg in lines:
+            out.append(f"[{stamp:>12}] {ident}: {msg}" if host is None
+                       else f"[{stamp:>12}] {host} {ident}: {msg}")
+        return "\n".join(out) + "\n"
+
+    _THIS = [
+        ("0.500000", "systemd[1]", "Hostname set to <AERO-deck>."),
+        ("12.345678", "kernel", "rtw88_8822ce 0000:01:00.0: failed to leave lps state"),
+        ("12.400000", "kernel", "usb 1-1: new high-speed USB device number 2"),
+        ("13.000000", "kernel", "PM: suspend exit"),
+        ("13.100000", "kernel", "wlan0: authenticate with 62:e9:31:0d:1f:e7 (local address=3c:e9:f7:12:34:56)"),
+        ("13.200000", "kernel", "ieee80211 phy0: Hardware restart was requested"),
+        ("13.300000", "kernel", "wlan0: deauthenticated from 62:e9:31:0d:1f:e7: (Reason: 4=DISASSOC_DUE_TO_INACTIVITY)"),
+    ]
+    _words = [a + b for a in "abcdefghij" for b in "abcdefghij"]
+    _PREV = ([(f"{100 + i}.000000", "kernel", f"rtw88_8822ce 0000:01:00.0: early note {_words[i]}") for i in range(60)]
+             + [("500.000000", "kernel", "PM: suspend entry (s2idle)"),
+                ("900.000000", "kernel", "PM: suspend exit"),
+                ("900.100000", "kernel", "rtw88_8822ce 0000:01:00.0: failed to leave lps state")]
+             + [(f"{901 + i}.000000", "kernel", f"rtw88_8822ce 0000:01:00.0: failed to send h2c command {i}") for i in range(120)]
+             + [(f"{1100 + i}.000000", "kernel", "wlan0: send auth to 62:e9:31:0d:1f:e7 (try 2/3)") for i in range(80)]
+             + [(f"{1300 + i}.000000", "kernel", f"rtw88_8822ce 0000:01:00.0: late note {_words[i]}") for i in range(60)])
     _seen = []
 
     class WakeDiag(Diag):
@@ -4955,21 +4976,32 @@ try:
         def _run_cmd(self, cmd, timeout=5):
             _seen.append(cmd)
             if cmd[0] == "/usr/bin/journalctl":
-                if cmd[cmd.index("-b") + 1] == "-1":
-                    return {"success": False, "stdout": "", "stderr": "Data from the specified boot (-1) is not available", "returncode": 1}
-                return _ok(_KLOG)
-            if cmd[0] == "/usr/bin/nmcli": return _ok("wlan0:wifi:disconnected\nlo:loopback:unmanaged\n")
+                host = None if "--no-hostname" in cmd else "AERO-deck"
+                return _ok(_journal(_THIS if cmd[cmd.index("-b") + 1] == "0" else _PREV, host))
+            if cmd[0] == "/usr/bin/nmcli":
+                if "-e" in cmd and cmd[cmd.index("-e") + 1] == "no":
+                    return _ok("wlan0:wifi:disconnected\nAA:BB:CC:DD:EE:F1:bluetooth:disconnected\n")
+                return _ok("wlan0:wifi:disconnected\nAA\\:BB\\:CC\\:DD\\:EE\\:F1:bluetooth:disconnected\n")
             return Diag._run_cmd(self, cmd, timeout)
 
-    _real_settings = m.SETTINGS_FILE
+    _real_settings, _real_plugin_dir = m.SETTINGS_FILE, getattr(m.decky, "DECKY_PLUGIN_DIR", None)
+    _home = tempfile.mkdtemp()
+    for _p in ("WiFi Optimizer", "decky-wifi-locker", "CSS Loader"):
+        os.makedirs(os.path.join(_home, "plugins", _p))
     try:
         m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+        m.decky.DECKY_PLUGIN_DIR = os.path.join(_home, "plugins", "WiFi Optimizer")
         m._save_settings(dict(m.DEFAULT_SETTINGS, band_preference_enabled=True,
                               band_preference_ssid="Smith Family 5G",
                               power_save_disabled=True, update_channel="beta"))
         _info = asyncio.run(WakeDiag().get_diagnostic_info())
+        _none = m.Plugin._diagnostic_extras(WakeDiag(), "rtw88", "none")
+        os.rename(os.path.join(_home, "plugins"), os.path.join(_home, "real-plugins"))
+        os.symlink(os.path.join(_home, "real-plugins"), os.path.join(_home, "plugins"))
+        _linked = m.Plugin._diagnostic_extras(WakeDiag(), "rtw88", "wlan0")
     finally:
         m.SETTINGS_FILE = _real_settings
+        m.decky.DECKY_PLUGIN_DIR = _real_plugin_dir
     _flat = json.dumps(_info)
     ok("plugin_version" in _info and "decky_version" in _info,
        "the plugin's and Decky's versions are in the report")
@@ -4984,21 +5016,51 @@ try:
            "/sys/module/rtw88_core/parameters/disable_lps_deep",
            "/sys/module/rtw88_pci/parameters/disable_aspm"},
        "the driver's power parameters are read for the radio actually present")
-    ok("modprobe_conf" in _info and "pcie" in _info and "rfkill" in _info
-       and "decky_plugins" in _info and "dispatcher_installed" in _info,
-       "with the modprobe file, the PCIe link state, rfkill and the other Decky plugins")
+    ok("modprobe_conf" in _info and "modprobe_conf_before_boot" in _info
+       and "pcie" in _info and "rfkill" in _info and "dispatcher_installed" in _info,
+       "with the modprobe file and whether it predates this boot, the PCIe link state and rfkill")
+    ok(_info.get("decky_plugins") == ["CSS Loader", "WiFi Optimizer", "decky-wifi-locker"],
+       "the other Decky plugins are listed")
+    ok(_linked.get("decky_plugins") == [],
+       "but not through a plugins folder swapped for a link")
+    ok(_none.get("pcie") == {}, "with no interface there is no made-up PCIe section")
     _nm = [c for c in _seen if c[0] == "/usr/bin/nmcli"]
     ok(_nm and "CONNECTION" not in " ".join(_nm[0]) and "wlan0:wifi:disconnected" in _info.get("nm_devices", ""),
        "NetworkManager's device states are read without the column that names the network")
+    ok("AA:BB:CC" not in _flat and "AA\\\\:BB" not in _flat and "<mac>:bluetooth" in _info.get("nm_devices", ""),
+       "and a paired phone named by its address is redacted, colons escaped or not")
     _this = _info.get("kernel_log_this_boot", [])
-    ok(len(_this) == 3 and not any("usb 1-1" in l for l in _this),
-       "the kernel log keeps the driver, wlan and suspend lines and drops the rest")
-    ok(_this and _this[0].startswith("[   12.345678] rtw88_8822ce") and "steamdeck-of-jane" not in _flat,
-       "with the timestamp kept and the hostname taken out")
-    ok(not re.search(r"(?i)62:e9:31", _flat) and any("<mac>" in l for l in _this),
-       "and the access point's address redacted like everywhere else")
-    ok(_info.get("kernel_log_previous_boot", [""])[0].startswith("unavailable:"),
-       "a previous boot the journal no longer has says so instead of failing the report")
+    ok("AERO-deck" not in _flat and not any("systemd" in l or "Hostname" in l for l in _this),
+       "no hostname, even one that looks like a kernel term, and no lines that are not the kernel's")
+    ok(not any("usb 1-1" in l for l in _this) and not any("authenticate with" in l for l in _this),
+       "USB lines and connection chatter are left out")
+    ok(any(l.startswith("[   12.345678] rtw88_8822ce") for l in _this)
+       and any("PM: suspend exit" in l for l in _this)
+       and any("Hardware restart was requested" in l for l in _this),
+       "while the driver, suspend and firmware restart lines stay, with their timestamps")
+    ok(not re.search(r"(?i)62:e9:31|3c:e9:f7", _flat) and any("<mac>" in l for l in _this),
+       "and addresses are redacted, including one followed by a colon")
+    _prev = _info.get("kernel_log_previous_boot", [])
+    ok(len(_prev) <= m.Plugin._DIAG_KERNEL_LINES + 2
+       and any("PM: suspend entry" in l for l in _prev)
+       and any("PM: suspend exit" in l for l in _prev)
+       and any("failed to leave lps state" in l for l in _prev),
+       "a long previous boot still shows the last suspend, the wake and the first error after it")
+    ok(any(l == "(repeated 119 more times)" for l in _prev)
+       and sum("failed to send h2c" in l for l in _prev) == 1,
+       "a repeated driver error is folded into a count")
+    ok(any("late note fj" in l for l in _prev[-3:]) and not any("send auth" in l for l in _prev),
+       "the end of the boot is kept and the chatter is not")
+    _wlp = m.Plugin._diag_kernel_lines(
+        "[  5.000000] kernel: wlp1s0: deauthenticated from <mac> (Reason: 3)\n",
+        m.Plugin._DIAG_KERNEL_TERMS + "|" + re.escape("wlp1s0"))
+    ok(len(_wlp) == 1, "an interface named wlp1s0 is covered when it is the one present")
+    ok("168.1.5" not in m.Plugin._redact_diagnostics("peer ::ffff:192.168.1.5 seen"),
+       "an IPv4-mapped IPv6 address is redacted whole")
+    _bad = asyncio.run(type("Raises", (Diag,), {
+        "get_device_info": lambda self: (_ for _ in ()).throw(RuntimeError("bad 62:e9:31:0d:1f:e7"))})().get_diagnostic_info())
+    ok(_bad.get("success") is False and "62:e9:31" not in json.dumps(_bad),
+       "an error report is redacted too")
 
     class BrokenExtras(Diag):
         def _diagnostic_extras(self, driver, iface): raise RuntimeError("boom")
