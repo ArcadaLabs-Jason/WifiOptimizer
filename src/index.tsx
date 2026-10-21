@@ -1156,8 +1156,8 @@ function Content() {
         />
         <InfoRow
           label="Stop background scanning"
-          subtitle="Locks to current AP - disable to switch networks or roam"
-          explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Locking to your current access point stops these scans entirely. You'll need to disable this before switching to a different network or access point."
+          subtitle="Pins one access point - disable to roam"
+          explanation="Your device scans for other WiFi networks every few minutes even while connected. Each scan causes a brief interruption that can drop packets and stutter game streaming. Pinning the connection to one access point stops these scans entirely. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock."
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
             ? { badge: "unknown" as const, text: "other network" }
             : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
