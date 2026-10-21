@@ -1083,9 +1083,9 @@ function Content() {
           text = r.message ?? "Backend switch failed";
         } else {
           const parts = [`Switched to ${r.backend}`];
-          if (r.recovery_performed) parts.push("recreated wlan0 interface");
+          if (r.recovery_performed) parts.push("wlan0 interface recreated");
           if (r.reconnect_timed_out) parts.push("WiFi didn't reconnect");
-          text = parts.join(" · ");
+          text = parts.join(", ");
         }
         return (
           <Banner variant={isWarning ? "warning" : "success"} icon={isWarning ? "⚠" : "✓"}>

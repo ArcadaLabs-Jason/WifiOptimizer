@@ -107,7 +107,6 @@ export function StreamingSection({
                 color: active ? theme.success.text : theme.info.text,
               }}
             >
-              {active ? "● " : "○ "}
               {stateText}
             </div>
           </PanelSectionRow>

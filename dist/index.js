@@ -342,8 +342,8 @@ function Banner({ variant, icon, children }) {
 
 const PHASE_TEXT = {
     idle: "",
-    switching: "Switching backend…",
-    reconnecting: "Reconnecting…",
+    switching: "Switching backend...",
+    reconnecting: "Reconnecting...",
     done: "",
     failed: "",
 };
@@ -372,12 +372,12 @@ function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
         ? backendSwitch.target === "wpa_supplicant"
         : isWpa;
     const phaseText = switching
-        ? PHASE_TEXT[backendSwitch.phase] || "Working…"
+        ? PHASE_TEXT[backendSwitch.phase] || "Working..."
         : null;
     const badge = error
         ? { badge: "error", text: "failed" }
         : switching
-            ? { badge: "unknown", text: "…" }
+            ? { badge: "unknown", text: "switching" }
             : isWpa
                 ? { badge: "active", text: "wpa_supplicant" }
                 : currentBackend === "iwd"
@@ -404,7 +404,7 @@ function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
                         fontSize: theme.fontSize.small,
                         color: timedOut ? theme.warning.text : theme.success.text,
                         padding: "2px 0",
-                    }, children: [timedOut ? "⚠" : "✓", " ", parts.join(" · ")] }) }));
+                    }, children: [timedOut ? "⚠" : "✓", " ", parts.join(", ")] }) }));
         })() }));
 }
 
@@ -579,10 +579,10 @@ function StreamingSection({ settings, live, disabled, error, notice, onToggle, }
     }
     return (SP_JSX.jsxs(DFL.PanelSection, { title: "Streaming auto mode", children: [SP_JSX.jsx(InfoRow, { label: "Only fix while streaming", subtitle: enabled
                     ? "Fixes apply while a streaming app runs"
-                    : "Off: enabled fixes apply all the time", explanation: "Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream. If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.", checked: enabled, disabled: disabled, error: error, notice: notice, onChange: (val) => onToggle("streaming", () => setStreamingMode(val)) }), enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: {
+                    : "Off: enabled fixes apply all the time", explanation: "Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream. If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.", checked: enabled, disabled: disabled, error: error, notice: notice, onChange: (val) => onToggle("streaming", () => setStreamingMode(val)) }), enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.body,
                                 color: active ? theme.success.text : theme.info.text,
-                            }, children: [active ? "● " : "○ ", stateText] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Keep fixes on", description: "For a stream that is not detected. Lasts until you restart.", checked: held, disabled: disabled, onChange: (val) => onToggle("streaming", () => setStreamingHold(val)) }) }), apps.map((a) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: a.label, checked: a.watched, disabled: disabled, onChange: (val) => toggleApp(a.id, val) }) }, a.id))), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Other process names (space-separated)", value: patterns, onChange: (e) => {
+                            }, children: stateText }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Keep fixes on", description: "For a stream that is not detected. Lasts until you restart.", checked: held, disabled: disabled, onChange: (val) => onToggle("streaming", () => setStreamingHold(val)) }) }), apps.map((a) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: a.label, checked: a.watched, disabled: disabled, onChange: (val) => toggleApp(a.id, val) }) }, a.id))), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Other process names (space-separated)", value: patterns, onChange: (e) => {
                                 setPatternsDirty(true);
                                 setPatterns(e.target.value);
                             } }) }), patternsDirty && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: savePatterns, children: "Save process names" }) }))] }))] }));
@@ -1611,10 +1611,10 @@ function Content() {
                 else {
                     const parts = [`Switched to ${r.backend}`];
                     if (r.recovery_performed)
-                        parts.push("recreated wlan0 interface");
+                        parts.push("wlan0 interface recreated");
                     if (r.reconnect_timed_out)
                         parts.push("WiFi didn't reconnect");
-                    text = parts.join(" · ");
+                    text = parts.join(", ");
                 }
                 return (SP_JSX.jsx(Banner, { variant: isWarning ? "warning" : "success", icon: isWarning ? "⚠" : "✓", children: text }));
             })(), optimizeResult && (() => {
