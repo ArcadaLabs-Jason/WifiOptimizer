@@ -5121,8 +5121,8 @@ try:
     ok("} catch (e) {" in _ht, "a toggle whose call throws shows an error instead of nothing")
     ok("disabled={isBusy}" not in _tsx and _tsx.count("isBusy || updating") >= 15,
        "every control is held while an update installs")
-    ok("const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;" in _tsx,
-       "the panel waits longer for an update than the script allows its download")
+    ok("const UPDATE_TIMEOUT_MS = 15 * 60 * 1000;" in _tsx,
+       "the panel waits for an update as long as the script may run, game wait included")
     _bp = _tsx[_tsx.index("const beginBackendPoll"):]
     _bp = _bp[:_bp.index("}, BACKEND_POLL_INTERVAL);")]
     ok("if (inFlight) return;" in _bp, "backend switch polls never overlap")
@@ -7194,7 +7194,7 @@ try:
        and 'handleToggle("band_preference"' not in _ix and _ix.count("clearBandMessages();") == 2,
        "each band toggle reports under its own key and clears the other's stale result")
     ok("isBusy={isBusy || updating}" in _ix, "Reset and Force Reapply wait while an update installs")
-    ok("UPDATE_TIMEOUT_MS = 10 * 60 * 1000" in _ix, "the panel's update timeout outlasts a slow update")
+    ok("UPDATE_TIMEOUT_MS = 15 * 60 * 1000" in _ix, "the panel's update timeout outlasts a slow update")
     _catch = _ix[_ix.index("const handleApplyUpdate"):]
     _catch = _catch[_catch.index("} catch {"):]
     _catch = _catch[:_catch.index("\n  };")]
@@ -7735,7 +7735,8 @@ try:
         m.decky.logger.info = _real_info
 
     _tsx = open("src/index.tsx").read()
-    _ban = _tsx[_tsx.index("{(status?.lock_weaker || errors.move_bssid_lock) && ("):]
+    # F8 renamed the condition: the finding is shown unless dismissed.
+    _ban = _tsx[_tsx.index("{(lockWeakerShown || errors.move_bssid_lock) && ("):]
     _ban = _ban[:_ban.index("Move the lock") + 40]
     ok("The access point lock is holding you on a weaker access point" in _ban
        and "A stronger one is in" in _ban and "status.lock_weaker.current_signal" in _ban
@@ -9879,6 +9880,309 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
     asyncio.sleep = _d_real_sleep
 m._save_settings(dict(m.DEFAULT_SETTINGS))
+
+
+# ---- QA pass 3, FRONT: panel and public docs (source checks; none reads dist) ----
+def _src(path):
+    try:
+        return open(path).read()
+    except OSError:
+        return ""
+def _between(text, start, end):
+    """text from start to the first end after it, or "" when start is missing."""
+    i = text.find(start)
+    if i < 0:
+        return ""
+    j = text.find(end, i + len(start))
+    return text[i:j if j >= 0 else len(text)]
+_F_IX = _src("src/index.tsx"); _F_UW = _src("src/updateWatch.ts"); _F_TY = _src("src/types.ts")
+_F_BT = _src("src/components/BackendToggleRow.tsx"); _F_SS = _src("src/components/StreamingSection.tsx")
+_F_US = _src("src/components/UpdatesSection.tsx"); _F_AS = _src("src/components/ActionsSection.tsx")
+_F_SG = _src("src/components/StatsGrid.tsx"); _F_TH = _src("src/theme.ts"); _F_PF = _src("src/components/PanelFooter.tsx")
+_F_RD = _src("README.md"); _F_SEC = _src("SECURITY.md"); _F_MAIN = _src("main.py")
+_F_ALL = "".join(_src(os.path.join(dp, f)) for dp, _dn, fs in os.walk("src") for f in fs)
+
+section("F1 Reset re-checks for updates, and says update settings are kept")
+try:
+    _rr = _between(_F_IX, "const runReset = async", "\n  };")
+    _ok = _between(_rr, "} else {", "} catch")
+    ok("updateCheckSeqRef.current += 1;" in _ok and "setUpdateInfo(null);" in _ok
+       and "runUpdateCheck(true);" in _ok, "a successful Reset drops the old offer and checks again")
+    ok("Update settings are kept." in _between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n"),
+       "the confirmation says the update settings are kept")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F2 a refused update re-checks, so the offer matches GitHub")
+try:
+    _ref = _between(_between(_F_IX, "const handleApplyUpdate", "\n  };"), "if (!result.success) {", "return;")
+    ok("updateCheckSeqRef.current += 1;" in _ref and "runUpdateCheck(true, true);" in _ref,
+       "the refusal branch asks again, keeping the refusal's reason on screen")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F3 the Optimize Safe / Fix now / Force Reapply result expires")
+try:
+    ok("setOptimizeResult((prev) => (prev === shown ? null : prev))" in _F_IX
+       and "MESSAGE_TTL_MS" in _between(_F_IX, "if (!optimizeResult) return;", "}, [optimizeResult]);"),
+       "the result banner goes MESSAGE_TTL_MS after it was set, like the marks it points at")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F4 a lock on for another network reads as done, as Optimize Safe treats it")
+try:
+    _ls = _between(_F_IX, "const lockSafe =", ";\n")
+    ok("!!status?.live?.bssid_lock_other_network ||" in _ls
+       and "!status?.live?.bssid_lock_other_network)" not in _ls,
+       "the panel's rule counts bssid_lock_other_network as satisfied")
+    ok("_lock_held_elsewhere" in _between(_F_MAIN, "async def optimize_safe", "def _record_reapplied"),
+       "and the backend rule it mirrors still leaves such a lock out (_lock_held_elsewhere)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F5 while the script waits for a game, the panel says so and waits as long")
+try:
+    ok('"Finishing the update. Steam restarts once no game or stream is running."' in _F_IX
+       and "Steam will restart" not in _F_IX, "the restarting phase says the restart waits for the game")
+    _ui = re.search(r"UPDATE_TIMEOUT_MS = (\d+) \* (\d+) \* (\d+);", _F_IX)
+    _mw = re.search(r"MAX_WATCH_MS = (\d+) \* (\d+) \* (\d+);", _F_UW)
+    _prod = lambda mt: int(mt.group(1)) * int(mt.group(2)) * int(mt.group(3)) if mt else -1
+    ok(_prod(_ui) == _prod(_mw) == 15 * 60 * 1000, "the panel's timeout is the watch's 15 minutes")
+    ok("so the panel waits a little longer than that" not in _F_IX, "and the old download-only comment is gone")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F6 no panel text tells people to restart Steam")
+try:
+    ok(not re.search(r"[Rr]estart Steam", _F_ALL),
+       "every failure says restart the device, which is known to load what is installed")
+    ok("If it still doesn't finish, restart the device." in _between(_F_IX, "const UPDATE_FAILED_TEXT", ";\n"),
+       "a failed update says to try again, then restart the device")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F7 backend switch failures: no raw output, one wording, failure checked first")
+try:
+    _bp = _between(_F_IX, "const beginBackendPoll", "}, BACKEND_POLL_INTERVAL);")
+    ok("s.result.detail ? ` (" not in _bp and "wifi_backend: backendResultText(s.result!)" in _bp,
+       "the row shows the banner's words, never the command output")
+    _brt = _between(_F_BT, "export function backendResultText", "\n}")
+    ok(0 <= _brt.find("if (!r.success)") < _brt.find("r.needs_reboot")
+       and "The switch didn't finish and the WiFi card didn't come back. Restart the device." in _brt,
+       "a failure with needs_reboot is not announced as Switched to")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F8 the WPA2 and weaker-lock notices can be dismissed")
+try:
+    ok("let findingsDismissed" in _F_IX and "onClick={handleDismissWpa2}" in _F_IX
+       and "onClick={handleDismissLockWeaker}" in _F_IX,
+       "each has a Dismiss, remembered across the panel closing")
+    ok("{(wpa2Shown || errors.allow_wpa2) && (" in _F_IX and "{(lockWeakerShown || errors.move_bssid_lock) && (" in _F_IX,
+       "and a dismissed finding stays hidden until it clears")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F9 All good is not a button that runs Optimize Safe")
+try:
+    _ob = _between(_F_IX, "<ButtonItem", "onClick={handleOptimize}")
+    _ob = _ob[_ob.rfind("<ButtonItem"):]
+    ok("allSafeActive" in _ob and "disabled=" in _ob, "the button is disabled while everything is applied")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F10 a dead or missing card is not told to connect first")
+try:
+    ok("live?.wifi_state" in _F_IX and "The WiFi card isn't responding. Restart the device." in _F_IX
+       and "WiFi is off. Turn it on in Steam's settings." in _F_IX,
+       "the disconnected banner follows wifi_state")
+    ok('?? "disconnected"' in _F_IX and "wifi_state?:" in _F_TY, "a backend without it reads as disconnected")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F11 the backend row says which backend comes at the next boot")
+try:
+    ok("wifi_backend_next" in _F_BT and "from the next boot." in _F_BT and "wifi_backend_next?:" in _F_TY,
+       "wifi_backend_next is shown in the subtitle")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F12 Reset says what it does: no reconnect, settings from the next connect")
+try:
+    ok('working === "reset" ? RESET_WORKING_TEXT' in _F_IX and 'const RESET_WORKING_TEXT = "Working...";' in _F_IX,
+       "Reset does not claim WiFi will reconnect")
+    ok("Every setting is back to its default" not in _F_IX and 'RESET_DONE_TEXT = "Done. Settings are reset."' in _F_IX,
+       "nor that every setting is at its default")
+    ok("from the next time WiFi connects" in _between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n"),
+       "and the confirmation says when the network settings come off")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F13 the region's Not managed entry says what choosing it does")
+try:
+    ok('"Not managed (put back the region from before)"' in _F_IX and "regdomain.setting\n" in _F_IX,
+       "once the plugin set a region, it is not labelled with that region")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F14 Keep fixes on lasts until the device restarts")
+try:
+    ok("restart." not in _F_SS.replace("restart the device.", "") and _F_SS.count("restart the device") == 2
+       and "until you restart the device" in _F_RD, "the panel and README say the device")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F15 the streaming idle text names only what is on, by the panel's names")
+try:
+    ok("Power save, buffer tuning and CAKE are paused" not in _F_SS
+       and all(k in _F_SS for k in ("settings?.power_save_disabled", "settings?.buffer_tuning_enabled",
+                                     "settings?.cake_enabled", '"Prevent lag spikes"')),
+       "built from the enabled fixes")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F16 update errors: channel and notice errors apart, and every one expires")
+try:
+    _nc = _between(_F_IX, "const handleNotifyChange", "\n  };") + _between(_F_IX, "const handleChannelChange", "\n  };")
+    ok("setUpdateError(result.message" not in _nc and "setUpdateSettingError(" in _nc
+       and "settingError={updateSettingError}" in _F_IX and "{settingError}" in _F_US,
+       "a failed channel or notice change is shown in the Updates section, not under Update")
+    ok("setUpdateError((prev) => (prev === shown ? null : prev))" in _F_IX,
+       "and an update error expires")
+    ok("if (info?.success && !keepError) setUpdateError(null);" in _F_IX,
+       "and goes on the next successful check")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F17 the process names field can be cancelled")
+try:
+    _cp = _between(_F_SS, "const cancelPatterns", "};")
+    ok("setPatternsDirty(false)" in _cp and "onClick={cancelPatterns}" in _F_SS,
+       "Cancel drops the draft and follows the saved value again")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F18 a paused result is not All applied")
+try:
+    _ob = _between(_F_IX, "{optimizeResult && (() => {", "})()}")
+    ok("v.paused" in _ob and "`Saved. ${pausedText}`" in _ob and "paused?: boolean;" in _F_TY,
+       "fixes saved for the next stream say so")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F19 the stranded-release banner is true for the band")
+try:
+    ok("The band\n          preference comes back after about 10 minutes" in _F_IX
+       and "applies again to whichever access point works" not in _F_IX,
+       "the band waits about 10 minutes and needs the band in range")
+    ok(getattr(m.Plugin, "_RELEASE_NOTICE_SECONDS", None) == 600, "which is the backend's own wait")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F20 README and the first-run banner: two fixes are on from install")
+try:
+    ok("already on from the moment the plugin is installed" in _F_RD,
+       "the README says Prevent lag spikes and Auto-fix are on from install")
+    ok("alreadyOn" in _F_IX and "to get started." not in _F_IX, "the first-run banner says which are on already")
+    ok(m.DEFAULT_SETTINGS.get("power_save_disabled") is True and m.DEFAULT_SETTINGS.get("auto_fix_on_wake") is True,
+       "which is what the defaults do")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F21 the README's Reset paragraph is true")
+try:
+    _rp = _between(_F_RD, "**Before uninstalling:**", "\n\n")
+    ok("deletes the plugin's own config files" not in _rp and "until WiFi next connects" in _rp
+       and "Allow WPA2" in _rp and "auto-fix script" in _rp,
+       "no deleted config claim, the next-connect timing, Allow WPA2 and the auto-fix script")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F22 the README's manual uninstall works and says how to undo network changes")
+try:
+    _un = _between(_F_RD, "## Uninstall", "## Building from source")
+    ok(0 <= _un.find("sudo systemctl restart plugin_loader") < _un.find("homebrew/settings/WiFi")
+       and "homebrew/logs/WiFi" in _un, "Decky restarts before the settings and logs go, and the logs go too")
+    ok("go to **Plugins**" in _un and "ipv6.method auto" in _un and "Steam's WiFi power management" in _un,
+       "the Decky path, the network undo line and the power management note are there")
+    ok("Disabling the plugin in Decky" in _un, "and what disabling does (J3)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F23 the README's install and update claims hold for the versions they name")
+try:
+    ok("curl -fsSL" in _F_RD and "curl -sL" not in _F_RD, "the one-liner fails on an HTTP error")
+    _upd = _between(_F_RD, "**Updating:**", "\n\n")
+    ok("From v0.19.0-beta on" in _upd and "From v0.24.2 on" in _upd and "Keep fixes on" in _upd,
+       "reload and the game refusal are version-qualified, and Keep fixes on is named")
+    ok("from late 2024 or newer" in _F_RD, "the zip-over-install claim names the Decky it holds for")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F24 F25 the README's hardware and region rows")
+try:
+    ok("Varies (often MediaTek MT7922 or Intel)" in _F_RD and "WiFi 6 (RTL8852) or WiFi 7" not in _F_RD,
+       "other handhelds are not claimed to use one chip")
+    ok("the Steam Deck OLED's among them" in _F_RD and "Steam Deck cards do" not in _F_RD,
+       "the region row is true for the LCD too")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F26 SECURITY.md: who owns the plugin folder")
+try:
+    ok("3.1.10" in _F_SEC and "The plugin's own folder is owned by root, so only" not in _F_SEC,
+       "the ownership claim names the installs it holds for")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F27 calls that hold a control are bounded")
+try:
+    ok("withTimeout(backend.startBackendSwitch(target))" in _F_IX, "starting a switch")
+    _bp = _between(_F_IX, "const beginBackendPoll", "}, BACKEND_POLL_INTERVAL);")
+    ok(0 <= _bp.find("pollStartedAt > BACKEND_SWITCH_MAX_S") < _bp.find("if (inFlight) return;")
+       and "withTimeout(backend.getBackendSwitchStatus()" in _bp,
+       "the switch poll gives up on its own time even when a call hangs")
+    _pl = _between(_F_UW, "async function poll()", "\n}")
+    ok(0 <= _pl.find("MAX_WATCH_MS") < _pl.find("if (inFlight) return;"),
+       "the update watch checks its age before the in-flight guard")
+    ok("withTimeout(backend.checkForUpdate())" in _F_IX and "withTimeout(backend.getDiagnosticInfo())" in _F_PF,
+       "and the update check and diagnostics, which hold their buttons too")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F28 the update watch is not ended by a sleep")
+try:
+    _pl = _between(_F_UW, "async function poll()", "\n}")
+    ok("startedAt" not in _F_UW and "MAX_TICK_MS" in _pl and "idleMs = 0;" in _pl
+       and "progress.phase !== lastPhase" in _pl,
+       "it stops after MAX_WATCH_MS awake with no new phase, not 15 minutes of wall clock")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F29 F30 F31 F32 F33 small panel text")
+try:
+    ok('band_preference: "Band preference"' in _F_IX, "F29 the drift list reads naturally")
+    ok("README mockup" not in _F_TH, "F30 no comment about a mockup that does not exist")
+    ok("parseInt(live.frequency" in _F_SG and "const freq = connected ? live.frequency" not in _F_SG,
+       "F31 the frequency is shown as a number, once with MHz")
+    ok(all(t in _F_AS + _F_US + _F_IX for t in ("Force reapply all", "Reset settings", '"Check for updates"',
+                                                '"Update now"', 'label="DNS provider"'))
+       and not any(t in _F_ALL for t in ("Force Reapply All", "Reset Settings", "Check for Updates\"",
+                                         "\"Update Now\"", "DNS Provider")),
+       "F32 buttons in sentence case")
+    ok("The other WiFi backend" not in _F_BT, "F32 the backend subtitle reads right with wpa_supplicant in use")
+    ok("Turn your settings back on, or tap Optimize Safe." in _F_TY, "F33 the recovered notice says what to do")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("J1 J2 FRONT: Allow WPA2 and custom DNS say what they do")
+try:
+    ok("Access points that offer WPA3 keep using it." not in _F_IX
+       and "Reset settings puts it back to WPA3 only." in _F_IX
+       and "| Allow WPA2 here |" in _F_RD, "the WPA2 banner and README are true before and after NetworkManager 1.58.1")
+    ok("no IPv4 at all" in _between(_F_IX, 'label="Custom DNS"', "checked="), "the DNS explanation warns about an IPv6-only network")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

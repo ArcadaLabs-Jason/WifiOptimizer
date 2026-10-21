@@ -32,13 +32,18 @@ const EXPLANATION =
   "switch back.";
 
 // What a finished switch says, in the banner at the top of the panel and
-// under the toggle.
+// under the toggle. A failure is checked first: a switch that failed and
+// left no WiFi card also asks for a restart, and was announced as
+// "Switched to".
 export function backendResultText(r: BackendSwitchResult): string {
-  if (r.needs_reboot) {
-    return `Switched to ${r.target}, but the WiFi card didn't come back. Restart the device to finish.`;
-  }
   if (!r.success) {
+    if (r.needs_reboot) {
+      return "The switch didn't finish and the WiFi card didn't come back. Restart the device.";
+    }
     return r.message ?? "The backend switch didn't work. If WiFi doesn't come back, restart the device.";
+  }
+  if (r.needs_reboot) {
+    return `Switched to ${r.backend || r.target}, but the WiFi card didn't come back. Restart the device to finish.`;
   }
   const parts = [`Switched to ${r.backend || r.target}.`];
   if (r.recovery_performed) parts.push("The WiFi card had to be restarted along the way.");
@@ -81,6 +86,20 @@ export function BackendToggleRow({
     ? PHASE_TEXT[backendSwitch!.phase] || "Working..."
     : null;
 
+  // On the generic method a change made by Reset (or an uninstall and
+  // reinstall without a reboot) lands at the next boot; until then the
+  // backend running is the one shown, and this says what comes next.
+  const next = status.live?.wifi_backend_next;
+  const subtitle =
+    phaseText ??
+    (next && next !== currentBackend
+      ? `Changes to ${next} from the next boot.`
+      : isWpa
+        ? "In use. Turn off to go back to iwd."
+        : currentBackend === "iwd"
+          ? "Instead of iwd. Can fix sleep and stability problems."
+          : "Can fix sleep and stability problems.");
+
   const badge: { badge: BadgeStatus; text: string } = error
     ? { badge: "error", text: "failed" }
     : switching
@@ -102,7 +121,7 @@ export function BackendToggleRow({
   return (
     <InfoRow
       label="Use wpa_supplicant backend"
-      subtitle={phaseText ?? "The other WiFi backend. Can fix sleep and stability problems."}
+      subtitle={subtitle}
       explanation={EXPLANATION}
       badge={badge.badge}
       text={badge.text}

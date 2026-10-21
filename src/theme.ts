@@ -1,7 +1,6 @@
-// Design tokens for the WiFi Optimizer panel. Keep this in sync with the
-// palette used in the README mockup and the four semantic banner colors
-// (success/warning/error/info) that Decky's Quick Access Menu supports well
-// against its dark background.
+// Design tokens for the WiFi Optimizer panel: the four semantic banner
+// colors (success/warning/error/info) that read well against the dark
+// background of Decky's Quick Access Menu, and the shared sizes.
 
 export const theme = {
   // Status colors - used for banners, badges, and text callouts.

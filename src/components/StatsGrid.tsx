@@ -47,7 +47,10 @@ export function StatsGrid({ live, connected }: StatsGridProps) {
   const signal = connected ? live.signal_dbm ?? na : na;
   const speed = connected ? speedLabel(live.tx_bitrate) ?? na : na;
   const band = connected ? bandLabel(live.frequency) : na;
-  const freq = connected ? live.frequency ?? "" : "";
+  // The number only: iw has reported "5180", "5180 MHz" and "5180.0", which
+  // showed as "5180 MHz MHz" or "5180.0 MHz". Read the way bandLabel does.
+  const mhz = connected ? parseInt(live.frequency ?? "") : NaN;
+  const freq = isNaN(mhz) ? "" : String(mhz);
   const channel = connected ? live.channel ?? na : na;
 
   const cell: React.CSSProperties = {

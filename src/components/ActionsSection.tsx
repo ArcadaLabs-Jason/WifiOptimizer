@@ -32,12 +32,12 @@ export function ActionsSection({
           disabled={!connected || isBusy}
           onClick={onForceReapply}
         >
-          Force Reapply All
+          Force reapply all
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem layout="below" disabled={isBusy} onClick={onReset}>
-          Reset Settings
+          Reset settings
         </ButtonItem>
       </PanelSectionRow>
       {workingText && (
