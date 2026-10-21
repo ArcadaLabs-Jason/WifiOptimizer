@@ -9,3 +9,26 @@ export function timeAgo(ts: number): string {
   if (diff < 86400) return `${Math.floor(diff / 3600)} hr ago`;
   return `${Math.floor(diff / 86400)}d ago`;
 }
+
+// A backend call that never answers used to leave every control greyed out
+// until the panel was reloaded. The slowest changes take about a minute.
+export const CALL_TIMEOUT_MS = 120 * 1000;
+
+export class NoAnswer extends Error {}
+
+// The call's own result, or NoAnswer once ms have passed without one.
+export function withTimeout<T>(call: Promise<T>, ms: number = CALL_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const id = setTimeout(() => reject(new NoAnswer()), ms);
+    call.then(
+      (value) => {
+        clearTimeout(id);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(id);
+        reject(err);
+      },
+    );
+  });
+}

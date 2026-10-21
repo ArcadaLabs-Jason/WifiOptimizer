@@ -2,6 +2,7 @@ import { PanelSection, PanelSectionRow, ButtonItem, Navigation } from "@decky/ui
 import { theme } from "../theme";
 import * as backend from "../backend";
 import { useState } from "react";
+import { withTimeout } from "../utils";
 
 const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
 
@@ -26,7 +27,8 @@ export function PanelFooter({ version }: PanelFooterProps) {
     setDiagState("copying");
     setSavedPath("");
     try {
-      const info = await backend.getDiagnosticInfo();
+      // Bounded, or the button could stay on "Collecting..." for good.
+      const info = await withTimeout(backend.getDiagnosticInfo());
       // A collection that failed comes back as a result, not a throw, and
       // copying it said "Copied to clipboard" over an error message.
       if (info?.success === false) throw new Error(String(info.error ?? "diagnostics failed"));
@@ -39,7 +41,7 @@ export function PanelFooter({ version }: PanelFooterProps) {
         // people looking for a file that was never written.
         let saved: Record<string, unknown> | null = null;
         try {
-          saved = await backend.saveDiagnosticInfo();
+          saved = await withTimeout(backend.saveDiagnosticInfo());
         } catch {
           saved = null;
         }

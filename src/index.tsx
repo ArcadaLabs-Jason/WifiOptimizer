@@ -49,20 +49,26 @@ import {
   startUpdateNotices,
 } from "./updateWatch";
 import { theme } from "./theme";
+import { NoAnswer, withTimeout } from "./utils";
 
 const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
 const BACKEND_POLL_INTERVAL = 750;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
 const UPDATE_CHECK_DEDUPE_MS = 60 * 1000;
-// The update script allows the download up to five minutes on a slow link,
-// so the panel waits a little longer than that before calling it failed.
-// Longer than an update can take on a slow link: up to about 2 minutes for
-// the check and the signature, 5 for the download, and the reload. A limit
-// inside that was reached while the update was still going, and the next
-// progress report took the "didn't complete" message straight back off.
-const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
+// How long the panel waits for an update with no new progress before it
+// says the update is taking too long. The same as the watch's limit in
+// updateWatch.ts. The script itself may run for 14 minutes: the download,
+// then, once the files are in place, as long as a game or stream is still
+// running before it restarts Decky. A shorter limit told people to restart
+// while the script was waiting for their game to end. Counted again from
+// each new phase, since the signature check before the script starts takes
+// up to two minutes of its own.
+const UPDATE_TIMEOUT_MS = 15 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
+// One switch status read. It answers from memory, so this is only for a
+// backend that has stopped answering altogether.
+const BACKEND_POLL_TIMEOUT_MS = 20 * 1000;
 // How long a finished backend switch's result stays up.
 const BACKEND_RESULT_MS = 60 * 1000;
 // How long an error or notice under a control stays up. They used to last
@@ -76,21 +82,26 @@ const BACKEND_POLL_MAX_FAILURES = 5;
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
 // Prevent lag spikes is saved as off, so it does not come back by itself.
+// The network settings are written to the saved networks without a
+// reconnect, so the connection in use keeps them until WiFi next connects.
+// The update channel and notices are kept (main.py _reset_locked).
 const RESET_CONFIRM_TEXT =
-  "This puts every setting back to its default and turns off what the plugin applied. Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting and custom DNS are removed from the networks they were set on.";
+  "This turns off what the plugin applied and puts its WiFi settings back to their defaults, except that Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are removed from the networks they were set on, from the next time WiFi connects. Update settings are kept.";
+// Reset does not reconnect, so it does not say WiFi will.
+const RESET_WORKING_TEXT = "Working...";
+const RESET_DONE_TEXT = "Done. Settings are reset.";
 // Only where the plugin can choose the backend itself. On SteamOS that is
 // Valve's setting, and Reset leaves it alone.
 const RESET_BACKEND_TEXT =
   " A WiFi backend chosen here goes back to the system default from the next boot.";
-// A backend call that never answers used to leave every control greyed out
-// until the panel was reloaded. The slowest changes take about a minute.
-const CALL_TIMEOUT_MS = 120 * 1000;
 // The refresh after a change is bounded too, for the same reason.
 const REFRESH_WAIT_MS = 15 * 1000;
 const NO_ANSWER_TEXT =
   "No answer after 2 minutes. The change may still finish, so check this setting again in a moment. If WiFi doesn't come back, restart the device.";
+// The device, not Steam: the backend runs in Decky's own service, which a
+// Steam restart is not known to restart.
 const UNREACHABLE_TEXT =
-  "Couldn't reach the plugin's backend. Wait a moment and try again. If it keeps happening, restart Steam.";
+  "Couldn't reach the plugin's backend. Wait a moment and try again. If it keeps happening, restart the device.";
 // Optimize Safe, Fix now and Force Reapply reconnect only when the lock or a
 // network setting is among what they apply.
 const BATCH_WORKING_TEXT = "Working. WiFi may reconnect, and this can take up to a minute.";
@@ -105,28 +116,17 @@ const DRIFT_LABELS: Record<string, string> = {
   power_save: "Prevent lag spikes",
   bssid_lock: "Stop background scanning",
   buffer_tuning: "Network buffer tuning",
-  band_preference: "The band preference",
+  band_preference: "Band preference",
   dns: "Custom DNS",
   ipv6: "Disable IPv6",
   cake: "Traffic shaping (CAKE)",
 };
 
-class NoAnswer extends Error {}
-
-function withTimeout<T>(call: Promise<T>, ms: number = CALL_TIMEOUT_MS): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const id = setTimeout(() => reject(new NoAnswer()), ms);
-    call.then(
-      (value) => {
-        clearTimeout(id);
-        resolve(value);
-      },
-      (err) => {
-        clearTimeout(id);
-        reject(err);
-      },
-    );
-  });
+// "A", "A and B", "A, B and C".
+function joinNames(names: string[]): string {
+  return names.length > 1
+    ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`
+    : names[0] ?? "";
 }
 
 // What a failed result says, without the raw command output some carry in
@@ -143,12 +143,19 @@ function isResult(value: unknown): value is MethodResult {
 // Kept across the panel closing and reopening, which can remount it.
 let detailsShown = false;
 let duplicatesDismissed = false;
-// The update script can stop after installing, when a game is still running
-// at its deadline, so a failed update may only need Steam restarted.
+// Findings dismissed by the user: hidden until the finding clears and comes
+// back. Not keyed on the signals they carry, which change on every scan and
+// would bring the notice straight back.
+let findingsDismissed = { wpa2: false, lockWeaker: false };
+// The script fails for many reasons (download, checksum, unpacking, the
+// version, copying files, or a game still running at its deadline, with the
+// new files in place). Trying again covers the first ones, and a restart of
+// the device loads files that are already in place. Restarting Steam is not
+// known to restart Decky's backend, so it is not offered.
 const UPDATE_FAILED_TEXT =
-  "The update didn't finish. Close any game or stream, then restart Steam or try the update again.";
+  "The update didn't finish. Try the update again. If it still doesn't finish, restart the device.";
 const UPDATE_SLOW_TEXT =
-  "The update is taking too long. Restart Steam, then check the version at the bottom of this panel. If it didn't change, try the update again.";
+  "The update is taking too long. Restart the device, then check the version at the bottom of this panel. If it didn't change, try the update again.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -164,8 +171,10 @@ function updatingText(progress: UpdateProgress | null): string {
     case "swapped":
     case "loaded":
       return "Reloading the plugin...";
+    // The script reports this before it waits for a game or stream to end,
+    // which can take many minutes, so it says when the restart comes.
     case "restarting":
-      return "Restarting Decky to finish. Steam will restart.";
+      return "Finishing the update. Steam restarts once no game or stream is running.";
     default:
       return "Starting the update...";
   }
@@ -313,6 +322,7 @@ function Content() {
   const [slowLoad, setSlowLoad] = useState(false);
   const [showDetails, setShowDetails] = useState(detailsShown);
   const [dupDismissed, setDupDismissed] = useState(duplicatesDismissed);
+  const [dismissed, setDismissed] = useState(findingsDismissed);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeSafeResult | null>(null);
   const [regdomain, setRegdomainInfo] = useState<RegdomainInfo | null>(null);
 
@@ -342,7 +352,12 @@ function Content() {
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
+  // Why an update could not start or did not finish. Shown under the update
+  // buttons, and expires like the other messages.
   const [updateError, setUpdateError] = useState<string | null>(null);
+  // A failed change to the channel or the notice toggle. Kept apart, so it
+  // is shown beside those controls rather than under the update button.
+  const [updateSettingError, setUpdateSettingError] = useState<string | null>(null);
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
 
   // --- Backend switch state ---
@@ -368,7 +383,11 @@ function Content() {
   // Runs checkForUpdate with dedupe - skips if a check was issued within the
   // dedupe window. Lowers GitHub API pressure in CGNAT/dorm scenarios where
   // many devices share an IP. Manual button bypasses this (force=true).
-  const runUpdateCheck = useCallback((force: boolean = false) => {
+  // A successful answer replaces any update error, which described an older
+  // state, except where the caller has just set the error it is about
+  // (keepError): a refused update re-checks so its offer is current, and
+  // the reason for the refusal has to stay readable.
+  const runUpdateCheck = useCallback((force: boolean = false, keepError: boolean = false) => {
     const now = Date.now();
     if (!force && now - lastUpdateCheckAtRef.current < UPDATE_CHECK_DEDUPE_MS) {
       return;
@@ -378,7 +397,9 @@ function Content() {
     backend
       .checkForUpdate()
       .then((info) => {
-        if (seq === updateCheckSeqRef.current) setUpdateInfo(info);
+        if (seq !== updateCheckSeqRef.current) return;
+        setUpdateInfo(info);
+        if (info?.success && !keepError) setUpdateError(null);
       })
       .catch(() => {});
   }, []);
@@ -400,13 +421,11 @@ function Content() {
       setStatusFailed(false);
       setStatus(s);
       if (s.settings) {
-        // Only adopt a stored value that exists. Turning DNS off clears
-        // dns_servers while leaving the provider on "custom", and copying
-        // that empty string back over the field every few seconds made the
-        // setting impossible to re-enable: the servers field is only
-        // rendered while DNS is on, and turning it on with an empty custom
-        // list is rejected. The backend also resets the provider when it
-        // clears the servers, so the pair cannot get stuck together.
+        // Only adopt a stored value that exists. Older backends cleared
+        // dns_servers when DNS was turned off, and copying that empty string
+        // back over the field every few seconds made the setting impossible
+        // to re-enable: the servers field is only rendered while DNS is on,
+        // and turning it on with an empty custom list is rejected.
         if (
           !dnsDirtyRef.current &&
           s.settings.dns_provider === "custom" &&
@@ -442,24 +461,39 @@ function Content() {
     // of whatever the user started next.
     let inFlight = false;
     let failures = 0;
+    // Once given up or finished, a reply still on its way is ignored, so it
+    // cannot clear busy under whatever the user started next.
+    let done = false;
+    const pollStartedAt = Date.now();
     const giveUp = async (message: string) => {
+      done = true;
       stopBackendPoll();
       setBackendSwitch(null);
       setErrors((prev) => ({ ...prev, wifi_backend: message }));
-      await refreshStatus(true);
+      await refreshAfterChange();
       setBusy(false);
     };
+    const tooLong = "The backend switch is taking too long. Restart the device if WiFi does not come back.";
     backendPollRef.current = setInterval(async () => {
+      if (done) return;
+      // Checked before the in-flight guard: a status call that never
+      // settles kept the guard set, and with it every control disabled.
+      if (Date.now() - pollStartedAt > BACKEND_SWITCH_MAX_S * 1000) {
+        await giveUp(tooLong);
+        return;
+      }
       if (inFlight) return;
       inFlight = true;
       try {
-        const s = await backend.getBackendSwitchStatus();
+        const s = await withTimeout(backend.getBackendSwitchStatus(), BACKEND_POLL_TIMEOUT_MS);
+        if (done) return;
         failures = 0;
         if (s.in_progress) {
           // A worker stuck on a wedged driver never reports back. Release
-          // the panel rather than keep every control disabled forever.
+          // the panel rather than keep every control disabled forever. The
+          // backend's own start time covers a panel opened mid-switch.
           if (s.started_at && Date.now() / 1000 - s.started_at > BACKEND_SWITCH_MAX_S) {
-            await giveUp("The backend switch is taking too long. Restart the device if WiFi does not come back.");
+            await giveUp(tooLong);
             return;
           }
           // Mid-switch: update so the subtitle can show the current phase.
@@ -471,18 +505,22 @@ function Content() {
         // steady until live.wifi_backend has caught up AND keeps other toggles
         // disabled until the whole UI has consistent state, avoiding any
         // toggle/untoggle flicker at the end of the switch.
+        done = true;
         stopBackendPoll();
-        if (s.result && !s.result.success && s.result.message) {
-          const detail = s.result.detail ? ` (${s.result.detail})` : "";
+        // The same words as the banner at the top, and never the raw command
+        // output some failures carry in "detail": that is for the log.
+        if (s.result && !s.result.success) {
+          if (s.result.detail) console.warn("WiFi Optimizer: backend switch detail", s.result.detail);
           setErrors((prev) => ({
             ...prev,
-            wifi_backend: s.result!.message! + detail,
+            wifi_backend: backendResultText(s.result!),
           }));
         }
-        await refreshStatus(true);
+        await refreshAfterChange();
         setBackendSwitch(s);
         setBusy(false);
       } catch (e) {
+        if (done) return;
         console.error("backend switch poll error", e);
         // One failed call is not the switch failing; the worker carries on
         // regardless. Only after several in a row is it lost.
@@ -494,7 +532,7 @@ function Content() {
         inFlight = false;
       }
     }, BACKEND_POLL_INTERVAL);
-  }, [refreshStatus, setBusy]);
+  }, [refreshAfterChange, setBusy]);
 
   // Main refresh interval, paused when the panel is hidden so we don't burn
   // CPU/battery on ~12 subprocess calls every 3s in the background. On return
@@ -543,6 +581,22 @@ function Content() {
       setDupDismissed(false);
     }
   }, [loaded, hasDuplicates]);
+
+  // The same for the WPA2 and weaker-lock notices: once a dismissed finding
+  // is no longer reported, the next one is shown again.
+  const hasWpa2Finding = !!status?.wpa2_only_stronger;
+  const hasLockWeaker = !!status?.lock_weaker;
+  useEffect(() => {
+    if (!loaded) return;
+    const next = {
+      wpa2: findingsDismissed.wpa2 && hasWpa2Finding,
+      lockWeaker: findingsDismissed.lockWeaker && hasLockWeaker,
+    };
+    if (next.wpa2 !== findingsDismissed.wpa2 || next.lockWeaker !== findingsDismissed.lockWeaker) {
+      findingsDismissed = next;
+      setDismissed(next);
+    }
+  }, [loaded, hasWpa2Finding, hasLockWeaker]);
 
   // One-time init: initial update check and resume backend polling if a switch
   // was already in flight when the panel opened.
@@ -604,10 +658,12 @@ function Content() {
     [runUpdateCheck],
   );
 
-  // Safety timeout: if an update was initiated but the plugin hasn't been
-  // reloaded within the time the script allows itself, it probably failed (network
+  // Safety timeout: if an update was initiated but the script has reported
+  // nothing new for as long as it allows itself, it probably failed (network
   // drop, tarball corruption, etc.). Revert the UI so the user isn't stuck staring
-  // at "Updating..." forever, and surface a message they can act on.
+  // at "Updating..." forever, and surface a message they can act on. Started
+  // again at each new phase, as the watch in updateWatch.ts is.
+  const updatePhase = updateProgress?.phase ?? "";
   useEffect(() => {
     if (!updating) return;
     const id = setTimeout(() => {
@@ -616,7 +672,39 @@ function Content() {
       setUpdateError(UPDATE_SLOW_TEXT);
     }, UPDATE_TIMEOUT_MS);
     return () => clearTimeout(id);
-  }, [updating]);
+  }, [updating, updatePhase]);
+
+  // The update messages and the Optimize Safe / Fix now / Force Reapply
+  // result expire like the messages under each setting. The result pointed
+  // at "failed" marks that had already gone, and a refusal such as "Close
+  // your game" stayed after the game was closed.
+  useEffect(() => {
+    if (!updateError) return;
+    const shown = updateError;
+    const id = setTimeout(
+      () => setUpdateError((prev) => (prev === shown ? null : prev)),
+      MESSAGE_TTL_MS,
+    );
+    return () => clearTimeout(id);
+  }, [updateError]);
+  useEffect(() => {
+    if (!updateSettingError) return;
+    const shown = updateSettingError;
+    const id = setTimeout(
+      () => setUpdateSettingError((prev) => (prev === shown ? null : prev)),
+      MESSAGE_TTL_MS,
+    );
+    return () => clearTimeout(id);
+  }, [updateSettingError]);
+  useEffect(() => {
+    if (!optimizeResult) return;
+    const shown = optimizeResult;
+    const id = setTimeout(
+      () => setOptimizeResult((prev) => (prev === shown ? null : prev)),
+      MESSAGE_TTL_MS,
+    );
+    return () => clearTimeout(id);
+  }, [optimizeResult]);
 
   // Periodic update re-check - QAM often caches the panel across close/reopen,
   // so the mount-effect check doesn't re-fire. This heartbeat catches new
@@ -840,8 +928,15 @@ function Content() {
       delete next[key];
       return next;
     });
-  const handleDismissMoveError = () => dismissError("move_bssid_lock");
-  const handleDismissWpa2Error = () => dismissError("allow_wpa2");
+  // Dismiss hides the notice and any failed attempt's message with it. A
+  // finding comes back only once it has cleared and is reported again.
+  const dismissFinding = (key: "wpa2" | "lockWeaker", errorKey: string) => {
+    dismissError(errorKey);
+    findingsDismissed = { ...findingsDismissed, [key]: true };
+    setDismissed(findingsDismissed);
+  };
+  const handleDismissLockWeaker = () => dismissFinding("lockWeaker", "move_bssid_lock");
+  const handleDismissWpa2 = () => dismissFinding("wpa2", "allow_wpa2");
 
   const handleDismissDuplicates = () => {
     duplicatesDismissed = true;
@@ -884,7 +979,13 @@ function Content() {
       if (!isResult(result) || !result.success) {
         setErrors({ reset: isResult(result) ? failureText(result) : GENERIC_FAIL_TEXT });
       } else {
-        setNotices({ reset: "Done. Every setting is back to its default." });
+        setNotices({ reset: RESET_DONE_TEXT });
+        // Reset keeps the update channel, but an older backend put it back
+        // to Stable. Either way the offer on screen may be for a channel no
+        // longer chosen, so it is dropped and asked for again.
+        updateCheckSeqRef.current += 1;
+        setUpdateInfo(null);
+        runUpdateCheck(true);
       }
     } catch (e) {
       console.error("reset error", e);
@@ -943,7 +1044,8 @@ function Content() {
     setOptimizeResult(null);
 
     try {
-      const res = await backend.startBackendSwitch(target);
+      // Bounded: a call that never settled kept the panel busy for good.
+      const res = await withTimeout(backend.startBackendSwitch(target));
       if (!res.accepted) {
         setErrors((prev) => ({
           ...prev,
@@ -965,12 +1067,24 @@ function Content() {
       });
       beginBackendPoll();
     } catch (e) {
+      console.error("startBackendSwitch error", e);
+      // The reply may be what was lost, with the switch running anyway.
+      // Follow it then, rather than say it never started.
+      try {
+        const s = await withTimeout(backend.getBackendSwitchStatus(), BACKEND_POLL_TIMEOUT_MS);
+        if (s.in_progress) {
+          setBackendSwitch(s);
+          beginBackendPoll();
+          return;
+        }
+      } catch {
+        // Nothing to follow.
+      }
       setBusy(false);
       setErrors((prev) => ({
         ...prev,
         wifi_backend: "Couldn't start the backend switch. Try again in a moment.",
       }));
-      console.error("startBackendSwitch error", e);
     }
   };
 
@@ -988,10 +1102,15 @@ function Content() {
         version?: string;
       };
       // Refused outright (no update after all, a backend switch running):
-      // say why now instead of showing "Updating..." for a minute.
+      // say why now instead of showing "Updating..." for a minute. Then ask
+      // GitHub again, so the offer on screen matches what it offers now: a
+      // refusal for "no update" or "the update changed" left the old offer
+      // up, and the Check button is hidden while an offer is shown.
       if (!result.success) {
         setUpdating(false);
         setUpdateError(result.message ?? "Couldn't start the update.");
+        updateCheckSeqRef.current += 1;
+        runUpdateCheck(true, true);
         return;
       }
       const version = result.version ?? updateInfo?.latest_version;
@@ -1010,7 +1129,8 @@ function Content() {
     lastUpdateCheckAtRef.current = Date.now();
     const seq = updateCheckSeqRef.current;
     try {
-      const result = await backend.checkForUpdate();
+      // Bounded, or "Checking..." could stay up with the button disabled.
+      const result = await withTimeout(backend.checkForUpdate());
       if (seq === updateCheckSeqRef.current) setUpdateInfo(result);
     } catch {
       // refreshStatus has its own catch; no need to log here
@@ -1020,32 +1140,33 @@ function Content() {
 
   const handleNotifyChange = async (enabled: boolean) => {
     try {
-      const result = await backend.setUpdateNotify(enabled);
+      const result = await withTimeout(backend.setUpdateNotify(enabled), REFRESH_WAIT_MS);
       if (!result.success) {
-        setUpdateError(result.message ?? "Couldn't change the update notice setting.");
+        setUpdateSettingError(result.message ?? "Couldn't change the update notice setting. Try again.");
         return;
       }
-      setUpdateError(null);
+      setUpdateSettingError(null);
     } catch (e) {
       console.error("set update notify error", e);
-      setUpdateError("Couldn't change the update notice setting.");
+      setUpdateSettingError("Couldn't change the update notice setting. Try again.");
     }
-    await refreshStatus(true);
+    await refreshAfterChange();
   };
 
   const handleChannelChange = async (nextChannel: string) => {
     try {
-      const result = await backend.setUpdateChannel(nextChannel);
+      const result = await withTimeout(backend.setUpdateChannel(nextChannel), REFRESH_WAIT_MS);
       if (!result.success) {
-        setUpdateError(result.message ?? "Couldn't change the update channel.");
+        setUpdateSettingError(result.message ?? "Couldn't change the update channel. Try again.");
         return;
       }
       updateCheckSeqRef.current += 1;
+      setUpdateSettingError(null);
       setUpdateError(null);
       setUpdateInfo(null);
     } catch (e) {
       console.error("set channel error", e);
-      setUpdateError("Couldn't change the update channel.");
+      setUpdateSettingError("Couldn't change the update channel. Try again.");
       return;
     }
     // Forced like the notify toggle. Unforced, it is skipped while another
@@ -1086,7 +1207,7 @@ function Content() {
         <PanelSectionRow>
           <div style={{ fontSize: theme.fontSize.body, color: theme.text.secondary }}>
             {statusFailed
-              ? "Couldn't reach the plugin. It keeps trying. If this stays, restart Steam."
+              ? "Couldn't reach the plugin. It keeps trying. If this stays, restart the device."
               : slowLoad
                 ? "Still reading WiFi status. This can take a while just after waking from sleep."
                 : "Loading WiFi status..."}
@@ -1149,18 +1270,41 @@ function Content() {
 
   // Under iwd Optimize Safe leaves the lock out, so it is not one of the
   // things to wait for there, or "All good" never came.
+  // The findings with a Dismiss, unless dismissed.
+  const wpa2Shown = !!status?.wpa2_only_stronger && !dismissed.wpa2;
+  const lockWeakerShown = !!status?.lock_weaker && !dismissed.lockWeaker;
+
+  // What the first-run prompt says is on already.
+  const alreadyOn = [
+    s?.power_save_disabled ? "Prevent lag spikes" : "",
+    s?.auto_fix_on_wake ? "Auto-fix on wake" : "",
+  ].filter(Boolean);
+
+  // Why there is no connection, where the backend can tell (older backends
+  // send nothing, which reads as plainly disconnected). "Connect first,
+  // then optimize" only before anything has been applied.
+  const wifiState = status?.live?.wifi_state ?? "disconnected";
+  const disconnectedText =
+    wifiState === "no_device" || wifiState === "not_responding" || wifiState === "unavailable"
+      ? "The WiFi card isn't responding. Restart the device."
+      : wifiState === "radio_off"
+        ? "WiFi is off. Turn it on in Steam's settings."
+        : s?.last_applied
+          ? "Not connected to WiFi."
+          : "Not connected to WiFi. Connect first, then optimize.";
+
+  // A lock that is on for another network counts as done too: Optimize Safe
+  // leaves it where it was set (_lock_held_elsewhere in main.py), so waiting
+  // for it here meant "All good" never came on any other network. The row
+  // itself says the lock does nothing here.
   const lockSafe =
     status?.live?.wifi_backend === "iwd" ||
     (s?.bssid_lock_enabled &&
-      !status?.drift?.bssid_lock &&
-      // The lock can be enabled but belong to a different network, in which
-      // case nothing has drifted and it is also doing nothing here. Without
-      // this, the panel reports all clear while one of the four is inert.
-      !status?.live?.bssid_lock_other_network);
+      (!!status?.live?.bssid_lock_other_network || !status?.drift?.bssid_lock));
 
   // Check if all safe optimizations are already active
   const allSafeActive =
-    connected &&
+    !!connected &&
     (status?.live?.power_save_off || (streamingIdle && s?.power_save_disabled)) &&
     !status?.drift?.power_save &&
     lockSafe &&
@@ -1185,7 +1329,7 @@ function Content() {
       {statusFailed && (
         <Banner variant="warning">
           Lost contact with the plugin, so this may be out of date. It keeps
-          trying. If this stays, restart Steam.
+          trying. If this stays, restart the device.
         </Banner>
       )}
 
@@ -1261,10 +1405,14 @@ function Content() {
         </PanelSection>
       )}
 
-      {/* First-run prompt */}
+      {/* First-run prompt. Prevent lag spikes and Auto-fix on wake are on
+          from install (and Auto-fix after a Reset), so it says which are
+          already on rather than reading as if nothing were. */}
       {connected && !s?.last_applied && (
         <Banner variant="info">
-          Tap <strong>Optimize Safe</strong> to get started.
+          {alreadyOn.length > 0 &&
+            `${joinNames(alreadyOn)} ${alreadyOn.length > 1 ? "are" : "is"} already on. `}
+          Tap <strong>Optimize Safe</strong> to turn on the rest of the recommended settings.
         </Banner>
       )}
 
@@ -1311,18 +1459,24 @@ function Content() {
       {/* Kept up for a failed attempt's message as well, as the lock's
           banner below is: a finding that clears would take the reason away
           with it. */}
-      {(status?.wpa2_only_stronger || errors.allow_wpa2) && (
+      {/* Access points that offer both keep using WPA3, but before
+          NetworkManager 1.58.1 a profile allowed WPA2 does not join one that
+          offers only WPA3 on its own. The backend only reports this where no
+          such access point is in view (or NetworkManager is new enough), and
+          Reset puts WPA3 only back. */}
+      {(wpa2Shown || errors.allow_wpa2) && (
         <Banner variant="info">
-          {status?.wpa2_only_stronger && (
+          {status?.wpa2_only_stronger && wpa2Shown && (
             <>
               A stronger access point on this network (signal{" "}
               {status.wpa2_only_stronger.signal} of 100, against{" "}
               {status.wpa2_only_stronger.current_signal} for the one in use) only
               offers WPA2, and this network is saved as WPA3-only, so this device
-              can't use it. Access points that offer WPA3 keep using it. Only
-              allow this if that access point is yours:
+              can't use it. Access points that offer both keep using WPA3, but
+              one that offers only WPA3 may then not be joined automatically.
+              Only allow this if that access point is yours:
               anyone nearby can broadcast your network's name. Allowing it
-              reconnects WiFi.
+              reconnects WiFi. Reset settings puts it back to WPA3 only.
             </>
           )}
           {errors.allow_wpa2 && (
@@ -1331,7 +1485,7 @@ function Content() {
         </Banner>
       )}
       {/* A real button, so it can be reached with the D-pad. */}
-      {status?.wpa2_only_stronger && (
+      {wpa2Shown && (
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleAllowWpa2}>
@@ -1340,10 +1494,12 @@ function Content() {
           </PanelSectionRow>
         </PanelSection>
       )}
-      {errors.allow_wpa2 && (
+      {/* Declining is a choice too: the notice stays away until the finding
+          clears and comes back. */}
+      {(wpa2Shown || errors.allow_wpa2) && (
         <PanelSection>
           <PanelSectionRow>
-            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissWpa2Error}>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissWpa2}>
               Dismiss
             </ButtonItem>
           </PanelSectionRow>
@@ -1357,9 +1513,9 @@ function Content() {
           move clears the finding and would otherwise take the reason away
           with it. That message can be dismissed, and expires like the
           others. */}
-      {(status?.lock_weaker || errors.move_bssid_lock) && (
+      {(lockWeakerShown || errors.move_bssid_lock) && (
         <Banner variant="warning">
-          {status?.lock_weaker && (
+          {status?.lock_weaker && lockWeakerShown && (
             <>
               The access point lock is holding you on a weaker access point
               (signal {status.lock_weaker.current_signal} of 100). A stronger one is in
@@ -1373,7 +1529,7 @@ function Content() {
         </Banner>
       )}
       {/* A real button, so it can be reached with the D-pad. */}
-      {status?.lock_weaker && (
+      {lockWeakerShown && (
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleMoveLock}>
@@ -1382,10 +1538,10 @@ function Content() {
           </PanelSectionRow>
         </PanelSection>
       )}
-      {errors.move_bssid_lock && (
+      {(lockWeakerShown || errors.move_bssid_lock) && (
         <PanelSection>
           <PanelSectionRow>
-            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissMoveError}>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissLockWeaker}>
               Dismiss
             </ButtonItem>
           </PanelSectionRow>
@@ -1402,9 +1558,11 @@ function Content() {
           did caused it, and the preference is not lost. */}
       {status?.external?.pin_released && (
         <Banner variant="warning">
-          WiFi could not connect for a while, so the locked access point or
-          band preference was released to let it reconnect. The setting is
-          still on and applies again to whichever access point works.
+          WiFi could not connect for a while, so the access point lock or the
+          band preference was released to let it reconnect. Both stay on. The
+          lock is set again on whichever access point works. The band
+          preference comes back after about 10 minutes, once an access point
+          on that band is in range.
         </Banner>
       )}
 
@@ -1434,11 +1592,10 @@ function Content() {
         </Banner>
       )}
 
-      {/* Disconnected banner */}
+      {/* Disconnected banner. A dead or missing card is not something
+          connecting fixes, so it says what to do for each case. */}
       {status?.success !== false && !connected && (
-        <Banner variant="error">
-          Not connected to WiFi. Connect first, then optimize.
-        </Banner>
+        <Banner variant="error">{disconnectedText}</Banner>
       )}
 
       {/* Backend switch result banner */}
@@ -1473,11 +1630,22 @@ function Content() {
           );
         }
         const all = optimizeResult.applied === optimizeResult.total;
+        // In streaming auto mode with no stream running, these were saved
+        // but not applied, so "All applied" was not true.
+        const paused = Object.entries(optimizeResult.results ?? {})
+          .filter(([, v]) => isResult(v) && v.success && v.paused)
+          .map(([k]) => DRIFT_LABELS[k] ?? k);
+        const pausedText = paused.length
+          ? `${joinNames(paused)} ${paused.length > 1 ? "apply" : "applies"} only while a streaming app is running.`
+          : "";
+        if (all && paused.length) {
+          return <Banner variant="info">{`Saved. ${pausedText}`}</Banner>;
+        }
         return (
           <Banner variant={all ? "success" : "warning"}>
             {all
               ? "All applied"
-              : `${optimizeResult.applied} of ${optimizeResult.total} applied. The settings marked failed below say why.`}
+              : `${optimizeResult.applied} of ${optimizeResult.total} applied. The settings marked failed below say why.${pausedText ? " " + pausedText : ""}`}
           </Banner>
         );
       })()}
@@ -1487,7 +1655,9 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected || applyingAll || isBusy || updating}
+            // "All good" is a state, not an action: pressing it ran Optimize
+            // Safe again, which can reconnect WiFi for nothing.
+            disabled={!connected || applyingAll || isBusy || updating || allSafeActive}
             onClick={handleOptimize}
           >
             {applyingAll
@@ -1586,10 +1756,15 @@ function Content() {
               label="WiFi region"
               description="Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely."
               rgOptions={[
-                // Not set by the plugin. Labelled with the region in use.
+                // Not set by the plugin: labelled with the region in use.
+                // Once the plugin has set one, choosing this puts back the
+                // region from before, so it says that instead of naming the
+                // plugin's own region.
                 {
                   data: REGION_UNMANAGED,
-                  label: `Not managed (${regdomain.governing || "unknown"})`,
+                  label: regdomain.setting
+                    ? "Not managed (put back the region from before)"
+                    : `Not managed (${regdomain.governing || "unknown"})`,
                 },
                 ...REGION_OPTIONS,
                 ...(regdomain.setting &&
@@ -1713,7 +1888,7 @@ function Content() {
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
-          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the WiFi network you set it on. Each change reconnects WiFi for a few seconds."
+          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the WiFi network you set it on, and replaces that network's own DNS servers, including any it offers over IPv6. The servers used are IPv4 addresses, so on the rare network with no IPv4 at all, websites would stop loading; leave this off there. Each change reconnects WiFi for a few seconds."
           {...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
             ? otherNetworkBadge
             : getBadge("dns", status, errors.dns ?? null))}
@@ -1736,7 +1911,7 @@ function Content() {
             <>
               <PanelSectionRow>
                 <DropdownItem
-                  label="DNS Provider"
+                  label="DNS provider"
                   rgOptions={DNS_OPTIONS}
                   selectedOption={dnsCustomOpen ? "custom" : s?.dns_provider ?? "cloudflare"}
                   disabled={isBusy || updating}
@@ -1872,7 +2047,7 @@ function Content() {
         onReset={handleResetSettings}
         resetError={errors.reset}
         resetNotice={notices.reset}
-        workingText={working === "reset" ? WORKING_TEXT : applyingAll ? BATCH_WORKING_TEXT : null}
+        workingText={working === "reset" ? RESET_WORKING_TEXT : applyingAll ? BATCH_WORKING_TEXT : null}
       />
 
       <UpdatesSection
@@ -1882,6 +2057,7 @@ function Content() {
         checkingUpdate={checkingUpdate}
         updateInfo={updateInfo}
         updateError={updateError}
+        settingError={updateSettingError}
         onChannelChange={handleChannelChange}
         notify={s?.update_notify ?? true}
         onNotifyChange={handleNotifyChange}

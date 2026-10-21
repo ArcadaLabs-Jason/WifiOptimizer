@@ -60,6 +60,12 @@ export function StreamingSection({
     }
   };
 
+  // Back to what is saved, and following it again.
+  const cancelPatterns = () => {
+    setPatternsDirty(false);
+    setPatterns(settings?.streaming_custom_patterns ?? "");
+  };
+
   const savePatterns = async () => {
     const result = await onToggle("streaming", () => backend.setStreamingPatterns(patterns));
     if (result?.success) {
@@ -72,14 +78,31 @@ export function StreamingSection({
   const held = live?.streaming_held ?? false;
   const app = live?.streaming_app ?? "";
   const process = live?.streaming_process ?? "";
+  // The fixes this mode governs that are turned on, by their names above.
+  const governed = [
+    settings?.power_save_disabled ? "Prevent lag spikes" : "",
+    settings?.buffer_tuning_enabled ? "Network buffer tuning" : "",
+    settings?.cake_enabled ? "Traffic shaping (CAKE)" : "",
+  ].filter(Boolean);
+  const governedList =
+    governed.length > 1
+      ? `${governed.slice(0, -1).join(", ")} and ${governed[governed.length - 1]}`
+      : governed[0] ?? "";
   let stateText: string;
   if (active && app) {
     stateText = `Streaming: ${app} (${process}). Fixes are on.`;
   } else if (active && held) {
-    stateText = "Held on by you. Fixes are on until you turn this off or restart.";
+    stateText = "Held on by you. Fixes are on until you turn this off or restart the device.";
+  } else if (active) {
+    // Flagged as running before the app has been named, just after a reload.
+    stateText = "A stream is running. Fixes are on.";
+  } else if (governed.length) {
+    stateText = `No streaming app running. ${governedList} ${
+      governed.length > 1 ? "are" : "is"
+    } paused until one starts.`;
   } else {
     stateText =
-      "No streaming app running. Power save, buffer tuning and CAKE are paused until one starts.";
+      "No streaming app running. Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) are all off, so there is nothing to pause.";
   }
 
   return (
@@ -113,7 +136,7 @@ export function StreamingSection({
           <PanelSectionRow>
             <ToggleField
               label="Keep fixes on"
-              description="For a stream that is not detected. Lasts until you restart."
+              description="For a stream that is not detected. Lasts until you restart the device."
               checked={held}
               disabled={disabled}
               onChange={(val: boolean) =>
@@ -142,11 +165,18 @@ export function StreamingSection({
             />
           </PanelSectionRow>
           {patternsDirty && (
-            <PanelSectionRow>
-              <ButtonItem layout="below" disabled={disabled} onClick={savePatterns}>
-                Save process names
-              </ButtonItem>
-            </PanelSectionRow>
+            <>
+              <PanelSectionRow>
+                <ButtonItem layout="below" disabled={disabled} onClick={savePatterns}>
+                  Save process names
+                </ButtonItem>
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ButtonItem layout="below" disabled={disabled} onClick={cancelPatterns}>
+                  Cancel
+                </ButtonItem>
+              </PanelSectionRow>
+            </>
           )}
         </>
       )}

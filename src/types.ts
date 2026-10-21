@@ -67,6 +67,12 @@ export interface LiveStatus {
   /** What was detected: the app's name and the process that matched. */
   streaming_app?: string;
   streaming_process?: string;
+  /** Sent only while not connected: why. Older backends leave it out,
+   * which the panel reads as "disconnected". */
+  wifi_state?: "no_device" | "not_responding" | "radio_off" | "unavailable" | "disconnected";
+  /** On the generic method only: the backend that takes over at the next
+   * boot, when it differs from wifi_backend, the one running now. */
+  wifi_backend_next?: string;
 }
 
 export interface StreamingApp {
@@ -124,6 +130,8 @@ export interface MethodResult {
   message?: string;
   detail?: string;
   reconnected?: boolean;
+  /** Saved in streaming auto mode with no stream running: applies later. */
+  paused?: boolean;
   [key: string]: unknown;
 }
 
@@ -229,7 +237,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
   write_failed: "Couldn't install the auto-fix script. Restart the device, then try again.",
   // Shown while the backend reports settings_recovered.
   parse_error:
-    "The settings file could not be read, so settings were reset to defaults. The old file was kept as settings.json.corrupt.",
+    "The settings file could not be read, so settings went back to their defaults. Turn your settings back on, or tap Optimize Safe. The old file was kept as settings.json.corrupt.",
   unexpected: "Something went wrong. Try again. If it keeps happening, use Copy diagnostics at the bottom of this panel and report it.",
 };
 

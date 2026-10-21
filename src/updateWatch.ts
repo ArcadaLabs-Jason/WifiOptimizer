@@ -21,8 +21,14 @@ import type { UpdateProgress } from "./types";
 
 const PLUGIN_NAME = "WiFi Optimizer";
 const POLL_MS = 1000;
-// The script's own limit is 15 minutes; a watch never outlives that.
+// The script's own limit is 15 minutes. A watch stops once it has gone this
+// long with no new phase reported, counted in time awake: a sleep stops the
+// script too, and a watch that counted the sleep stopped before the script
+// got to "swapped", so nothing asked for the reload and Steam restarted.
 const MAX_WATCH_MS = 15 * 60 * 1000;
+// The longest gap between two polls counted as time awake. Anything longer
+// was a sleep (or a stalled page), and counts as one poll.
+const MAX_TICK_MS = 5 * POLL_MS;
 // A "done" this recent, for the version now running, is the update that
 // just loaded this copy of the plugin.
 const JUST_UPDATED_S = 120;
@@ -38,7 +44,10 @@ const shared = (): Shared => {
 };
 
 let timer: ReturnType<typeof setInterval> | null = null;
-let startedAt = 0;
+// Time awake since the phase last changed, and the last poll's time.
+let idleMs = 0;
+let lastTickAt = 0;
+let lastPhase = "";
 let inFlight = false;
 let target = "";
 let current: UpdateProgress | null = null;
@@ -81,11 +90,16 @@ function askDeckyToReload(version: string) {
 }
 
 async function poll() {
-  if (inFlight) return;
-  if (Date.now() - startedAt > MAX_WATCH_MS) {
+  // Before the in-flight check: a progress call that never settles kept
+  // that set, and the watch then never stopped.
+  const now = Date.now();
+  idleMs += Math.min(Math.max(0, now - lastTickAt), MAX_TICK_MS);
+  lastTickAt = now;
+  if (idleMs > MAX_WATCH_MS) {
     stop();
     return;
   }
+  if (inFlight) return;
   inFlight = true;
   try {
     const progress = await backend.getUpdateProgress();
@@ -93,6 +107,10 @@ async function poll() {
     // Until the script has written anything, the file is either absent or
     // removed by apply_update, so an empty phase is just "starting".
     if (progress.phase && progress.version !== target) return;
+    if (progress.phase !== lastPhase) {
+      lastPhase = progress.phase;
+      idleMs = 0;
+    }
     publish(progress);
     // Only while the old backend is still the one answering: once the new
     // version answers, the reload has happened.
@@ -127,7 +145,9 @@ export function watchUpdate(version: string, fresh = false) {
   }
   stop();
   target = version;
-  startedAt = Date.now();
+  idleMs = 0;
+  lastTickAt = Date.now();
+  lastPhase = "";
   publish(null);
   timer = setInterval(poll, POLL_MS);
 }

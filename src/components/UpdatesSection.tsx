@@ -10,6 +10,8 @@ interface UpdatesSectionProps {
   checkingUpdate: boolean;
   updateInfo: UpdateCheckResult | null;
   updateError: string | null;
+  // A failed change to the channel or the notice toggle, shown under them.
+  settingError?: string | null;
   onChannelChange: (channel: string) => void;
   // The toast when an update comes out, from the check that runs with the
   // panel closed.
@@ -29,7 +31,7 @@ const CHANNEL_OPTIONS = [
 
 // The Updates panel section: channel selector, optional warning text for a
 // stuck / failed update, and a button that context-switches between
-// "Updating...", "Update Now", "Up to date", and "Check for Updates"
+// "Updating...", "Update now", "Up to date", and "Check for updates"
 // depending on state.
 export function UpdatesSection({
   channel,
@@ -38,6 +40,7 @@ export function UpdatesSection({
   checkingUpdate,
   updateInfo,
   updateError,
+  settingError,
   onChannelChange,
   notify,
   onNotifyChange,
@@ -65,6 +68,13 @@ export function UpdatesSection({
           onChange={onNotifyChange}
         />
       </PanelSectionRow>
+      {settingError && (
+        <PanelSectionRow>
+          <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>
+            {settingError}
+          </div>
+        </PanelSectionRow>
+      )}
       {updateError && !updating && (
         <PanelSectionRow>
           <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>
@@ -96,7 +106,7 @@ export function UpdatesSection({
             <ButtonItem layout="below" disabled={busy} onClick={onApply}>
               {updateInfo.is_downgrade
                 ? `Go back to v${updateInfo.latest_version}`
-                : "Update Now"}
+                : "Update now"}
             </ButtonItem>
           </PanelSectionRow>
         </>
@@ -115,7 +125,7 @@ export function UpdatesSection({
                 ? "Checking..."
                 : updateInfo?.success && !updateInfo?.update_available
                   ? "Up to date"
-                  : "Check for Updates"}
+                  : "Check for updates"}
             </ButtonItem>
           </PanelSectionRow>
         </>
