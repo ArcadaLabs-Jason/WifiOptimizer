@@ -841,6 +841,10 @@ const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
 // How long a finished backend switch's result stays up.
 const BACKEND_RESULT_MS = 60 * 1000;
+// How long an error or notice under a control stays up. They used to last
+// until that control was used again, so a failure from an hour ago still
+// read as the current state.
+const MESSAGE_TTL_MS = 2 * 60 * 1000;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE = "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
@@ -1259,6 +1263,45 @@ function Content() {
         const id = setTimeout(() => setBackendSwitch((prev) => (prev === shown ? null : prev)), BACKEND_RESULT_MS);
         return () => clearTimeout(id);
     }, [backendSwitch]);
+    // Expire each error and notice MESSAGE_TTL_MS after it first appeared. A
+    // message set again with the same text keeps its time; one that changed,
+    // or went and came back, starts over.
+    const messageSeenRef = SP_REACT.useRef({});
+    SP_REACT.useEffect(() => {
+        const now = Date.now();
+        const seen = {};
+        const shown = [
+            ...Object.entries(errors).map(([k, v]) => [`e:${k}`, v]),
+            ...Object.entries(notices).map(([k, v]) => [`n:${k}`, v]),
+        ];
+        for (const [key, text] of shown) {
+            const before = messageSeenRef.current[key];
+            seen[key] = before && before.text === text ? before : { text, at: now };
+        }
+        messageSeenRef.current = seen;
+        const times = Object.values(seen).map((m) => m.at);
+        if (!times.length)
+            return;
+        const id = setTimeout(() => {
+            // A second of slack, so a timer that fires a little early still
+            // clears the message it was set for.
+            const due = Date.now() + 1000 - MESSAGE_TTL_MS;
+            const expire = (prefix) => (prev) => {
+                const stale = Object.keys(prev).filter((k) => {
+                    const m = messageSeenRef.current[prefix + k];
+                    return m && m.text === prev[k] && m.at <= due;
+                });
+                if (!stale.length)
+                    return prev;
+                const next = { ...prev };
+                stale.forEach((k) => delete next[k]);
+                return next;
+            };
+            setErrors(expire("e:"));
+            setNotices(expire("n:"));
+        }, Math.max(0, Math.min(...times) + MESSAGE_TTL_MS - now));
+        return () => clearTimeout(id);
+    }, [errors, notices]);
     // ---- User action handlers ----
     //
     // Generic toggle handler used by every setter toggle (power_save, BSSID,
@@ -1375,6 +1418,11 @@ function Content() {
     const handleForceReapply = () => runBatch(() => reapplyAll());
     const handleAllowWpa2 = () => handleToggle("allow_wpa2", () => allowWpa2());
     const handleMoveLock = () => handleToggle("move_bssid_lock", () => moveBssidLock());
+    const handleDismissMoveError = () => setErrors((prev) => {
+        const next = { ...prev };
+        delete next.move_bssid_lock;
+        return next;
+    });
     // Reset asks first: see RESET_CONFIRM_TEXT.
     const handleResetSettings = () => {
         if (busyRef.current)
@@ -1608,7 +1656,7 @@ function Content() {
                         ? s.chip_label
                         : undefined }), supportTier === 3 && (SP_JSX.jsx(Banner, { variant: "info", children: "Unknown WiFi hardware detected. Some optimizations may not apply." })), status?.settings_recovered && (SP_JSX.jsx(Banner, { variant: "warning", children: ERROR_MESSAGES.parse_error })), status?.settings_recovered && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleDismissRecovered, children: "Dismiss" }) }) })), updateInfo?.update_available && !updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleApplyUpdate, children: updateInfo.is_downgrade
                             ? `Go back to v${updateInfo.latest_version}`
-                            : `Update to v${updateInfo.latest_version}` }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText(updateProgress) }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), status?.external?.duplicate_profiles && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent. The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority." })), status?.address_conflict && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Another device on your network is using the same address as your handheld (", status.address_conflict.ip, "), so the connection may not work. That's the router, not a WiFi setting. Restarting the router usually fixes it."] })), status?.wpa2_only_stronger && (SP_JSX.jsxs(Banner, { variant: "info", children: ["A stronger access point on this network (signal", " ", status.wpa2_only_stronger.signal, " vs", " ", status.wpa2_only_stronger.current_signal, ") only offers WPA2, and this network is saved as WPA3-only, so this device can't use it. Access points that offer WPA3 keep using it. Only allow this if that access point is yours: anyone nearby can broadcast your network's name.", errors.allow_wpa2 && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.allow_wpa2 }))] })), status?.wpa2_only_stronger && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleAllowWpa2, children: "Allow WPA2 here" }) }) })), (status?.lock_weaker || errors.move_bssid_lock) && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [status?.lock_weaker && (SP_JSX.jsxs(SP_JSX.Fragment, { children: ["The access point lock is holding you on a weaker access point (signal ", status.lock_weaker.current_signal, "). A stronger one is in range (signal ", status.lock_weaker.signal, ")."] })), errors.move_bssid_lock && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.move_bssid_lock }))] })), status?.lock_weaker && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleMoveLock, children: "Move the lock" }) }) })), status?.external?.pin_released && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "WiFi could not connect for a while, so the locked access point or band preference was released to let it reconnect. The setting is still on and applies again to whichever access point works." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: driftCount > 1
+                            : `Update to v${updateInfo.latest_version}` }) }) })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText(updateProgress) }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: ["Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to get started."] })), status?.external?.duplicate_profiles && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent. The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority." })), status?.address_conflict && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: ["Another device on your network is using the same address as your handheld (", status.address_conflict.ip, "), so the connection may not work. That's the router, not a WiFi setting. Restarting the router usually fixes it."] })), status?.wpa2_only_stronger && (SP_JSX.jsxs(Banner, { variant: "info", children: ["A stronger access point on this network (signal", " ", status.wpa2_only_stronger.signal, " vs", " ", status.wpa2_only_stronger.current_signal, ") only offers WPA2, and this network is saved as WPA3-only, so this device can't use it. Access points that offer WPA3 keep using it. Only allow this if that access point is yours: anyone nearby can broadcast your network's name.", errors.allow_wpa2 && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.allow_wpa2 }))] })), status?.wpa2_only_stronger && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleAllowWpa2, children: "Allow WPA2 here" }) }) })), (status?.lock_weaker || errors.move_bssid_lock) && (SP_JSX.jsxs(Banner, { variant: "warning", icon: "\u26A0", children: [status?.lock_weaker && (SP_JSX.jsxs(SP_JSX.Fragment, { children: ["The access point lock is holding you on a weaker access point (signal ", status.lock_weaker.current_signal, "). A stronger one is in range (signal ", status.lock_weaker.signal, ")."] })), errors.move_bssid_lock && (SP_JSX.jsx("div", { style: { color: theme.error.text }, children: errors.move_bssid_lock }))] })), status?.lock_weaker && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleMoveLock, children: "Move the lock" }) }) })), errors.move_bssid_lock && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleDismissMoveError, children: "Dismiss" }) }) })), status?.external?.pin_released && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: "WiFi could not connect for a while, so the locked access point or band preference was released to let it reconnect. The setting is still on and applies again to whichever access point works." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(Banner, { variant: "warning", icon: "\u26A0", children: driftCount > 1
                     ? `${driftCount} settings no longer match what you set.`
                     : "1 setting no longer matches what you set." })), connected && !!s?.last_applied && driftCount > 0 && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleRepairDrift, children: "Fix now" }) }) })), status?.success === false && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u26A0", children: status?.message ?? "Couldn't read WiFi status." })), status?.success !== false && !connected && (SP_JSX.jsx(Banner, { variant: "error", icon: "\u2715", children: "Not connected to WiFi. Connect first, then optimize." })), backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
                 const r = backendSwitch.result;

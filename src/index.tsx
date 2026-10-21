@@ -65,6 +65,10 @@ const UPDATE_TIMEOUT_MS = 10 * 60 * 1000;
 const BACKEND_SWITCH_MAX_S = 240;
 // How long a finished backend switch's result stays up.
 const BACKEND_RESULT_MS = 60 * 1000;
+// How long an error or notice under a control stays up. They used to last
+// until that control was used again, so a failure from an hour ago still
+// read as the current state.
+const MESSAGE_TTL_MS = 2 * 60 * 1000;
 // Shown on the lock and band toggles while the iwd backend is in use.
 const IWD_PIN_NOTICE =
   "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
@@ -522,6 +526,44 @@ function Content() {
     return () => clearTimeout(id);
   }, [backendSwitch]);
 
+  // Expire each error and notice MESSAGE_TTL_MS after it first appeared. A
+  // message set again with the same text keeps its time; one that changed,
+  // or went and came back, starts over.
+  const messageSeenRef = useRef<Record<string, { text: string; at: number }>>({});
+  useEffect(() => {
+    const now = Date.now();
+    const seen: Record<string, { text: string; at: number }> = {};
+    const shown = [
+      ...Object.entries(errors).map(([k, v]) => [`e:${k}`, v] as const),
+      ...Object.entries(notices).map(([k, v]) => [`n:${k}`, v] as const),
+    ];
+    for (const [key, text] of shown) {
+      const before = messageSeenRef.current[key];
+      seen[key] = before && before.text === text ? before : { text, at: now };
+    }
+    messageSeenRef.current = seen;
+    const times = Object.values(seen).map((m) => m.at);
+    if (!times.length) return;
+    const id = setTimeout(() => {
+      // A second of slack, so a timer that fires a little early still
+      // clears the message it was set for.
+      const due = Date.now() + 1000 - MESSAGE_TTL_MS;
+      const expire = (prefix: string) => (prev: Record<string, string>) => {
+        const stale = Object.keys(prev).filter((k) => {
+          const m = messageSeenRef.current[prefix + k];
+          return m && m.text === prev[k] && m.at <= due;
+        });
+        if (!stale.length) return prev;
+        const next = { ...prev };
+        stale.forEach((k) => delete next[k]);
+        return next;
+      };
+      setErrors(expire("e:"));
+      setNotices(expire("n:"));
+    }, Math.max(0, Math.min(...times) + MESSAGE_TTL_MS - now));
+    return () => clearTimeout(id);
+  }, [errors, notices]);
+
   // ---- User action handlers ----
   //
   // Generic toggle handler used by every setter toggle (power_save, BSSID,
@@ -641,6 +683,13 @@ function Content() {
 
   const handleMoveLock = () =>
     handleToggle("move_bssid_lock", () => backend.moveBssidLock());
+
+  const handleDismissMoveError = () =>
+    setErrors((prev) => {
+      const next = { ...prev };
+      delete next.move_bssid_lock;
+      return next;
+    });
 
   // Reset asks first: see RESET_CONFIRM_TEXT.
   const handleResetSettings = () => {
@@ -1018,7 +1067,8 @@ function Content() {
           range. Moving reconnects, so it is offered rather than done. The
           banner also stays up for a failed move's message, because a failed
           move clears the finding and would otherwise take the reason away
-          with it. */}
+          with it. That message can be dismissed, and expires like the
+          others. */}
       {(status?.lock_weaker || errors.move_bssid_lock) && (
         <Banner variant="warning" icon="⚠">
           {status?.lock_weaker && (
@@ -1039,6 +1089,15 @@ function Content() {
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleMoveLock}>
               Move the lock
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+      {errors.move_bssid_lock && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissMoveError}>
+              Dismiss
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
