@@ -4331,6 +4331,52 @@ try:
            f"{name} refuses while another profile change is mid-flight, and leaves its guard alone")
         p = m.Plugin(); p._update_starting = True
         ok(asyncio.run(call(p)).get("error") == "busy", f"{name} refuses while an update installs")
+
+    # DNS and IPv6 write the profile and reconnect just as the lock and the
+    # band do, and a backend switch restarts NetworkManager under all four.
+    import threading as _thr
+    class DnsGuard(Dns):
+        def __init__(self, active):
+            super().__init__(active); self.depth_seen = []; self.threads = []
+        def _hard_reconnect(self, uuid=None):
+            self.depth_seen.append(getattr(self, "_profile_change_depth", 0))
+            self.threads.append(_thr.current_thread() is _thr.main_thread()); return True
+    _guarded = [("set_dns", lambda p: p.set_dns(True, "cloudflare", "")),
+                ("set_ipv6", lambda p: p.set_ipv6(True))]
+    for name, call in _guarded:
+        p = DnsGuard(A6); p._profile_change_depth = 1
+        r = asyncio.run(call(p))
+        ok(r.get("error") == "busy" and not p.mods and p._profile_change_depth == 1,
+           f"{name} refuses while another profile change is mid-flight, touching nothing")
+        p = DnsGuard(A6); p._update_starting = True
+        ok(asyncio.run(call(p)).get("error") == "busy" and not p.mods, f"{name} refuses while an update installs")
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        p = DnsGuard(A6)
+        r = asyncio.run(call(p))
+        ok(r.get("success") is True and p.depth_seen == [1] and getattr(p, "_profile_change_depth", 0) == 0,
+           f"{name} holds the guard across its reconnect and gives it back after ({p.depth_seen})")
+        ok(p.threads == [False], f"and {name}'s reconnect runs off the event loop")
+    for name, call in _guarded + [("set_bssid_lock", lambda p: p.set_bssid_lock(True)),
+                                  ("set_band_preference", lambda p: p.set_band_preference(True, "a")),
+                                  ("allow_wpa2", lambda p: p.allow_wpa2())]:
+        p = DnsGuard(A6); p._ensure_backend_switch_state(); p._backend_switch["in_progress"] = True
+        r = asyncio.run(call(p))
+        ok(r.get("error") == "busy" and not p.mods, f"{name} refuses while the WiFi backend is being switched")
+    class LockOffThread(m.Plugin):
+        def __init__(self): super().__init__(); self.threads = []
+        def _get_wifi_interface(self): return "wlan0"
+        def _get_active_connection_uuid(self): return A6
+        def _nmcli_modify(self, u, k, v, timeout=5): return _ok()
+        def _hard_reconnect(self, uuid=None):
+            self.threads.append(_thr.current_thread() is _thr.main_thread()); return True
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True, "bssid_lock_connection_uuid": A6})
+    lt = LockOffThread()
+    ok(asyncio.run(lt.set_bssid_lock(False)).get("success") is True and lt.threads == [False],
+       "turning the lock off reconnects off the event loop too")
+    _sw = Switch(); _sw._profile_change_depth = 1
+    r = asyncio.run(_sw.start_backend_switch("wpa_supplicant"))
+    ok(r.get("accepted") is False and r.get("reason") == "busy" and _sw._backend_switch["in_progress"] is False,
+       "no backend switch while a profile change is mid-flight")
     _lock_src = _src_all[_src_all.index("    async def set_bssid_lock"):_src_all.index("    async def set_band_preference")]
     # The slice runs on to set_band_preference, so it takes in _lock_onto_best,
     # where the enable path's settling now lives, shared with moving the lock.
@@ -4500,7 +4546,7 @@ try:
     r = asyncio.run(OnIwd().set_band_preference(True, "a"))
     ok(r.get("error") == "needs_wpa_supplicant", "and so is the band preference")
     class IwdOff(OnIwd):
-        def _release_lock_from_all_profiles(self): self.released = True; return None
+        async def _release_lock_from_all_profiles(self): self.released = True; return None
     io = IwdOff(); r = asyncio.run(io.set_bssid_lock(False))
     ok(r.get("success") and io.released, "turning the lock off still works under iwd")
 
@@ -6825,7 +6871,7 @@ try:
         # stretch the owner had to ask whether he had done it himself.
         class Unlock(m.Plugin):
             def __init__(self, err=None): super().__init__(); self.err = err
-            def _release_lock_from_all_profiles(self): return self.err
+            async def _release_lock_from_all_profiles(self): return self.err
         _logged.clear()
         r = asyncio.run(Unlock().set_bssid_lock(False))
         ok(r.get("success") is True and "BSSID lock turned off" in _logged,

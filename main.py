@@ -2122,6 +2122,17 @@ class Plugin:
         "message": "The WiFi radio didn't come back on. Try toggling WiFi in Steam settings.",
     }
 
+    async def _reconnect(self, uuid: str | None = None) -> bool:
+        """_hard_reconnect from a coroutine, in a worker thread.
+
+        `nmcli con up` waits for the activation, up to ten seconds, and the
+        radio commands up to five each against a NetworkManager that is slow
+        to answer. On the event loop that froze every other call for as long.
+        The setters that reconnect hold the reconciliation guard across this,
+        so no poll writes to the profile while it runs.
+        """
+        return await asyncio.to_thread(self._hard_reconnect, uuid)
+
     def _hard_reconnect(self, uuid: str | None = None) -> bool:
         """Reconnect by cycling WiFi radio to fully reset NM connection state.
 
@@ -5093,6 +5104,18 @@ class Plugin:
         # there is nothing a deadline here could catch that this does not.
         return getattr(self, "_profile_change_depth", 0) > 0
 
+    def _profile_change_refused(self) -> bool:
+        """Whether a setter that rewrites profiles must not start now.
+
+        Another one mid-change interleaves its radio cycle and writes with
+        ours. An update reloads the plugin when it finishes, which would cut
+        this off between its writes and its reconnect. A backend switch
+        restarts NetworkManager under it, and a switch to iwd clears the very
+        pins the lock and band write.
+        """
+        return (self._profile_change_in_flight() or self._update_running()
+                or self._backend_switch_running())
+
     def _backend_switch_running(self) -> bool:
         return bool((getattr(self, "_backend_switch", None) or {}).get("in_progress"))
 
@@ -5585,7 +5608,7 @@ class Plugin:
         it, so this only widens what can be joined. If the profile cannot
         connect afterwards it is put back as it was.
         """
-        if self._profile_change_in_flight() or self._update_running():
+        if self._profile_change_refused():
             return dict(self._BUSY_RESULT)
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         held = True
@@ -5656,7 +5679,7 @@ class Plugin:
     _RECONNECT_WAIT_SECONDS = 30
 
     async def _reconnected_to(self, uuid: str) -> bool:
-        if not self._hard_reconnect(uuid):
+        if not await self._reconnect(uuid):
             return False
         for _ in range(self._RECONNECT_WAIT_SECONDS):
             if await asyncio.to_thread(self._connection_activated, uuid):
@@ -6184,7 +6207,7 @@ class Plugin:
                 "message": "Couldn't change the auto-fix script.",
             }
 
-    def _release_lock_from_all_profiles(self) -> dict | None:
+    async def _release_lock_from_all_profiles(self) -> dict | None:
         """Take the address pin off every profile that still carries it.
 
         Returns an error dict if the pin could not be released, None if it was.
@@ -6200,7 +6223,9 @@ class Plugin:
         honouring will fail to associate if NM ever picks it again, and no
         control would clear it.
 
-        Deliberately await-free, as the rest of this setter's body is.
+        Await-free up to the save, so nothing lands between the pin writes
+        and the settings that record them. Only the reconnect after it waits,
+        in a worker thread.
         """
         # Disabling works on saved profiles - no active WiFi needed
         _iface, uuid, _err = self._require_wifi()
@@ -6262,7 +6287,7 @@ class Plugin:
         settings["bssid_lock_connection_uuid"] = ""
         settings["bssid_lock_uuids"] = unresolved
         _save_settings_with_timestamp(settings)
-        if not self._hard_reconnect(uuid):
+        if not await self._reconnect(uuid):
             return dict(self._RADIO_OFF_RESULT)
 
         return None
@@ -6372,7 +6397,7 @@ class Plugin:
         # an association, so a status poll can now land in the middle of this
         # setter where previously none could - and the one it would run is
         # exactly the re-point that writes a BSSID to this profile.
-        if self._profile_change_in_flight() or self._update_running():
+        if self._profile_change_refused():
             return dict(self._BUSY_RESULT)
         self._profile_change_depth = getattr(
             self, "_profile_change_depth", 0
@@ -6389,7 +6414,7 @@ class Plugin:
                     return err
                 return await self._lock_onto_best(iface, uuid, moving=False)
 
-            err = self._release_lock_from_all_profiles()
+            err = await self._release_lock_from_all_profiles()
             if err:
                 return err
             # Said in the log because the panel only shows the toggle as it is
@@ -6534,7 +6559,7 @@ class Plugin:
             known.append(uuid)
         settings["bssid_lock_uuids"] = known[-self._MAX_TRACKED_LOCK_UUIDS:]
         _save_settings_with_timestamp(settings)
-        if not self._hard_reconnect(uuid):
+        if not await self._reconnect(uuid):
             return dict(self._RADIO_OFF_RESULT)
 
         if moved_to:
@@ -6587,13 +6612,13 @@ class Plugin:
                            "connection, and the lock could not be changed. "
                            "Turn the lock off to release it.")
             _save_settings_with_timestamp(restored)
-            if not self._hard_reconnect(uuid):
+            if not await self._reconnect(uuid):
                 return dict(self._RADIO_OFF_RESULT)
             return {"success": False, "error": "move_failed",
                     "reconnected": True, "message": message}
         restored["bssid_lock_value"] = previous
         _save_settings_with_timestamp(restored)
-        if not self._hard_reconnect(uuid):
+        if not await self._reconnect(uuid):
             return dict(self._RADIO_OFF_RESULT)
         if moving:
             # A move the user asked for that did not happen is a failure to
@@ -6628,11 +6653,7 @@ class Plugin:
         look rather than the one a cached scan pointed at, and it rolls back
         the same way if that one will not have us.
         """
-        if (
-            self._profile_change_in_flight()
-            or self._update_running()
-            or (getattr(self, "_backend_switch", None) or {}).get("in_progress")
-        ):
+        if self._profile_change_refused():
             return dict(self._BUSY_RESULT)
         self._profile_change_depth = getattr(
             self, "_profile_change_depth", 0
@@ -6863,7 +6884,7 @@ class Plugin:
                     "band_preference_uuids", "band_preference_ssid", "pins_owned"):
             settings[key] = copy.deepcopy(before.get(key, DEFAULT_SETTINGS[key]))
         _save_settings_with_timestamp(settings)
-        if not self._hard_reconnect(uuid):
+        if not await self._reconnect(uuid):
             return dict(self._RADIO_OFF_RESULT)
         if had_lock:
             await asyncio.sleep(3)
@@ -6890,7 +6911,7 @@ class Plugin:
         # behind it as a failsafe; a slow NetworkManager could outlive
         # that deadline and it failed open in exactly the circumstance
         # where reassociation is slowest and the race most likely.
-        if self._profile_change_in_flight() or self._update_running():
+        if self._profile_change_refused():
             return dict(self._BUSY_RESULT)
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
@@ -7040,7 +7061,7 @@ class Plugin:
                     settings["band_preference_ssid"] = scope_ssid
             _save_settings_with_timestamp(settings)
 
-            if not self._hard_reconnect(uuid):
+            if not await self._reconnect(uuid):
                 return dict(self._RADIO_OFF_RESULT)
 
             if enabled and band == "6GHz":
@@ -7072,6 +7093,11 @@ class Plugin:
         # From the panel. Anything but a real True counts as False, so a
         # stray value is never saved as is.
         enabled = enabled is True
+        # A profile change like the lock and the band: it writes the profile
+        # and reconnects, and two at once interleave their radio cycles.
+        if self._profile_change_refused():
+            return dict(self._BUSY_RESULT)
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
 
             uuid, err = self._resolve_uuid(
@@ -7176,17 +7202,24 @@ class Plugin:
             settings["dns_servers"] = servers
             _save_settings_with_timestamp(settings)
 
-            if not self._hard_reconnect(uuid):
+            if not await self._reconnect(uuid):
                 return dict(self._RADIO_OFF_RESULT)
             return {"success": True, "dns_set": enabled, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_dns error: {e}")
             return self._unexpected_response(e)
+        finally:
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
+            )
 
     async def set_ipv6(self, disabled: bool) -> dict:
         # From the panel. Anything but a real True counts as False, so a
         # stray value is never saved as is.
         disabled = disabled is True
+        if self._profile_change_refused():
+            return dict(self._BUSY_RESULT)
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
 
             uuid, err = self._resolve_uuid(
@@ -7220,12 +7253,16 @@ class Plugin:
                 settings["ipv6_uuids"] = [u for u in known if u != uuid]
             _save_settings_with_timestamp(settings)
 
-            if not self._hard_reconnect(uuid):
+            if not await self._reconnect(uuid):
                 return dict(self._RADIO_OFF_RESULT)
             return {"success": True, "ipv6_disabled": disabled, "reconnected": True}
         except Exception as e:
             decky.logger.error(f"set_ipv6 error: {e}")
             return self._unexpected_response(e)
+        finally:
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
+            )
 
     def _capture_sysctl_baseline(self, settings: dict):
         """Record what the buffer sysctls are before we change them.
@@ -9508,6 +9545,16 @@ class Plugin:
                     "accepted": False,
                     "reason": "update_in_progress",
                     "message": "An update is being installed. Try again once it finishes.",
+                }
+            # A lock, band, DNS or IPv6 change, or a Reset, is part way
+            # through its writes and reconnect. Restarting NetworkManager
+            # under it, or clearing the pins it is writing, leaves the
+            # profile in neither state.
+            if self._profile_change_in_flight():
+                return {
+                    "accepted": False,
+                    "reason": "busy",
+                    "message": self._BUSY_RESULT["message"],
                 }
             # Reserve before the first await. Checking and then awaiting let
             # two requests both pass the check and both start a worker.
