@@ -1136,6 +1136,7 @@ function Content() {
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
           error={errors.power_save}
+          notice={notices.power_save}
           onChange={(val: boolean) =>
             handleToggle("power_save", () => backend.setPowerSave(val))
           }
@@ -1182,6 +1183,7 @@ function Content() {
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
           error={errors.buffer_tuning}
+          notice={notices.buffer_tuning}
           onChange={(val: boolean) =>
             handleToggle("buffer_tuning", () => backend.setBufferTuning(val))
           }
@@ -1389,6 +1391,7 @@ function Content() {
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.cake_enabled)}
           error={errors.cake}
+          notice={notices.cake}
           onChange={(val: boolean) =>
             handleToggle("cake", () => backend.setCake(val))
           }
