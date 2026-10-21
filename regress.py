@@ -2996,6 +2996,18 @@ d = Dns(B6)
 d._clear_profile_pins()
 ok((A6, "ipv4.dns", "") in d.mods, "reset and uninstall clear DNS too")
 
+m._save_settings({**m.DEFAULT_SETTINGS, "last_connection_uuid": A6, "pins_owned": []})
+d = Dns(B6)
+d._clear_profile_pins()
+ok(not any(k == "802-11-wireless.band" for _, k, _v in d.mods),
+   "reset and uninstall leave alone a band this plugin never pinned")
+m._save_settings({**m.DEFAULT_SETTINGS, "last_connection_uuid": A6,
+                  "pins_owned": ["802-11-wireless.band"]})
+d = Dns(B6)
+d._clear_profile_pins()
+ok((A6, "802-11-wireless.band", "") in d.mods,
+   "but clear one it did, even on a profile it lost track of")
+
 class HalfDns(Dns):
     def _nmcli_modify(self, uuid, key, value, timeout=5):
         self.mods.append((uuid, key, value))
@@ -3875,6 +3887,120 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("startup: migrated settings first, nothing lost, nothing left running")
+try:
+    class Boot(m.Plugin):
+        def __init__(self, driver="unknown", during=None):
+            super().__init__(); self.calls = []; self._driver = driver; self._during = during
+        async def get_device_info(self):
+            return {"success": True, "driver": self._driver, "model": "Jupiter",
+                    "device_family": "deck_lcd", "device_label": "Steam Deck LCD",
+                    "chip_label": "unknown" if self._driver == "unknown" else "WiFi 5 (RTL8822CE)"}
+        def _nm_version(self):
+            if self._during:
+                self._during()
+            return "1.52.1"
+        def _detect_distro(self): return {"id": "steamos", "name": "SteamOS"}
+        def _acknowledge_update(self): pass
+        def _rotate_logs(self, keep=10): pass
+        def _run_cmd(self, cmd, timeout=5): return _ok()
+        def _install_dispatcher(self): self.calls.append("install"); return True
+        def _remove_dispatcher(self): self.calls.append("remove"); return True
+        def _heal_orphaned_iwd_conf(self):
+            self.calls.append(("heal", m._load_settings().get("settings_version"))); return False
+        async def _unpin_if_iwd(self):
+            self.calls.append(("unpin", m._load_settings().get("settings_version")))
+        async def _startup_streaming(self, settings): pass
+        def _get_wifi_interface(self): return None
+        def _get_backend_method(self): return "none"
+        async def _stranded_watch(self): return
+
+    def _concurrent():
+        cur = m._load_settings(); cur["dns_enabled"] = True; m._save_settings(cur)
+
+    _real = m.SETTINGS_FILE
+    try:
+        m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+        m._save_settings({**m.DEFAULT_SETTINGS, "settings_version": 0, "driver": "rtw88",
+                          "chip_label": "WiFi 5 (RTL8822CE)", "bssid_lock_enabled": True,
+                          "bssid_lock_connection_uuid": "U1"})
+        b = Boot("unknown", _concurrent)
+        async def _run_main(plugin):
+            await plugin._main()
+            await asyncio.sleep(0)
+        asyncio.run(_run_main(b))
+        st = m._load_settings()
+        ok(st.get("driver") == "rtw88" and st.get("chip_label") == "WiFi 5 (RTL8822CE)",
+           "a radio missing at load does not overwrite the driver already known")
+        ok(("unpin", 2) in b.calls and ("heal", 2) in b.calls,
+           "the iwd unpin and the backend heal see the migrated settings")
+        ok(st.get("dns_enabled") is True,
+           "a setting saved while startup was waiting is not overwritten")
+        m._save_settings({**m.DEFAULT_SETTINGS, "auto_fix_on_wake": False})
+        b = Boot("rtw88"); asyncio.run(_run_main(b))
+        ok("remove" in b.calls and "install" not in b.calls,
+           "with auto-fix off, a script an older version left is removed")
+        ok(m._load_settings().get("driver") == "rtw88", "and a detected driver is recorded")
+    finally:
+        m.SETTINGS_FILE = _real
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("system config files are written whole, and teardown undoes power save and region now")
+try:
+    _d = tempfile.mkdtemp(); _f = os.path.join(_d, "conf.d", "99-x.conf")
+    ok(m._write_system_conf(_f, "a=1\n") is True and open(_f).read() == "a=1\n",
+       "a config file is written")
+    _ino = os.stat(_f).st_ino
+    ok(m._write_system_conf(_f, "a=1\n") is False and os.stat(_f).st_ino == _ino,
+       "and left untouched when it already says the same")
+    ok(m._write_system_conf(_f, "a=2\n") is True and open(_f).read() == "a=2\n"
+       and os.listdir(os.path.dirname(_f)) == ["99-x.conf"],
+       "a change replaces it whole, leaving no temp file behind")
+
+    class Tear(m.Plugin):
+        valve = None
+        def __init__(self): super().__init__(); self.cmds = []
+        def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+        def _get_wifi_interface(self): return "wlan0"
+        def _valve_powersave(self): return self.valve
+        def _release_valve_powersave(self, settings): pass
+        def _apply_driver_fixes(self, enable, persist=True): pass
+        def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+    _rn, _rm, _rs = m.NM_CONF_PATH, m.MODPROBE_CONF_PATH, m.SETTINGS_FILE
+    try:
+        m.NM_CONF_PATH = os.path.join(_d, "99-wifi-optimizer.conf")
+        m.MODPROBE_CONF_PATH = os.path.join(_d, "99-modprobe.conf")
+        m.SETTINGS_FILE = os.path.join(_d, "settings.json")
+        open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        open(m.MODPROBE_CONF_PATH, "w").write("options rtw88_pci disable_aspm=Y\n")
+        t = Tear(); t._release_power_save()
+        ok(not os.path.exists(m.NM_CONF_PATH) and not os.path.exists(m.MODPROBE_CONF_PATH)
+           and ["/usr/bin/nmcli", "general", "reload", "conf"] in t.cmds
+           and ["/usr/bin/iw", "dev", "wlan0", "set", "power_save", "on"] in t.cmds,
+           "Reset and uninstall have NetworkManager drop our file now and turn power save back on")
+        open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        t = Tear(); t.valve = "2"; t._release_power_save()
+        ok(not any(c[:2] == ["/usr/bin/iw", "dev"] for c in t.cmds),
+           "but leave it off when Steam's own setting has it off")
+        m._save_settings({**m.DEFAULT_SETTINGS, "regdomain": "DE", "regdomain_previous": "US"})
+        t = Tear(); t._release_regdomain()
+        ok(["/usr/bin/iw", "reg", "set", "US"] in t.cmds, "a region chosen here is put back to the one before it")
+        m._save_settings({**m.DEFAULT_SETTINGS, "regdomain": ""})
+        t = Tear(); t._release_regdomain()
+        ok(t.cmds == [], "and nothing is touched when no region was chosen here")
+    finally:
+        m.NM_CONF_PATH, m.MODPROBE_CONF_PATH, m.SETTINGS_FILE = _rn, _rm, _rs
+    _tm3 = open("defaults/dispatcher.sh.tmpl").read()
+    ok("/run/wifi-optimizer/pcie-baseline" in _tm3 and 'PCIE_BASELINE_FILE = "/run/wifi-optimizer/pcie-baseline"' in open("main.py").read()
+       and _tm3.index("pcie-baseline") < _tm3.index('echo 0 2>/dev/null > "$WIFI_PCI/link/$f"')
+       and "O_EXCL" in _tm3,
+       "the dispatcher notes the system's PCIe values once a boot, before its first write")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("Reset and uninstall do not strand WiFi on a backend switched from here")
 try:
     import inspect as _insp
@@ -4019,7 +4145,12 @@ try:
     for name in ("reset_settings", "_uninstall"):
         body = _src_all[_src_all.index(f"    async def {name}(self"):]
         body = body[:body.index("\n    async def ", 10)]
-        ok("self._release_valve_powersave(" in body, f"{name} gives Valve's power save setting back")
+        ok("self._release_power_save(" in body, f"{name} gives Valve's power save setting back")
+    _rel = _src_all[_src_all.index("    def _release_power_save(self"):]
+    _rel = _rel[:_rel.index("\n    def ", 10)]
+    ok("self._release_valve_powersave(" in _rel and "self._reload_nm_conf()" in _rel
+       and '"power_save", "on"' in _rel,
+       "which also has NetworkManager drop our file now and turns the radio's power save back on")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -4650,7 +4781,7 @@ try:
     ok(not os.path.exists(m.STREAM_FLAG_FILE) and not os.path.exists(m.STREAM_HOLD_FILE),
        "with auto mode off a leftover flag is cleared, so the dispatcher never reads it")
     _main_src = _src[_src.index("    async def _main(self):"):]
-    ok(_main_src.index("await self._startup_streaming(settings)")
+    ok(_main_src.index("await self._startup_streaming(")
        < _main_src.index("if iface and self._volatile_gate_open("),
        "startup looks for a stream before its own apply, which is gated")
 

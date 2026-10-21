@@ -668,6 +668,40 @@ def _read_pcie_baseline() -> dict:
     }
 
 
+def _write_system_conf(path: str, content: str) -> bool:
+    """Write a root-owned config file whole, or not at all. False if unchanged.
+
+    These are rewritten on every reapply (each game launch). Written in place,
+    an interruption could leave half a NetworkManager keyfile, which can stop
+    NetworkManager starting. So a temp file beside it is renamed over it, and
+    a file that already says the same is left untouched.
+    """
+    try:
+        with open(path, "r") as f:
+            if f.read(65536) == content:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".new")
+    try:
+        os.remove(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
 def _first_existing(paths: list[str]) -> str | None:
     """First path in the list that exists, or None."""
     for path in paths:
@@ -1746,6 +1780,45 @@ class Plugin:
             f"from the next boot, so {after} is enabled and {named} disabled"
         )
 
+    def _release_power_save(self):
+        """Undo Prevent lag spikes now, for Reset and uninstall.
+
+        Removing our file alone left power save off until the next reboot:
+        NetworkManager keeps the config it read at startup, and nothing put
+        the radio's own power save back. It goes back on unless Steam's own
+        WiFi power management setting has it off.
+        """
+        had_conf = os.path.exists(NM_CONF_PATH)
+        try:
+            os.remove(NM_CONF_PATH)
+        except FileNotFoundError:
+            pass
+        if had_conf:
+            self._reload_nm_conf()
+        self._release_valve_powersave(_load_settings())
+        try:
+            os.remove(MODPROBE_CONF_PATH)
+        except FileNotFoundError:
+            pass
+        self._apply_driver_fixes(False)
+        self._apply_pcie_aspm_fix(False)
+        iface = self._get_wifi_interface()
+        if iface and IFACE_RE.match(iface) and self._valve_powersave() != "2":
+            self._run_cmd(["/usr/bin/iw", "dev", iface, "set", "power_save", "on"])
+
+    def _release_regdomain(self):
+        """Put back the wireless region from before the user chose one here.
+
+        `iw reg set` lasts until reboot, so without this Reset and uninstall
+        left the chosen region in force for the rest of the boot.
+        """
+        settings = _load_settings()
+        if not settings.get("regdomain"):
+            return
+        target = settings.get("regdomain_previous", "") or "00"
+        if REGDOMAIN_RE.match(target):
+            self._run_cmd(["/usr/bin/iw", "reg", "set", target], timeout=5)
+
     def _ensure_backend_switch_state(self):
         if not hasattr(self, "_backend_switch"):
             self._backend_switch = {
@@ -1853,8 +1926,12 @@ class Plugin:
                 f"{'ok' if result['success'] else 'not found'}"
             )
         last = settings.get("last_connection_uuid", "")
-        band_uuids = settings.get("band_preference_uuids", [])
-        for uuid in {u for u in list(band_uuids) + uuids + [last] if u}:
+        band_uuids = list(settings.get("band_preference_uuids", []))
+        # The profiles beyond the recorded list only if a band pin was ever
+        # ours: otherwise a band set by hand would be wiped by Reset.
+        if "802-11-wireless.band" in settings.get("pins_owned", []):
+            band_uuids += uuids + [last]
+        for uuid in {u for u in band_uuids if u}:
             self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
         # Same reasoning as the pins: after teardown nothing is left that
         # knows this plugin turned IPv6 off, so it has to be undone here or
@@ -1982,11 +2059,11 @@ class Plugin:
         options = self._safe_modprobe_options(settings.get("driver", ""), profile)
         if enable and options and persist:
             try:
-                os.makedirs(os.path.dirname(MODPROBE_CONF_PATH), exist_ok=True)
-                with open(MODPROBE_CONF_PATH, "w") as f:
-                    f.write("# WiFi Optimizer - driver power save fixes\n")
-                    for opt in options:
-                        f.write(opt + "\n")
+                _write_system_conf(
+                    MODPROBE_CONF_PATH,
+                    "# WiFi Optimizer - driver power save fixes\n"
+                    + "".join(opt + "\n" for opt in options),
+                )
             except Exception as e:
                 decky.logger.error(f"Failed to write modprobe config: {e}")
         elif not enable:
@@ -2213,18 +2290,25 @@ class Plugin:
             self._rotate_logs()
             self._ensure_backend_switch_state()
             info = await self.get_device_info()
+            # Read here so the status collector can use it without forking.
+            # Before the settings are loaded: anything saved during an await
+            # between loading and saving them would be overwritten.
+            await asyncio.to_thread(self._nm_version)
             settings = _load_settings()
             settings["model"] = info.get("model", "unknown")
-            settings["driver"] = info.get("driver", "unknown")
             settings["device_family"] = info.get("device_family", "unknown")
             settings["device_label"] = info.get("device_label", "Unknown Device")
-            settings["chip_label"] = info.get("chip_label", "unknown")
-            settings["supports_6ghz"] = info.get("supports_6ghz", False)
+            # The radio can be missing at load (a reload while WiFi is down
+            # after a bad wake). Keep what was detected before rather than
+            # recording "unknown", which turns off the driver's fixes.
+            if info.get("driver", "unknown") != "unknown" or settings.get("driver") in (
+                    None, "", "unknown"):
+                settings["driver"] = info.get("driver", "unknown")
+                settings["chip_label"] = info.get("chip_label", "unknown")
+                settings["supports_6ghz"] = info.get("supports_6ghz", False)
             distro = self._detect_distro()
             settings["distro_id"] = distro["id"]
             settings["distro_name"] = distro["name"]
-            # Read here so the status collector can use it without forking.
-            await asyncio.to_thread(self._nm_version)
             # `iw reg set` does not survive a reboot, so a region the user
             # chose has to be put back here. This runs when the plugin loads,
             # which can be after the first association - so the very first
@@ -2235,8 +2319,6 @@ class Plugin:
                     ["/usr/bin/iw", "reg", "set", chosen_region], timeout=5
                 )
             self._migrate_settings(settings)
-            self._heal_orphaned_iwd_conf()
-            await self._unpin_if_iwd()
             if settings.get("auto_fix_on_wake", True):
                 if not self._install_dispatcher():
                     # Don't leave the toggle reading on with nothing installed.
@@ -2253,9 +2335,18 @@ class Plugin:
                     decky.logger.error(
                         "Auto-fix disabled: the dispatcher could not be installed"
                     )
+            else:
+                # An older version may have left its script there with the
+                # toggle off, and NetworkManager would go on running it.
+                self._remove_dispatcher()
 
             _save_settings(settings)
-            await self._startup_streaming(settings)
+            # After the save: both read the settings from disk, and before it
+            # they saw the un-migrated copy, which knows nothing of the pins
+            # an older version left (and the unpin then latches for the boot).
+            self._heal_orphaned_iwd_conf()
+            await self._unpin_if_iwd()
+            await self._startup_streaming(_load_settings())
 
             # Apply volatile settings that may have been lost on reboot.
             # The dispatcher handles reconnects, but on a fresh boot WiFi
@@ -2405,17 +2496,16 @@ class Plugin:
             decky.logger.info("WiFi Optimizer uninstalling")
             self._clear_profile_pins()
             self._remove_dispatcher()
-            self._apply_driver_fixes(False)
-            self._apply_pcie_aspm_fix(False)
+            self._release_power_save()
+            self._release_regdomain()
             self._revert_queue_tuning(_load_settings())
-            self._release_valve_powersave(_load_settings())
             self._release_generic_backend_conf()
             # The diagnostics file and a settings file set aside as unreadable
             # are ours too, and nothing else would ever remove them.
             users = (SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
                      LEGACY_ENFORCED_FILE)
-            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH,
-                         *users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE]:
+            for path in [*users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE,
+                         PCIE_BASELINE_FILE, UPDATE_STATE_FILE]:
                 # One that cannot go (the settings directory is the user's,
                 # so anything can sit at these names) does not stop the rest.
                 try:
@@ -5798,9 +5888,7 @@ class Plugin:
                         "" if found is None
                         else found if found in _VALVE_POWERSAVE_VALUES else "?"
                     )
-                os.makedirs(os.path.dirname(NM_CONF_PATH), exist_ok=True)
-                with open(NM_CONF_PATH, "w") as f:
-                    f.write("[connection]\nwifi.powersave = 2\n")
+                _write_system_conf(NM_CONF_PATH, "[connection]\nwifi.powersave = 2\n")
             elif not disabled:
                 # Only our own file can have put our value into Valve's. With
                 # none to remove (always so in streaming auto mode, which never
@@ -7457,24 +7545,15 @@ class Plugin:
             # Before the settings naming them are discarded.
             self._clear_profile_pins()
             # Revert runtime state
-            self._apply_driver_fixes(False)
-            self._apply_pcie_aspm_fix(False)
+            self._release_power_save()
+            self._release_regdomain()
             self._revert_queue_tuning(_load_settings())
-            try:
-                os.remove(NM_CONF_PATH)
-            except FileNotFoundError:
-                pass
             # A settings file set aside as unreadable is kept through a reset,
             # since it may be the only copy of what the user had. Whether
             # they have already dismissed the notice about it is kept too:
             # dropping that would bring back a notice they have seen, about a
             # file that has not changed.
             acknowledged = _load_settings().get("corrupt_acknowledged", [])
-            self._release_valve_powersave(_load_settings())
-            try:
-                os.remove(MODPROBE_CONF_PATH)
-            except FileNotFoundError:
-                pass
             # In the user's directory: _remove_no_follow, which does not
             # follow a link swapped in anywhere along the way.
             for path in (SETTINGS_FILE, LEGACY_ENFORCED_FILE):
@@ -8982,14 +9061,18 @@ class Plugin:
             before = self._VALVE_POWERSAVE_DEFAULT
         self._set_valve_powersave(before or None)
 
+    _BACKEND_CONF_TEXT = {
+        "iwd": "[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n",
+        "wpa_supplicant": "[device]\nwifi.backend=wpa_supplicant\n",
+    }
+
     def _put_back_backend_conf(self, before: str | None):
         """Return our backend conf file to what it held before a switch."""
         try:
             if before is None:
                 os.remove(GENERIC_BACKEND_CONF)
             else:
-                with open(GENERIC_BACKEND_CONF, "w") as f:
-                    f.write(before)
+                _write_system_conf(GENERIC_BACKEND_CONF, before)
         except OSError as e:
             decky.logger.error(f"restoring backend conf: {e}")
 
@@ -9002,11 +9085,7 @@ class Plugin:
         tried = "iwd" if backend == "wpa_supplicant" else "wpa_supplicant"
         self._run_cmd(["/usr/bin/systemctl", "disable", "--now", tried], timeout=15)
         try:
-            with open(GENERIC_BACKEND_CONF, "w") as f:
-                if backend == "iwd":
-                    f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
-                else:
-                    f.write("[device]\nwifi.backend=wpa_supplicant\n")
+            _write_system_conf(GENERIC_BACKEND_CONF, self._BACKEND_CONF_TEXT[backend])
         except OSError as e:
             decky.logger.error(f"restoring backend conf: {e}")
         for cmd in (["/usr/bin/systemctl", "enable", backend],
@@ -9029,12 +9108,7 @@ class Plugin:
                     before = f.read(4096)
             except OSError:
                 before = None
-            if target == "iwd":
-                with open(GENERIC_BACKEND_CONF, "w") as f:
-                    f.write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
-            else:
-                with open(GENERIC_BACKEND_CONF, "w") as f:
-                    f.write("[device]\nwifi.backend=wpa_supplicant\n")
+            _write_system_conf(GENERIC_BACKEND_CONF, self._BACKEND_CONF_TEXT[target])
 
             # Ask NetworkManager which backend it will now use BEFORE stopping
             # anything. Another conf.d file can outrank ours, and stopping the

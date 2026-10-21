@@ -128,6 +128,31 @@ if [ "$POWER_SAVE" = "True" ]; then
     # Disable PCIe ASPM for WiFi device (all drivers)
     WIFI_PCI=$(readlink -f /sys/class/net/"$IFACE"/device 2>/dev/null)
     if [ -d "$WIFI_PCI/link" ]; then
+        # This runs at boot before the plugin loads, so the plugin only ever
+        # saw our own values. Note what the system had, once per boot and
+        # before the first write, so turning this off puts that back rather
+        # than a guess. Same file and format the plugin reads.
+        if [ ! -e /run/wifi-optimizer/pcie-baseline ]; then
+            python3 - "$WIFI_PCI" <<'PYEOF' 2>/dev/null
+import json, os, sys
+dev = sys.argv[1]
+names = ["link/" + n for n in ("l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
+                               "l1_1_pcipm", "l1_2_pcipm")] + ["power/control"]
+base = {}
+for name in names:
+    path = os.path.join(dev, name)
+    try:
+        with open(path) as f:
+            base[path] = f.read(16).strip()
+    except OSError:
+        pass
+os.makedirs("/run/wifi-optimizer", mode=0o755, exist_ok=True)
+fd = os.open("/run/wifi-optimizer/pcie-baseline",
+             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+with os.fdopen(fd, "w") as f:
+    json.dump(base, f)
+PYEOF
+        fi
         for f in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
             echo 0 2>/dev/null > "$WIFI_PCI/link/$f"
         done
