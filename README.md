@@ -36,9 +36,9 @@ This requires a user password - set one with `passwd` in Konsole if you haven't 
 
 Switch back to Game Mode. Open the Quick Access Menu (**...** button) > Decky > WiFi Optimizer.
 
-**Updating:** The plugin checks for updates automatically when you open it, and from v0.24.0 on also twice a day in the background: when a new version comes out you get one notification (never during a game or a stream), and tapping it opens the plugin. You can turn that off with **Tell me about updates** in the Updates section. Nothing installs on its own. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. You can also update manually by running the install command above again.
+**Updating:** The plugin checks for updates automatically when you open it, and from v0.24.0 on also twice a day in the background: when a new version comes out you get one notification (never during a game or a stream), and tapping it opens the plugin. You can turn that off with **Tell me about updates** in the Updates section. Nothing installs on its own. If an update is available, an update button appears at the top of the panel - tap it and the plugin updates and reloads itself, without restarting Steam. If Decky can't reload it, the plugin restarts Decky instead, which restarts Steam. The button won't start an update while a game or a stream is running; close it first. You can also update manually by running the install command above again. That always installs the latest stable release, so on the beta channel it can take you back to an older version.
 
-Releases are signed. From v0.21.0-beta on, before installing an update, the plugin checks the release's signature against the keys built into it and the download against the signed checksum, and installs nothing that doesn't match. Earlier versions install what they download. The install command doesn't check signatures: it downloads the release over HTTPS from GitHub. [SECURITY.md](SECURITY.md) lists the keys and how to check a release yourself. The beta channel installs the newest release of either kind, beta or stable.
+Releases are signed. From v0.21.0-beta on, before installing an update, the plugin checks the release's signature against the keys built into it and the download against the signed checksum, and installs nothing that doesn't match. Earlier versions install what they download. The install command doesn't check signatures: it downloads the latest stable release over HTTPS from GitHub, or the current main branch if it can't look up the release. [SECURITY.md](SECURITY.md) lists the keys and how to check a release yourself. The beta channel installs the newest release of either kind, beta or stable.
 
 > **Note:** If you're on a version before v0.6.6, the in-app updater had bugs. Please update manually using the install command above to get working auto-updates.
 
@@ -106,10 +106,13 @@ The plugin has two parts:
 
 2. **A NetworkManager dispatcher script** runs independently of Decky, outside of Steam. Every time your WiFi reconnects (including after sleep), it automatically reapplies the volatile settings (power save, PCIe power states, buffers, CAKE). In streaming auto mode it only does that while a stream is running. If you uninstall the plugin, the script removes itself.
 
-The panel polls for live status only while it is open. Two things run without
-it: the dispatcher script, whenever WiFi reconnects, and a reapply of the
-volatile settings shortly after a game launches. In streaming auto mode the
-plugin also checks every few seconds whether a streaming app is running.
+The panel polls for live status only while it is open. A few things run
+without it: the dispatcher script, whenever WiFi reconnects; a reapply of the
+volatile settings shortly after a game launches; a check every 20 seconds,
+while the access point lock or a band preference is on, that releases a pin
+keeping the device offline; and the update check twice a day, unless **Tell me
+about updates** is off. In streaming auto mode the plugin also checks every few
+seconds whether a streaming app is running.
 
 ## Uninstall
 
@@ -118,7 +121,7 @@ plugin also checks every few seconds whether a streaming app is running.
 Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
 
 ```bash
-rm -rf ~/homebrew/plugins/WiFi\ Optimizer
+sudo rm -rf ~/homebrew/plugins/WiFi\ Optimizer
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-wifi-optimizer
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf
