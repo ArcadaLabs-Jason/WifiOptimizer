@@ -909,12 +909,31 @@ function Content() {
     await refreshStatus(true);
   };
 
-  const handleBackendToggle = async (on: boolean) => {
+  // The switch takes WiFi down for up to a minute, so it asks first, as
+  // Reset does.
+  const handleBackendToggle = (on: boolean) => {
+    if (busyRef.current) return;
+    const target = on ? "wpa_supplicant" : "iwd";
+    const paused =
+      !on && (status?.settings?.bssid_lock_enabled || status?.settings?.band_preference_enabled)
+        ? " Under iwd, Stop background scanning and the band preference are paused."
+        : "";
+    showModal(
+      <ConfirmModal
+        strTitle="Switch the WiFi backend?"
+        strDescription={`This switches to ${target}. WiFi disconnects while it switches, usually for less than a minute.${paused} If WiFi doesn't come back, switch back here or restart the device.`}
+        strOKButtonText="Switch"
+        strCancelButtonText="Cancel"
+        onOK={() => void runBackendSwitch(target)}
+      />,
+    );
+  };
+
+  const runBackendSwitch = async (target: string) => {
     // Re-entrancy guard: drop rapid clicks or clicks that land while another
     // operation is already running. Protects against duplicate backend calls
     // and the Force-Reapply/backend-switch overlap case.
     if (busyRef.current) return;
-    const target = on ? "wpa_supplicant" : "iwd";
     setBusy(true);
     setErrors((prev) => {
       const next = { ...prev };
@@ -928,7 +947,7 @@ function Content() {
       if (!res.accepted) {
         setErrors((prev) => ({
           ...prev,
-          wifi_backend: res.message ?? "Could not start backend switch",
+          wifi_backend: res.message ?? "Couldn't start the backend switch. Try again in a moment.",
         }));
         // Clear any stale result banner/inline from a prior switch so we don't
         // render old success + new error side-by-side.
@@ -949,7 +968,7 @@ function Content() {
       setBusy(false);
       setErrors((prev) => ({
         ...prev,
-        wifi_backend: "Failed to start backend switch",
+        wifi_backend: "Couldn't start the backend switch. Try again in a moment.",
       }));
       console.error("startBackendSwitch error", e);
     }
