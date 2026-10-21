@@ -1024,16 +1024,23 @@ def _load_settings() -> dict:
             raise
         with f:
             raw = f.read(65536)
-            if f.read(1):
-                raise ValueError("settings file too large")
+            oversized = bool(f.read(1))
     except FileNotFoundError:
         return _default_settings()
     except Exception:
-        # Not a regular file, too large or unreadable. Nothing was parsed,
-        # so there is nothing to keep: defaults stand in as always, and
-        # whatever sits at the path is left where it is.
-        _SETTINGS_STATE["read_failed"] = True
+        # Not a regular file, or unreadable. Nothing was parsed, so the
+        # defaults stand in, and whatever sits at the path is left where it
+        # is: _save_settings will not write over the file that could not be
+        # read, so a read error that passes does not cost the user their
+        # settings.
+        _note_unread_settings()
         return copy.deepcopy(DEFAULT_SETTINGS)
+    if oversized:
+        # A regular file past the cap is set aside like one that does not
+        # parse. Left in place, the first save replaced it with the defaults
+        # and the tracked profile lists went with it.
+        _set_aside_corrupt_settings(read_stat, ValueError("settings file too large"))
+        return _default_settings()
     try:
         data = json.loads(raw)
         if not isinstance(data, dict):
@@ -1044,16 +1051,43 @@ def _load_settings() -> dict:
     try:
         settings = _clean_settings(data)
     except Exception:
-        _SETTINGS_STATE["read_failed"] = True
+        _note_unread_settings()
         return copy.deepcopy(DEFAULT_SETTINGS)
     _SETTINGS_STATE["read_failed"] = False
+    _SETTINGS_STATE["unread"] = None
     return settings
+
+
+def _settings_file_identity() -> tuple | None:
+    """Device, inode and modification time of the regular file at the
+    settings name, not following a link, or None for anything else."""
+    try:
+        st = os.lstat(SETTINGS_FILE)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns) if _is_regular(st.st_mode) else None
+
+
+def _note_unread_settings():
+    """A read that failed: the defaults stand in, and the regular file that
+    could not be read, if that is what sits there, is noted so no save
+    replaces it (see _save_settings). A directory, FIFO or link at the name
+    holds no settings to lose."""
+    _SETTINGS_STATE["read_failed"] = True
+    _SETTINGS_STATE["unread"] = _settings_file_identity()
+
+
+def _unread_settings_in_place() -> bool:
+    """Whether the file the last read could not read is still there."""
+    unread = _SETTINGS_STATE.get("unread")
+    return bool(unread) and _settings_file_identity() == unread
 
 
 # What the last settings read and save came to, for the status the panel
 # shows and for the streaming watch. read_failed: the file is there but the
 # defaults had to stand in for it. save_failed: the last save did not land.
-_SETTINGS_STATE = {"read_failed": False, "save_failed": False}
+# unread: the regular file a failed read left in place (see _note_unread_settings).
+_SETTINGS_STATE = {"read_failed": False, "save_failed": False, "unread": None}
 
 
 def _default_settings() -> dict:
@@ -1066,6 +1100,7 @@ def _default_settings() -> dict:
     which is what an install that has a .corrupt file to show has done.
     """
     _SETTINGS_STATE["read_failed"] = False
+    _SETTINGS_STATE["unread"] = None
     settings = copy.deepcopy(DEFAULT_SETTINGS)
     if _corrupt_settings_identity() is not None:
         settings["pins_owned"] = ["802-11-wireless.bssid", "802-11-wireless.band"]
@@ -1090,6 +1125,10 @@ def _clean_settings(data: dict) -> dict:
     # a band with no control able to clear it.
     if merged.get("band_preference") not in BAND_NAMES:
         merged["band_preference"] = "a"
+    # Only the two channels exist. A hand-edited "Beta" was treated as
+    # stable while the panel's dropdown had no option to show for it.
+    if merged.get("update_channel") not in ("stable", "beta"):
+        merged["update_channel"] = "stable"
     # Compared against GitHub's answer and shown in a toast.
     notified = merged.get("update_notified_version", "")
     if notified and (len(notified) > 64 or not VERSION_RE.match(notified)):
@@ -1173,7 +1212,13 @@ def _save_settings(data: dict):
     The outcome is kept for the status: a settings directory that is full,
     read-only or not the user's any more otherwise fails every toggle with
     nothing on the panel saying why.
+
+    Refused while the file at the name could not be read: what is being
+    saved was built on the defaults that stood in for it.
     """
+    if _unread_settings_in_place():
+        _SETTINGS_STATE["save_failed"] = True
+        raise SettingsSaveError("settings not saved: the file there could not be read")
     try:
         _write_settings(data)
     except Exception as e:
@@ -1567,6 +1612,10 @@ EXPECTED="$6"
 # The tarball's sha256, from the release's signed SHA256SUMS. It is what
 # makes the download trustworthy, so there is no way on without one.
 EXPECTED_SHA="${7:-}"
+# What counts as a stream, as one extended regex: the streaming apps the user
+# has ticked and their own process names, the same ones the plugin watches.
+# Empty when nothing is watched, and then only a game counts.
+STREAM_PATTERNS="${8:-}"
 
 STATE=/run/wifi-optimizer/update-state
 # This script's own time limit, in seconds since it started. Inside the
@@ -1715,11 +1764,15 @@ set_state restarting
 # Restarting plugin_loader restarts Steam, which ends a game. The panel only
 # checked for one when the update started, and a download can take minutes,
 # so look again and wait for it (or a stream) to end. A stream is one the
-# plugin has flagged, or one of the streaming apps it knows by name running
-# with auto mode off, when nothing flags it.
+# plugin has flagged, or one of the apps the user has it watch running with
+# auto mode off, when nothing flags it. This script is never one: its own
+# command line carries the patterns, and its paths and address could match
+# a name of the user's.
 playing() {
-    pgrep -if 'steamlaunch appid=|__STREAM_PATTERNS__' >/dev/null 2>&1 ||
-        [ -e /run/wifi-optimizer/streaming ]
+    for pid in $(pgrep -if "steamlaunch appid=${STREAM_PATTERNS:+|$STREAM_PATTERNS}" 2>/dev/null); do
+        [ "$pid" = "$$" ] || return 0
+    done
+    [ -e /run/wifi-optimizer/streaming ]
 }
 if playing; then
     logger -t wifi-optimizer "Update installed; waiting for the game or stream to end before restarting Decky"
@@ -1745,16 +1798,13 @@ fi
 """
 
 
-def _stream_process_pattern() -> str:
-    """The built-in streaming apps' patterns as one extended regex for the
-    update script's pgrep, each matched as plain text, as the plugin does."""
+def _stream_process_pattern(patterns: list[str]) -> str:
+    """Process patterns as one extended regex for the update script's pgrep,
+    each matched as plain text, as the plugin does."""
     return "|".join(
         re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", pattern)
-        for _app_id, _label, patterns in STREAMING_APPS for pattern in patterns
+        for pattern in dict.fromkeys(patterns)
     )
-
-
-UPDATE_SCRIPT = UPDATE_SCRIPT.replace("__STREAM_PATTERNS__", _stream_process_pattern())
 
 
 class Plugin:
@@ -9350,7 +9400,9 @@ class Plugin:
                 decky.logger.error(f"Update refused: approved v{version}, GitHub now offers v{latest}")
                 return {"success": False, "message": "The available update changed. Check again and retry."}
             plugin_dir = decky.DECKY_PLUGIN_DIR
-            label = f"beta v{latest}" if channel == "beta" else f"v{latest}"
+            # By the release itself: the beta channel also offers stable
+            # releases, and "Updated to beta v0.24.5" misnamed those.
+            label = f"beta v{latest}" if "-" in latest else f"v{latest}"
 
             # Nothing is downloaded to run until the release's signed
             # checksum list has been checked here. The script then refuses a
@@ -9390,10 +9442,18 @@ class Plugin:
             except OSError:
                 pass
             try:
+                # The script waits for a stream to end before it restarts
+                # Decky, so it is told what counts as one here: the apps
+                # the user watches and their own process names, as the
+                # plugin's own search does. Built in, it waited on every
+                # known app, ticked or not, and never on the user's own.
+                streams = _stream_process_pattern(
+                    [pattern for _label, pattern in self._stream_patterns(_load_settings())]
+                )
                 await asyncio.to_thread(
                     self._launch_updater,
                     ["/bin/bash", script_path, script_dir, plugin_dir,
-                     download_url, src_dir, label, latest, sha256],
+                     download_url, src_dir, label, latest, sha256, streams],
                 )
             except Exception:
                 # Nothing started, so nothing will remove the directory, and
@@ -9460,21 +9520,35 @@ class Plugin:
         # (SIGKILL, once systemd gave up on its TERM) cannot remove its
         # directory, and every update, backend switch, Reset and profile
         # change was refused until Decky restarted.
-        directory = getattr(self, "_update_dir", None)
-        started = getattr(self, "_update_started_at", None)
-        if (directory and os.path.isdir(directory)
-                and (started is None or time.monotonic() - started < UPDATE_STATE_MAX_AGE)):
+        if self._update_script_alive():
             return True
         # After a reload this is a new backend that did not start the script,
         # which is still finishing. What the script reports covers that.
         phase, _, age = _read_update_state()
         return phase in UPDATE_ACTIVE_PHASES and age < UPDATE_STATE_MAX_AGE
 
+    def _update_script_alive(self) -> bool:
+        """Whether this backend can tell the update script it started is
+        still running: its directory is there (it removes it as it exits)
+        and its time limit, kept on the monotonic clock as systemd keeps
+        the unit's, has not passed. A backend that did not start it (one
+        loaded since) cannot tell, and answers False."""
+        directory = getattr(self, "_update_dir", None)
+        started = getattr(self, "_update_started_at", None)
+        return bool(directory and os.path.isdir(directory)
+                    and (started is None
+                         or time.monotonic() - started < UPDATE_STATE_MAX_AGE))
+
     async def get_update_progress(self) -> dict:
         """How far a running update has got, for the panel to show and act on."""
         try:
             phase, version, age = _read_update_state()
-            if phase in UPDATE_ACTIVE_PHASES and age >= UPDATE_STATE_MAX_AGE:
+            # Old by the clock is not enough: the clock runs through sleep,
+            # and an update that slept part way through is still running.
+            # Called failed then, the panel stopped asking Decky to reload
+            # the plugin, and the script fell back to restarting Steam.
+            if (phase in UPDATE_ACTIVE_PHASES and age >= UPDATE_STATE_MAX_AGE
+                    and not self._update_script_alive()):
                 phase = "failed"
             return {"success": True, "phase": phase, "version": version, "age": int(age),
                     "running_version": decky.DECKY_PLUGIN_VERSION}

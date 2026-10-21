@@ -5792,9 +5792,12 @@ try:
            "nor does a FIFO at the settings path")
         os.remove(m.SETTINGS_FILE)
         open(m.SETTINGS_FILE, "w").write('{"driver": "' + "x" * 70000 + '"}')
-        ok(m._load_settings() == m.DEFAULT_SETTINGS and os.path.exists(m.SETTINGS_FILE)
-           and not os.path.exists(_corrupt), "nor does an oversized one")
-        os.remove(m.SETTINGS_FILE)
+        _big = m._load_settings()
+        ok({**_big, "pins_owned": []} == m.DEFAULT_SETTINGS and not os.path.exists(m.SETTINGS_FILE)
+           and os.path.exists(_corrupt),
+           "an oversized one is set aside like one that does not parse (L22)")
+        for _left in (_corrupt, m.SETTINGS_FILE):
+            if os.path.exists(_left): os.remove(_left)
 
         def _reloaded():
             """A plugin as a reload leaves it: a fresh copy of the module, so
@@ -6770,7 +6773,7 @@ try:
        < _au.index("self._launch_updater"),
        "apply_update checks the signature, and stops on a failure, before it launches anything")
     ok('download_url = signed["url"]' in _au and 'sha256 = signed["sha256"]' in _au
-       and "latest, sha256]" in _au,
+       and "latest, sha256, streams]" in _au,
        "and what it downloads and the sha256 it hands the script both come from the signed list")
     ok("archive/refs/heads" not in _main_src and "archive/refs/tags" not in _main_src
        and "contents/package.json" not in _main_src,
@@ -6929,8 +6932,8 @@ try:
         _r = _apply(_rel_ok)
         _argv = _rel_ok.launched[0] if _rel_ok.launched else []
         ok(_r.get("success") is True and _r.get("version") == _VER, f"a correctly signed release starts ({_r})")
-        ok(_argv[:1] == ["/bin/bash"] and _argv[4:] == [f"{_DL}/v{_VER}/{_TAR}", f"WifiOptimizer-{_VER}",
-                                                        f"beta v{_VER}", _VER, _TAR_SHA],
+        ok(_argv[:1] == ["/bin/bash"] and _argv[4:9] == [f"{_DL}/v{_VER}/{_TAR}", f"WifiOptimizer-{_VER}",
+                                                         f"beta v{_VER}", _VER, _TAR_SHA],
            f"the script gets the release's tarball, its directory and its signed sha256 ({_argv[4:]})")
         _gets = [c for c in _rel_ok.cmds if c[:1] == ["/usr/bin/curl"]]
         ok([c[-1] for c in _gets] == [f"{_DL}/v{_VER}/SHA256SUMS", f"{_DL}/v{_VER}/SHA256SUMS.minisig"],
@@ -6940,7 +6943,9 @@ try:
         ok(not _rel_ok._update_running(), "and the claim is released afterwards")
         _st = Release(_files(), channel="stable")
         _r = _apply(_st)
-        ok(_st.launched and _st.launched[0][4:7] == [f"{_DL}/v{_VER}/{_TAR}", f"WifiOptimizer-{_VER}", f"v{_VER}"],
+        # The label follows the release, not the channel (L27), so only the
+        # asset and the directory are compared here.
+        ok(_st.launched and _st.launched[0][4:6] == [f"{_DL}/v{_VER}/{_TAR}", f"WifiOptimizer-{_VER}"],
            "stable fetches the same release asset and unpacks the same directory")
 
         # What installs is what the user approved. GitHub is asked again
@@ -7225,7 +7230,7 @@ tar() { : > "$FX/tar-ran"; command tar "$@"; }
 logger() { echo "$*" >> "$FX/log"; }
 sleep() { :; }
 systemctl() { echo "$*" >> "$FX/systemctl"; return 0; }
-pgrep() { [ -n "${PGREP_HOOK:-}" ] && eval "$PGREP_HOOK"; return "${PGREP_RC:-1}"; }
+pgrep() { [ -n "${PGREP_HOOK:-}" ] && eval "$PGREP_HOOK"; [ "${PGREP_RC:-1}" = 0 ] && echo 99999; return "${PGREP_RC:-1}"; }
 export -f curl tar logger sleep systemctl pgrep
 exec /bin/bash "$0" "$@"
 '''
@@ -7306,8 +7311,10 @@ exec /bin/bash "$0" "$@"
     _bud = re.search(r"^BUDGET=(\d+)$", m.UPDATE_SCRIPT, re.M)
     ok(bool(_bud) and int(_bud.group(1)) + 15 < m.UPDATE_STATE_MAX_AGE and '"$SECONDS" -lt "$BUDGET"' in m.UPDATE_SCRIPT,
        "the script's own deadline, and the wait that ends on it, fall inside the time its systemd unit is given")
-    ok(all(_pt.replace(".", "\\.") in m.UPDATE_SCRIPT for _a, _l, _ps in m.STREAMING_APPS for _pt in _ps),
-       "and a game is not the only thing it waits for: the streaming apps the plugin knows by name count too")
+    ok('STREAM_PATTERNS="${8:-}"' in m.UPDATE_SCRIPT
+       and '"steamlaunch appid=${STREAM_PATTERNS:+|$STREAM_PATTERNS}"' in m.UPDATE_SCRIPT,
+       "and a game is not the only thing it waits for: the streaming apps the user watches, "
+       "handed over by the plugin, count too (L26)")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -7737,6 +7744,261 @@ try:
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 3, BACKEND-LIFECYCLE (L1-L36, J1, J2) ----
+# Each section is named after its item in session-artifacts/qa-0.24.4/
+# pass3-triage.md. Shared stubs first: the system files these touch, a Reset,
+# an uninstall and a startup with everything around them stubbed.
+import errno as _l_errno, threading as _l_thr, builtins as _l_bi, shutil as _l_sh
+
+
+def _l_paths():
+    """Point the system files Reset, uninstall and startup touch at a scratch
+    directory. Returns (directory, restore)."""
+    d = tempfile.mkdtemp()
+    os.mkdir(os.path.join(d, "conf.d")); os.mkdir(os.path.join(d, "run"))
+    places = {
+        "SETTINGS_FILE": os.path.join(d, "settings", "settings.json"),
+        "LEGACY_ENFORCED_FILE": os.path.join(d, "settings", "last_enforced"),
+        "NM_CONF_PATH": os.path.join(d, "conf.d", "99-wifi-optimizer.conf"),
+        "GENERIC_BACKEND_CONF": os.path.join(d, "conf.d", "99-wifi-optimizer-backend.conf"),
+        "WIFI_BACKEND_CONF": os.path.join(d, "conf.d", "99-valve-wifi-backend.conf"),
+        "BAZZITE_IWD_CONF": os.path.join(d, "conf.d", "iwd.conf"),
+        "NM_DEFAULT_CONF": os.path.join(d, "usr-10-steamos-defaults.conf"),
+        "HOLO_NM_DEFAULT_CONF": os.path.join(d, "usr-10-holo-defaults.conf"),
+        "MODPROBE_CONF_PATH": os.path.join(d, "99-modprobe.conf"),
+        "DISPATCHER_PATH": os.path.join(d, "99-dispatcher"),
+        "ENFORCED_FILE": os.path.join(d, "run", "last_enforced"),
+    }
+    os.mkdir(os.path.join(d, "settings"))
+    saved = {name: getattr(m, name) for name in places if hasattr(m, name)}
+    for name in saved:
+        setattr(m, name, places[name])
+
+    def restore():
+        for name, value in saved.items():
+            setattr(m, name, value)
+        for path in (m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE, m.BACKEND_SWITCH_MARKER):
+            if os.path.exists(path):
+                os.remove(path)
+    return d, restore
+
+
+def _l_valve(value=None):
+    """Valve's NetworkManager file, with wifi.powersave set to value or absent."""
+    text = "[device]\nwifi.backend=wpa_supplicant\n"
+    if value is not None:
+        text = f"[connection]\nwifi.powersave={value}\n" + text
+    open(m.WIFI_BACKEND_CONF, "w").write(text)
+
+
+class _LReset(m.Plugin):
+    """Reset with the system around it stubbed, recording the order of its steps."""
+    driver = "rtw88"
+
+    def __init__(self, left=None, real_drivers=False):
+        super().__init__(); self.order = []; self.cmds = []; self.fixes = []
+        self._left = left; self._real_drivers = real_drivers
+    async def get_device_info(self):
+        return {"success": True, "model": "lcd", "driver": self.driver,
+                "device_family": "deck_lcd", "device_label": "Steam Deck LCD",
+                "chip_label": "unknown" if self.driver == "unknown" else "WiFi 5 (RTL8822CE)",
+                "supports_6ghz": False}
+    def _detect_distro(self): return {"id": "steamos", "name": "SteamOS"}
+    def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+    def _get_wifi_interface(self): return None
+    def _install_dispatcher(self): return True
+    def _remove_dispatcher(self): return True
+    def _release_generic_backend_conf(self): self.order.append("backend")
+    def _release_regdomain(self, settings=None): self.order.append("region")
+    def _revert_queue_tuning(self, settings): self.order.append("queue")
+    def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+        self.fixes.append(enable)
+        if self._real_drivers:
+            return m.Plugin._apply_driver_fixes(self, enable, persist, record_all)
+    def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+    def _clear_profile_pins(self, deadline=None, settings=None):
+        self.order.append("pins")
+        if self._left is not None:
+            return self._left
+        return m.Plugin._clear_profile_pins(self, deadline, settings)
+    def _release_power_save(self, settings=None, reload_conf=False):
+        self.order.append("power save")
+        return m.Plugin._release_power_save(self, settings, reload_conf)
+
+
+class _LTear(m.Plugin):
+    """Uninstall with the system around it stubbed."""
+    def __init__(self): super().__init__(); self.cmds = []
+    def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+    def _get_wifi_interface(self): return None
+    def _remove_dispatcher(self): return True
+    def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+    def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+    def _release_generic_backend_conf(self): pass
+
+
+class _LBoot(m.Plugin):
+    """A plugin load with the system stubbed; the setters record their calls."""
+    backend_method = "none"
+
+    def __init__(self): super().__init__(); self.calls = []; self.cmds = []
+    async def get_device_info(self):
+        return {"success": True, "driver": "rtw88", "model": "lcd", "device_family": "deck_lcd",
+                "device_label": "Steam Deck LCD", "chip_label": "WiFi 5 (RTL8822CE)",
+                "supports_6ghz": False}
+    def _nm_version(self): return (1, 52, 1)
+    def _detect_distro(self): return {"id": "steamos", "name": "SteamOS"}
+    def _acknowledge_update(self): pass
+    def _rotate_logs(self, keep=10): pass
+    def _reconcile_backend_switch(self): pass
+    def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+    def _install_dispatcher(self): return True
+    def _remove_dispatcher(self): return True
+    def _heal_orphaned_iwd_conf(self): return False
+    async def _unpin_if_iwd(self): pass
+    def _get_wifi_interface(self): return "wlan0"
+    def _get_backend_method(self): return self.backend_method
+    async def _stranded_watch(self): return
+    def _find_stream(self, patterns): return None
+    def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+    def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+    def _revert_queue_tuning(self, settings): pass
+    async def set_power_save(self, disabled):
+        self.calls.append(("power_save", disabled)); return {"success": True}
+    async def set_buffer_tuning(self, enabled):
+        self.calls.append(("buffer_tuning", enabled)); return {"success": True}
+    async def set_cake(self, enabled):
+        self.calls.append(("cake", enabled)); return {"success": True}
+
+
+def _l_main(plugin):
+    """Run _main; whether auto mode's watch was started."""
+    async def go():
+        await plugin._main()
+        return getattr(plugin, "_stream_task", None) is not None
+    return asyncio.run(go())
+
+
+section("L22 a settings file that cannot be read is kept, not overwritten")
+try:
+    _d, _restore = _l_paths()
+    try:
+        _big22 = json.dumps({**m.DEFAULT_SETTINGS, "bssid_lock_uuids": ["dddddddd-0000-0000-0000-0000000000b2"],
+                             "streaming_custom_patterns": "x" * 71680})
+        open(m.SETTINGS_FILE, "w").write(_big22)
+        _l_main(_LBoot())
+        _corrupt22 = m.SETTINGS_FILE + ".corrupt"
+        ok(os.path.isfile(_corrupt22) and open(_corrupt22).read() == _big22,
+           "a 70 KiB file is kept as settings.json.corrupt after a load")
+        ok(sorted(m._load_settings()["pins_owned"]) == ["802-11-wireless.band", "802-11-wireless.bssid"],
+           "and the pins it named count as ours, as for a file that does not parse")
+        if os.path.exists(_corrupt22): os.remove(_corrupt22)
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            m._save_settings({**m.DEFAULT_SETTINGS, "dns_enabled": True})
+            os.chmod(m.SETTINGS_FILE, 0)
+            try:
+                m._load_settings()
+                try:
+                    m._save_settings(dict(m.DEFAULT_SETTINGS)); _refused22 = False
+                except OSError:
+                    _refused22 = True
+            finally:
+                os.chmod(m.SETTINGS_FILE, 0o644)
+            ok(_refused22 and json.load(open(m.SETTINGS_FILE)).get("dns_enabled") is True,
+               "a file that could not be read is not replaced by the defaults that stood in for it")
+            m._load_settings()
+            m._save_settings(dict(m.DEFAULT_SETTINGS))
+            ok(json.load(open(m.SETTINGS_FILE)).get("dns_enabled") is False,
+               "and once it reads again, saves go through")
+    finally:
+        _restore()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L24 an update channel that is not one of the two loads as stable")
+try:
+    ok(m._clean_settings({**m.DEFAULT_SETTINGS, "update_channel": "Beta"})["update_channel"] == "stable"
+       and m._clean_settings({**m.DEFAULT_SETTINGS, "update_channel": "beta"})["update_channel"] == "beta",
+       "\"Beta\" loads as stable, \"beta\" as beta")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L26 L27 the update script waits on the streams the user watches, and names the release right")
+try:
+    class _L26(m.Plugin):
+        def __init__(self, version):
+            super().__init__(); self.version = version; self.launched = []
+        async def check_for_update(self):
+            return {"update_available": True, "channel": "beta", "latest_version": self.version}
+        async def _signed_release(self, version):
+            return {"ok": True, "url": f"https://example.invalid/v{version}.tar.gz", "sha256": "0" * 64}
+        def _launch_updater(self, argv): self.launched.append(argv)
+    def _l26_apply(version):
+        p = _L26(version)
+        r = asyncio.run(p.apply_update(version))
+        if getattr(p, "_update_dir", None) and os.path.isdir(p._update_dir):
+            _l_sh.rmtree(p._update_dir)
+        p._update_dir = None
+        return r, (p.launched[0] if p.launched else [])
+    _moon = [pt for app, _l, pts in m.STREAMING_APPS if app == "moonlight" for pt in pts]
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_apps": {"moonlight": False},
+                      "streaming_custom_patterns": "mystreamer"})
+    _r26, _argv26 = _l26_apply("0.24.6-beta")
+    ok(_r26.get("success") and _argv26 and "mystreamer" in _argv26[-1]
+       and not any(pt.replace(".", "\\.") in _argv26[-1] for pt in _moon),
+       f"the script is handed the user's own name and not an unticked app's ({_argv26[-1:]})")
+    _r27, _argv27 = _l26_apply("0.24.5")
+    ok(_r27.get("success") and _argv27[6:7] == ["v0.24.5"],
+       f"a stable release offered on the beta channel is not called beta ({_argv27[6:7]})")
+    ok(_argv26[6:7] == ["beta v0.24.6-beta"], "and a beta release is")
+    # The script's own command line carries the patterns, so it must not
+    # count itself as the stream it waits for.
+    import subprocess as _l_sp
+    _fn26 = m.UPDATE_SCRIPT[m.UPDATE_SCRIPT.index("playing() {"):]
+    _fn26 = _fn26[:_fn26.index("\n}\n") + 3]
+    def _l26_playing(pids):
+        args = os.path.join(tempfile.mkdtemp(), "args")
+        body = ('STREAM_PATTERNS="mystreamer"\n'
+                'pgrep() { echo "$*" > "$ARGS"; for p in ' + pids + '; do echo "$p"; done; }\n'
+                + _fn26.replace("/run/wifi-optimizer/streaming", "/nonexistent/streaming")
+                + "if playing; then echo yes; else echo no; fi\n")
+        out = _l_sp.run(["/bin/bash", "-c", body], capture_output=True, text=True,
+                        env={**os.environ, "ARGS": args}).stdout.strip()
+        return out, (open(args).read().strip() if os.path.exists(args) else "")
+    _self26, _args26 = _l26_playing("$$")
+    ok(_self26 == "no" and "mystreamer" in _args26,
+       f"the script looks for the names it was given, and does not count itself ({_self26}, {_args26!r})")
+    ok(_l26_playing("1")[0] == "yes", "another process that matches counts")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L36 an update that slept is not called failed while its script still runs")
+try:
+    _real_state36 = m.UPDATE_STATE_FILE
+    m.UPDATE_STATE_FILE = os.path.join(tempfile.mkdtemp(), "update-state")
+    try:
+        open(m.UPDATE_STATE_FILE, "w").write("downloading 0.24.6\n")
+        _old36 = time.time() - 1000
+        os.utime(m.UPDATE_STATE_FILE, (_old36, _old36))
+        _p36 = m.Plugin(); _p36._update_dir = tempfile.mkdtemp(); _p36._update_started_at = time.monotonic() - 30
+        ok(asyncio.run(_p36.get_update_progress()).get("phase") == "downloading",
+           "1000 s by the clock, 30 s awake, its directory there: still downloading")
+        os.rmdir(_p36._update_dir)
+        ok(asyncio.run(_p36.get_update_progress()).get("phase") == "failed",
+           "with its directory gone it is failed")
+        ok(asyncio.run(m.Plugin().get_update_progress()).get("phase") == "failed",
+           "and a backend that did not start it goes by the clock, as before")
+    finally:
+        m.UPDATE_STATE_FILE = _real_state36
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
