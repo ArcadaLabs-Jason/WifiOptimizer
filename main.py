@@ -69,6 +69,8 @@ if hasattr(decky.logger, "addFilter"):
 
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 SYSFS_NET = "/sys/class/net"
+# Every wireless radio (wiphy), whether or not it has an interface.
+SYSFS_IEEE80211 = "/sys/class/ieee80211"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
 # Where modprobe looks for options, in its order of precedence.
@@ -2092,12 +2094,14 @@ class Plugin:
             return "wpa_supplicant"
         return None
 
-    def _configured_backend_from_files(self, skip: str | None = None) -> str | None:
+    def _configured_backend_from_files(self, skip: str | None = None,
+                                       only: str | None = None) -> str | None:
         """The backend the known conf files name, highest priority first.
 
         NetworkManager reads conf.d in name order and the later file wins, so
         Bazzite's iwd.conf outranks our 99-wifi-optimizer-backend.conf, which
         outranks Valve's 99-valve-wifi-backend.conf; /usr/lib defaults last.
+        only: read just that one of them.
         """
         for path in (
             BAZZITE_IWD_CONF,
@@ -2106,7 +2110,7 @@ class Plugin:
             NM_DEFAULT_CONF,
             HOLO_NM_DEFAULT_CONF,
         ):
-            if path == skip:
+            if path == skip or (only is not None and path != only):
                 continue
             try:
                 with open(path, "r") as f:
@@ -2123,6 +2127,16 @@ class Plugin:
                 continue
             except Exception:
                 continue
+        return None
+
+    def _file_naming_backend(self, backend: str) -> str | None:
+        """The highest-priority known conf file, other than ours, that names
+        backend, or None."""
+        for path in (BAZZITE_IWD_CONF, WIFI_BACKEND_CONF, NM_DEFAULT_CONF,
+                     HOLO_NM_DEFAULT_CONF):
+            if self._configured_backend_from_files(
+                    skip=GENERIC_BACKEND_CONF, only=path) == backend:
+                return path
         return None
 
     def _release_generic_backend_conf(self):
@@ -2304,7 +2318,8 @@ class Plugin:
             return "The system didn't respond in time. Try again in a moment."
         if "network is unreachable" in d or "connection refused" in d:
             return "Network problem during the switch. Check WiFi and try again."
-        return "The WiFi backend switch didn't take effect."
+        return ("The WiFi backend switch didn't take effect. Restart the device, "
+                "then try again.")
 
     def _require_wifi(self) -> tuple:
         iface = self._get_wifi_interface()
@@ -5598,7 +5613,38 @@ class Plugin:
     )
 
     def _backend_is_iwd(self) -> bool:
-        return self._get_current_backend() == "iwd"
+        return self._backend_in_use() == "iwd"
+
+    def _backend_in_use(self, configured: str | None = None) -> str | None:
+        """The WiFi backend running now: 'iwd', 'wpa_supplicant' or None.
+
+        On SteamOS the configured one, as before. Elsewhere a change of
+        backend only lands at the next boot after Reset or an uninstall (our
+        file goes, the old backend keeps running), so the configuration can
+        name one that is not running. There the service decides: when exactly
+        one of the two is active, that one is in use. Reading the config
+        instead wrote pins under a live iwd and refused the lock under a live
+        wpa_supplicant. configured: _get_current_backend(), when the caller
+        already has it.
+        """
+        if configured is None:
+            configured = self._get_current_backend()
+        try:
+            if _load_settings().get("distro_id") == "steamos":
+                return configured
+        except Exception:
+            return configured
+        return self._running_backend() or configured
+
+    def _running_backend(self) -> str | None:
+        """The one of iwd and wpa_supplicant whose service is active, when
+        exactly one is; None when neither or both are, or it cannot tell."""
+        active = [
+            name for name in ("iwd", "wpa_supplicant")
+            if (self._run_cmd(["/usr/bin/systemctl", "is-active", name], timeout=3)
+                .get("stdout") or "").strip() == "active"
+        ]
+        return active[0] if len(active) == 1 else None
 
     def _pins_for_backend(self, settings: dict, status: dict) -> dict:
         """The settings this pass acts on, with both pins off under iwd.
@@ -5711,7 +5757,13 @@ class Plugin:
         )
         status["live"]["backend_tool_available"] = backend_available
         if backend_available:
-            status["live"]["wifi_backend"] = self._get_current_backend() or ""
+            configured = self._get_current_backend()
+            in_use = self._backend_in_use(configured)
+            status["live"]["wifi_backend"] = in_use or ""
+            # The one NetworkManager is set to start at the next boot, when
+            # that is not the one running (contract C5).
+            if configured and in_use and configured != in_use:
+                status["live"]["wifi_backend_next"] = configured
 
     def _propose_precedence(self, settings: dict, uuid: str,
                             pending: dict, actions: list):
@@ -9504,14 +9556,16 @@ class Plugin:
     async def _backend_switch_worker(self, target: str):
         """Background task that switches the WiFi backend with phase transitions.
 
-        Invokes the privileged helper directly (at /usr/bin/steamos-polkit-helpers/…)
-        to bypass pkexec, which fails from a rootful systemd context with no polkit
-        agent. The helper handles wlan0 recovery on ath11k devices internally; we parse its
-        output to report whether recovery fired.
+        Invokes the privileged helper directly (BACKEND_HELPER, under
+        /usr/bin/steamos-polkit-helpers or holo-polkit-helpers) to bypass
+        pkexec, which fails from a rootful systemd context with no polkit
+        agent. The helper tries to recreate a missing wlan0 itself, on phy0
+        only; we parse its output to report whether that fired, then check
+        for an interface whatever the driver, since stopping iwd removes it on
+        every radio but rtw88, and recover it ourselves when the helper could
+        not.
         """
         try:
-            settings = _load_settings()
-            has_wlan0_quirk = settings.get("driver") == "ath11k_pci"
             other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
 
             # Phase: switching - write config then restart services.
@@ -9556,31 +9610,16 @@ class Plugin:
             rs_stdout = restart_result.get("stdout", "")
             rs_stderr = restart_result.get("stderr", "")
             recovery_performed = "missing wlan0" in rs_stdout
-            needs_reboot = "wlan0 could not be created" in rs_stderr
 
-            await asyncio.sleep(1)
-            if has_wlan0_quirk and target == "wpa_supplicant":
-                iface_check = await asyncio.to_thread(self._get_wifi_interface)
-                # Absence is the failure, not the name. An interface that came
-                # back as wlpXsY is working, and treating that as a failure
-                # tells the user to reboot a system that is fine.
-                if not iface_check:
-                    needs_reboot = True
-
-            # The helper reports "wlan0 could not be created" by name, but an
-            # interface that came back as wlpXsY is working. Check before
-            # acting on that claim, the same way the quirk branch above does.
-            if needs_reboot and await asyncio.to_thread(self._get_wifi_interface):
-                needs_reboot = False
-
-            # The helper's own recovery only knows about phy0. Try again with
-            # the real phy before making the user reboot.
-            if needs_reboot:
-                if await asyncio.to_thread(self._recover_wlan0):
-                    await asyncio.sleep(2)
-                    if await asyncio.to_thread(self._get_wifi_interface):
-                        needs_reboot = False
-                        recovery_performed = True
+            # Absence is the failure, not the name, and on every driver. The
+            # helper says "wlan0 could not be created" by name, but an
+            # interface that came back as wlpXsY is working; and the helper's
+            # own recovery only knows phy0, so under wpa_supplicant a missing
+            # one is recreated on the real phy before anyone is told to
+            # reboot. Under iwd, which makes its own, it is waited for.
+            iface, recovered = await self._settle_interface(target)
+            recovery_performed = recovery_performed or recovered
+            needs_reboot = not iface
 
             # Phase: reconnecting. Poll nmcli at 1-second cadence for up to 15s
             # to confirm WiFi actually comes back. 15s is generous for typical
@@ -9679,7 +9718,7 @@ class Plugin:
         even though wlan0 is gone.
         """
         try:
-            phys = os.listdir("/sys/class/ieee80211")
+            phys = os.listdir(SYSFS_IEEE80211)
         except Exception:
             return False
         if not phys:
@@ -9690,7 +9729,7 @@ class Plugin:
             # is a genuine mess, and the caller reaches here whenever the
             # interface is merely named something other than wlan0.
             try:
-                return bool(os.listdir(f"/sys/class/ieee80211/{phy}/device/net"))
+                return bool(os.listdir(os.path.join(SYSFS_IEEE80211, phy, "device", "net")))
             except Exception:
                 return False
 
@@ -9702,7 +9741,7 @@ class Plugin:
             # Steam Deck LCD - and the preference silently degraded to
             # alphabetical order.
             for probe in ("device/driver/module", "device/driver"):
-                path = f"/sys/class/ieee80211/{phy}/{probe}"
+                path = os.path.join(SYSFS_IEEE80211, phy, probe)
                 # realpath does not raise on a missing path, it just returns
                 # the normalised name - which would hand back the literal
                 # "module" and then match nothing.
@@ -9775,7 +9814,9 @@ class Plugin:
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
-                    "message": "Couldn't reach the SteamOS settings service.",
+                    "message": ("Couldn't reach the SteamOS settings service. Try "
+                                "again in a moment. If it keeps failing, restart "
+                                "the device."),
                 }
                 return
 
@@ -9877,7 +9918,8 @@ class Plugin:
                     "reconnect_timed_out": reconnect_timed_out,
                     "message": (
                         f"Expected {target} but the system reports "
-                        f"{final_backend or 'no backend'}. A reboot may help."
+                        f"{final_backend or 'no backend'}. Restart the device, "
+                        f"then try the switch again."
                     ),
                 }
 
@@ -10143,11 +10185,17 @@ class Plugin:
         except OSError as e:
             decky.logger.error(f"restoring backend conf: {e}")
 
-    def _restore_generic_backend(self, backend: str):
+    def _restore_generic_backend(self, backend: str) -> tuple:
         """Point NM back at a backend and start it, after a failed switch.
 
         The one we tried is stopped and disabled first: left enabled, both
         start at the next boot and fight over the interface.
+
+        Returns (whether there is a WiFi interface afterwards, whether we
+        recreated it). Stopping iwd destroys the interface on every radio but
+        rtw88 (it owns the netdev on drivers outside its default-interface
+        list), and wpa_supplicant never makes one, so putting wpa_supplicant
+        back left no WiFi at all until a reboot.
         """
         tried = "iwd" if backend == "wpa_supplicant" else "wpa_supplicant"
         self._run_cmd(["/usr/bin/systemctl", "disable", "--now", tried], timeout=15)
@@ -10159,6 +10207,35 @@ class Plugin:
                     ["/usr/bin/systemctl", "start", backend],
                     ["/usr/bin/systemctl", "restart", "NetworkManager"]):
             self._run_cmd(cmd, timeout=15)
+        return self._interface_after_restart(backend)
+
+    # How long _interface_after_restart gives a restart to settle, then (iwd
+    # only) how many more seconds it waits for iwd's own interface. The same
+    # as _settle_interface, for callers already off the event loop.
+    _SETTLE_SECONDS = 2
+    _IWD_INTERFACE_WAIT = 8
+
+    def _interface_after_restart(self, backend: str | None) -> tuple:
+        """(whether there is a WiFi interface, whether we recreated it) once a
+        backend restart settles. Blocking: for worker threads only. Under
+        wpa_supplicant a missing interface is recreated; under iwd it is
+        waited for, since iwd makes its own (see _settle_interface)."""
+        if self._get_wifi_interface():
+            return True, False
+        time.sleep(self._SETTLE_SECONDS)
+        if self._get_wifi_interface():
+            return True, False
+        if backend == "iwd":
+            for _ in range(self._IWD_INTERFACE_WAIT):
+                time.sleep(1)
+                if self._get_wifi_interface():
+                    return True, False
+            return False, False
+        if not self._recover_wlan0():
+            return False, False
+        time.sleep(self._SETTLE_SECONDS)
+        present = bool(self._get_wifi_interface())
+        return present, present
 
     async def _generic_backend_switch_worker(self, target: str):
         """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
@@ -10191,14 +10268,22 @@ class Plugin:
             merged = await asyncio.to_thread(self._merged_nm_backend)
             if merged is not None and merged != target:
                 self._put_back_backend_conf(before)
+                # Name the file when it is one we know (Bazzite's iwd.conf),
+                # so there is something to act on.
+                where = await asyncio.to_thread(self._file_naming_backend, merged)
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
                     "success": False,
                     "backend": merged,
                     "target": target,
                     "message": (
-                        f"Another NetworkManager setting on this system keeps "
-                        f"{merged} in force, so nothing was changed."
+                        f"Another NetworkManager setting on this system "
+                        + (f"({where}) " if where else "")
+                        + f"keeps {merged} in force, so nothing was changed. "
+                        + ("To switch, remove or change that setting first."
+                           if where else
+                           "To switch, find the file in /etc/NetworkManager/conf.d "
+                           "that sets wifi.backend and change it first.")
                     ),
                 }
                 return
@@ -10234,14 +10319,18 @@ class Plugin:
                 # Going on would leave NetworkManager pointed at a backend
                 # that is not running and the other one stopped: no WiFi.
                 # Put the previous one back first.
-                await asyncio.to_thread(self._restore_generic_backend, other)
+                present, recovered = await asyncio.to_thread(
+                    self._restore_generic_backend, other)
                 detail = started.get("stderr", "")[:200]
                 self._backend_switch["phase"] = "failed"
                 self._log_detail("_generic_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
-                    "message": f"{target} would not start, so {other} was kept.",
+                    "recovery_performed": recovered,
+                    "needs_reboot": not present,
+                    "message": (f"{target} would not start, so {other} was kept. "
+                                + self._after_restore_text(present)),
                     "detail": detail,
                 }
                 return
@@ -10255,75 +10344,40 @@ class Plugin:
                 # The old backend is stopped and disabled by now, and
                 # NetworkManager may not be running at all. Put the previous
                 # one back, as when the new one would not start.
-                await asyncio.to_thread(self._restore_generic_backend, other)
+                present, recovered = await asyncio.to_thread(
+                    self._restore_generic_backend, other)
                 detail = restart.get("stderr", "")[:200]
                 self._backend_switch["phase"] = "failed"
                 self._log_detail("_generic_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
+                    "recovery_performed": recovered,
+                    "needs_reboot": not present,
                     "message": self._friendly_backend_error(detail),
                     "detail": detail,
                 }
                 return
 
-            # Phase: reconnecting
+            # Phase: reconnecting. The interface first: stopping iwd destroys
+            # it on every radio but rtw88 (iwd owns the netdev on drivers
+            # outside its default-interface list: ath11k, mt7921e, iwlwifi,
+            # rtw89), and wpa_supplicant never makes one. Waiting for a
+            # reconnection without it timed out and then reported success,
+            # on a device with no WiFi until a reboot.
             self._backend_switch["phase"] = "reconnecting"
+            iface, recovery_performed = await self._settle_interface(target)
             reconnect_timed_out = True
-            for _ in range(15):
+            for _ in range(15 if iface else 0):
                 await asyncio.sleep(1)
-                iface = await asyncio.to_thread(self._get_wifi_interface)
-                if iface:
+                if await asyncio.to_thread(self._get_wifi_interface):
                     uuid = await asyncio.to_thread(self._get_active_connection_uuid)
                     if uuid:
                         reconnect_timed_out = False
                         break
 
-            # Judged from what is running, not from the file just written:
-            # reading that back always agreed with itself. Another file in
-            # conf.d can still win (Bazzite's iwd.conf sorts after ours), and
-            # the service can fail after starting. Allow a few seconds for a
-            # service that is still coming up.
-            final_backend = None
-            for _ in range(5):
-                final_backend = await asyncio.to_thread(self._effective_generic_backend)
-                if final_backend == target:
-                    break
-                await asyncio.sleep(1)
-
-            if final_backend == target:
-                self._backend_switch["phase"] = "done"
-                self._backend_switch["result"] = {
-                    "success": True,
-                    "backend": final_backend,
-                    "target": target,
-                    "recovery_performed": False,
-                    "needs_reboot": False,
-                    "reconnect_timed_out": reconnect_timed_out,
-                }
-            else:
-                # Put the previous backend back rather than leave a half
-                # switch: the new one is not in force and the old one is
-                # stopped and disabled.
-                await asyncio.to_thread(self._restore_generic_backend, other)
-                self._backend_switch["phase"] = "failed"
-                self._backend_switch["result"] = {
-                    "success": False,
-                    "backend": final_backend,
-                    "target": target,
-                    "recovery_performed": False,
-                    "needs_reboot": False,
-                    "reconnect_timed_out": reconnect_timed_out,
-                    "message": (
-                        f"{target} did not take over, so {other} was put back. "
-                        f"A reboot may help."
-                    ),
-                }
-
-            decky.logger.info(
-                f"generic backend switch: target={target}, final={final_backend}, "
-                f"reconnect_timed_out={reconnect_timed_out}"
-            )
+            await self._judge_generic_switch(target, other, bool(iface),
+                                             recovery_performed, reconnect_timed_out)
         except asyncio.CancelledError:
             # Ended part way, so the marker stays for the next load.
             cancelled = True
@@ -10348,6 +10402,77 @@ class Plugin:
             if not cancelled:
                 self._set_backend_marker(None)
             self._backend_switch["in_progress"] = False
+
+    async def _judge_generic_switch(self, target: str, other: str, iface: bool,
+                                    recovery_performed: bool, reconnect_timed_out: bool):
+        """The end of a generic switch: whether it took, and the result.
+
+        Judged from what is running, not from the file just written: reading
+        that back always agreed with itself. Another file in conf.d can still
+        win (Bazzite's iwd.conf sorts after ours), and the service can fail
+        after starting. Allow a few seconds for a service that is still
+        coming up. iface: whether the WiFi interface came back.
+        """
+        final_backend = None
+        for _ in range(5):
+            final_backend = await asyncio.to_thread(self._effective_generic_backend)
+            if final_backend == target:
+                break
+            await asyncio.sleep(1)
+
+        if final_backend == target and iface:
+            self._backend_switch["phase"] = "done"
+            self._backend_switch["result"] = {
+                "success": True,
+                "backend": final_backend,
+                "target": target,
+                "recovery_performed": recovery_performed,
+                "needs_reboot": False,
+                "reconnect_timed_out": reconnect_timed_out,
+            }
+        elif final_backend == target:
+            # Switched, but no interface could be had: the radio comes
+            # back with the next boot.
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "backend": final_backend,
+                "target": target,
+                "recovery_performed": recovery_performed,
+                "needs_reboot": True,
+                "reconnect_timed_out": reconnect_timed_out,
+                "message": "The WiFi backend was switched, but WiFi didn't come back. Restart the device.",
+            }
+        else:
+            # Put the previous backend back rather than leave a half
+            # switch: the new one is not in force and the old one is
+            # stopped and disabled.
+            present, recovered = await asyncio.to_thread(
+                self._restore_generic_backend, other)
+            self._backend_switch["phase"] = "failed"
+            self._backend_switch["result"] = {
+                "success": False,
+                "backend": final_backend,
+                "target": target,
+                "recovery_performed": recovery_performed or recovered,
+                "needs_reboot": not present,
+                "reconnect_timed_out": reconnect_timed_out,
+                "message": (f"{target} did not take over, so {other} was put back. "
+                            + self._after_restore_text(present)),
+            }
+
+        decky.logger.info(
+            f"generic backend switch: target={target}, final={final_backend}, "
+            f"iface={iface}, recovery={recovery_performed}, "
+            f"reconnect_timed_out={reconnect_timed_out}"
+        )
+
+    @staticmethod
+    def _after_restore_text(present: bool) -> str:
+        """What to do once the previous backend was put back."""
+        if present:
+            return "Restart the device, then try the switch again."
+        return "WiFi didn't come back. Restart the device."
 
     def _set_backend_marker(self, text: str | None):
         """Write, or with None remove, the marker of a switch under way."""
@@ -10397,10 +10522,11 @@ class Plugin:
                 f"so {other} is left disabled"
             )
         else:
-            self._restore_generic_backend(other)
+            present, _recovered = self._restore_generic_backend(other)
             decky.logger.info(
                 f"A backend switch to {target} was cut off part way and had not "
                 f"taken; put {other} back"
+                + ("" if present else ", but no WiFi interface came back; a reboot brings it back")
             )
 
     async def start_backend_switch(self, backend: str) -> dict:
@@ -10501,9 +10627,13 @@ class Plugin:
         finally:
             # Anything that returned without starting a worker gives the
             # reservation back, or every later switch reads "in progress".
+            # Without the previous switch's result: a panel that saw the
+            # reservation took it for a switch under way, and then showed
+            # that old result as this one's.
             if reserved and not launched and previous is not None:
                 self._backend_switch.clear()
                 self._backend_switch.update(previous)
+                self._backend_switch["result"] = None
 
     async def get_backend_switch_status(self) -> dict:
         """Return current phase and, when terminal, the final result."""
@@ -10531,7 +10661,7 @@ class Plugin:
                 "result": {
                     "success": False,
                     "target": "",
-                    "message": "Couldn't read the backend switch status.",
+                    "message": "Couldn't read the backend switch status. Try again in a moment.",
                 },
-                "message": "Couldn't read the backend switch status.",
+                "message": "Couldn't read the backend switch status. Try again in a moment.",
             }

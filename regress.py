@@ -32,6 +32,10 @@ m.PCIE_BASELINE_FILE = os.path.join(_run_dir, "pcie-baseline")
 m.BACKEND_SWITCH_MARKER = os.path.join(_run_dir, "backend-switch")
 m.UPDATE_LOCK_FILE = os.path.join(_run_dir, "update.lock")
 m.PROC_DIR = os.path.join(tempfile.mkdtemp(), "no-proc")
+# Nor the host's radios or radio switches: the backend switch's interface
+# recovery lists every wiphy, and the not-connected reason reads rfkill.
+m.SYSFS_IEEE80211 = os.path.join(tempfile.mkdtemp(), "no-ieee80211")
+m.Plugin.RFKILL_DIR = os.path.join(tempfile.mkdtemp(), "no-rfkill")
 # Nor where the host keeps its tools: a check run on a Mac would otherwise
 # see /usr/bin/sysctl turned into the Mac's /usr/sbin/sysctl.
 _REAL_TOOL_DIRS = getattr(m, "TOOL_DIRS", ())
@@ -7798,6 +7802,137 @@ def _d_netdev(root, name, module, operstate="up", link=("l1_aspm",), control="fi
     open(os.path.join(net, "operstate"), "w").write(operstate + "\n")
     return dev
 
+section("D1 the generic backend switch brings the WiFi interface back")
+try:
+    class IwdTakesIface(m.Plugin):
+        """A generic system whose radio iwd owns: stopping iwd destroys the
+        netdev, and wpa_supplicant never makes one. Only an `iw phy ...
+        interface add` (here _recover_wlan0) brings it back."""
+        _SETTLE_SECONDS = 0
+        _IWD_INTERFACE_WAIT = 0
+        def __init__(self, recovers=True, fail=()):
+            super().__init__(); self._ensure_backend_switch_state()
+            self.iface = "wlan0"; self.recovers = recovers; self.recovered = 0
+            self.cmds = []; self.fail = fail
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(cmd)
+            if cmd[1:3] == ["stop", "iwd"] or cmd[1:4] == ["disable", "--now", "iwd"]:
+                self.iface = None
+            if tuple(cmd[1:3]) in self.fail:
+                return {"success": False, "stdout": "", "stderr": "failed", "returncode": 1}
+            return _ok()
+        def _get_wifi_interface(self): return self.iface
+        def _get_active_connection_uuid(self): return "u" if self.iface else None
+        def _recover_wlan0(self):
+            self.recovered += 1
+            if self.recovers: self.iface = "wlan0"
+            return self.recovers
+        def _merged_nm_backend(self): return None
+        def _effective_generic_backend(self): return "wpa_supplicant"
+    _rc_d1 = m.GENERIC_BACKEND_CONF
+    asyncio.sleep = _no_sleep
+    try:
+        m.GENERIC_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "99-backend.conf")
+        g1 = IwdTakesIface(); asyncio.run(g1._generic_backend_switch_worker("wpa_supplicant"))
+        r1 = g1._backend_switch["result"] or {}
+        ok(r1.get("success") is True and r1.get("recovery_performed") is True
+           and g1.recovered == 1 and r1.get("reconnect_timed_out") is False,
+           f"iwd to wpa_supplicant recreates the interface iwd took with it, and says so ({r1})")
+        os.path.exists(m.GENERIC_BACKEND_CONF) and os.remove(m.GENERIC_BACKEND_CONF)
+        g2 = IwdTakesIface(recovers=False); asyncio.run(g2._generic_backend_switch_worker("wpa_supplicant"))
+        r2 = g2._backend_switch["result"] or {}
+        ok(r2.get("success") is False and r2.get("needs_reboot") is True,
+           f"and when it cannot, the switch is not reported as a success with no interface ({r2})")
+        os.path.exists(m.GENERIC_BACKEND_CONF) and os.remove(m.GENERIC_BACKEND_CONF)
+        # A failure branch that puts wpa_supplicant back after iwd took the interface.
+        class IwdToWpaFails(IwdTakesIface):
+            def _effective_generic_backend(self): return None
+        g3 = IwdToWpaFails(); g3.iface = "wlan0"
+        asyncio.run(g3._generic_backend_switch_worker("iwd"))
+        r3 = g3._backend_switch["result"] or {}
+        ok(r3.get("success") is False and "needs_reboot" in r3 and "recovery_performed" in r3,
+           f"a switch that is undone reports whether the interface came back ({r3})")
+        g4 = IwdTakesIface(); g4.iface = None
+        _back = g4._restore_generic_backend("wpa_supplicant")
+        ok(_back == (True, True) and g4.recovered == 1,
+           f"putting wpa_supplicant back recreates a missing interface ({_back})")
+        g5 = IwdTakesIface(recovers=False); g5.iface = None
+        ok(g5._restore_generic_backend("wpa_supplicant") == (False, False),
+           "and says when there is none")
+        open(m.BACKEND_SWITCH_MARKER, "w").write("wpa_supplicant iwd\n")
+        g6 = IwdTakesIface(); g6.iface = None
+        g6._reconcile_backend_switch()
+        ok(g6.recovered == 1, "a switch cut off part way is undone with the interface brought back too")
+    finally:
+        asyncio.sleep = _d_real_sleep
+        m.GENERIC_BACKEND_CONF = _rc_d1
+        if os.path.exists(m.BACKEND_SWITCH_MARKER): os.remove(m.BACKEND_SWITCH_MARKER)
+
+    # SteamOS's helper: the interface is checked on every driver, not only ath11k.
+    _rv_d1 = m.WIFI_BACKEND_CONF
+    try:
+        m.WIFI_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "99-valve.conf")
+        class HelperNoIface(m.Plugin):
+            def __init__(self):
+                super().__init__(); self._ensure_backend_switch_state()
+                self.iface = None; self.recovered = 0
+            def _run_cmd(self, cmd, timeout=5): return _ok()
+            def _get_wifi_interface(self): return self.iface
+            def _get_active_connection_uuid(self): return "u" if self.iface else None
+            def _recover_wlan0(self):
+                self.recovered += 1; self.iface = "wlan0"; return True
+            def _get_current_backend(self): return "wpa_supplicant"
+            def _valve_powersave(self): return None
+        m._save_settings({**m.DEFAULT_SETTINGS, "driver": "mt7921e", "distro_id": "steamos"})
+        asyncio.sleep = _no_sleep
+        try:
+            hn = HelperNoIface(); asyncio.run(hn._backend_switch_worker("wpa_supplicant"))
+        finally:
+            asyncio.sleep = _d_real_sleep
+        rh = hn._backend_switch["result"] or {}
+        ok(hn.recovered == 1 and rh.get("recovery_performed") is True and rh.get("success") is True,
+           f"the SteamOS helper path recovers a missing interface on mt7921e too ({rh})")
+    finally:
+        m.WIFI_BACKEND_CONF = _rv_d1
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+    import inspect as _d_insp
+    _hsrc = _d_insp.getsource(m.Plugin._backend_switch_worker)
+    ok("has_wlan0_quirk" not in _hsrc and all(ord(c) < 128 for c in _hsrc),
+       "with no ath11k-only interface check, and a plain ASCII docstring")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+    asyncio.sleep = _d_real_sleep
+
+section("D7 on other systems the backend in use is the one running")
+try:
+    class Running(m.Plugin):
+        def __init__(self, active=("iwd",)): super().__init__(); self.active = active
+        def _get_current_backend(self): return "wpa_supplicant"
+        def _get_backend_method_cached(self): return True
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[:2] == ["/usr/bin/systemctl", "is-active"]:
+                return _ok("active") if cmd[2] in self.active else \
+                    {"success": False, "stdout": "inactive", "stderr": "", "returncode": 3}
+            return _ok()
+    m._save_settings({**m.DEFAULT_SETTINGS, "distro_id": "bazzite"})
+    _st7 = {"live": {}}; Running()._collect_backend_state(_st7)
+    ok(Running()._backend_is_iwd() is True and _st7["live"].get("wifi_backend") == "iwd"
+       and _st7["live"].get("wifi_backend_next") == "wpa_supplicant",
+       f"config says wpa_supplicant while iwd still runs: iwd is in use, wpa_supplicant next ({_st7['live']})")
+    _st7b = {"live": {}}; Running(active=("iwd", "wpa_supplicant"))._collect_backend_state(_st7b)
+    ok(_st7b["live"].get("wifi_backend") == "wpa_supplicant" and "wifi_backend_next" not in _st7b["live"],
+       "with both running there is no telling, so the configured one stands")
+    m._save_settings({**m.DEFAULT_SETTINGS, "distro_id": "steamos"})
+    _st7c = {"live": {}}; Running()._collect_backend_state(_st7c)
+    ok(_st7c["live"].get("wifi_backend") == "wpa_supplicant" and "wifi_backend_next" not in _st7c["live"]
+       and Running()._backend_is_iwd() is False,
+       "and SteamOS answers from its configuration as before")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("D8 driver parameters only for the card they belong to, and only while associated")
 try:
     _r8 = tempfile.mkdtemp()
@@ -7867,6 +8002,23 @@ try:
                                    "LOG_TAG=t", "APPLIED=0"], {"sysctl": 1, "ip": 0, "logger": 0}, _r10)
     ok("APPLIED=0" in _o10b and any("nothing took" in l for l in _l10b),
        "and buffer tuning that every sysctl refused is not either")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D17 a switch request that stops early does not bring back the last result")
+try:
+    class EarlyOut(m.Plugin):
+        def _has_backend_tool(self): return True
+        def _get_current_backend(self): return "iwd"
+        def _get_backend_method(self): return "steamos"
+    eo = EarlyOut(); eo._ensure_backend_switch_state()
+    eo._backend_switch.update({"phase": "done", "target": "iwd",
+                               "result": {"success": True, "backend": "iwd", "target": "iwd"}})
+    _r17 = asyncio.run(eo.start_backend_switch("iwd"))
+    ok(_r17.get("reason") == "already_set" and eo._backend_switch["in_progress"] is False
+       and eo._backend_switch["result"] is None and eo._backend_switch["phase"] == "done",
+       f"the reservation is given back without the previous switch's result ({eo._backend_switch})")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
