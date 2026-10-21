@@ -8041,70 +8041,119 @@ class Plugin:
             decky.logger.error(f"repair_drifted error: {e}")
             return self._unexpected_response(e)
 
+    # How long Reset spends taking pins off profiles. Ones it does not reach
+    # stay tracked, and the leftover-pin cleanup takes them off later.
+    _RESET_PIN_BUDGET = 30
+
     async def reset_settings(self) -> dict:
-        """Delete settings and revert to defaults."""
+        """Undo everything and go back to the defaults, with everything off."""
+        # A profile change of its own: it rewrites the profiles the lock,
+        # band, DNS and IPv6 setters write, so none of them may run alongside.
         # An update reloads the plugin when it finishes, which would cut a
-        # reset off between clearing the pins and saving the defaults.
-        if self._update_running():
+        # reset off part way; a backend switch restarts NetworkManager under it.
+        if self._profile_change_refused():
             return dict(self._BUSY_RESULT)
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
-            # Before the settings naming them are discarded.
-            self._clear_profile_pins()
-            # Revert runtime state
-            self._release_power_save()
-            self._release_regdomain()
-            self._revert_queue_tuning(_load_settings())
-            # A settings file set aside as unreadable is kept through a reset,
-            # since it may be the only copy of what the user had. Whether
-            # they have already dismissed the notice about it is kept too:
-            # dropping that would bring back a notice they have seen, about a
-            # file that has not changed.
-            acknowledged = _load_settings().get("corrupt_acknowledged", [])
-            # In the user's directory: _remove_no_follow, which does not
-            # follow a link swapped in anywhere along the way.
-            for path in (SETTINGS_FILE, LEGACY_ENFORCED_FILE):
-                try:
-                    _remove_no_follow(path)
-                except FileNotFoundError:
-                    pass
-            for path in (ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE):
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
-            # Diagnostics too: they describe the setup being reset. In the
-            # user's directory, so a directory planted at the name is logged
-            # rather than allowed to fail the whole reset.
-            try:
-                _remove_no_follow(_diagnostics_path())
-            except FileNotFoundError:
-                pass
-            except OSError as e:
-                decky.logger.error(f"reset_settings could not remove diagnostics: {e}")
-            await asyncio.to_thread(self._release_generic_backend_conf)
-
-            # Repopulate model/driver so the plugin doesn't show as "UNKNOWN /
-            # Unsupported device" until the next plugin reload. Mirrors the
-            # hardware detection _main does on startup.
-            info = await self.get_device_info()
-            fresh = copy.deepcopy(DEFAULT_SETTINGS)
-            fresh["model"] = info.get("model", "unknown")
-            fresh["driver"] = info.get("driver", "unknown")
-            fresh["device_family"] = info.get("device_family", "unknown")
-            fresh["device_label"] = info.get("device_label", "Unknown Device")
-            fresh["chip_label"] = info.get("chip_label", "unknown")
-            fresh["supports_6ghz"] = info.get("supports_6ghz", False)
-            distro = self._detect_distro()
-            fresh["distro_id"] = distro["id"]
-            fresh["distro_name"] = distro["name"]
-            fresh["corrupt_acknowledged"] = acknowledged
-            _save_settings(fresh)
-
-            decky.logger.info("Settings reset to defaults")
-            return {"success": True, "message": "Settings reset to defaults"}
+            # And no streaming pass may put the fixes back while they come
+            # off, or take them off half way through.
+            async with self._stream_guard():
+                return await self._reset_locked()
         except Exception as e:
             decky.logger.error(f"reset_settings error: {e}")
             return self._unexpected_response(e)
+        finally:
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
+            )
+
+    async def _reset_locked(self) -> dict:
+        before = _load_settings()
+        # The new settings are saved before anything is undone. The
+        # dispatcher reapplies whatever the settings say on every reconnect,
+        # and the old ones said on until the very end.
+        #
+        # Power save is saved off, which is not the default a fresh install
+        # gets. Reset has just turned it back on, so a default of off-is-on
+        # read as drifted at once, and the dispatcher put it back off at the
+        # next reconnect with nobody having asked.
+        #
+        # The pins are kept, and what this install owns: the leftover-pin
+        # cleanup works from both, and the profiles still carry them until
+        # they are taken off below.
+        info = await self.get_device_info()
+        fresh = copy.deepcopy(DEFAULT_SETTINGS)
+        fresh["model"] = info.get("model", "unknown")
+        fresh["driver"] = info.get("driver", "unknown")
+        fresh["device_family"] = info.get("device_family", "unknown")
+        fresh["device_label"] = info.get("device_label", "Unknown Device")
+        fresh["chip_label"] = info.get("chip_label", "unknown")
+        fresh["supports_6ghz"] = info.get("supports_6ghz", False)
+        distro = self._detect_distro()
+        fresh["distro_id"] = distro["id"]
+        fresh["distro_name"] = distro["name"]
+        # A settings file set aside as unreadable is kept through a reset,
+        # since it may be the only copy of what the user had. Whether they
+        # have already dismissed the notice about it is kept too: dropping
+        # that would bring back a notice they have seen, about a file that
+        # has not changed.
+        fresh["corrupt_acknowledged"] = before.get("corrupt_acknowledged", [])
+        fresh["power_save_disabled"] = False
+        fresh["pins_owned"] = list(before.get("pins_owned", []))
+        for key in ("bssid_lock_uuids", "band_preference_uuids", "ipv6_uuids", "dns_uuids"):
+            fresh[key] = list(before.get(key, []))
+        _save_settings(fresh)
+
+        left = await asyncio.to_thread(
+            self._clear_profile_pins, time.monotonic() + self._RESET_PIN_BUDGET, before
+        )
+        await asyncio.to_thread(self._release_power_save, before)
+        await asyncio.to_thread(self._release_regdomain, before)
+        await asyncio.to_thread(self._revert_queue_tuning, before)
+        try:
+            _remove_no_follow(LEGACY_ENFORCED_FILE)
+        except FileNotFoundError:
+            pass
+        for path in (ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        # Diagnostics too: they describe the setup being reset. In the
+        # user's directory, so a directory planted at the name is logged
+        # rather than allowed to fail the whole reset.
+        try:
+            _remove_no_follow(_diagnostics_path())
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            decky.logger.error(f"reset_settings could not remove diagnostics: {e}")
+        await asyncio.to_thread(self._release_generic_backend_conf)
+        # A pin released before the reset is not news after it.
+        self._pin_released_at = 0
+        self._released_at = {}
+        self._repoll_after_release = False
+        self._offline_since = None
+        self._stream_match = None
+
+        # Auto-fix is on in the defaults, so the script has to be there for
+        # the toggle to tell the truth: with auto-fix off before, there was
+        # none. With every fix off it applies nothing.
+        installed = self._install_dispatcher()
+        if not installed:
+            self._remove_dispatcher()
+        settings = _load_settings()
+        settings.update(left)
+        settings["auto_fix_on_wake"] = installed
+        _save_settings(settings)
+        if any(left.values()):
+            decky.logger.info(
+                f"Reset left {sum(len(v) for v in left.values())} profile pin(s) "
+                "it could not take off; they stay tracked and are retried"
+            )
+
+        decky.logger.info("Settings reset to defaults")
+        return {"success": True, "message": "Settings reset to defaults"}
 
     # ---- Streaming auto mode ----
     #
@@ -8223,6 +8272,13 @@ class Plugin:
         if not settings.get("streaming_mode_enabled"):
             return
         found = await asyncio.to_thread(self._find_stream, self._stream_patterns(settings))
+        # Looked at again after the wait. Everything that turns auto mode
+        # off takes the stream guard this pass holds, so it cannot have
+        # changed, but a pass that went on regardless would put the fixes
+        # back under settings that no longer have auto mode at all.
+        settings = _load_settings()
+        if not settings.get("streaming_mode_enabled"):
+            return
         held = os.path.isfile(STREAM_HOLD_FILE)
         was_open = os.path.isfile(STREAM_FLAG_FILE)
         if found or held:

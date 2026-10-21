@@ -5509,6 +5509,116 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("Reset: everything off, nothing lost, nothing alongside")
+try:
+    import threading as _thr3
+    R1, R2, R3 = ("eeeeeeee-0000-0000-0000-0000000000a1", "eeeeeeee-0000-0000-0000-0000000000a2",
+                  "eeeeeeee-0000-0000-0000-0000000000a3")
+    class Resetting(m.Plugin):
+        def __init__(self, refuse=(), slow=0.0, installs=True):
+            super().__init__(); self.cmds = []; self.mods = []; self.refuse = set(refuse)
+            self.slow = slow; self.installs = installs; self.installed = None
+            self.on_loop = []; self.depth = []; self.ps_at_revert = []
+        async def get_device_info(self):
+            return {"success": True, "model": "lcd", "driver": "rtw88", "device_family": "deck_lcd",
+                    "device_label": "Steam Deck LCD", "chip_label": "WiFi 5 (RTL8822CE)",
+                    "supports_6ghz": False}
+        def _detect_distro(self): return {"id": "steamos", "name": "SteamOS"}
+        def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+        def _get_wifi_interface(self): return "wlan0"
+        def _valve_powersave(self): return "3"
+        def _nmcli_modify(self, uuid, key, value, timeout=5):
+            self.on_loop.append(_thr3.current_thread() is _thr3.main_thread())
+            self.depth.append(getattr(self, "_profile_change_depth", 0))
+            if self.slow: time.sleep(self.slow)
+            self.mods.append((uuid, key, value))
+            if uuid in self.refuse:
+                return {"success": False, "stdout": "", "stderr": "permission denied", "returncode": 1}
+            return _ok()
+        def _apply_driver_fixes(self, enable, persist=True):
+            self.ps_at_revert.append(m._load_settings()["power_save_disabled"])
+        def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+        def _install_dispatcher(self): self.installed = self.installs; return self.installs
+        def _remove_dispatcher(self): return True
+        def _release_generic_backend_conf(self): pass
+    def _before(**extra):
+        m._save_settings({**m.DEFAULT_SETTINGS, "power_save_disabled": True, "auto_fix_on_wake": False,
+                          "bssid_lock_enabled": True, "bssid_lock_uuids": [R1, R2],
+                          "bssid_lock_connection_uuid": R1, "dns_enabled": True, "dns_uuids": [R3],
+                          "pins_owned": ["802-11-wireless.bssid"], "cake_enabled": True, **extra})
+    _before()
+    rs = Resetting(refuse=[R2])
+    r = asyncio.run(rs.reset_settings())
+    _after = m._load_settings()
+    ok(r.get("success") is True and _after["power_save_disabled"] is False,
+       "Reset saves power save off: it has just turned it back on, so on would read as drifted "
+       "and the dispatcher would put it back off by itself")
+    ok(rs.ps_at_revert and all(v is False for v in rs.ps_at_revert),
+       f"and saves it before anything comes off, so nothing reapplies it part way ({rs.ps_at_revert})")
+    ok(_after["bssid_lock_uuids"] == [R2] and _after["pins_owned"] == ["802-11-wireless.bssid"]
+       and _after["dns_uuids"] == [] and _after["bssid_lock_enabled"] is False,
+       "a pin that would not come off stays tracked, with what this install owns, for the cleanup to finish")
+    ok(rs.installed is True and _after["auto_fix_on_wake"] is True,
+       "auto-fix reads on, as the defaults have it, with the script actually put in place")
+    _before()
+    rs = Resetting(installs=False); asyncio.run(rs.reset_settings())
+    ok(m._load_settings()["auto_fix_on_wake"] is False,
+       "and reads off when the script could not be installed")
+    ok(rs.on_loop and not any(rs.on_loop), "the profile writes run off the event loop")
+    ok(rs.depth and all(d == 1 for d in rs.depth),
+       "holding the profile-change guard, so no lock, band, DNS or IPv6 change runs alongside")
+    _before(); rs = Resetting(); rs._pin_released_at = time.time(); rs._released_at = {"x": 1.0}
+    asyncio.run(rs.reset_settings())
+    ok(not getattr(rs, "_pin_released_at", 0) and not getattr(rs, "_released_at", {}),
+       "a pin released before the reset is not still announced after it")
+    # Out of time: what is left stays tracked, rather than Reset taking minutes.
+    _before(bssid_lock_uuids=[f"eeeeeeee-0000-0000-0000-0000000001{i:02d}" for i in range(8)],
+            bssid_lock_connection_uuid="")
+    rs = Resetting(slow=0.2); rs._RESET_PIN_BUDGET = 1.0
+    _t = time.monotonic(); asyncio.run(rs.reset_settings()); _took = time.monotonic() - _t
+    ok(_took < 1.5 and 0 < len(m._load_settings()["bssid_lock_uuids"]) < 8,
+       f"Reset's pin clearing stops at its budget and keeps the rest tracked ({_took:.1f}s, "
+       f"{len(m._load_settings()['bssid_lock_uuids'])} left)")
+    # Refused while something else is changing the same things.
+    for what, setup in [
+        ("another profile change is mid-flight", lambda p: setattr(p, "_profile_change_depth", 1)),
+        ("the WiFi backend is being switched",
+         lambda p: (p._ensure_backend_switch_state(), p._backend_switch.update(in_progress=True))),
+    ]:
+        _before(); rs = Resetting(); setup(rs)
+        r = asyncio.run(rs.reset_settings())
+        ok(r.get("error") == "busy" and not rs.mods and m._load_settings()["power_save_disabled"] is True,
+           f"Reset refuses while {what}, touching nothing")
+    # A streaming pass applying or taking off the fixes finishes first.
+    async def _reset_waits():
+        _before(); rs = Resetting()
+        guard = rs._stream_guard(); await guard.acquire()
+        task = asyncio.ensure_future(rs.reset_settings())
+        await asyncio.sleep(0.05)
+        early = (list(rs.mods), m._load_settings()["power_save_disabled"])
+        guard.release(); await task
+        return early
+    _early = asyncio.run(_reset_waits())
+    ok(_early == ([], True), f"Reset waits for a streaming pass in progress ({_early})")
+
+    # The pass itself: auto mode turned off while it looked for a stream.
+    class LateOff(m.Plugin):
+        def __init__(self): super().__init__(); self.applied = 0; self.reverted = 0
+        def _find_stream(self, patterns):
+            m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": False})
+            return {"app": "Moonlight", "process": "moonlight"}
+        async def reapply_volatile(self): self.applied += 1; return {"success": True}
+        def _revert_volatile_fixes(self, settings): self.reverted += 1
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True})
+    for _fl in (m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE):
+        if os.path.exists(_fl): os.remove(_fl)
+    lo = LateOff(); asyncio.run(lo._stream_pass())
+    ok(lo.applied == 0 and not os.path.exists(m.STREAM_FLAG_FILE),
+       "a streaming pass that finds auto mode gone after its search applies nothing")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("diagnostics: no network names or addresses")
 try:
     _IW_DEV = ("phy#0\n\tInterface wlan0\n\t\tifindex 3\n\t\twdev 0x1\n"
