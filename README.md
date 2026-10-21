@@ -1,4 +1,4 @@
-# WiFi Optimizer v0.24.4
+# WiFi Optimizer v0.24.5-beta
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, a reboot usually fixes it. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
@@ -47,7 +47,7 @@ Releases are signed. From v0.21.0-beta on, before installing an update, the plug
 1. Open WiFi Optimizer from the Decky sidebar
 2. Tap **Optimize Safe**. This applies four optimizations that suit most setups (three when the WiFi backend is `iwd`, where the BSSID lock is left out):
    - Disables WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
-   - Locks your BSSID (stops background scanning interruptions, but also stops roaming between access points, see below)
+   - Locks you to one access point (stops background scanning interruptions, but also stops roaming between access points, see below). If the lock is already on for another network, it is left there
    - Enables auto-fix on wake (reapplies settings after sleep)
    - Tunes network buffers (handles streaming traffic bursts)
 3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
@@ -116,7 +116,7 @@ seconds whether a streaming app is running.
 
 ## Uninstall
 
-**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. WiFi power save goes back on straight away (unless Steam's own WiFi power management setting has it off), and a WiFi region chosen in the plugin is put back. Power save then follows the plugin's defaults until you uninstall. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. On SteamOS the WiFi backend choice (iwd vs wpa_supplicant) is Valve's own setting and is left as it is. On other systems, a backend chosen from the plugin goes back to the system's default from the next boot, and that backend's service is turned back on so WiFi still works. Uninstalling from Decky does the same.
+**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. WiFi power save goes back on straight away (unless Steam's own WiFi power management setting has it off), the driver's power settings go back to what your system had, and a WiFi region chosen in the plugin is put back. Prevent lag spikes then stays off until you turn it on again. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. On SteamOS the WiFi backend choice (iwd vs wpa_supplicant) is Valve's own setting and is left as it is. On other systems, a backend chosen from the plugin goes back to the system's default from the next boot, and that backend's service is turned back on so WiFi still works. One thing is left in place: where a network is saved more than once, the plugin gives the copy you use a higher autoconnect priority so the same copy is picked every time, and that priority stays, since it does no harm. Uninstalling from Decky does the same.
 
 Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
 
@@ -125,8 +125,12 @@ sudo rm -rf ~/homebrew/plugins/WiFi\ Optimizer
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-wifi-optimizer
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
 sudo rm -f /etc/modprobe.d/99-wifi-optimizer.conf
+sudo nmcli general reload conf
+rm -rf ~/homebrew/settings/WiFi\ Optimizer
 sudo systemctl restart plugin_loader
 ```
+
+Restart the device afterwards: WiFi power save, the driver's power settings and the PCIe power states go back to your system's own from the next boot.
 
 If you switched the WiFi backend from the plugin on a system other than SteamOS, switch it back in the plugin before removing it by hand, or leave `/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf` in place: removing that file alone leaves the other backend turned off.
 
