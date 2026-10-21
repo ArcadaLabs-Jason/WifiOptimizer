@@ -1,10 +1,18 @@
 name: CI
 
+# Pushing to beta or main is itself a release: plugins up to 0.20.0-beta on
+# the beta channel install the beta branch as it stands, and install.sh falls
+# back to main when GitHub's API does not answer. So CI must never be the
+# reason to push either branch. It runs on a pushed release tag (which
+# release.sh requires to have passed before it publishes), on a pull request,
+# or by hand from the Actions tab, and never on a branch push. The branches
+# are moved to the tag only after release.sh has published it.
 on:
   push:
-    branches: [beta, main]
+    tags: ['v*']
   pull_request:
     branches: [beta, main]
+  workflow_dispatch:
 
 # Read-only: this workflow builds and tests, it never writes to the repo.
 permissions:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # WiFi Optimizer - Decky Plugin Installer
-# Usage: curl -sL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
+# Usage: curl -fsSL https://github.com/ArcadaLabs-Jason/WifiOptimizer/raw/main/install.sh -o /tmp/wifi-opt-install.sh && sudo bash /tmp/wifi-opt-install.sh
 
 set -e
 
@@ -56,8 +56,16 @@ TMP_DIR=$(mktemp -d)
 STAGE_DIR="$USER_HOME/homebrew/.wifi-optimizer-stage"
 OLD_DIR="$USER_HOME/homebrew/.wifi-optimizer-previous"
 
+# Set just before the installed copy is moved aside. If the script is cut
+# off (a closed terminal, Ctrl+C) before the new copy is in its place, the
+# old one goes back, so the plugin folder is never left missing. A missing
+# folder would also make the dispatcher remove itself at the next connect.
+MOVED_ASIDE=false
 cleanup() {
     rm -rf "$TMP_DIR" "$STAGE_DIR"
+    if [ "$MOVED_ASIDE" = true ] && [ ! -d "$PLUGIN_DIR" ] && [ -d "$OLD_DIR" ]; then
+        mv "$OLD_DIR" "$PLUGIN_DIR" && echo "Interrupted: the previous version was put back."
+    fi
 }
 trap cleanup EXIT
 
@@ -91,6 +99,7 @@ if [ -d "$PLUGIN_DIR" ]; then
     echo "Upgrading existing installation..."
     UPGRADING=true
     rm -rf "$OLD_DIR"
+    MOVED_ASIDE=true
     mv "$PLUGIN_DIR" "$OLD_DIR"
 else
     echo "Installing to $PLUGIN_DIR..."
@@ -103,7 +112,9 @@ if ! mv "$STAGE_DIR" "$PLUGIN_DIR"; then
     fi
     exit 1
 fi
-rm -rf "$OLD_DIR"
+# The new copy is in place; a previous copy that will not delete is only
+# clutter, so it must not stop the restart below.
+rm -rf "$OLD_DIR" || true
 
 # Restart Decky
 echo "Restarting Decky Loader..."

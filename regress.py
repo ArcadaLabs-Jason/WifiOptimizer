@@ -6471,6 +6471,118 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("J5 CI runs on a release tag, never on a push to beta or main")
+# A push to beta is a release for plugins up to 0.20.0-beta on the beta
+# channel (they install the branch as it stands), and install.sh installs main
+# when GitHub's API does not answer. CI used to run only on those pushes, so
+# every release was out before it was checked or signed. CI now runs on a
+# pushed v* tag, on pull requests and by hand; the branches move to the tag
+# only after release.sh has published it.
+try:
+    _wf = open(".github/workflows/ci.yml").read()
+    _on = re.search(r"^on:\n((?:[ #].*\n|\n)*)", _wf, re.M)
+    _on = _on.group(1) if _on else ""
+    _push = re.search(r"^  push:\n((?:    .*\n)*)", _on, re.M)
+    _push = _push.group(1) if _push else ""
+    ok(re.search(r"^    tags: \[\s*'v\*'\s*\]\s*$", _push, re.M) is not None,
+       "CI runs when a v* tag is pushed")
+    ok("branches" not in _push, "and never on a push to a branch")
+    ok(re.search(r"^  workflow_dispatch:", _on, re.M) is not None, "it can also be run by hand")
+    ok(re.search(r"^  pull_request:", _on, re.M) is not None, "and on pull requests")
+    ok("release.sh" in _wf[:_wf.index("\non:")], "the workflow says why, next to its triggers")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("R1 install.sh never leaves the plugin folder missing")
+# A closed terminal or Ctrl+C between moving the installed copy aside and
+# moving the new one into place used to leave no plugin folder; at the next
+# connect the dispatcher then removed itself and the conf files. Run for real
+# with stubbed root, network and systemctl, and a SIGHUP in that window.
+try:
+    import shutil, subprocess as _rsp
+    _inst = open("install.sh").read()
+    ok(re.search(r'rm -rf "\$OLD_DIR" \|\| true', _inst) is not None,
+       "a previous copy that will not delete does not stop the restart")
+    _bash, _mv = shutil.which("bash"), shutil.which("mv")
+    if not (_bash and _mv and shutil.which("tar")):
+        ok(False, "bash, mv and tar are needed to run install.sh here")
+    else:
+        _t = tempfile.mkdtemp(); _bin = os.path.join(_t, "bin"); os.mkdir(_bin)
+        _pay = os.path.join(_t, "pay", "WifiOptimizer-9.9.9")
+        for _f in ("plugin.json", "package.json", "main.py", "decky.pyi", "dist/index.js",
+                   "defaults/dispatcher.sh.tmpl"):
+            os.makedirs(os.path.dirname(os.path.join(_pay, _f)), exist_ok=True)
+            open(os.path.join(_pay, _f), "w").write("new\n")
+        _tgz = os.path.join(_t, "payload.tgz")
+        _rsp.run(["tar", "czf", _tgz, "-C", os.path.dirname(_pay), "WifiOptimizer-9.9.9"], check=True)
+        _home = os.path.join(_t, "home")
+        _stubs = {
+            "id": "echo 0\n",
+            "getent": f'echo "deck:x:1000:1000::{_home}:/bin/bash"\n',
+            "systemctl": 'echo "systemctl $*" >> "$STUB_LOG"\n',
+            # The release lookup answers with a tag; the download writes the payload.
+            "curl": ('out=""; prev=""\nfor a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+                     f'if [ -n "$out" ]; then cp "{_tgz}" "$out"; else echo \'  "tag_name": "v9.9.9",\'; fi\n'),
+            # Hangs up on the installer right after it moves the installed copy aside.
+            "mv": (f'"{_mv}" "$@" || exit $?\n'
+                   'case "$2" in *.wifi-optimizer-previous) [ -n "$HUP_AFTER_ASIDE" ] && kill -HUP $PPID ;; esac\n'
+                   'exit 0\n'),
+        }
+        for _n, _body in _stubs.items():
+            _p = os.path.join(_bin, _n); open(_p, "w").write("#!" + _bash + "\n" + _body); os.chmod(_p, 0o755)
+        _plug = os.path.join(_home, "homebrew", "plugins", "WiFi Optimizer")
+        def _install(hup):
+            shutil.rmtree(_home, ignore_errors=True); os.makedirs(_plug)
+            open(os.path.join(_plug, "main.py"), "w").write("old\n")
+            _env = dict(os.environ, PATH=_bin + os.pathsep + os.environ.get("PATH", ""), SUDO_USER="deck",
+                        STUB_LOG=os.path.join(_t, "log"), HUP_AFTER_ASIDE="1" if hup else "")
+            _r = _rsp.run([_bash, os.path.abspath("install.sh")], env=_env, capture_output=True, text=True, timeout=60)
+            _main = os.path.join(_plug, "main.py")
+            return _r, (open(_main).read().strip() if os.path.isfile(_main) else None)
+        _r, _got = _install(hup=True)
+        ok(_got == "old", "hung up between the two moves: the installed copy is put back")
+        ok(not os.path.exists(os.path.join(_home, "homebrew", ".wifi-optimizer-previous")),
+           "and nothing is left aside")
+        _r, _got = _install(hup=False)
+        ok(_r.returncode == 0 and _got == "new", "an uninterrupted install still installs the new copy")
+        shutil.rmtree(_t, ignore_errors=True)
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("R2 the VS Code deploy works against a root-owned plugin folder")
+# The plugin folder belongs to root after install.sh, the updater or Decky
+# 3.1.10+, the folder name has a space, and sudo over ssh needs a terminal.
+try:
+    _tasks = {t["label"]: t for t in json.load(open(".vscode/tasks.json"))["tasks"]}
+    _defs = json.load(open(".vscode/defsettings.json"))
+    ok("pnpm@10" in _tasks["pnpmsetup"]["command"] and "pnpm@9" not in _tasks["pnpmsetup"]["command"],
+       "the setup task installs pnpm 10, as the README and CI use")
+    _dep = _tasks["deploy"]["command"]
+    ok('\\"${config:deckdir}/homebrew/plugins/${config:pluginname}/\\"' in json.dumps(_dep)
+       or '"${config:deckdir}/homebrew/plugins/${config:pluginname}/"' in _dep,
+       "the plugin folder, whose name has a space, is quoted")
+    ok("ssh -t" in _dep and "sudo rsync" in _dep and "sudo chown -R root:root" in _dep,
+       "it installs as root over an ssh session with a terminal, so sudo can ask for the password")
+    ok("--exclude='*'" in _dep and all(x not in _dep for x in (".claude", ".mcp.json", ".kijito_persona", "--exclude node_modules")),
+       "only the plugin's own files are copied, nothing else from the working folder")
+    ok("ssh -t" in _tasks["restartdecky"]["command"], "restarting Decky also runs sudo with a terminal")
+    ok("deckpass" not in _defs and "deckpass" not in json.dumps(_tasks), "no unused password setting")
+    _rd = open("README.md").read()
+    _bfs = _rd[_rd.index("## Building from source"):]
+    _bfs = _bfs[:_bfs.index("\n## ", 5)]
+    ok("pnpm 10" in _bfs and "password" in _bfs and "IP and password" not in _bfs and "sudo" in _bfs,
+       "the README's build section says what the deploy needs")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("R3 install.sh's own usage line fails on an HTTP error")
+try:
+    _usage = [l for l in open("install.sh").read().splitlines() if l.startswith("# Usage:")]
+    ok(len(_usage) == 1 and "curl -fsSL " in _usage[0] and "curl -sL " not in _usage[0],
+       "the usage line uses curl -fsSL, so an error page is never run by sudo bash")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("release signatures: checked strictly, and required for every update")
 try:
     import base64, hashlib
