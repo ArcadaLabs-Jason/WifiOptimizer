@@ -294,6 +294,11 @@ NM_6GHZ_WPA_PSK = (1, 58, 1)
 # single argument, so there is no shell involved, but the value is stored and
 # replayed later and should be addresses and nothing else.
 DNS_SERVER_RE = re.compile(r"^[0-9A-Fa-f:.]{2,45}\Z")
+# Custom servers go into the profile's ipv4.dns, which NetworkManager only
+# accepts IPv4 addresses for: anything else got as far as nmcli and came
+# back as a failure that read like a broken network.
+DNS_IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+                         r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\Z")
 
 
 DNS_PROVIDERS = {
@@ -851,7 +856,9 @@ def _write_system_conf(path: str, content: str) -> bool:
         with open(path, "r") as f:
             if f.read(65536) == content:
                 return False
-    except OSError:
+    except (OSError, ValueError):
+        # Missing, or not text (UnicodeDecodeError is a ValueError): a file
+        # that cannot be read is replaced like one that differs.
         pass
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".new")
@@ -2305,14 +2312,14 @@ class Plugin:
             return None, None, {
                 "success": False,
                 "error": "no_wifi",
-                "message": "Not connected to WiFi",
+                "message": "Not connected to WiFi. Connect first, then try again.",
             }
         uuid = self._get_active_connection_uuid()
         if not uuid:
             return iface, None, {
                 "success": False,
                 "error": "no_wifi",
-                "message": "No active WiFi connection",
+                "message": "Not connected to WiFi. Connect first, then try again.",
             }
         return iface, uuid, None
 
@@ -3311,14 +3318,24 @@ class Plugin:
                 "error": "settings_unwritable",
                 "message": (
                     "Couldn't save the plugin's settings, so the panel may not "
-                    "match what is applied. Check the Decky log for details."
+                    "match what is applied. Try again. If it keeps happening, restart "
+                    "the device."
                 ),
             }
         return {
             "success": False,
             "error": "unexpected",
-            "message": "Something went wrong. Check the Decky log for details.",
+            "message": ("Something went wrong. Try again. If it keeps happening, use "
+                        "Copy diagnostics at the bottom of this panel and report it."),
         }
+
+    @staticmethod
+    def _log_detail(where: str, detail) -> None:
+        """Log the command output behind a failure the panel reports in
+        plain words. The panel no longer shows it, so this is where a report
+        finds it."""
+        if detail:
+            decky.logger.error(f"{where} failed: {str(detail)[:300]}")
 
     def _nmcli_modify(self, uuid: str, key: str, value: str, timeout: int = 5) -> dict:
         """Run `nmcli con mod uuid <uuid> <key> <value>`. Returns the
@@ -3351,7 +3368,7 @@ class Plugin:
             return None, {
                 "success": False,
                 "error": "nmcli_failed",
-                "message": "No connection UUID found. Connect to WiFi first.",
+                "message": "Connect to WiFi first.",
             }
         return uuid, None
 
@@ -3410,6 +3427,7 @@ class Plugin:
                 self._run_cmd, ["/usr/bin/iw", "reg", "set", target], 5
             )
             if not applied["success"]:
+                self._log_detail("set_regdomain", (applied.get("stderr") or "")[:200])
                 return {
                     "success": False, "error": "iw_failed",
                     "message": "Couldn't set the wireless region.",
@@ -4100,6 +4118,8 @@ class Plugin:
         self._record_reassert("priority", bumped["success"])
         if bumped["success"]:
             pending["priority_set"] = True
+            if uuid == getattr(self, "_dup_checked_for", None):
+                self._dup_outranks = True
         else:
             # Don't record it as done when it wasn't, or the profile
             # never gets the priority that stops NM preferring a
@@ -5526,6 +5546,13 @@ class Plugin:
     def _propose_band(self, settings: dict, uuid: str, live_band: str,
                       active_ssid, status: dict, actions: list):
         """Report band drift, and propose writing it back when that is safe."""
+        # On another network the preference is not ours to enforce, and the
+        # toggle reading plain "on" there claims a band that is not held.
+        scoped_to = settings.get("band_preference_ssid", "")
+        if settings.get("band_preference_enabled") and scoped_to:
+            here = active_ssid()
+            if here is not None and here != scoped_to:
+                status["live"]["band_other_network"] = True
         expected_band = settings.get("band_preference", "a")
         if (
             not self._band_preference_applies_here(settings, active_ssid)
@@ -5908,6 +5935,7 @@ class Plugin:
         # list existed, which applied to whichever network was in use.
         tracked = settings.get("dns_uuids", [])
         if tracked and uuid not in tracked:
+            status["live"]["dns_other_network"] = True
             return
         want = str(settings.get("dns_servers", "")).replace(",", " ").split()
         if not want:
@@ -6189,8 +6217,9 @@ class Plugin:
                 uuid, "802-11-wireless-security.key-mgmt", "wpa-psk"
             )
             if not done["success"]:
+                self._log_detail("allow_wpa2", done["stderr"])
                 return {"success": False, "error": "nmcli_failed",
-                        "message": "Couldn't change the network's security",
+                        "message": "Couldn't change the network's security. Try again in a moment.",
                         "detail": done["stderr"]}
             if not await self._reconnected_to(uuid):
                 self._nmcli_modify(uuid, "802-11-wireless-security.key-mgmt", "sae")
@@ -6290,14 +6319,15 @@ class Plugin:
         # An install marked done long ago can still be sitting on a tie - and
         # with duplicates present that tie is what makes one network behave
         # like two. Reuse the rivals already read here rather than enumerating
-        # them again.
-        if rivals and settings.get("priority_set"):
-            settled = self._precedence_priority(uuid, rivals=rivals)
-            if settled is not None:
-                actions.append({
-                    "kind": "priority", "uuid": uuid,
-                    "value": settled, "force": True,
-                })
+        # them again. Whether the profile in use already outranks them is
+        # also what the panel may claim about it.
+        settled = self._precedence_priority(uuid, rivals=rivals) if rivals else None
+        self._dup_outranks = bool(rivals) and settled is None
+        if settled is not None and settings.get("priority_set"):
+            actions.append({
+                "kind": "priority", "uuid": uuid,
+                "value": settled, "force": True,
+            })
         if self._dup_conflict:
             self._log_throttled(
                 "duplicate_profiles",
@@ -6307,6 +6337,18 @@ class Plugin:
                 f"which copy NetworkManager picks changes which access "
                 f"points are reachable",
             )
+
+    def _lock_held_elsewhere(self) -> bool:
+        """Whether the access point lock is on, for a network other than the
+        one in use (or one that cannot be read, which counts as other)."""
+        settings = _load_settings()
+        if not settings.get("bssid_lock_enabled"):
+            return False
+        uuid = self._get_active_connection_uuid()
+        if not uuid:
+            return False
+        ssid = self._get_profile_ssid(uuid)
+        return not self._lock_is_for_this_network(settings, uuid, ssid)
 
     def _lock_is_for_this_network(self, settings: dict, uuid: str,
                                  active_ssid: str | None,
@@ -6602,6 +6644,8 @@ class Plugin:
             self._recheck_rival_profiles(settings, uuid, active_ssid, actions)
             if getattr(self, "_dup_conflict", False):
                 status["external"]["duplicate_profiles"] = True
+                # Only claimed once the copy in use really outranks the rest.
+                status["duplicates_prioritized"] = bool(getattr(self, "_dup_outranks", False))
             self._report_network_problems(status, uuid, iface, active_ssid() or "", settings)
             self._report_lock_weaker(settings, status, uuid, iface,
                                      active_ssid() or "", link_out)
@@ -6658,10 +6702,11 @@ class Plugin:
                         settings = _load_settings()
                         settings["power_save_disabled"] = True
                         _save_settings(settings)
+                    self._log_detail("set_power_save", result["stderr"])
                     return {
                         "success": False,
                         "error": "iw_failed",
-                        "message": "Couldn't change WiFi power save",
+                        "message": "Couldn't change WiFi power save. Turn WiFi off and on, then try again.",
                         "detail": result["stderr"],
                     }
 
@@ -6676,7 +6721,11 @@ class Plugin:
                         "" if found is None
                         else found if found in _VALVE_POWERSAVE_VALUES else "?"
                     )
-                _write_system_conf(NM_CONF_PATH, "[connection]\nwifi.powersave = 2\n")
+                # NetworkManager keeps the config it read at startup, and
+                # turns power save back on at the next reconnect until it is
+                # told to read it again.
+                if _write_system_conf(NM_CONF_PATH, "[connection]\nwifi.powersave = 2\n"):
+                    await asyncio.to_thread(self._reload_nm_conf)
             elif not disabled:
                 # Only our own file can have put our value into Valve's. With
                 # none to remove (always so in streaming auto mode, which never
@@ -6799,15 +6848,16 @@ class Plugin:
             return {
                 "success": False,
                 "error": "nmcli_failed",
-                "message": "No connection UUID found. Connect to WiFi first.",
+                "message": "Connect to WiFi first.",
             }
 
         result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
         if not result["success"]:
+            self._log_detail("_release_lock_from_all_profiles", result["stderr"])
             return {
                 "success": False,
                 "error": "nmcli_failed",
-                "message": "Couldn't unlock BSSID",
+                "message": "Couldn't release the access point lock. Try again in a moment.",
                 "detail": result["stderr"],
             }
 
@@ -7109,7 +7159,7 @@ class Plugin:
             return {
                 "success": False,
                 "error": "nmcli_failed",
-                "message": "Couldn't lock BSSID",
+                "message": "Couldn't lock to this access point. Try again in a moment.",
                 "detail": result["stderr"],
             }
 
@@ -7484,7 +7534,7 @@ class Plugin:
                 return {
                     "success": False,
                     "error": "nmcli_failed",
-                    "message": f"Invalid band '{band}'. Must be 'a' (5 GHz), 'bg' (2.4 GHz) or '6GHz'.",
+                    "message": "Choose 5 GHz, 2.4 GHz or 6 GHz.",
                 }
             if enabled and await asyncio.to_thread(self._backend_is_iwd):
                 return {"success": False, "error": "needs_wpa_supplicant",
@@ -7569,10 +7619,11 @@ class Plugin:
                                  if settings.get("band_preference_enabled") else "")
             result = self._nmcli_modify(uuid, "802-11-wireless.band", value)
             if not result["success"]:
+                self._log_detail("set_band_preference", result["stderr"])
                 return {
                     "success": False,
                     "error": "nmcli_failed",
-                    "message": "Couldn't update band preference",
+                    "message": "Couldn't change the band preference. Try again in a moment.",
                     "detail": result["stderr"],
                 }
 
@@ -7600,7 +7651,7 @@ class Plugin:
                     return {
                         "success": False,
                         "error": "nmcli_failed",
-                        "message": "Couldn't release the access point lock for the band change",
+                        "message": "Couldn't release the access point lock for the band change. Try again in a moment.",
                         "detail": unlocked["stderr"],
                     }
 
@@ -7675,37 +7726,41 @@ class Plugin:
                     if not custom_servers or not custom_servers.strip():
                         return {
                             "success": False,
-                            "error": "nmcli_failed",
-                            "message": "Custom DNS servers cannot be empty",
+                            "error": "invalid_dns",
+                            "message": "Enter at least one DNS server address.",
                         }
                     # Older versions stored the field as typed, and nmcli
                     # also accepts commas, so a list saved that way is valid.
                     servers = " ".join(custom_servers.replace(",", " ").split())
                     parts = servers.split()
                     if len(parts) > 6 or not all(
-                        DNS_SERVER_RE.match(part) for part in parts
+                        DNS_IPV4_RE.match(part) for part in parts
                     ):
                         return {
                             "success": False,
-                            "error": "nmcli_failed",
-                            "message": "DNS servers must be a space-separated list of IP addresses.",
+                            "error": "invalid_dns",
+                            "message": (
+                                "Custom DNS takes up to six IPv4 addresses with spaces "
+                                "between them, for example 1.1.1.1 9.9.9.9."
+                            ),
                         }
                 elif provider in DNS_PROVIDERS:
                     servers = DNS_PROVIDERS[provider]
                 else:
                     return {
                         "success": False,
-                        "error": "nmcli_failed",
-                        "message": f"Unknown DNS provider '{provider}'",
+                        "error": "invalid_dns",
+                        "message": "Choose a DNS provider from the list.",
                     }
 
                 previous = self._read_profile_field(uuid, "ipv4.dns")
                 result = self._nmcli_modify(uuid, "ipv4.dns", servers)
                 if not result["success"]:
+                    self._log_detail("set_dns", result["stderr"])
                     return {
                         "success": False,
                         "error": "nmcli_failed",
-                        "message": "Couldn't set DNS",
+                        "message": "Couldn't set this network's DNS servers. Try again in a moment.",
                         "detail": result["stderr"],
                     }
 
@@ -7715,10 +7770,11 @@ class Plugin:
                     # Put the profile back the way it was rather than leave a
                     # change the settings do not record.
                     self._nmcli_modify(uuid, "ipv4.dns", previous.replace(",", " "))
+                    self._log_detail("set_dns", result2["stderr"])
                     return {
                         "success": False,
                         "error": "nmcli_failed",
-                        "message": "Couldn't set ignore-auto-dns",
+                        "message": "Couldn't switch this network to these DNS servers. Try again in a moment.",
                         "detail": result2["stderr"],
                     }
             else:
@@ -7736,18 +7792,20 @@ class Plugin:
                 # DNS recorded as off, the drift check would not report it.
                 restored = self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
                 if not restored["success"]:
+                    self._log_detail("set_dns", restored["stderr"])
                     return {
                         "success": False,
                         "error": "nmcli_failed",
-                        "message": "Couldn't restore automatic DNS",
+                        "message": "Couldn't give this network its router's DNS back. Try again in a moment.",
                         "detail": restored["stderr"],
                     }
                 cleared = self._nmcli_modify(uuid, "ipv4.dns", "")
                 if not cleared["success"]:
+                    self._log_detail("set_dns", cleared["stderr"])
                     return {
                         "success": False,
                         "error": "nmcli_failed",
-                        "message": "Couldn't clear the custom DNS servers",
+                        "message": "Couldn't clear the custom DNS servers. Try again in a moment.",
                         "detail": cleared["stderr"],
                     }
                 servers = ""
@@ -7795,10 +7853,11 @@ class Plugin:
             method = "disabled" if disabled else "auto"
             result = self._nmcli_modify(uuid, "ipv6.method", method)
             if not result["success"]:
+                self._log_detail("set_ipv6", result["stderr"])
                 return {
                     "success": False,
                     "error": "nmcli_failed",
-                    "message": "Couldn't update IPv6 setting",
+                    "message": "Couldn't change IPv6 for this network. Try again in a moment.",
                     "detail": result["stderr"],
                 }
 
@@ -8007,10 +8066,11 @@ class Plugin:
                     "cake", "unlimited", "diffserv4", "nat", "ack-filter",
                 ])
                 if not result["success"]:
+                    self._log_detail("set_cake", result.get("stderr", ""))
                     return {
                         "success": False,
                         "error": "unexpected",
-                        "message": "Failed to apply CAKE qdisc.",
+                        "message": "Couldn't turn on CAKE. If it keeps failing, this system may not include it.",
                         "detail": result.get("stderr", ""),
                     }
                 # Lower txqueuelen to complement CAKE's queue management
@@ -8085,6 +8145,14 @@ class Plugin:
             # so Optimize Safe leaves it out rather than report it failed.
             if await asyncio.to_thread(self._backend_is_iwd):
                 total -= 1
+            elif await asyncio.to_thread(self._lock_held_elsewhere):
+                # Turning it on again here would move the lock off the
+                # network it was set on, which nobody asked Optimize to do.
+                total -= 1
+                results["bssid_lock"] = {
+                    "success": True,
+                    "message": "Left as it is: the access point lock is on for another network.",
+                }
             else:
                 r = await self.set_bssid_lock(True)
                 results["bssid_lock"] = r
@@ -8298,7 +8366,7 @@ class Plugin:
                     "total": 0,
                     "applied": 0,
                     "results": {},
-                    "message": "No optimizations enabled",
+                    "message": "No optimizations are turned on.",
                 }
 
             result = {
@@ -8878,7 +8946,7 @@ class Plugin:
         """Set the update channel to 'stable' or 'beta'."""
         try:
             if channel not in ("stable", "beta"):
-                return {"success": False, "message": "Channel must be 'stable' or 'beta'"}
+                return {"success": False, "message": "Choose Stable or Beta."}
             settings = _load_settings()
             settings["update_channel"] = channel
             _save_settings(settings)
@@ -9036,7 +9104,7 @@ class Plugin:
                     "current_version": current,
                     "update_available": False,
                     "channel": channel,
-                    "message": "Couldn't reach GitHub",
+                    "message": "Couldn't reach GitHub to check for updates. Check the connection and try again.",
                 }
 
             data = json.loads(result["stdout"])
@@ -9061,11 +9129,17 @@ class Plugin:
                 }
 
             if not latest:
-                # GitHub explains a refusal (a rate limit) in "message".
-                msg = data.get("message") if isinstance(data, dict) else None
-                if not isinstance(msg, str) or not msg:
-                    msg = "No releases found." if channel == "beta" else "couldn't parse version"
-                decky.logger.error(f"Update check: no version - {msg}")
+                # GitHub explains a refusal (a rate limit) in "message". Its
+                # wording is logged as is but never shown: it is English for
+                # developers, and a rate limit names the network's address.
+                raw = data.get("message") if isinstance(data, dict) else None
+                raw = raw if isinstance(raw, str) else ""
+                decky.logger.error(f"Update check: no version - {raw[:200] or 'none given'}")
+                if "rate limit" in raw.lower():
+                    msg = ("GitHub is limiting update checks from this network "
+                           "for now. Try again in an hour.")
+                else:
+                    msg = "GitHub didn't list a release to update to. Try again later."
                 return {
                     "success": False,
                     "current_version": current,
@@ -9423,8 +9497,8 @@ class Plugin:
     # ---- WiFi backend switch (iwd / wpa_supplicant) ----
 
     _BACKEND_SWITCH_UNEXPECTED = (
-        "The WiFi backend switch stopped on an unexpected error. "
-        "Check the Decky log for details."
+        "The WiFi backend switch stopped on an unexpected error. If WiFi "
+        "doesn't come back, restart the device."
     )
 
     async def _backend_switch_worker(self, target: str):
@@ -9540,11 +9614,12 @@ class Plugin:
                     "target": target,
                     "recovery_performed": recovery_performed,
                     "needs_reboot": True,
-                    "message": "Backend switched but wlan0 didn't come back. Reboot required.",
+                    "message": "The WiFi backend was switched, but WiFi didn't come back. Restart the device.",
                 }
             elif not restart_result["success"] or final_backend != target:
                 detail = rs_stderr[:200] or rs_stdout[:200]
                 self._backend_switch["phase"] = "failed"
+                self._log_detail("_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "backend": final_backend,
@@ -9575,7 +9650,7 @@ class Plugin:
             self._backend_switch["result"] = {
                 "success": False,
                 "target": target,
-                "message": "Backend switch cancelled",
+                "message": "The WiFi backend switch was cancelled.",
             }
             raise
         except Exception as e:
@@ -9726,6 +9801,7 @@ class Plugin:
                 )
                 iface, recovered = await self._settle_interface(in_force)
                 self._backend_switch["phase"] = "failed"
+                self._log_detail("_steamos_manager_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
@@ -9778,7 +9854,7 @@ class Plugin:
                     "recovery_performed": recovery_performed,
                     "needs_reboot": True,
                     "reconnect_timed_out": reconnect_timed_out,
-                    "message": "Backend switched but the WiFi interface didn't come back. Reboot required.",
+                    "message": "The WiFi backend was switched, but WiFi didn't come back. Restart the device.",
                 }
             elif final_backend == target:
                 self._backend_switch["phase"] = "done"
@@ -9816,7 +9892,7 @@ class Plugin:
             self._backend_switch["result"] = {
                 "success": False,
                 "target": target,
-                "message": "Backend switch cancelled",
+                "message": "The WiFi backend switch was cancelled.",
             }
             raise
         except Exception as e:
@@ -10138,6 +10214,7 @@ class Plugin:
             if not enabled["success"]:
                 self._put_back_backend_conf(before)
                 self._backend_switch["phase"] = "failed"
+                self._log_detail("_generic_backend_switch_worker", enabled.get("stderr", "")[:200])
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
@@ -10160,6 +10237,7 @@ class Plugin:
                 await asyncio.to_thread(self._restore_generic_backend, other)
                 detail = started.get("stderr", "")[:200]
                 self._backend_switch["phase"] = "failed"
+                self._log_detail("_generic_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
@@ -10180,6 +10258,7 @@ class Plugin:
                 await asyncio.to_thread(self._restore_generic_backend, other)
                 detail = restart.get("stderr", "")[:200]
                 self._backend_switch["phase"] = "failed"
+                self._log_detail("_generic_backend_switch_worker", detail)
                 self._backend_switch["result"] = {
                     "success": False,
                     "target": target,
@@ -10252,7 +10331,7 @@ class Plugin:
             self._backend_switch["result"] = {
                 "success": False,
                 "target": target,
-                "message": "Backend switch cancelled",
+                "message": "The WiFi backend switch was cancelled.",
             }
             raise
         except Exception as e:
@@ -10335,13 +10414,13 @@ class Plugin:
                 return {
                     "accepted": False,
                     "reason": "invalid_backend",
-                    "message": "Backend must be 'iwd' or 'wpa_supplicant'.",
+                    "message": "Choose iwd or wpa_supplicant.",
                 }
             if self._backend_switch.get("in_progress"):
                 return {
                     "accepted": False,
                     "reason": "in_progress",
-                    "message": "Backend switch already in progress.",
+                    "message": "A WiFi backend switch is already running.",
                 }
             if self._update_running():
                 return {
@@ -10374,7 +10453,7 @@ class Plugin:
                 return {
                     "accepted": False,
                     "reason": "tool_missing",
-                    "message": "WiFi backend switch tool not found on this system.",
+                    "message": "This system has no way to switch the WiFi backend.",
                 }
             current = await asyncio.to_thread(self._get_current_backend)
             method = await asyncio.to_thread(self._get_backend_method)
@@ -10388,7 +10467,7 @@ class Plugin:
                 return {
                     "accepted": False,
                     "reason": "already_set",
-                    "message": f"Backend is already {backend}.",
+                    "message": f"WiFi already uses {backend}.",
                     "backend": current,
                 }
 
@@ -10417,7 +10496,7 @@ class Plugin:
             return {
                 "accepted": False,
                 "reason": "unexpected",
-                "message": "Couldn't start the WiFi backend switch. Check the Decky log for details.",
+                "message": "Couldn't start the WiFi backend switch. Try again in a moment.",
             }
         finally:
             # Anything that returned without starting a worker gives the

@@ -4800,6 +4800,111 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("NetworkManager reads our power save file as soon as it is written")
+try:
+    _rn_nm = m.NM_CONF_PATH
+    m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+    class Reloads(m.Plugin):
+        def __init__(self): super().__init__(); self.reloads = 0
+        def _get_wifi_interface(self): return None
+        def _apply_driver_fixes(self, *a, **k): pass
+        def _apply_pcie_aspm_fix(self, *a, **k): return []
+        def _valve_powersave(self): return "3"
+        def _reload_nm_conf(self): self.reloads += 1
+    try:
+        m._save_settings({**m.DEFAULT_SETTINGS, "power_save_disabled": False})
+        _rl = Reloads(); asyncio.run(_rl.set_power_save(True))
+        ok(_rl.reloads == 1, "writing it has NetworkManager read its config again")
+        _rl = Reloads(); asyncio.run(_rl.set_power_save(True))
+        ok(_rl.reloads == 0, "and an unchanged file does not")
+    finally:
+        m.NM_CONF_PATH = _rn_nm
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("a system config file that is not text is replaced, not a dead end")
+try:
+    _bin = os.path.join(tempfile.mkdtemp(), "99-x.conf")
+    open(_bin, "wb").write(b"\xff\xfe\x00garbage")
+    ok(m._write_system_conf(_bin, "[connection]\n") is True and open(_bin).read() == "[connection]\n",
+       "a file of undecodable bytes at the name is written over")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("the panel is told plainly what holds where")
+try:
+    _st = {"drift": {}, "external": {}, "live": {}}
+    m.Plugin()._propose_band({**m.DEFAULT_SETTINGS, "band_preference_enabled": True,
+                              "band_preference_ssid": "Home"}, A6, "", lambda: "Cafe", _st, [])
+    ok(_st["live"].get("band_other_network") is True and not _st["drift"],
+       "a band preference set on another network is reported as such, not as drift")
+    _st = {"drift": {}, "external": {}, "live": {}}
+    m.Plugin()._propose_band({**m.DEFAULT_SETTINGS, "band_preference_enabled": True,
+                              "band_preference_ssid": "Home"}, A6, "a", lambda: None, _st, [])
+    ok("band_other_network" not in _st["live"], "but not when the network in use could not be read")
+    _st = {"drift": {}, "external": {}, "live": {}}
+    m.Plugin()._check_dns_drift({**m.DEFAULT_SETTINGS, "dns_enabled": True, "dns_uuids": [A6]}, B6, _st)
+    ok(_st["live"].get("dns_other_network") is True, "and so is custom DNS set on another network")
+
+    class Rivals(m.Plugin):
+        prio = None
+        def _profile_key_mgmt(self, uuid): return "sae" if uuid == A6 else "wpa-psk"
+        def _rival_profiles(self, uuid, ssid): return [(B6, "wpa-psk")]
+        def _profile_pins(self, uuid): return {}
+        def _precedence_priority(self, uuid, rivals=None): return self.prio
+    _rv = Rivals(); _rv.prio = 5; _acts = []
+    _rv._recheck_rival_profiles({**m.DEFAULT_SETTINGS, "priority_set": False}, A6, lambda: "Home", _acts)
+    ok(_rv._dup_conflict and _rv._dup_outranks is False,
+       "duplicates still tied are not claimed as prioritized")
+    _rv._nmcli_modify = lambda *a, **k: _ok()
+    _rv._reassert_exhausted = lambda kind: False
+    _rv._apply_priority({"kind": "priority", "uuid": A6, "value": 5},
+                        {**m.DEFAULT_SETTINGS, "priority_set": False}, _st, {})
+    ok(_rv._dup_outranks is True, "and are once the priority has been written")
+    _rv2 = Rivals(); _rv2.prio = None
+    _rv2._recheck_rival_profiles({**m.DEFAULT_SETTINGS, "priority_set": True}, A6, lambda: "Home", [])
+    ok(_rv2._dup_outranks is True, "or when the copy in use already outranks the rest")
+
+    class DnsCheck(Dns):
+        pass
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    for _bad in ("2606:4700::1111", "1.1.1", "1.1.1.256", "01.1.1.1x"):
+        _r = asyncio.run(DnsCheck(A6).set_dns(True, "custom", _bad))
+        ok(_r.get("success") is False and _r.get("error") == "invalid_dns"
+           and "IPv4" in (_r.get("message") or ""),
+           f"custom DNS {_bad!r} is refused before nmcli sees it, saying what is accepted")
+    _r = asyncio.run(DnsCheck(A6).set_dns(True, "custom", "1.1.1.1, 9.9.9.9"))
+    ok(_r.get("success") is True, "while IPv4 addresses, commas or not, are taken")
+
+    _src_all_now = open("main.py").read()
+    _msgs = re.findall(r'"message": f?"([^"]*)"', _src_all_now)
+    # Messages built over several lines are caught by their phrases.
+    _msgs += re.findall(r"Decky log|Reboot required", _src_all_now)
+    _jargon = [t for t in _msgs if re.search(r"BSSID|UUID|wlan0|Decky log|Reboot required|qdisc|nmcli", t)]
+    ok(not _jargon, f"no message the panel shows uses jargon ({_jargon})")
+    _logged = []
+    _real_err = m.decky.logger.error
+    m.decky.logger.error = staticmethod(lambda msg: _logged.append(msg))
+    try:
+        class NoBand(Band):
+            def _nmcli_modify(self, uuid, key, value, timeout=5):
+                if key == "802-11-wireless.band" and value:
+                    return {"success": False, "stdout": "", "stderr": "Error: nope here", "returncode": 1}
+                return super()._nmcli_modify(uuid, key, value, timeout)
+        m._save_settings(band_settings())
+        _nb = NoBand(); _nb.bands_in_range = (5180,)
+        _r = asyncio.run(_nb.set_band_preference(True, "a"))
+    finally:
+        m.decky.logger.error = _real_err
+    ok(_r.get("success") is False and any("nope here" in l for l in _logged),
+       f"the command output the panel no longer shows is logged instead ({_r.get('message')!r})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("SteamOS after 3.9: Valve's holo names")
 try:
     ok(m._HOLO_BACKEND_HELPER == "/usr/bin/holo-polkit-helpers/holo-wifi-set-backend-privileged",
@@ -5062,6 +5167,21 @@ try:
     io = IwdOptimize(); r = asyncio.run(io.optimize_safe())
     ok(not io.locked and r.get("total") == 3 and r.get("applied") == 3,
        "Optimize Safe leaves the lock out under iwd instead of reporting it failed")
+    class ElsewhereOptimize(IwdOptimize):
+        def _backend_is_iwd(self): return False
+        def _get_active_connection_uuid(self): return B6
+        def _get_profile_ssid(self, uuid, timeout=5): return {A6: "Home", B6: "Cafe"}.get(uuid)
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                      "bssid_lock_connection_uuid": A6, "bssid_lock_uuids": [A6]})
+    io = ElsewhereOptimize(); r = asyncio.run(io.optimize_safe())
+    ok(not io.locked and r.get("total") == 3 and r.get("results", {}).get("bssid_lock", {}).get("success")
+       and "another network" in r["results"]["bssid_lock"].get("message", ""),
+       "Optimize Safe on another network leaves the lock where it was set, and says so")
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                      "bssid_lock_connection_uuid": B6, "bssid_lock_uuids": [B6]})
+    io = ElsewhereOptimize(); asyncio.run(io.optimize_safe())
+    ok(io.locked, "while on the locked network it is applied as before")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
 
     # Pins we wrote are cleared under iwd, even with the setting still on.
     LOCKU = "dddddddd-0000-0000-0000-0000000000e1"
@@ -6723,11 +6843,13 @@ try:
            "and a list with nothing usable offers nothing")
         _r, _ = _beta_check([])
         ok(_r.get("success") is False and _r.get("update_available") is False
-           and _r.get("message") == "No releases found.",
+           and "didn't list a release" in (_r.get("message") or ""),
            f"an empty list is handled, and said ({_r.get('message')!r})")
-        _r, _ = _beta_check(None, raw=json.dumps({"message": "API rate limit exceeded"}))
-        ok(_r.get("success") is False and _r.get("message") == "API rate limit exceeded",
-           "GitHub's own reason for refusing is passed on")
+        _r, _ = _beta_check(None, raw=json.dumps(
+            {"message": "API rate limit exceeded for 203.0.113.7. (But here's the good news...)"}))
+        ok(_r.get("success") is False and "203.0.113" not in (_r.get("message") or "")
+           and "limiting update checks" in (_r.get("message") or ""),
+           f"GitHub's rate limit is said plainly, without the address it names ({_r.get('message')!r})")
         _r, _ = _beta_check(None, raw="[" + " " * (m.RELEASES_LIST_MAX + 1) + "]")
         ok(_r.get("success") is False and _r.get("update_available") is False,
            "an answer too large to be real is not parsed")
