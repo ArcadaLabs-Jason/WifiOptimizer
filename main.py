@@ -234,6 +234,10 @@ STREAM_POLL_SECONDS = 5
 # Passes without a stream before the fixes come off. A stream app that
 # restarts, or a pass that lands mid-exec, should not flap them.
 STREAM_MISSES_TO_CLOSE = 2
+# Present while a backend switch on a system without SteamOS's own tools is
+# under way: "<previous> <target>". Left by a switch the plugin did not live
+# to finish, so the next load can finish or undo it.
+BACKEND_SWITCH_MARKER = "/run/wifi-optimizer/backend-switch"
 # What the PCIe power files held before we first changed them this boot.
 PCIE_BASELINE_FILE = "/run/wifi-optimizer/pcie-baseline"
 # Every path the baseline may name is under here; the file is root's, but a
@@ -2603,6 +2607,7 @@ class Plugin:
             self._acknowledge_update()
             self._rotate_logs()
             self._ensure_backend_switch_state()
+            await asyncio.to_thread(self._reconcile_backend_switch)
             info = await self.get_device_info()
             # Read here so the status collector can use it without forking.
             # Before the settings are loaded: anything saved during an await
@@ -3094,7 +3099,7 @@ class Plugin:
             return info
         except Exception as e:
             decky.logger.error(f"get_regdomain error: {e}")
-            return {"success": False, "error": str(e), "readable": False,
+            return {"success": False, "error": "unexpected", "readable": False,
                     "changeable": False, "self_managed": False,
                     "global": "", "governing": "", "phys": [], "setting": ""}
 
@@ -3494,7 +3499,8 @@ class Plugin:
             return {"success": True, "path": diag_path}
         except Exception as e:
             decky.logger.error(f"save_diagnostic_info error: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": "write_failed",
+                    "message": "Couldn't write the diagnostics file."}
 
     # ---- Status ----
 
@@ -9069,6 +9075,11 @@ class Plugin:
 
     # ---- WiFi backend switch (iwd / wpa_supplicant) ----
 
+    _BACKEND_SWITCH_UNEXPECTED = (
+        "The WiFi backend switch stopped on an unexpected error. "
+        "Check the Decky log for details."
+    )
+
     async def _backend_switch_worker(self, target: str):
         """Background task that switches the WiFi backend with phase transitions.
 
@@ -9226,7 +9237,9 @@ class Plugin:
             self._backend_switch["result"] = {
                 "success": False,
                 "target": target,
-                "message": str(e),
+                # The exception is in the log above. Its text is not for
+                # the panel, which shows this message as it is.
+                "message": self._BACKEND_SWITCH_UNEXPECTED,
             }
         finally:
             self._backend_switch["in_progress"] = False
@@ -9465,7 +9478,9 @@ class Plugin:
             self._backend_switch["result"] = {
                 "success": False,
                 "target": target,
-                "message": str(e),
+                # The exception is in the log above. Its text is not for
+                # the panel, which shows this message as it is.
+                "message": self._BACKEND_SWITCH_UNEXPECTED,
             }
         finally:
             self._backend_switch["in_progress"] = False
@@ -9684,13 +9699,21 @@ class Plugin:
 
     async def _generic_backend_switch_worker(self, target: str):
         """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
-        Writes NM config directly and manages systemd services."""
-        try:
-            other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
+        Writes NM config directly and manages systemd services.
 
+        A marker in /run says a switch is under way until it ends one way or
+        the other. A plugin reload or a kill part way leaves it behind, and
+        the next load finishes or undoes the switch (see
+        _reconcile_backend_switch) rather than leave NetworkManager pointed
+        at a backend that is not running.
+        """
+        other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
+        cancelled = False
+        try:
             self._backend_switch["phase"] = "switching"
             decky.logger.info(f"generic backend switch: {other} -> {target}")
 
+            self._set_backend_marker(f"{other} {target}")
             os.makedirs(os.path.dirname(GENERIC_BACKEND_CONF), exist_ok=True)
             try:
                 with open(GENERIC_BACKEND_CONF) as f:
@@ -9717,11 +9740,27 @@ class Plugin:
                 }
                 return
 
-            # Stop old, enable + start new, restart NM
+            # The new one is enabled before the old one is touched, and that
+            # is checked. Stopping and disabling first left a stretch with
+            # neither enabled (and no D-Bus alias for wpa_supplicant), which
+            # a failed enable, or a reload landing there, made a boot with
+            # no WiFi.
+            enabled = await asyncio.to_thread(
+                self._run_cmd, ["/usr/bin/systemctl", "enable", target], 10
+            )
+            if not enabled["success"]:
+                self._put_back_backend_conf(before)
+                self._backend_switch["phase"] = "failed"
+                self._backend_switch["result"] = {
+                    "success": False,
+                    "target": target,
+                    "message": f"{target} could not be enabled, so nothing was changed.",
+                    "detail": enabled.get("stderr", "")[:200],
+                }
+                return
             for cmd in [
                 ["/usr/bin/systemctl", "stop", other],
                 ["/usr/bin/systemctl", "disable", other],
-                ["/usr/bin/systemctl", "enable", target],
             ]:
                 await asyncio.to_thread(self._run_cmd, cmd, 10)
             started = await asyncio.to_thread(
@@ -9748,6 +9787,10 @@ class Plugin:
                 15,
             )
             if not restart["success"]:
+                # The old backend is stopped and disabled by now, and
+                # NetworkManager may not be running at all. Put the previous
+                # one back, as when the new one would not start.
+                await asyncio.to_thread(self._restore_generic_backend, other)
                 detail = restart.get("stderr", "")[:200]
                 self._backend_switch["phase"] = "failed"
                 self._backend_switch["result"] = {
@@ -9816,6 +9859,8 @@ class Plugin:
                 f"reconnect_timed_out={reconnect_timed_out}"
             )
         except asyncio.CancelledError:
+            # Ended part way, so the marker stays for the next load.
+            cancelled = True
             self._backend_switch["phase"] = "failed"
             self._backend_switch["result"] = {
                 "success": False,
@@ -9829,10 +9874,68 @@ class Plugin:
             self._backend_switch["result"] = {
                 "success": False,
                 "target": target,
-                "message": str(e),
+                # The exception is in the log above. Its text is not for
+                # the panel, which shows this message as it is.
+                "message": self._BACKEND_SWITCH_UNEXPECTED,
             }
         finally:
+            if not cancelled:
+                self._set_backend_marker(None)
             self._backend_switch["in_progress"] = False
+
+    def _set_backend_marker(self, text: str | None):
+        """Write, or with None remove, the marker of a switch under way."""
+        if text is None:
+            try:
+                os.remove(BACKEND_SWITCH_MARKER)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                decky.logger.error(f"Could not remove the backend switch marker: {e}")
+            return
+        try:
+            os.makedirs(os.path.dirname(BACKEND_SWITCH_MARKER), mode=0o755, exist_ok=True)
+        except OSError:
+            pass
+        _write_no_follow(BACKEND_SWITCH_MARKER, text + "\n")
+
+    def _reconcile_backend_switch(self):
+        """Finish or undo a backend switch this plugin did not see through.
+
+        The worker's marker is still there only if the plugin was reloaded,
+        or killed, part way through one. /run is cleared at boot, so it is
+        from this boot. If the new backend is in force the old one is left
+        disabled, so the two do not both start at the next boot; otherwise
+        the old one is put back, as a switch that failed would have done.
+        """
+        try:
+            fd = os.open(BACKEND_SWITCH_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return
+        try:
+            words = (os.read(fd, 64).decode("ascii", "replace").split()
+                     if _is_regular(os.fstat(fd).st_mode) else [])
+        except OSError:
+            words = []
+        finally:
+            os.close(fd)
+        self._set_backend_marker(None)
+        backends = ("iwd", "wpa_supplicant")
+        if len(words) != 2 or words[0] not in backends or words[1] not in backends:
+            return
+        other, target = words
+        if self._effective_generic_backend() == target:
+            self._run_cmd(["/usr/bin/systemctl", "disable", other], timeout=10)
+            decky.logger.info(
+                f"A backend switch to {target} was cut off part way; it had taken, "
+                f"so {other} is left disabled"
+            )
+        else:
+            self._restore_generic_backend(other)
+            decky.logger.info(
+                f"A backend switch to {target} was cut off part way and had not "
+                f"taken; put {other} back"
+            )
 
     async def start_backend_switch(self, backend: str) -> dict:
         """Kick off a backend switch. Returns immediately; poll get_backend_switch_status for progress."""
@@ -9927,7 +10030,7 @@ class Plugin:
             return {
                 "accepted": False,
                 "reason": "unexpected",
-                "message": str(e),
+                "message": "Couldn't start the WiFi backend switch. Check the Decky log for details.",
             }
         finally:
             # Anything that returned without starting a worker gives the
@@ -9962,7 +10065,7 @@ class Plugin:
                 "result": {
                     "success": False,
                     "target": "",
-                    "message": f"Couldn't read backend switch status: {e}",
+                    "message": "Couldn't read the backend switch status.",
                 },
-                "message": str(e),
+                "message": "Couldn't read the backend switch status.",
             }

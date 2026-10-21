@@ -3245,6 +3245,35 @@ try:
 finally:
     m.GENERIC_BACKEND_CONF = _real_conf
 
+# What went wrong is in the log. The panel shows these messages as they are,
+# and an exception's text is no message for anyone.
+class SwitchBoom(Switch):
+    def __init__(self): super().__init__(); self._ensure_backend_switch_state()
+    def _has_backend_tool(self): raise RuntimeError("Traceback /usr/lib/secret detail")
+r = asyncio.run(SwitchBoom().start_backend_switch("wpa_supplicant"))
+ok(r.get("accepted") is False and "secret" not in r.get("message", "") and r.get("message"),
+   f"a backend switch that fails to start says so plainly ({r.get('message')!r})")
+_real_conf_e = m.GENERIC_BACKEND_CONF
+try:
+    m.GENERIC_BACKEND_CONF = os.path.join(tempfile.mkdtemp(), "conf.d", "99-backend.conf")
+    class WorkerBoom(m.Plugin):
+        def __init__(self): super().__init__(); self._ensure_backend_switch_state()
+        def _merged_nm_backend(self): raise RuntimeError("Traceback /usr/lib/secret detail")
+    wb = WorkerBoom(); asyncio.run(wb._generic_backend_switch_worker("iwd"))
+    _wm = wb._backend_switch["result"].get("message", "")
+    ok(_wm and "secret" not in _wm, f"and so does one that fails part way ({_wm!r})")
+finally:
+    m.GENERIC_BACKEND_CONF = _real_conf_e
+class RegBoom(m.Plugin):
+    def _regdomain_info(self): raise RuntimeError("Traceback /usr/lib/secret detail")
+ok("secret" not in json.dumps(asyncio.run(RegBoom().get_regdomain())),
+   "reading the wireless region hands back no exception text")
+class DiagBoom(m.Plugin):
+    async def get_diagnostic_info(self): raise RuntimeError("Traceback /usr/lib/secret detail")
+_dr = asyncio.run(DiagBoom().save_diagnostic_info())
+ok(_dr.get("success") is False and "secret" not in json.dumps(_dr) and _dr.get("message"),
+   "nor does saving the diagnostics")
+
 section("auto-fix and CAKE: off only once actually off")
 
 class StuckDispatcher(m.Plugin):
@@ -3977,9 +4006,67 @@ try:
            "but left alone while iwd is installed")
         open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=wpa_supplicant\n")
         ok(NoIwd()._heal_orphaned_iwd_conf() is False, "and when it names wpa_supplicant")
+        os.remove(m.GENERIC_BACKEND_CONF)
+
+        # The new backend is enabled, and checked, before the old one is
+        # stopped or disabled. The other way round, a failed enable or a
+        # reload in between left neither enabled: no WiFi from the next boot.
+        class Takes(Outranked):
+            fail = ()
+            def _merged_nm_backend(self): return None
+            def _effective_generic_backend(self): return "iwd"
+            def _get_wifi_interface(self): return "wlan0"
+            def _get_active_connection_uuid(self): return "u"
+            def _run_cmd(self, cmd, timeout=5):
+                self.cmds.append(cmd)
+                self.marked = getattr(self, "marked", []) + [os.path.exists(m.BACKEND_SWITCH_MARKER)]
+                if tuple(cmd[1:3]) in self.fail:
+                    return {"success": False, "stdout": "", "stderr": "failed", "returncode": 1}
+                return _ok()
+        asyncio.sleep = _no_sleep
+        try:
+            tk = Takes(); asyncio.run(tk._generic_backend_switch_worker("iwd"))
+            _c = [c[1:3] for c in tk.cmds]
+            ok(tk._backend_switch["result"]["success"] is True
+               and _c.index(["enable", "iwd"]) < _c.index(["stop", "wpa_supplicant"])
+               and _c.index(["enable", "iwd"]) < _c.index(["disable", "wpa_supplicant"]),
+               f"switching enables the new backend before stopping or disabling the old ({_c})")
+            ok(all(tk.marked) and not os.path.exists(m.BACKEND_SWITCH_MARKER),
+               "with a marker in /run while it works, gone once it is done")
+            if os.path.exists(m.GENERIC_BACKEND_CONF): os.remove(m.GENERIC_BACKEND_CONF)
+            tk = Takes(); tk.fail = (("enable", "iwd"),)
+            asyncio.run(tk._generic_backend_switch_worker("iwd"))
+            ok(tk._backend_switch["result"]["success"] is False
+               and not any(c[1] in ("stop", "disable") for c in tk.cmds)
+               and not os.path.exists(m.GENERIC_BACKEND_CONF),
+               "a new backend that cannot be enabled stops the switch with nothing stopped or disabled")
+            tk = Takes(); tk.fail = (("restart", "NetworkManager"),)
+            asyncio.run(tk._generic_backend_switch_worker("iwd"))
+            _c = [c[1:3] for c in tk.cmds]
+            ok(tk._backend_switch["result"]["success"] is False
+               and ["start", "wpa_supplicant"] in _c[_c.index(["restart", "NetworkManager"]):],
+               "and when NetworkManager will not restart the previous backend is put back")
+        finally:
+            asyncio.sleep = _real_sleep2
+        # A switch the plugin did not live to finish is settled at the next load.
+        for effective, expect, label in [
+            ("iwd", ["disable", "wpa_supplicant"], "one that took has the old backend left disabled"),
+            (None, ["start", "wpa_supplicant"], "one that had not taken has the old backend put back"),
+        ]:
+            class Interrupted(Outranked):
+                def _effective_generic_backend(self): return effective
+            open(m.BACKEND_SWITCH_MARKER, "w").write("wpa_supplicant iwd\n")
+            ip = Interrupted()
+            getattr(ip, "_reconcile_backend_switch", lambda: None)()
+            ok(expect in [c[1:3] for c in ip.cmds] and not os.path.exists(m.BACKEND_SWITCH_MARKER),
+               f"a backend switch cut off part way is settled at the next load: {label}")
+        ip = Interrupted(); getattr(ip, "_reconcile_backend_switch", lambda: None)()
+        ok(not ip.cmds, "with no marker nothing is touched")
+        if os.path.exists(m.GENERIC_BACKEND_CONF): os.remove(m.GENERIC_BACKEND_CONF)
     finally:
         m.GENERIC_BACKEND_CONF = _real_conf
     ok("self._heal_orphaned_iwd_conf()" in _main_src, "_main runs that check")
+    ok("self._reconcile_backend_switch" in _main_src, "and the one for an interrupted switch")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
