@@ -8,6 +8,11 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 SETTINGS_FILE=__SETTINGS_PATH__
 PLUGIN_DIR=__PLUGIN_DIR__
 LOG_TAG="wifi-optimizer"
+# The name Decky knows the plugin by (plugin.json), and Decky's own settings,
+# which sit beside the plugin's settings folder.
+PLUGIN_NAME="WiFi Optimizer"
+LOADER_SETTINGS="${SETTINGS_FILE%/*/*}/loader.json"
+SYS_NET=/sys/class/net
 
 # Only fire on interface up
 [ "$2" != "up" ] && exit 0
@@ -109,6 +114,32 @@ if [ -z "$POWER_SAVE" ]; then
     logger -t "$LOG_TAG" "Settings parse failed, safe defaults only"
 fi
 
+# Disabled in Decky (Settings > Plugins): Decky stops the plugin but leaves
+# this script in place, and reapplying everything at each connect under a
+# plugin that reads as off made disabling it prove nothing. Decky's file is
+# read as data, under the same rules as the settings above (no link at the
+# name, no FIFO, a regular file, capped), and anything unreadable counts as
+# not disabled, which is how this behaved before.
+plugin_disabled() {
+    python3 -I - "$LOADER_SETTINGS" "$PLUGIN_NAME" 2>/dev/null <<'DISABLEDEOF'
+import json, os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        if (os.fstat(fh.fileno()).st_mode & 0o170000) != 0o100000:
+            raise ValueError("not a regular file")
+        raw = fh.read(262144)
+    names = json.loads(raw).get("disabled_plugins", [])
+    print("yes" if isinstance(names, list) and sys.argv[2] in names else "no")
+except Exception:
+    print("no")
+DISABLEDEOF
+}
+if [ "$(plugin_disabled)" = "yes" ]; then
+    logger -t "$LOG_TAG" "plugin disabled in Decky, nothing applied"
+    exit 0
+fi
+
 # Streaming auto mode: these fixes are only for while a stream runs, which
 # the plugin marks with a file in /run. Without it, leave them off.
 if [ "$STREAM_MODE" = "True" ] && [ ! -f /run/wifi-optimizer/streaming ]; then
@@ -116,10 +147,62 @@ if [ "$STREAM_MODE" = "True" ] && [ ! -f /run/wifi-optimizer/streaming ]; then
     exit 0
 fi
 
+# A WiFi driver that wedged on a bad wake leaves iw stuck in the kernel for
+# good, and every iw, ip or tc started for it after that joins it, holding
+# this connect, and NetworkManager's queue of dispatcher runs behind it. An iw
+# for this interface still running after several seconds is that, not a slow
+# command (the plugin's own give up within five). The sysfs writes below do
+# not go through the driver's netlink path, so they still run. A pgrep too old
+# to know -O fails, which reads as nothing stuck, as before.
+NETLINK_STUCK=0
+if pgrep -O 8 -f "^([^ ]*/)?iw dev $IFACE( |\$)" >/dev/null 2>&1; then
+    NETLINK_STUCK=1
+    logger -t "$LOG_TAG" "an earlier iw on $IFACE is still stuck, so iw, ip and tc are left out this time"
+fi
+
+# Whether $IFACE is the radio the settings' driver drives: its module is that
+# driver or a variant of it (rtw88_8822ce is rtw88). A second radio coming up,
+# a USB adapter, is not the card the driver fixes and the PCIe baseline are
+# about.
+iface_module() {
+    m=$(readlink -f "$SYS_NET/$1/device/driver/module" 2>/dev/null)
+    printf '%s' "${m##*/}"
+}
+OUR_CARD=0
+case "$(iface_module "$IFACE")" in
+    "$DRIVER"*) OUR_CARD=1 ;;
+esac
+# With no driver profile there is nothing to tell the radios apart by, and the
+# PCIe writes go to whichever came up, as they always did.
+[ "$DRIVER" = "unknown" ] && OUR_CARD=1
+
+# The first run of a boot that nothing of ours ran before: no PCIe baseline
+# yet, and no last_enforced either. A dispatcher from 0.24.3 or older wrote its
+# values and last_enforced without a baseline, and the plugin writes
+# last_enforced when it applies at startup, so with that file present the
+# values here are ours, not the system's, and are not recorded as the system's.
+FIRST_RUN=0
+if [ ! -e /run/wifi-optimizer/pcie-baseline ] && [ ! -e /run/wifi-optimizer/last_enforced ]; then
+    FIRST_RUN=1
+fi
+
 # Apply power save
 if [ "$POWER_SAVE" = "True" ]; then
-    iw dev "$IFACE" set power_save off 2>/dev/null
-    WIFI_PCI=$(readlink -f /sys/class/net/"$IFACE"/device 2>/dev/null)
+    # What took and what did not, so the log and last_enforced say only what
+    # really happened: every write here is silent on failure.
+    TOOK=0
+    FAILED=0
+    if [ "$NETLINK_STUCK" = 1 ]; then
+        :
+    elif iw dev "$IFACE" set power_save off 2>/dev/null; then
+        TOOK=$((TOOK + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+    WIFI_PCI=$(readlink -f "$SYS_NET/$IFACE/device" 2>/dev/null)
+    # Another radio's PCIe device is not the one the plugin manages and
+    # restores, so its files are left alone (no path, nothing below matches).
+    [ "$OUR_CARD" = 1 ] || WIFI_PCI=""
     # Driver-specific sysfs fixes, as in the plugin's DRIVER_PROFILES.
     DRIVER_PARAMS=""
     if [ "$DRIVER" = "rtw88" ]; then
@@ -129,21 +212,29 @@ if [ "$POWER_SAVE" = "True" ]; then
     elif [ "$DRIVER" = "mt7921e" ]; then
         DRIVER_PARAMS="/sys/module/mt7921e/parameters/disable_aspm"
     fi
+    [ "$OUR_CARD" = 1 ] || DRIVER_PARAMS=""
     # What they held before this write, in the journal. When WiFi does not
     # come back after sleep, the report is read after the reboot that fixed
-    # it, and this says whether the fixes were in force during that boot.
+    # it, and this says whether the fixes were in force during that boot. The
+    # first run of a boot marks its line "at load": that is what the driver
+    # loaded with, and later lines read Y because this script wrote it.
     if [ -n "$DRIVER_PARAMS" ]; then
         BEFORE=""
         for p in $DRIVER_PARAMS; do
             BEFORE="$BEFORE ${p##*/}=$(cat "$p" 2>/dev/null || echo missing)"
         done
-        logger -t "$LOG_TAG" "driver parameters before applying:$BEFORE"
+        if [ "$FIRST_RUN" = 1 ]; then
+            logger -t "$LOG_TAG" "driver parameters at load:$BEFORE"
+        else
+            logger -t "$LOG_TAG" "driver parameters before applying:$BEFORE"
+        fi
     fi
     # This runs at boot before the plugin loads, so the plugin only ever
     # saw our own values. Note what the system had, once per boot and
     # before the first write, so turning this off puts that back rather
-    # than a guess. Same file and format the plugin reads.
-    if [ ! -e /run/wifi-optimizer/pcie-baseline ]; then
+    # than a guess. Same file and format the plugin reads. Only for the
+    # radio the plugin manages: another one's values would stand in for it.
+    if [ "$FIRST_RUN" = 1 ] && [ "$OUR_CARD" = 1 ]; then
         python3 -I - "$WIFI_PCI" $DRIVER_PARAMS <<'PYEOF' 2>/dev/null
 import json, os, sys
 dev, params = sys.argv[1], sys.argv[2:]
@@ -192,41 +283,83 @@ with os.fdopen(fd, "w") as f:
     json.dump(base, f)
 PYEOF
     fi
+    # Only while associated, as the plugin does (ASSOCIATED_ONLY_PARAMS):
+    # rtw88 reads disable_aspm each time the PCIe link changes power state,
+    # and a Y written while the radio idles in one leaves ASPM stuck on.
+    if [ -n "$DRIVER_PARAMS" ] && [ "$(cat "$SYS_NET/$IFACE/operstate" 2>/dev/null)" != "up" ]; then
+        logger -t "$LOG_TAG" "$IFACE is not associated: driver parameters left for the next connect"
+        DRIVER_PARAMS=""
+    fi
     for p in $DRIVER_PARAMS; do
-        echo Y 2>/dev/null > "$p"
+        [ -e "$p" ] || continue
+        if echo Y 2>/dev/null > "$p"; then
+            TOOK=$((TOOK + 1))
+        else
+            FAILED=$((FAILED + 1))
+        fi
     done
     # Disable PCIe ASPM for WiFi device (all drivers)
     if [ -d "$WIFI_PCI/link" ]; then
         for f in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
-            echo 0 2>/dev/null > "$WIFI_PCI/link/$f"
+            # Not every device has every file (the OLED has no l0s_aspm).
+            [ -e "$WIFI_PCI/link/$f" ] || continue
+            if echo 0 2>/dev/null > "$WIFI_PCI/link/$f"; then
+                TOOK=$((TOOK + 1))
+            else
+                FAILED=$((FAILED + 1))
+            fi
         done
     fi
     # Runtime power management is the device's own, with or without a link
     # directory for ASPM, as in the plugin.
     if [ -f "$WIFI_PCI/power/control" ]; then
-        echo on 2>/dev/null > "$WIFI_PCI/power/control"
+        if echo on 2>/dev/null > "$WIFI_PCI/power/control"; then
+            TOOK=$((TOOK + 1))
+        else
+            FAILED=$((FAILED + 1))
+        fi
     fi
-    APPLIED=1
-    logger -t "$LOG_TAG" "power_save off applied to $IFACE (driver=$DRIVER)"
+    if [ "$TOOK" -gt 0 ]; then
+        APPLIED=1
+        if [ "$FAILED" -gt 0 ]; then
+            logger -t "$LOG_TAG" "power_save off applied to $IFACE (driver=$DRIVER), $FAILED writes refused"
+        else
+            logger -t "$LOG_TAG" "power_save off applied to $IFACE (driver=$DRIVER)"
+        fi
+    else
+        logger -t "$LOG_TAG" "power_save off: nothing took on $IFACE (driver=$DRIVER, $FAILED writes refused)"
+    fi
 fi
 
 # Apply buffer tuning
 if [ "$BUFFER_TUNING" = "True" ]; then
-    sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1
-    sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1
-    sysctl -w net.core.rmem_default=1048576 >/dev/null 2>&1
-    sysctl -w net.core.wmem_default=1048576 >/dev/null 2>&1
-    sysctl -w net.core.netdev_max_backlog=5000 >/dev/null 2>&1
-    sysctl -w net.core.netdev_budget=600 >/dev/null 2>&1
-    sysctl -w net.core.netdev_budget_usecs=8000 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    ip link set "$IFACE" txqueuelen 2000 2>/dev/null
-    APPLIED=1
-    logger -t "$LOG_TAG" "buffer tuning applied"
+    TOOK=0
+    FAILED=0
+    sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    sysctl -w net.core.rmem_default=1048576 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    sysctl -w net.core.wmem_default=1048576 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    sysctl -w net.core.netdev_max_backlog=5000 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    sysctl -w net.core.netdev_budget=600 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    sysctl -w net.core.netdev_budget_usecs=8000 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
+    [ "$NETLINK_STUCK" = 1 ] || ip link set "$IFACE" txqueuelen 2000 2>/dev/null
+    if [ "$TOOK" -gt 0 ]; then
+        APPLIED=1
+        if [ "$FAILED" -gt 0 ]; then
+            logger -t "$LOG_TAG" "buffer tuning applied, $FAILED settings refused"
+        else
+            logger -t "$LOG_TAG" "buffer tuning applied"
+        fi
+    else
+        logger -t "$LOG_TAG" "buffer tuning: nothing took ($FAILED settings refused)"
+    fi
 fi
 
 # Apply CAKE QoS (unlimited: FQ + AQM + ack-filter, no bandwidth shaper)
-if [ "$CAKE" = "True" ]; then
+if [ "$CAKE" = "True" ] && [ "$NETLINK_STUCK" = 1 ]; then
+    logger -t "$LOG_TAG" "CAKE QoS left out on $IFACE: an earlier iw is stuck"
+elif [ "$CAKE" = "True" ]; then
     modprobe sch_cake 2>/dev/null
     if tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter 2>/dev/null; then
         ip link set "$IFACE" txqueuelen 256 2>/dev/null

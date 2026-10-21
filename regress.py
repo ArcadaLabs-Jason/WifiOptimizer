@@ -3134,8 +3134,11 @@ try:
     _linkblk = _linkblk[:_linkblk.index("\n    fi\n")]
     ok('if [ -f "$WIFI_PCI/power/control" ]' in _psd and "power/control" not in _linkblk,
        "and writes power/control whether or not the device has a link directory")
+    # D9: the template also reads last_enforced earlier, so the write is what
+    # has to come after the gate.
     ok('[ "$APPLIED" = 1 ] || exit 0' in _tmd
-       and _tmd.index('[ "$APPLIED" = 1 ] || exit 0') < _tmd.index("last_enforced"),
+       and _tmd.index('[ "$APPLIED" = 1 ] || exit 0')
+       < _tmd.index("date +%s > /run/wifi-optimizer/last_enforced"),
        "last_enforced is stamped only when something was applied")
     ok("SETTINGS_DIR" not in _tmd, "no unused SETTINGS_DIR")
 except Exception as _e:
@@ -7737,6 +7740,201 @@ try:
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- BACKEND-DEVICES, QA pass 3 (items D1-D21, J3, U1) ----
+import subprocess as _dsp
+_d_real_sleep = asyncio.sleep
+_d_real_err, _d_real_info = m.decky.logger.error, m.decky.logger.info
+
+def _d_template():
+    return open("defaults/dispatcher.sh.tmpl").read()
+
+def _d_filled():
+    t = _d_template().replace("__SETTINGS_PATH__",
+                              m._sh_quote("/home/deck/homebrew/settings/WiFi Optimizer/settings.json"))
+    return t.replace("__PLUGIN_DIR__", m._sh_quote("/home/deck/homebrew/plugins/WiFi Optimizer"))
+
+# A fake sysfs and a stub PATH to run parts of the dispatcher for real.
+def _d_block(start, end):
+    t = _d_template()
+    return t[t.index(start):t.index(end)]
+
+def _d_run(snippet, env_lines, stubs, root):
+    """Run a piece of the dispatcher in bash with tools from stubs (name ->
+    exit code, every call logged) ahead of the system's, and /sys/module and
+    /run/wifi-optimizer moved under root. Returns (stdout, log lines)."""
+    bindir = os.path.join(root, "bin"); os.makedirs(bindir, exist_ok=True)
+    log = os.path.join(root, "calls.log")
+    for name, code in stubs.items():
+        path = os.path.join(bindir, name)
+        open(path, "w").write(f'#!/bin/sh\necho "{name} $*" >> "{log}"\nexit {code}\n')
+        os.chmod(path, 0o755)
+    body = (snippet.replace("/sys/module/", root + "/module/")
+                   .replace("/run/wifi-optimizer/", root + "/run/"))
+    script = (f'export PATH="{bindir}:$PATH"\n' + "\n".join(env_lines) + "\n" + body
+              + '\necho "APPLIED=$APPLIED OUR_CARD=$OUR_CARD FIRST_RUN=$FIRST_RUN"\n')
+    out = _dsp.run(["/bin/bash", "-c", script], capture_output=True, text=True, timeout=20).stdout
+    return out, (open(log).read().splitlines() if os.path.exists(log) else [])
+
+def _d_netdev(root, name, module, operstate="up", link=("l1_aspm",), control="file"):
+    """A netdev under root/net bound to a device whose driver module is module."""
+    dev = os.path.join(root, "devices", name)
+    os.makedirs(os.path.join(dev, "link"), exist_ok=True)
+    os.makedirs(os.path.join(dev, "power"), exist_ok=True)
+    for f in link:
+        open(os.path.join(dev, "link", f), "w").write("1\n")
+    if control == "file":
+        open(os.path.join(dev, "power", "control"), "w").write("auto\n")
+    else:
+        os.makedirs(os.path.join(dev, "power", "control"), exist_ok=True)
+    mod = os.path.join(root, "modules", module); os.makedirs(mod, exist_ok=True)
+    os.makedirs(os.path.join(dev, "driver"), exist_ok=True)
+    if not os.path.islink(os.path.join(dev, "driver", "module")):
+        os.symlink(mod, os.path.join(dev, "driver", "module"))
+    net = os.path.join(root, "net", name)
+    os.makedirs(os.path.join(net, "phy80211"), exist_ok=True)
+    if not os.path.islink(os.path.join(net, "device")):
+        os.symlink(dev, os.path.join(net, "device"))
+    open(os.path.join(net, "operstate"), "w").write(operstate + "\n")
+    return dev
+
+section("D8 driver parameters only for the card they belong to, and only while associated")
+try:
+    _r8 = tempfile.mkdtemp()
+    _d_netdev(_r8, "wlan0", "mt7921u")
+    _d_netdev(_r8, "wlan1", "rtw88_8822ce", operstate="down")
+    _guard = _d_block("iface_module() {", "# The first run of a boot")
+    def _card(iface, driver):
+        out, _ = _d_run(_guard, [f'SYS_NET="{_r8}/net"', f"IFACE={iface}", f"DRIVER={driver}"], {}, _r8)
+        return re.search(r"OUR_CARD=(\d)", out).group(1)
+    ok(_card("wlan1", "rtw88") == "1" and _card("wlan0", "rtw88") == "0"
+       and _card("wlan0", "unknown") == "1",
+       "the dispatcher tells the radio bound to the settings' driver from a second one")
+    os.makedirs(os.path.join(_r8, "module", "rtw88_core", "parameters"))
+    os.makedirs(os.path.join(_r8, "module", "rtw88_pci", "parameters"))
+    for _pp in ("rtw88_core/parameters/disable_lps_deep", "rtw88_pci/parameters/disable_aspm"):
+        open(os.path.join(_r8, "module", _pp), "w").write("N\n")
+    _ps8 = _d_block("# Apply power save", "# Apply buffer tuning")
+    _env8 = [f'SYS_NET="{_r8}/net"', "IFACE=wlan1", "DRIVER=rtw88", "POWER_SAVE=True",
+             "OUR_CARD=1", "FIRST_RUN=0", "NETLINK_STUCK=0", "LOG_TAG=t", "APPLIED=0"]
+    _out8, _log8 = _d_run(_ps8, _env8, {"iw": 0, "logger": 0}, _r8)
+    _aspm = open(os.path.join(_r8, "module", "rtw88_pci/parameters/disable_aspm")).read().strip()
+    ok(_aspm == "N" and any("not associated" in l for l in _log8),
+       f"with the radio not associated the driver parameters are left for the next connect ({_aspm})")
+    open(os.path.join(_r8, "net", "wlan1", "operstate"), "w").write("up\n")
+    _d_run(_ps8, _env8, {"iw": 0, "logger": 0}, _r8)
+    ok(open(os.path.join(_r8, "module", "rtw88_pci/parameters/disable_aspm")).read().strip() == "Y",
+       "and written once it is")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D9 an upgrade mid-boot does not record our own values as the system's")
+try:
+    _first = _d_block("FIRST_RUN=0", "# Apply power save")
+    def _fr(files):
+        _r9 = tempfile.mkdtemp(); os.makedirs(os.path.join(_r9, "run"))
+        for f in files: open(os.path.join(_r9, "run", f), "w").write("1\n")
+        out, _ = _d_run(_first, [], {}, _r9)
+        return re.search(r"FIRST_RUN=(\d)", out).group(1)
+    ok(_fr([]) == "1" and _fr(["last_enforced"]) == "0" and _fr(["pcie-baseline"]) == "0",
+       "the first run of a boot is one with neither a baseline nor a last_enforced")
+    _ps9 = _d_block("# Apply power save", "# Apply buffer tuning")
+    ok('if [ "$FIRST_RUN" = 1 ] && [ "$OUR_CARD" = 1 ]; then\n        python3 -I - "$WIFI_PCI"' in _ps9,
+       "and only then is the baseline recorded")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D10 the dispatcher stamps last_enforced only for what really took")
+try:
+    _r10 = tempfile.mkdtemp()
+    _d_netdev(_r10, "wlan0", "ath11k_pci", link=(), control="dir")
+    os.makedirs(os.path.join(_r10, "devices", "wlan0", "link", "l1_aspm"))
+    _ps10 = _d_block("# Apply power save", "# Apply buffer tuning")
+    _env10 = [f'SYS_NET="{_r10}/net"', "IFACE=wlan0", "DRIVER=ath11k_pci", "POWER_SAVE=True",
+              "OUR_CARD=1", "FIRST_RUN=0", "NETLINK_STUCK=0", "LOG_TAG=t", "APPLIED=0"]
+    _o10, _l10 = _d_run(_ps10, _env10, {"iw": 1, "logger": 0}, _r10)
+    ok("APPLIED=0" in _o10 and any("nothing took" in l for l in _l10),
+       f"nothing taking (iw refused, every write refused) is not reported as applied ({_o10.strip()})")
+    os.rmdir(os.path.join(_r10, "devices", "wlan0", "power", "control"))
+    open(os.path.join(_r10, "devices", "wlan0", "power", "control"), "w").write("auto\n")
+    _o10, _l10 = _d_run(_ps10, _env10, {"iw": 1, "logger": 0}, _r10)
+    ok("APPLIED=1" in _o10 and any("2 writes refused" in l for l in _l10),
+       f"one that took is, with the refused ones counted ({[l for l in _l10 if 'power_save' in l]})")
+    _buf10 = _d_block("# Apply buffer tuning", "# Apply CAKE")
+    _o10b, _l10b = _d_run(_buf10, ["IFACE=wlan0", "BUFFER_TUNING=True", "NETLINK_STUCK=0",
+                                   "LOG_TAG=t", "APPLIED=0"], {"sysctl": 1, "ip": 0, "logger": 0}, _r10)
+    ok("APPLIED=0" in _o10b and any("nothing took" in l for l in _l10b),
+       "and buffer tuning that every sysctl refused is not either")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D18 the dispatcher does not start iw, ip or tc behind a stuck one")
+try:
+    _r18 = tempfile.mkdtemp(); _d_netdev(_r18, "wlan0", "ath11k_pci")
+    _ps18 = _d_block("# Apply power save", "# Apply buffer tuning")
+    _o18, _l18 = _d_run(_ps18, [f'SYS_NET="{_r18}/net"', "IFACE=wlan0", "DRIVER=ath11k_pci",
+                                "POWER_SAVE=True", "OUR_CARD=1", "FIRST_RUN=0", "NETLINK_STUCK=1",
+                                "LOG_TAG=t", "APPLIED=0"], {"iw": 0, "logger": 0}, _r18)
+    ok(not any(l.startswith("iw ") for l in _l18) and "APPLIED=1" in _o18
+       and open(os.path.join(_r18, "devices", "wlan0", "power", "control")).read().strip() == "on",
+       "then iw is not run, while the sysfs writes still are")
+    _buf18 = _d_block("# Apply buffer tuning", "# Apply CAKE")
+    _o18b, _l18b = _d_run(_buf18, ["IFACE=wlan0", "BUFFER_TUNING=True", "NETLINK_STUCK=1",
+                                   "LOG_TAG=t", "APPLIED=0"], {"sysctl": 0, "ip": 0, "logger": 0}, _r18)
+    _cake18 = _d_block("# Apply CAKE", "# Record enforcement")
+    _o18c, _l18c = _d_run(_cake18, ["IFACE=wlan0", "CAKE=True", "NETLINK_STUCK=1", "LOG_TAG=t",
+                                    "APPLIED=0"], {"tc": 0, "ip": 0, "modprobe": 0, "logger": 0}, _r18)
+    ok(not any(l.startswith(("ip ", "tc ")) for l in _l18b + _l18c)
+       and any(l.startswith("sysctl ") for l in _l18b),
+       "nor ip or tc, while the sysctls still are")
+    _t18 = _d_template()
+    _stuck = _t18[_t18.index("NETLINK_STUCK=0"):_t18.index("# Apply power save")]
+    ok('pgrep -O 8 -f "^([^ ]*/)?iw dev $IFACE( |\\$)"' in _stuck and "NETLINK_STUCK=1" in _stuck,
+       "an iw on this interface still running after seconds is what marks the netlink path stuck")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("J3 the dispatcher stands down while the plugin is disabled in Decky")
+try:
+    _tj = _d_template()
+    _prog = _tj[_tj.index("<<'DISABLEDEOF'\n") + len("<<'DISABLEDEOF'\n"):]
+    _prog = _prog[:_prog.index("\nDISABLEDEOF")]
+    def _dis(path, name="WiFi Optimizer"):
+        return _dsp.run([sys.executable, "-I", "-c", _prog, path, name], capture_output=True,
+                        text=True, timeout=10).stdout.strip()
+    _dj = tempfile.mkdtemp()
+    _lj = os.path.join(_dj, "loader.json")
+    open(_lj, "w").write(json.dumps({"disabled_plugins": ["CSS Loader", "WiFi Optimizer"]}))
+    ok(_dis(_lj) == "yes", "listed in Decky's disabled_plugins reads as disabled")
+    open(_lj, "w").write(json.dumps({"disabled_plugins": ["CSS Loader"], "branch": 0}))
+    ok(_dis(_lj) == "no", "and not listed as not")
+    _lk = os.path.join(_dj, "link.json"); os.symlink(_lj, _lk)
+    open(_lj, "w").write(json.dumps({"disabled_plugins": ["WiFi Optimizer"]}))
+    _ff = os.path.join(_dj, "fifo.json"); os.mkfifo(_ff)
+    _bad = os.path.join(_dj, "bad.json"); open(_bad, "w").write("{not json")
+    ok(_dis(_lk) == "no" and _dis(_ff) == "no" and _dis(_bad) == "no"
+       and _dis(os.path.join(_dj, "missing.json")) == "no",
+       "a link at the name, a FIFO, a broken file or none at all count as not disabled")
+    _assign = "\n".join(l for l in _d_filled().splitlines()
+                        if l.startswith(("SETTINGS_FILE=", "PLUGIN_NAME=", "LOADER_SETTINGS=")))
+    _vals = _dsp.run(["/bin/bash", "-c", _assign + '\nprintf "%s|%s" "$LOADER_SETTINGS" "$PLUGIN_NAME"'],
+                     capture_output=True, text=True).stdout
+    ok(_vals == "/home/deck/homebrew/settings/loader.json|" + json.load(open("plugin.json"))["name"],
+       f"Decky's settings are read beside the plugin's, for the name plugin.json gives ({_vals})")
+    _gate = _tj.index('if [ "$(plugin_disabled)" = "yes" ]; then')
+    ok(_gate < _tj.index("# Apply power save") and "exit 0" in _tj[_gate:_gate + 150]
+       and _tj.index("# Self-removal") < _gate,
+       "and it exits before anything is applied, after the clean-up for a removed plugin")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+m._save_settings(dict(m.DEFAULT_SETTINGS))
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
