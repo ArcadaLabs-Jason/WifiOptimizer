@@ -36,6 +36,37 @@ except ImportError:
             @staticmethod
             def error(msg): print(f"[ERROR] {msg}")
 
+
+# People are asked to share this log in public threads. An access point's
+# address can be looked up in the public WiFi databases, so every address
+# the log would carry keeps only its last two octets: enough to tell access
+# points apart when reading it, not enough to place anyone.
+_LOG_MAC_RE = re.compile(
+    r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){4}([0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2})(?![0-9A-Fa-f])"
+)
+
+
+def _mask_addresses(text: str) -> str:
+    return _LOG_MAC_RE.sub(lambda m: "xx:xx:xx:xx:" + m.group(1), text)
+
+
+# Any object with a filter method works as a logging filter, so the logging
+# module itself is not imported (Decky's bundle carries only what it uses).
+class _MaskAddresses:
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        masked = _mask_addresses(message)
+        if masked != message:
+            record.msg, record.args = masked, ()
+        return True
+
+
+if hasattr(decky.logger, "addFilter"):
+    decky.logger.addFilter(_MaskAddresses())
+
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 SYSFS_NET = "/sys/class/net"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
@@ -904,6 +935,13 @@ def _clean_settings(data: dict) -> dict:
         if k in STREAMING_APP_IDS and isinstance(v, bool)
     }
     merged["streaming_custom_patterns"] = merged.get("streaming_custom_patterns", "")[:512]
+    # Sorted by time when recording a new failure: a non-number there made
+    # that raise part way through moving the lock.
+    merged["ap_move_failures"] = {
+        k: v for k, v in merged.get("ap_move_failures", {}).items()
+        if isinstance(k, str) and BSSID_RE.match(k)
+        and isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
     # Only ever compared, but a malformed value would never match and would
     # keep the notice up however often it was dismissed. bool is excluded by
     # name because Python counts it as an int.
@@ -1394,9 +1432,9 @@ fi
 
 # Copy everything beside the live files first, and only then move each into
 # place. A copy that fails part way (a full disk) leaves the installed
-# version whole. package.json goes last because it carries the version: if
-# anything before it fails, the installed version is unchanged and the same
-# update is offered again.
+# version whole. package.json goes last because it carries the version: if a
+# move fails, the files already moved stay new but the version reads old, so
+# the same update is offered again and completes the set.
 set_state installing
 mkdir -p "$PLUGIN_DIR/dist" "$PLUGIN_DIR/defaults" || {
     logger -t wifi-optimizer "Update failed: could not create directories"
@@ -1435,6 +1473,19 @@ for _ in $(seq 1 45); do
 done
 
 set_state restarting
+# Restarting plugin_loader restarts Steam, which ends a game. The panel only
+# checked for one when the update started, and a download can take minutes,
+# so look again and wait for it (or a stream the plugin knows of) to end.
+playing() {
+    pgrep -if 'steamlaunch appid=' >/dev/null 2>&1 || [ -e /run/wifi-optimizer/streaming ]
+}
+if playing; then
+    logger -t wifi-optimizer "Update installed; waiting for the game or stream to end before restarting Decky"
+    for _ in $(seq 1 2880); do
+        playing || break
+        sleep 15
+    done
+fi
 if systemctl restart plugin_loader; then
     FINISHED=1
     set_state done
@@ -2401,7 +2452,7 @@ class Plugin:
                     settings["band_preference_ssid"] = adopted
                     _save_settings(settings)
                     decky.logger.info(
-                        f"Band preference scoped to {adopted!r} on upgrade"
+                        "Band preference scoped to the current network on upgrade"
                     )
                 else:
                     # Leaving it enabled with no network attached is the state
@@ -4661,8 +4712,8 @@ class Plugin:
             return None
         name = BAND_NAMES.get(band, band)
         decky.logger.info(
-            f"Refusing band {band!r}: no {name} access point for "
-            f"{self._get_profile_ssid(uuid)!r} in the scan of {iface}"
+            f"Refusing band {band!r}: no {name} access point for this "
+            f"network in the scan of {iface}"
         )
         return {
             "success": False,
@@ -5855,6 +5906,9 @@ class Plugin:
     # ---- Optimization setters ----
 
     async def set_power_save(self, disabled: bool) -> dict:
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        disabled = disabled is True
         try:
             if disabled and self._paused_by_streaming():
                 return self._record_paused("power_save_disabled")
@@ -5930,6 +5984,9 @@ class Plugin:
             return self._unexpected_response(e)
 
     async def set_auto_fix(self, enabled: bool) -> dict:
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         try:
 
             settings = _load_settings()
@@ -6160,6 +6217,9 @@ class Plugin:
         return None, iface, bssid, link_out
 
     async def set_bssid_lock(self, enabled: bool) -> dict:
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         # Held for the whole call. The enable path awaits while it waits for
         # an association, so a status poll can now land in the middle of this
         # setter where previously none could - and the one it would run is
@@ -6668,6 +6728,9 @@ class Plugin:
         }
 
     async def set_band_preference(self, enabled: bool, band: str = "a") -> dict:
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         # This setter deliberately clears the BSSID, cycles the radio and
         # re-locks once NM associates on the new band. It awaits in the
         # middle, so a status poll can land between those steps. Hold the
@@ -6858,6 +6921,9 @@ class Plugin:
     async def set_dns(
         self, enabled: bool, provider: str = "cloudflare", custom_servers: str = ""
     ) -> dict:
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         try:
 
             uuid, err = self._resolve_uuid(
@@ -6970,6 +7036,9 @@ class Plugin:
             return self._unexpected_response(e)
 
     async def set_ipv6(self, disabled: bool) -> dict:
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        disabled = disabled is True
         try:
 
             uuid, err = self._resolve_uuid(
@@ -7091,6 +7160,9 @@ class Plugin:
                 self._run_cmd(["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"])
 
     async def set_buffer_tuning(self, enabled: bool) -> dict:
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         try:
             if enabled and self._paused_by_streaming():
                 return self._record_paused("buffer_tuning_enabled")
@@ -7160,6 +7232,9 @@ class Plugin:
 
     async def set_cake(self, enabled: bool) -> dict:
         """Enable or disable CAKE QoS (unlimited mode: FQ + AQM + ack-filter, no bandwidth shaper)."""
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         try:
             if enabled and self._paused_by_streaming():
                 return self._record_paused("cake_enabled")
@@ -7399,8 +7474,7 @@ class Plugin:
                 # into it, which is the stranding this scoping exists to stop.
                 if not scoped_to or here != scoped_to:
                     decky.logger.info(
-                        f"Skipping band preference: it belongs to {scoped_to!r}, "
-                        f"this is {here!r}"
+                        "Skipping band preference: it belongs to another network"
                     )
                 else:
                     total += 1
@@ -7833,6 +7907,9 @@ class Plugin:
 
     async def set_streaming_mode(self, enabled: bool) -> dict:
         """Turn streaming auto mode on or off."""
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         try:
             if self._profile_change_in_flight() or self._update_running():
                 return dict(self._BUSY_RESULT)
@@ -7866,6 +7943,9 @@ class Plugin:
 
     async def set_streaming_hold(self, held: bool) -> dict:
         """Keep the fixes on until reboot, for a stream that is not detected."""
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        held = held is True
         try:
             if not _load_settings().get("streaming_mode_enabled"):
                 return {"success": False, "message": "Streaming auto mode is off."}
@@ -7878,6 +7958,9 @@ class Plugin:
 
     async def set_streaming_app(self, app_id: str, watched: bool) -> dict:
         """Watch or ignore one of the known streaming apps."""
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        watched = watched is True
         try:
             if app_id not in STREAMING_APP_IDS:
                 return {"success": False, "message": "Unknown app."}
@@ -7958,6 +8041,9 @@ class Plugin:
 
     async def set_update_notify(self, enabled: bool) -> dict:
         """Turn the available-update toast on or off."""
+        # From the panel. Anything but a real True counts as False, so a
+        # stray value is never saved as is.
+        enabled = enabled is True
         try:
             settings = _load_settings()
             settings["update_notify"] = bool(enabled)
@@ -8110,7 +8196,7 @@ class Plugin:
                 latest = self._newest_release(data)
             else:
                 tag = data.get("tag_name", "") if isinstance(data, dict) else ""
-                latest = tag.lstrip("v") if isinstance(tag, str) else ""
+                latest = tag[1:] if isinstance(tag, str) and tag.startswith("v") else tag if isinstance(tag, str) else ""
 
             if latest and (len(latest) > 64 or not VERSION_RE.match(latest)):
                 # Refuse rather than sanitise. This value reaches a download

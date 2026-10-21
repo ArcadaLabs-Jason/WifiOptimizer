@@ -4001,6 +4001,48 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("the plugin log carries no network names and only part of each address")
+try:
+    import logging as _lg, inspect as _insp2
+    ok(m._mask_addresses("Locking to D8:07:B6:90:C7:D1 rather than 62:e9:31:0d:1f:e7")
+       == "Locking to xx:xx:xx:xx:C7:D1 rather than xx:xx:xx:xx:1f:e7",
+       "an access point's address keeps only its last two octets")
+    _lgr = _lg.getLogger("wifiopt-test"); _cap = []
+    class _Cap(_lg.Handler):
+        def emit(self, record): _cap.append(record.getMessage())
+    _lgr.addHandler(_Cap()); _lgr.addFilter(m._MaskAddresses()); _lgr.propagate = False
+    _lgr.warning("moved from %s", "D8:07:B6:90:C7:D1")
+    ok(_cap == ["moved from xx:xx:xx:xx:C7:D1"], "applied to every message the logger handles, arguments included")
+    import re as _re2
+    _bad = []
+    for _mm in _re2.finditer(r"(decky\.logger\.(?:info|error|warning)|self\._log_throttled)\(", _src_all):
+        _i = _mm.end(); _dp = 1; _j = _i
+        while _dp and _j < len(_src_all):
+            _c = _src_all[_j]; _dp += _c == "("; _dp -= _c == ")"; _j += 1
+        if _re2.search(r"\{[^}]*(?<![bB])(ssid|scoped_to|adopted)\b[^}]*\}|_get_profile_ssid", _src_all[_i:_j]):
+            _bad.append(_src_all.count("\n", 0, _mm.start()) + 1)
+    ok(_bad == [], f"no log call writes a network name (found at lines {_bad})")
+    _t = open("defaults/dispatcher.sh.tmpl").read()
+    ok(_t.index("export PATH=/usr/bin:/bin:/usr/sbin:/sbin") < _t.index("python3"),
+       "the root dispatcher finds its tools on a fixed PATH")
+    _cs = m._clean_settings({**m.DEFAULT_SETTINGS, "ap_move_failures": {
+        "D8:07:B6:90:C7:D1": 1792603383, "62:E9:31:0D:1F:E7": "yesterday", "not-a-mac": 5,
+        "AA:BB:CC:DD:EE:FF": True}})
+    ok(_cs["ap_move_failures"] == {"D8:07:B6:90:C7:D1": 1792603383},
+       "a hand-edited access point failure that is not an address and a time is dropped on load")
+    _setters = {"set_power_save": "disabled", "set_auto_fix": "enabled", "set_bssid_lock": "enabled",
+                "set_band_preference": "enabled", "set_dns": "enabled", "set_ipv6": "disabled",
+                "set_buffer_tuning": "enabled", "set_cake": "enabled", "set_streaming_mode": "enabled",
+                "set_streaming_hold": "held", "set_streaming_app": "watched", "set_update_notify": "enabled"}
+    _missing = [n for n, p in _setters.items()
+                if f"{p} = {p} is True" not in _insp2.getsource(getattr(m.Plugin, n))]
+    ok(_missing == [], f"every on/off setter takes only a real True as on (missing: {_missing})")
+    ok('tag[1:] if isinstance(tag, str) and tag.startswith("v")' in _src_all,
+       "a release tag loses one leading v, not every one")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("Reset and uninstall do not strand WiFi on a backend switched from here")
 try:
     import inspect as _insp
