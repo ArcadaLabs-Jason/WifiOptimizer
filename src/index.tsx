@@ -330,7 +330,7 @@ function Content() {
           // A worker stuck on a wedged driver never reports back. Release
           // the panel rather than keep every control disabled forever.
           if (s.started_at && Date.now() / 1000 - s.started_at > BACKEND_SWITCH_MAX_S) {
-            await giveUp("The backend switch is taking too long. Restart the Deck if WiFi does not come back.");
+            await giveUp("The backend switch is taking too long. Restart the device if WiFi does not come back.");
             return;
           }
           // Mid-switch: update so the subtitle can show the current phase.
@@ -963,8 +963,8 @@ function Content() {
           is the obvious suspect. */}
       {status?.address_conflict && (
         <Banner variant="warning" icon="⚠">
-          Another device on your network is using the same address as the Deck
-          ({status.address_conflict.ip}), so the connection may not work. That's
+          Another device on your network is using the same address as your
+          handheld ({status.address_conflict.ip}), so the connection may not work. That's
           the router, not a WiFi setting. Restarting the router usually fixes it.
         </Banner>
       )}
@@ -977,7 +977,7 @@ function Content() {
           A stronger access point on this network (signal{" "}
           {status.wpa2_only_stronger.signal} vs{" "}
           {status.wpa2_only_stronger.current_signal}) only offers WPA2, and this
-          network is saved as WPA3-only, so the Deck can't use it. Access points
+          network is saved as WPA3-only, so this device can't use it. Access points
           that offer WPA3 keep using it. Only allow this if that access point
           is yours: anyone nearby can broadcast your network's name.
           {errors.allow_wpa2 && (
@@ -1243,7 +1243,8 @@ function Content() {
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
               WiFi region: {regdomain.governing || "unknown"}. This device's
               WiFi card sets its own region, so it cannot be changed here. That
-              is normal on the Steam Deck and does not mean a band is missing.
+              is normal for many cards, the Steam Deck's included, and does not
+              mean a band is missing.
             </div>
           </PanelSectionRow>
         )}
