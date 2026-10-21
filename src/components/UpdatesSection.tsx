@@ -52,21 +52,23 @@ export function UpdatesSection({
           label="Update channel"
           rgOptions={CHANNEL_OPTIONS}
           selectedOption={channel}
+          disabled={updating}
           onChange={(option: { data: string }) => onChannelChange(option.data)}
         />
       </PanelSectionRow>
       <PanelSectionRow>
         <ToggleField
           label="Tell me about updates"
-          description="Shows a notification when a new version is out, never during a game. Nothing installs until you choose to."
+          description="Shows one notification when a new version is out, never during a game or a stream. Nothing installs until you choose to."
           checked={notify}
+          disabled={updating}
           onChange={onNotifyChange}
         />
       </PanelSectionRow>
       {updateError && !updating && (
         <PanelSectionRow>
           <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>
-            &#9888; {updateError}
+            {updateError}
           </div>
         </PanelSectionRow>
       )}
@@ -108,7 +110,7 @@ export function UpdatesSection({
             </PanelSectionRow>
           )}
           <PanelSectionRow>
-            <ButtonItem layout="below" disabled={checkingUpdate} onClick={onCheck}>
+            <ButtonItem layout="below" disabled={checkingUpdate || updating} onClick={onCheck}>
               {checkingUpdate
                 ? "Checking..."
                 : updateInfo?.success && !updateInfo?.update_available
