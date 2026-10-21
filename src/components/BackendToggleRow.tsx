@@ -2,6 +2,7 @@ import { PanelSectionRow } from "@decky/ui";
 import type {
   BadgeStatus,
   BackendSwitchPhase,
+  BackendSwitchResult,
   BackendSwitchStatus,
   PluginStatus,
 } from "../types";
@@ -20,14 +21,32 @@ const EXPLANATION =
   "Linux handhelds use one of two WiFi backends, and which one your " +
   "system is on varies by device and OS version. Some devices see " +
   "disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors " +
-  "with iwd. Switching to wpa_supplicant trades slightly slower reconnect " +
-  "(about 5s vs 1-2s) for broader compatibility and better stability on " +
-  "certain routers. The setting survives reboots and OS updates. On some " +
-  "devices, the switch may briefly disrupt the WiFi interface - the plugin " +
-  "handles recovery automatically, but a reboot is needed as a last resort. " +
-  "Note: some networks (WPA3-only, certain enterprise setups) behave " +
-  "differently between backends - if your WiFi stops connecting after a " +
-  "switch, try switching back.";
+  "with iwd. Switching to wpa_supplicant trades a slightly slower reconnect " +
+  "(about 5 seconds instead of 1 or 2) for broader compatibility and better " +
+  "stability on some routers. The setting survives reboots and OS updates. " +
+  "Switching takes WiFi down for up to a minute. On some devices the WiFi " +
+  "card has to be restarted along the way, which the plugin does by itself, " +
+  "and if that doesn't work a restart of the device finishes the switch. " +
+  "Some networks (WPA3-only, some work or school networks) behave " +
+  "differently between the two. If WiFi stops connecting after a switch, " +
+  "switch back.";
+
+// What a finished switch says, in the banner at the top of the panel and
+// under the toggle.
+export function backendResultText(r: BackendSwitchResult): string {
+  if (r.needs_reboot) {
+    return `Switched to ${r.target}, but the WiFi card didn't come back. Restart the device to finish.`;
+  }
+  if (!r.success) {
+    return r.message ?? "The backend switch didn't work. If WiFi doesn't come back, restart the device.";
+  }
+  const parts = [`Switched to ${r.backend || r.target}.`];
+  if (r.recovery_performed) parts.push("The WiFi card had to be restarted along the way.");
+  if (r.reconnect_timed_out) {
+    parts.push("WiFi hasn't reconnected yet. Pick your network in the WiFi settings, or switch back here.");
+  }
+  return parts.join(" ");
+}
 
 interface BackendToggleRowProps {
   status: PluginStatus;
@@ -83,7 +102,7 @@ export function BackendToggleRow({
   return (
     <InfoRow
       label="Use wpa_supplicant backend"
-      subtitle={phaseText ?? "Alternate WiFi backend - can fix sleep/wake and stability issues"}
+      subtitle={phaseText ?? "The other WiFi backend. Can fix sleep and stability problems."}
       explanation={EXPLANATION}
       badge={badge.badge}
       text={badge.text}
@@ -94,13 +113,6 @@ export function BackendToggleRow({
     >
       {lastResult?.success && (() => {
         const timedOut = lastResult.reconnect_timed_out;
-        const parts: string[] = [
-          lastResult.backend
-            ? `Switched to ${lastResult.backend}`
-            : `Switched to ${lastResult.target}`,
-        ];
-        if (lastResult.recovery_performed) parts.push("wlan0 interface recreated");
-        if (timedOut) parts.push("WiFi didn't reconnect");
         return (
           <PanelSectionRow>
             <div
@@ -110,7 +122,7 @@ export function BackendToggleRow({
                 padding: "2px 0",
               }}
             >
-              {timedOut ? "⚠" : "✓"} {parts.join(", ")}
+              {backendResultText(lastResult)}
             </div>
           </PanelSectionRow>
         );
