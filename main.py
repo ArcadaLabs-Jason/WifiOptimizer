@@ -7910,6 +7910,11 @@ class Plugin:
             await asyncio.sleep(STREAM_POLL_SECONDS)
             try:
                 if not _load_settings().get("streaming_mode_enabled"):
+                    # The defaults standing in for a file that could not be
+                    # read say off too. Ending the watch on one of those left
+                    # the fixes as they were until the next reload.
+                    if _SETTINGS_STATE["read_failed"]:
+                        continue
                     return
                 await self._stream_pass()
             except Exception as e:

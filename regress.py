@@ -4859,6 +4859,36 @@ try:
     ok(_b is True and _a is False,
        "turning auto mode off waits for a pass that is applying or taking off the fixes")
 
+    # A read that fails hands back the defaults, which say auto mode is off.
+    # The watch used to end on that and never look again until a reload.
+    class Watched(m.Plugin):
+        def __init__(self): super().__init__(); self.passes = 0
+        async def _stream_pass(self, settle=False): self.passes += 1
+    async def _watch_through_bad_read():
+        _real_poll = m.STREAM_POLL_SECONDS
+        m.STREAM_POLL_SECONDS = 0.01
+        try:
+            m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True})
+            _keep = m.SETTINGS_FILE + ".keep"; _link = m.SETTINGS_FILE + ".link"
+            w = Watched(); task = asyncio.ensure_future(w._streaming_watch())
+            await asyncio.sleep(0.05)
+            os.replace(m.SETTINGS_FILE, _keep)
+            os.symlink(_keep, _link); os.replace(_link, m.SETTINGS_FILE)  # not followed: unreadable
+            await asyncio.sleep(0.05)
+            os.replace(_keep, m.SETTINGS_FILE)
+            seen = w.passes; await asyncio.sleep(0.05)
+            alive = not task.done() and w.passes > seen
+            m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": False})
+            await asyncio.sleep(0.05)
+            ended = task.done()
+            task.cancel()
+            return alive, ended
+        finally:
+            m.STREAM_POLL_SECONDS = _real_poll
+    _alive, _ended = asyncio.run(_watch_through_bad_read())
+    ok(_alive, "the streaming watch carries on through a settings read that fails")
+    ok(_ended, "and still ends once the settings really say auto mode is off")
+
     # Startup: a reload mid-stream keeps the fixes on.
     m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True}); _flags(flag=True)
     st = Stream({"app": "Moonlight", "process": "moonlight"})
