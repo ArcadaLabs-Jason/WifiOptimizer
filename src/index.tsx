@@ -834,20 +834,35 @@ function Content() {
   const handleMoveLock = () =>
     handleToggle("move_bssid_lock", () => backend.moveBssidLock());
 
-  const handleDismissMoveError = () =>
+  const dismissError = (key: string) =>
     setErrors((prev) => {
       const next = { ...prev };
-      delete next.move_bssid_lock;
+      delete next[key];
       return next;
     });
+  const handleDismissMoveError = () => dismissError("move_bssid_lock");
+  const handleDismissWpa2Error = () => dismissError("allow_wpa2");
+
+  const handleDismissDuplicates = () => {
+    duplicatesDismissed = true;
+    setDupDismissed(true);
+  };
+
+  const handleShowDetails = (on: boolean) => {
+    detailsShown = on;
+    setShowDetails(on);
+  };
 
   // Reset asks first: see RESET_CONFIRM_TEXT.
   const handleResetSettings = () => {
     if (busyRef.current) return;
+    const distro = status?.settings?.distro_id ?? "";
+    const description =
+      RESET_CONFIRM_TEXT + (distro && distro !== "steamos" ? RESET_BACKEND_TEXT : "");
     showModal(
       <ConfirmModal
         strTitle="Reset WiFi Optimizer?"
-        strDescription={RESET_CONFIRM_TEXT}
+        strDescription={description}
         strOKButtonText="Reset"
         strCancelButtonText="Cancel"
         bDestructiveWarning={true}
@@ -859,20 +874,26 @@ function Content() {
   const runReset = async () => {
     if (busyRef.current) return;
     setBusy(true);
+    setWorking("reset");
     setOptimizeResult(null);
     setErrors({});
     setNotices({});
     resetDnsDraft();
     try {
-      const result = await backend.resetSettings();
-      if (!result.success) {
-        setErrors({ reset: result.message ?? "Couldn't reset settings." });
+      const result = await withTimeout(backend.resetSettings());
+      if (!isResult(result) || !result.success) {
+        setErrors({ reset: isResult(result) ? failureText(result) : GENERIC_FAIL_TEXT });
+      } else {
+        setNotices({ reset: "Done. Every setting is back to its default." });
       }
     } catch (e) {
       console.error("reset error", e);
-      setErrors({ reset: "Couldn't reset settings." });
+      setErrors({ reset: e instanceof NoAnswer ? NO_ANSWER_TEXT : UNREACHABLE_TEXT });
     } finally {
-      await refreshStatus(true);
+      await refreshAfterChange();
+      // The region is read once, not polled, and Reset can put it back.
+      refreshRegdomain();
+      setWorking(null);
       setBusy(false);
     }
   };
