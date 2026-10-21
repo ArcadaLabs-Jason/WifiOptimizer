@@ -1252,7 +1252,7 @@ function Content() {
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If your network is 2.4 GHz only, this will prevent you from connecting.${
+          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only enable this if your router supports 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you.${
             supports6GHz
               ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz."
               : ""
@@ -1284,7 +1284,7 @@ function Content() {
           <InfoRow
             label="Force 6 GHz band"
             subtitle="Stay on 6 GHz where your router has it"
-            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
+            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
             {...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null)}
             checked={on6GHz}
             disabled={isBusy || updating || (!connected && !on6GHz)}
