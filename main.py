@@ -201,6 +201,8 @@ UPDATE_PHASES = ("downloading", "installing", "swapped", "loaded",
 # time limit, they are left over from one that was killed.
 UPDATE_ACTIVE_PHASES = ("downloading", "installing", "swapped", "loaded", "restarting")
 UPDATE_STATE_MAX_AGE = 900
+# Held by the update script for as long as it runs, so only one runs.
+UPDATE_LOCK_FILE = "/run/wifi-optimizer-update.lock"
 
 # Streaming auto mode: power save, buffer tuning and CAKE are applied only
 # while one of these is running, matched against each process's command line.
@@ -1896,7 +1898,7 @@ class Plugin:
             return "wpa_supplicant"
         return None
 
-    def _configured_backend_from_files(self) -> str | None:
+    def _configured_backend_from_files(self, skip: str | None = None) -> str | None:
         """The backend the known conf files name, highest priority first.
 
         NetworkManager reads conf.d in name order and the later file wins, so
@@ -1910,6 +1912,8 @@ class Plugin:
             NM_DEFAULT_CONF,
             HOLO_NM_DEFAULT_CONF,
         ):
+            if path == skip:
+                continue
             try:
                 with open(path, "r") as f:
                     for line in f:
@@ -1937,6 +1941,10 @@ class Plugin:
         So the backend it will fall back to is enabled and the one our file
         named is disabled. Nothing is stopped or restarted now, so the
         connection in use carries on and the change lands at the next boot.
+
+        Enabled before the file goes, and the file kept if that fails. The
+        other way round, an uninstall killed between the two, or an enable
+        that did not take, left exactly the no-WiFi boot this exists to stop.
         """
         try:
             with open(GENERIC_BACKEND_CONF) as f:
@@ -1947,6 +1955,17 @@ class Plugin:
             decky.logger.error(f"Could not read our backend setting: {e}")
             return
         found = re.search(r"^\s*wifi\.backend\s*=\s*(iwd|wpa_supplicant)\s*$", text, re.M)
+        named = found.group(1) if found else None
+        after = self._backend_without_ours() if named else None
+        if named and after != named:
+            enabled = self._run_cmd(["/usr/bin/systemctl", "enable", after], timeout=15)
+            if not enabled["success"]:
+                decky.logger.error(
+                    f"Kept our backend setting ({named}): {after}, which NetworkManager "
+                    f"would use without it, could not be enabled: "
+                    f"{enabled.get('stderr', '')[:120]}"
+                )
+                return
         try:
             os.remove(GENERIC_BACKEND_CONF)
         except FileNotFoundError:
@@ -1954,55 +1973,112 @@ class Plugin:
         except OSError as e:
             decky.logger.error(f"Could not remove our backend setting: {e}")
             return
-        if not found:
+        if not named or after == named:
             return
-        named = found.group(1)
-        after = (self._merged_nm_backend()
-                 or self._configured_backend_from_files()
-                 or "wpa_supplicant")
-        if after == named:
-            return
-        for cmd in (["/usr/bin/systemctl", "enable", after],
-                    ["/usr/bin/systemctl", "disable", named]):
-            self._run_cmd(cmd, timeout=15)
+        self._run_cmd(["/usr/bin/systemctl", "disable", named], timeout=15)
         decky.logger.info(
             f"Removed our backend setting ({named}); NetworkManager uses {after} "
             f"from the next boot, so {after} is enabled and {named} disabled"
         )
 
-    def _release_power_save(self):
+    def _backend_without_ours(self) -> str:
+        """The backend NetworkManager will use once our conf file is gone.
+
+        Asked of NetworkManager itself, with our file moved aside for the
+        moment it takes (it reads only names ending .conf), then put back:
+        the file only goes once the backend it leaves is ready.
+        """
+        aside = os.path.join(os.path.dirname(GENERIC_BACKEND_CONF),
+                             "." + os.path.basename(GENERIC_BACKEND_CONF) + ".aside")
+        try:
+            os.replace(GENERIC_BACKEND_CONF, aside)
+        except OSError:
+            aside = None
+        try:
+            if aside:
+                return (self._merged_nm_backend()
+                        or self._configured_backend_from_files()
+                        or "wpa_supplicant")
+            return self._configured_backend_from_files(skip=GENERIC_BACKEND_CONF) or "wpa_supplicant"
+        finally:
+            if aside:
+                try:
+                    os.replace(aside, GENERIC_BACKEND_CONF)
+                except OSError as e:
+                    decky.logger.error(f"Could not put our backend setting back: {e}")
+
+    def _release_power_save(self, settings: dict | None = None, reload_conf: bool = False):
         """Undo Prevent lag spikes now, for Reset and uninstall.
 
         Removing our file alone left power save off until the next reboot:
         NetworkManager keeps the config it read at startup, and nothing put
         the radio's own power save back. It goes back on unless Steam's own
         WiFi power management setting has it off.
+
+        Every step is tried whatever the one before it did. One that raised
+        (a read-only file, a driver that refused) used to end the whole
+        Reset there, with the rest left as it was. settings are the ones
+        from before a Reset replaced them. reload_conf: the files were
+        already released, without the reload, earlier in an uninstall.
         """
-        had_conf = os.path.exists(NM_CONF_PATH)
-        try:
-            os.remove(NM_CONF_PATH)
-        except FileNotFoundError:
-            pass
-        if had_conf:
+        settings = settings if settings is not None else _load_settings()
+        changed = self._release_power_save_files(settings)
+        if reload_conf and not changed:
             self._reload_nm_conf()
-        self._release_valve_powersave(_load_settings())
-        try:
-            os.remove(MODPROBE_CONF_PATH)
-        except FileNotFoundError:
-            pass
-        self._apply_driver_fixes(False)
-        self._apply_pcie_aspm_fix(False)
+        for what, undo in (("driver fixes", lambda: self._apply_driver_fixes(False)),
+                           ("PCIe power states", lambda: self._apply_pcie_aspm_fix(False))):
+            try:
+                undo()
+            except Exception as e:
+                decky.logger.error(f"Undoing power save, {what}: {e}")
+        # Only if it was this plugin that had it off. Otherwise it is off for
+        # a reason of the user's, and turning it on is not undoing anything.
+        if not (settings.get("power_save_disabled") and self._volatile_gate_open(settings)):
+            return
         iface = self._get_wifi_interface()
         if iface and IFACE_RE.match(iface) and self._valve_powersave() != "2":
             self._run_cmd(["/usr/bin/iw", "dev", iface, "set", "power_save", "on"])
 
-    def _release_regdomain(self):
+    def _release_power_save_files(self, settings: dict, reload: bool = True) -> bool:
+        """The files that hold power save off past a reboot: ours for
+        NetworkManager, our value in Valve's, and the modprobe options.
+        Returns whether NetworkManager has anything new to read.
+
+        Valve's line goes before NetworkManager is told to read its config
+        again. Reloaded first, it read our 2 still in Valve's file and kept
+        power save off until the next reload.
+        """
+        changed = False
+        try:
+            os.remove(NM_CONF_PATH)
+            changed = True
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            decky.logger.error(f"Undoing power save, our NetworkManager file: {e}")
+        try:
+            valve = self._valve_powersave()
+            self._release_valve_powersave(settings)
+            changed = changed or self._valve_powersave() != valve
+        except Exception as e:
+            decky.logger.error(f"Undoing power save, Valve's setting: {e}")
+        try:
+            os.remove(MODPROBE_CONF_PATH)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            decky.logger.error(f"Undoing power save, the modprobe options: {e}")
+        if changed and reload:
+            self._reload_nm_conf()
+        return changed
+
+    def _release_regdomain(self, settings: dict | None = None):
         """Put back the wireless region from before the user chose one here.
 
         `iw reg set` lasts until reboot, so without this Reset and uninstall
         left the chosen region in force for the rest of the boot.
         """
-        settings = _load_settings()
+        settings = settings if settings is not None else _load_settings()
         if not settings.get("regdomain"):
             return
         target = settings.get("regdomain_previous", "") or "00"
@@ -2090,7 +2166,8 @@ class Plugin:
         _, sep, value = result.get("stdout", "").partition(":")
         return value.strip() if sep else None
 
-    def _clear_profile_pins(self):
+    def _clear_profile_pins(self, deadline: float | None = None,
+                            settings: dict | None = None) -> dict:
         """Remove the pins this plugin added from every profile it touched.
 
         The lock follows whichever profile NetworkManager uses, so discarding
@@ -2101,8 +2178,29 @@ class Plugin:
         The band preference is cleared alongside it, for the same reason: a
         profile left demanding a band its network does not offer will not
         connect, and after teardown there is nothing left to undo it.
+
+        Returns the tracked lists of what is still pinned: a profile that
+        refused the write, or that deadline (time.monotonic()) left no time
+        for. Reset keeps those, so the leftover-pin cleanup finishes the job,
+        rather than dropping the only record of them. Each call is an nmcli
+        round trip, and Decky kills an uninstall that runs past five seconds.
         """
-        settings = _load_settings()
+        settings = settings if settings is not None else _load_settings()
+        left: dict = {"bssid_lock_uuids": [], "band_preference_uuids": [],
+                      "ipv6_uuids": [], "dns_uuids": []}
+
+        def budget(default: float) -> float | None:
+            """The timeout for the next call, or None when time is up."""
+            if deadline is None:
+                return default
+            remaining = deadline - time.monotonic()
+            return min(default, remaining) if remaining >= 0.5 else None
+
+        def cleared(result: dict) -> bool:
+            # A profile that no longer exists has nothing left to undo.
+            return result["success"] or "unknown connection" in (
+                result.get("stderr") or "").lower()
+
         uuids = list(settings.get("bssid_lock_uuids", []))
         current = settings.get("bssid_lock_connection_uuid", "")
         if current and current not in uuids:
@@ -2110,35 +2208,50 @@ class Plugin:
         # Unconditional. Gating on the toggle skipped exactly the profiles
         # left behind by turning it OFF, which is when they are stranded.
         for uuid in uuids:
-            result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "")
+            timeout = budget(5)
+            if timeout is None:
+                left["bssid_lock_uuids"].append(uuid)
+                continue
+            result = self._nmcli_modify(uuid, "802-11-wireless.bssid", "", timeout=timeout)
             decky.logger.info(
                 f"Clearing BSSID lock from {uuid}: "
                 f"{'ok' if result['success'] else 'not found'}"
             )
+            if not cleared(result):
+                left["bssid_lock_uuids"].append(uuid)
         last = settings.get("last_connection_uuid", "")
         band_uuids = list(settings.get("band_preference_uuids", []))
         # The profiles beyond the recorded list only if a band pin was ever
         # ours: otherwise a band set by hand would be wiped by Reset.
         if "802-11-wireless.band" in settings.get("pins_owned", []):
             band_uuids += uuids + [last]
-        for uuid in {u for u in band_uuids if u}:
-            self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=2)
+        for uuid in dict.fromkeys(u for u in band_uuids if u):
+            timeout = budget(2)
+            if timeout is None or not cleared(
+                    self._nmcli_modify(uuid, "802-11-wireless.band", "", timeout=timeout)):
+                left["band_preference_uuids"].append(uuid)
         # Same reasoning as the pins: after teardown nothing is left that
         # knows this plugin turned IPv6 off, so it has to be undone here or
         # not at all. Bounded to profiles we recorded writing to.
-        for uuid in {u for u in settings.get("ipv6_uuids", []) if u}:
-            self._nmcli_modify(uuid, "ipv6.method", "auto", timeout=2)
+        for uuid in dict.fromkeys(u for u in settings.get("ipv6_uuids", []) if u):
+            timeout = budget(2)
+            if timeout is None or not cleared(
+                    self._nmcli_modify(uuid, "ipv6.method", "auto", timeout=timeout)):
+                left["ipv6_uuids"].append(uuid)
         # And DNS, which no reset or uninstall used to touch at all: the
         # profile kept public servers and ignored the router's afterwards.
-        for uuid in {u for u in settings.get("dns_uuids", []) if u}:
-            self._clear_dns(uuid)
+        for uuid in dict.fromkeys(u for u in settings.get("dns_uuids", []) if u):
+            timeout = budget(2)
+            if timeout is None or not self._clear_dns(uuid, timeout=timeout):
+                left["dns_uuids"].append(uuid)
+        return left
 
-    def _clear_dns(self, uuid: str) -> bool:
+    def _clear_dns(self, uuid: str, timeout: float = 2) -> bool:
         """Give a profile back its automatic DNS. True when done, or when the
         profile no longer exists and there is nothing left to undo."""
         results = [
-            self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no", timeout=2),
-            self._nmcli_modify(uuid, "ipv4.dns", "", timeout=2),
+            self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no", timeout=timeout),
+            self._nmcli_modify(uuid, "ipv4.dns", "", timeout=timeout),
         ]
         gone = any("unknown connection" in (r.get("stderr") or "").lower()
                    for r in results)
@@ -2700,31 +2813,99 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"_unload error: {e}")
 
+    # Decky kills a plugin about five seconds after asking it to stop, and
+    # _unload and _uninstall both run inside that.
+    _UNINSTALL_BUDGET = 4.0
+
     async def _uninstall(self):
+        """Undo everything, in a worker thread and inside Decky's budget.
+
+        On the event loop, a slow nmcli held up the rest of Decky's shutdown
+        of the plugin as well. Whatever comes after the kill does not
+        happen, so what lasts longest goes first: the backend setting (no
+        WiFi at the next boot if it is left wrong), then the files that hold
+        power save off past a reboot, then the pins, which nothing else
+        would take off. The dispatcher goes after the files it would remove
+        itself on the next connect, once it finds the plugin gone. What a
+        reboot undoes anyway comes last.
+        """
         try:
             decky.logger.info("WiFi Optimizer uninstalling")
-            self._clear_profile_pins()
-            self._remove_dispatcher()
-            self._release_power_save()
-            self._release_regdomain()
-            self._revert_queue_tuning(_load_settings())
-            self._release_generic_backend_conf()
-            # The diagnostics file and a settings file set aside as unreadable
-            # are ours too, and nothing else would ever remove them.
-            users = (SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
-                     LEGACY_ENFORCED_FILE)
-            for path in [*users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE,
-                         PCIE_BASELINE_FILE, UPDATE_STATE_FILE]:
-                # One that cannot go (the settings directory is the user's,
-                # so anything can sit at these names) does not stop the rest.
-                try:
-                    (_remove_no_follow if path in users else os.remove)(path)
-                except FileNotFoundError:
-                    pass
-                except OSError as e:
-                    decky.logger.error(f"_uninstall could not remove {path}: {e}")
+            await asyncio.to_thread(self._teardown, time.monotonic() + self._UNINSTALL_BUDGET)
         except Exception as e:
             decky.logger.error(f"_uninstall error: {e}")
+
+    def _teardown(self, deadline: float):
+        """_uninstall's work, each step skipped once deadline has passed."""
+        settings = _load_settings()
+
+        def step(what: str, undo, *args):
+            if time.monotonic() >= deadline:
+                decky.logger.error(f"_uninstall ran out of time before {what}")
+                return None
+            try:
+                return undo(*args)
+            except Exception as e:
+                decky.logger.error(f"_uninstall could not undo {what}: {e}")
+                return None
+
+        step("the backend setting", self._release_generic_backend_conf)
+        step("a running update", self._stop_update)
+        reloaded = step("the power save files", self._release_power_save_files, settings, False)
+        # A second left for the steps after it, which are quick.
+        left = step("the profile pins", self._clear_profile_pins, deadline - 1.0, settings) or {}
+        step("the dispatcher", self._remove_dispatcher)
+        step("power save", self._release_power_save, settings, bool(reloaded))
+        step("the region", self._release_regdomain, settings)
+        step("buffer tuning and CAKE", self._revert_queue_tuning, settings)
+        # The diagnostics file and a settings file set aside as unreadable
+        # are ours too, and nothing else would ever remove them.
+        users = [SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
+                 LEGACY_ENFORCED_FILE]
+        if any(left.values()):
+            # Pins that are still on profiles. A settings file naming only
+            # them lets a reinstall take them off; without it they are set
+            # by hand as far as anything can tell, for good.
+            try:
+                _save_settings({**left, "pins_owned": settings.get("pins_owned", [])})
+                users.remove(SETTINGS_FILE)
+                decky.logger.error(
+                    "_uninstall could not take every pin off; kept the settings "
+                    "file naming those profiles so a reinstall can"
+                )
+            except OSError as e:
+                decky.logger.error(f"_uninstall could not keep the unreleased pins: {e}")
+        for path in [*users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE,
+                     PCIE_BASELINE_FILE, UPDATE_STATE_FILE, UPDATE_LOCK_FILE]:
+            # One that cannot go (the settings directory is the user's,
+            # so anything can sit at these names) does not stop the rest.
+            try:
+                (_remove_no_follow if path in users else os.remove)(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                decky.logger.error(f"_uninstall could not remove {path}: {e}")
+
+    def _stop_update(self):
+        """Stop an update still running when the plugin is uninstalled.
+
+        Left alone it would put the plugin's files back after Decky removed
+        them, or restart Decky for a plugin that is gone. The script tidies
+        up after itself on SIGTERM.
+        """
+        if not self._update_running():
+            return
+        proc = getattr(self, "_update_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                # 15 is SIGTERM, named by number: the signal module is not
+                # one Decky's build is relied on to carry.
+                os.killpg(proc.pid, 15)
+            except OSError:
+                pass
+        if os.path.exists(SYSTEMD_RUN):
+            self._run_cmd(["/usr/bin/systemctl", "stop", "--no-block",
+                           "wifi-optimizer-update-*.service"], timeout=2)
 
     async def _migration(self):
         pass
@@ -8787,7 +8968,7 @@ class Plugin:
                 f"systemd-run could not start the update ({result['stderr'][:200]}), "
                 "starting it directly"
             )
-        subprocess.Popen(
+        self._update_proc = subprocess.Popen(
             argv,
             start_new_session=True,
             stdout=subprocess.DEVNULL,

@@ -29,6 +29,8 @@ _run_dir = tempfile.mkdtemp()
 m.STREAM_FLAG_FILE = os.path.join(_run_dir, "streaming")
 m.STREAM_HOLD_FILE = os.path.join(_run_dir, "streaming-hold")
 m.PCIE_BASELINE_FILE = os.path.join(_run_dir, "pcie-baseline")
+m.BACKEND_SWITCH_MARKER = os.path.join(_run_dir, "backend-switch")
+m.UPDATE_LOCK_FILE = os.path.join(_run_dir, "update.lock")
 m.PROC_DIR = os.path.join(tempfile.mkdtemp(), "no-proc")
 FAILS = []
 def ok(c, l):
@@ -36,6 +38,11 @@ def ok(c, l):
     if not c: FAILS.append(l)
 
 def section(t): print(f"\n--- {t} ---")
+
+def _maybe_run(result):
+    """Run a coroutine to its end; anything else is already the result.
+    For calls that became coroutines, so older code still runs the check."""
+    return asyncio.run(result) if asyncio.iscoroutine(result) else result
 
 section("security: driver profile validation")
 p = m.Plugin()
@@ -4125,6 +4132,33 @@ try:
         t = Tear(); t.valve = "2"; t._release_power_save()
         ok(not any(c[:2] == ["/usr/bin/iw", "dev"] for c in t.cmds),
            "but leave it off when Steam's own setting has it off")
+        # Valve's line before NetworkManager rereads its config: the other
+        # way round it read our 2 still there and kept power save off.
+        class TearValve(Tear):
+            def _release_valve_powersave(self, settings): self.cmds.append(["valve released"])
+        open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        t = TearValve(); t._release_power_save()
+        _reload = ["/usr/bin/nmcli", "general", "reload", "conf"]
+        ok(["valve released"] in t.cmds and _reload in t.cmds
+           and t.cmds.index(["valve released"]) < t.cmds.index(_reload),
+           f"Valve's power save line is put back before NetworkManager rereads its config ({t.cmds[:3]})")
+        m._save_settings({**m.DEFAULT_SETTINGS, "power_save_disabled": False})
+        t = Tear(); t._release_power_save()
+        ok(not any(c[-2:] == ["power_save", "on"] for c in t.cmds),
+           "the radio's power save is only turned on where this plugin had it off")
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        # One step that fails does not leave the rest undone.
+        os.mkdir(m.NM_CONF_PATH); open(os.path.join(m.NM_CONF_PATH, "x"), "w").close()
+        open(m.MODPROBE_CONF_PATH, "w").write("options rtw88_pci disable_aspm=Y\n")
+        t = Tear()
+        try:
+            t._release_power_save(); _raised = None
+        except Exception as _e2:
+            _raised = _e2
+        ok(_raised is None and not os.path.exists(m.MODPROBE_CONF_PATH)
+           and ["/usr/bin/iw", "dev", "wlan0", "set", "power_save", "on"] in t.cmds,
+           f"a file that cannot be removed does not stop the rest being undone ({_raised!r})")
+        os.remove(os.path.join(m.NM_CONF_PATH, "x")); os.rmdir(m.NM_CONF_PATH)
         m._save_settings({**m.DEFAULT_SETTINGS, "regdomain": "DE", "regdomain_previous": "US"})
         t = Tear(); t._release_regdomain()
         ok(["/usr/bin/iw", "reg", "set", "US"] in t.cmds, "a region chosen here is put back to the one before it")
@@ -4222,11 +4256,38 @@ try:
         open(m.BAZZITE_IWD_CONF, "w").write("[device]\nwifi.backend=iwd\n")
         ok(Release()._configured_backend_from_files() == "iwd",
            "Bazzite's iwd.conf outranks ours, the order NetworkManager reads them in")
+        os.remove(m.BAZZITE_IWD_CONF)
+        # The backend left in charge is enabled while our file still names
+        # the other, and the file kept if that fails: killed or refused in
+        # between, the other order left a boot with no WiFi.
+        class ReleaseOrder(Release):
+            enable_ok = True
+            def _run_cmd(self, cmd, timeout=5):
+                self.cmds.append((cmd[1:], os.path.exists(m.GENERIC_BACKEND_CONF)))
+                if cmd[1] == "enable" and not self.enable_ok:
+                    return {"success": False, "stdout": "", "stderr": "no", "returncode": 1}
+                return _ok()
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        ro = ReleaseOrder(); ro._release_generic_backend_conf()
+        ok(ro.cmds == [(["enable", "wpa_supplicant"], True), (["disable", "iwd"], False)]
+           and not os.path.exists(m.GENERIC_BACKEND_CONF),
+           f"wpa_supplicant is enabled before our iwd setting goes, iwd disabled after ({ro.cmds})")
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        ro = ReleaseOrder(); ro.enable_ok = False; ro._release_generic_backend_conf()
+        ok(os.path.exists(m.GENERIC_BACKEND_CONF) and not any(c[0][0] == "disable" for c in ro.cmds),
+           "and when it cannot be enabled our setting stays, with nothing disabled")
+        ok(not [f for f in os.listdir(_d) if "aside" in f],
+           "asking NetworkManager what it falls back to leaves nothing set aside")
+        os.remove(m.GENERIC_BACKEND_CONF)
     finally:
         m.GENERIC_BACKEND_CONF, m.BAZZITE_IWD_CONF = _rc, _rb
-    ok("self._release_generic_backend_conf" in _insp.getsource(m.Plugin._uninstall)
-       and "self._release_generic_backend_conf" in _insp.getsource(m.Plugin.reset_settings)
-       and "GENERIC_BACKEND_CONF" not in _insp.getsource(m.Plugin._uninstall),
+    _uninst_src = _insp.getsource(m.Plugin._uninstall) + _insp.getsource(
+        getattr(m.Plugin, "_teardown", m.Plugin._uninstall))
+    _reset_src = _insp.getsource(m.Plugin.reset_settings) + _insp.getsource(
+        getattr(m.Plugin, "_reset_locked", m.Plugin.reset_settings))
+    ok("self._release_generic_backend_conf" in _uninst_src
+       and "self._release_generic_backend_conf" in _reset_src
+       and "GENERIC_BACKEND_CONF" not in _uninst_src,
        "uninstall and Reset both go through that, and neither deletes the file directly")
     _tm2 = open("defaults/dispatcher.sh.tmpl").read()
     _gone = _tm2[_tm2.index('if [ ! -d "$PLUGIN_DIR" ]'):]
@@ -4235,6 +4296,78 @@ try:
        "the dispatcher's own clean-up leaves the backend setting in place")
     ok(_gone.index("sleep") < _gone.index("rm -f"),
        "and looks again before removing anything, since an install swaps the directory briefly")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("uninstall: what lasts longest first, inside Decky's five seconds")
+try:
+    import threading as _thr4
+    U1, U2 = "eeeeeeee-0000-0000-0000-0000000000b1", "eeeeeeee-0000-0000-0000-0000000000b2"
+    class Steps(m.Plugin):
+        """Each teardown step recorded, in order, and where it ran."""
+        def __init__(self):
+            super().__init__(); self.order = []; self.threads = []
+        def _note(self, name):
+            self.order.append(name); self.threads.append(_thr4.current_thread() is _thr4.main_thread())
+        def _release_generic_backend_conf(self): self._note("backend")
+        def _stop_update(self): self._note("update")
+        def _release_power_save_files(self, settings, reload=True): self._note("power save files"); return True
+        def _clear_profile_pins(self, deadline=None, settings=None):
+            self._note("pins"); return {"bssid_lock_uuids": []}
+        def _remove_dispatcher(self): self._note("dispatcher"); return True
+        def _release_power_save(self, settings=None, reload_conf=False): self._note("power save")
+        def _release_regdomain(self, settings=None): self._note("region")
+        def _revert_queue_tuning(self, settings): self._note("queue")
+    st = Steps(); asyncio.run(st._uninstall())
+    _o = st.order
+    ok(_o[:1] == ["backend"] and "power save files" in _o and "pins" in _o and "dispatcher" in _o
+       and _o.index("power save files") < _o.index("pins") < _o.index("dispatcher"),
+       f"the backend setting goes first, then the files that outlive a reboot and the pins, "
+       f"then the dispatcher that would clean up after them ({_o})")
+    ok(st.threads and not any(st.threads), "and all of it runs off the event loop")
+
+    # A NetworkManager that answers slowly: the pins it does not reach stay
+    # recorded for a reinstall, and the rest still happens in time.
+    class SlowNm(m.Plugin):
+        def __init__(self): super().__init__(); self.cmds = []
+        def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+        def _nmcli_modify(self, uuid, key, value, timeout=5):
+            time.sleep(min(timeout, 0.6)); return _ok()
+        def _get_wifi_interface(self): return None
+        def _apply_driver_fixes(self, enable, persist=True): pass
+        def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+        def _remove_dispatcher(self): return True
+        def _release_generic_backend_conf(self): pass
+    _many = [f"eeeeeeee-0000-0000-0000-0000000002{i:02d}" for i in range(12)]
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_uuids": _many,
+                      "pins_owned": ["802-11-wireless.bssid"]})
+    open(m.UPDATE_LOCK_FILE, "w").close()
+    sn = SlowNm(); _t = time.monotonic(); asyncio.run(sn._uninstall()); _took = time.monotonic() - _t
+    _kept = m._load_settings()
+    ok(_took < m.Plugin._UNINSTALL_BUDGET + 1 if hasattr(m.Plugin, "_UNINSTALL_BUDGET") else False,
+       f"uninstall finishes inside Decky's budget however slow nmcli is ({_took:.1f}s)")
+    ok(os.path.exists(m.SETTINGS_FILE) and 0 < len(_kept["bssid_lock_uuids"]) < 12
+       and _kept["pins_owned"] == ["802-11-wireless.bssid"],
+       "pins it ran out of time for stay in a settings file a reinstall can work from")
+    ok(not os.path.exists(m.UPDATE_LOCK_FILE), "the update script's lock file goes too")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    asyncio.run(SlowNm()._uninstall())
+    ok(not os.path.exists(m.SETTINGS_FILE), "with every pin off, the settings file is removed as before")
+
+    # An update still running would put the plugin's files back.
+    _real_sr2 = m.SYSTEMD_RUN
+    try:
+        m.SYSTEMD_RUN = os.path.join(tempfile.mkdtemp(), "systemd-run"); open(m.SYSTEMD_RUN, "w").close()
+        su = SlowNm(); su._update_dir = tempfile.mkdtemp()
+        asyncio.run(su._uninstall())
+        ok(["/usr/bin/systemctl", "stop", "--no-block", "wifi-optimizer-update-*.service"] in su.cmds,
+           "uninstall stops an update that is still running")
+        su = SlowNm(); asyncio.run(su._uninstall())
+        ok(not any("wifi-optimizer-update-*.service" in c for c in su.cmds),
+           "and leaves systemd alone when none is")
+    finally:
+        m.SYSTEMD_RUN = _real_sr2
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -4325,12 +4458,10 @@ try:
             m.NM_CONF_PATH = _real_nm
     finally:
         m.WIFI_BACKEND_CONF = _real_valve
-    for name in ("reset_settings", "_uninstall"):
-        body = _src_all[_src_all.index(f"    async def {name}(self"):]
-        body = body[:body.index("\n    async def ", 10)]
-        ok("self._release_power_save(" in body, f"{name} gives Valve's power save setting back")
+    for name, body in (("reset_settings", _reset_src), ("_uninstall", _uninst_src)):
+        ok("self._release_power_save" in body, f"{name} gives Valve's power save setting back")
     _rel = _src_all[_src_all.index("    def _release_power_save(self"):]
-    _rel = _rel[:_rel.index("\n    def ", 10)]
+    _rel = _rel[:_rel.index("\n    def _release_regdomain", 10)]
     ok("self._release_valve_powersave(" in _rel and "self._reload_nm_conf()" in _rel
        and '"power_save", "on"' in _rel,
        "which also has NetworkManager drop our file now and turns the radio's power save back on")
@@ -4922,14 +5053,14 @@ try:
         m._save_settings({**m.DEFAULT_SETTINGS, "valve_powersave_before": "2"})
         class RealValve(Cmds):
             def _valve_powersave(self): return m.Plugin._valve_powersave(self)
-        c = RealValve(); asyncio.run(c._drop_persistent_power_save())
+        c = RealValve(); _maybe_run(c._drop_persistent_power_save())
         ok(["/usr/bin/nmcli", "general", "reload", "conf"] in c.cmds,
            "NetworkManager reads its config again once our file is gone, or it holds power save off until reboot")
         ok(m._load_settings()["valve_powersave_before"] == "2",
            "Steam's own power management setting stays recorded as the user's")
         m.Plugin()._release_valve_powersave(m._load_settings())
         ok(m.Plugin()._valve_powersave() == "2", "so a later Reset or uninstall leaves it alone")
-        c = RealValve(); asyncio.run(c._drop_persistent_power_save())
+        c = RealValve(); _maybe_run(c._drop_persistent_power_save())
         ok(["/usr/bin/nmcli", "general", "reload", "conf"] not in c.cmds,
            "and nothing is reloaded when there was no file of ours to remove")
         # QA gate 2026-10-20: with no file of ours, a 2 in Valve's file is the
@@ -4937,7 +5068,7 @@ try:
         # the end of every stream.
         open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=wpa_supplicant\n")
         m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "valve_powersave_before": ""})
-        c = RealValve(); asyncio.run(c._drop_persistent_power_save())
+        c = RealValve(); _maybe_run(c._drop_persistent_power_save())
         ok(m.Plugin()._valve_powersave() == "2" and m._load_settings()["valve_powersave_before"] == "2",
            "a load with no file of ours leaves the user's Steam power management setting alone, and records it as theirs")
         m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "power_save_disabled": True,
