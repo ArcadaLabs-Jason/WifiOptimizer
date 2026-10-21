@@ -3132,16 +3132,20 @@ class Plugin:
     # wlp1s0 or a driver missing from this list is covered too.
     _DIAG_KERNEL_TERMS = (
         r"rtw88|rtw89|rtw_|ath1[012]k|mt7\d|iwlwifi|brcmfmac|wlan\d|"
-        r"ieee80211 phy\d|cfg80211|PM: |ACPI: PM|pcieport|AER"
+        r"ieee80211 phy\d|cfg80211|PM: |ACPI: PM|pcieport|AER|ASPM|FADT"
     )
     # Connection chatter: on a healthy boot it is most of what matches, and it
     # pushed the suspend lines out of the report on Jason's own Deck.
     _DIAG_CHATTER_RE = re.compile(
         r": (?:authenticate with|send auth to|authenticated|associate with|"
-        r"RX AssocResp|associated|deauthenticating from|disassociated from|"
+        r"RX AssocResp|associated|deauthenticating from|"
         r"Limiting TX power|aborting authentication|authentication with)"
     )
     _DIAG_KERNEL_LINES = 50
+    # A kernel WARN prints a call trace and every loaded module on one line.
+    # Its first frames say where it fired; the rest would crowd out the wake.
+    _DIAG_TRACE_FRAMES = 12
+    _DIAG_LINE_MAX = 300
     # How much of a boot's kernel log is read. Bounds memory and time when a
     # driver has been logging errors for days.
     _DIAG_JOURNAL_MAX = "5000"
@@ -3153,45 +3157,78 @@ class Plugin:
     def _diag_kernel_lines(cls, text: str, terms: str) -> list:
         """The lines of one boot's kernel log worth reading for a WiFi problem.
 
-        Repeats are folded into a count, since a wedged driver logs the same
-        error thousands of times, and connection chatter is dropped. If what
-        is left is still too long, it keeps the stretch from the last suspend
-        onwards (where a failed wake shows) plus the very end of the boot.
+        Repeats are folded into a count on the line they repeat, since a
+        wedged driver logs the same error thousands of times, and connection
+        chatter is dropped. A WARN's call trace keeps only its first frames.
+        If what is left is still too long, it keeps the stretch from the last
+        suspend onwards (where a failed wake shows) plus the very end of the
+        boot, or simply the end when the last suspend is within it.
         """
         wanted = re.compile(terms)
-        lines, last_key, repeats = [], None, 0
+        lines, last_key, repeats, frames = [], None, 0, None
+
+        def fold():
+            if repeats:
+                lines[-1] += f" (repeated {repeats} more times)"
+
         for raw in text.splitlines():
             found = cls._DIAG_KERNEL_LINE_RE.match(raw)
             if not found:
                 continue
             stamp, message = found.groups()
+            if message.startswith("Call Trace:"):
+                frames = 0
+            elif frames is not None:
+                if "---[ end trace" in message:
+                    frames = None
+                else:
+                    frames += 1
+                    if frames > cls._DIAG_TRACE_FRAMES:
+                        continue
+            if message.startswith("Modules linked in:"):
+                continue
             if not wanted.search(message) or cls._DIAG_CHATTER_RE.search(message):
                 continue
             key = re.sub(r"\d+", "#", message)
             if key == last_key:
                 repeats += 1
                 continue
-            if repeats:
-                lines.append(f"(repeated {repeats} more times)")
-            lines.append(f"{stamp} {message}")
+            fold()
+            lines.append(f"{stamp} {message}"[:cls._DIAG_LINE_MAX])
             last_key, repeats = key, 0
-        if repeats:
-            lines.append(f"(repeated {repeats} more times)")
+        fold()
         cap = cls._DIAG_KERNEL_LINES
         if len(lines) <= cap:
             return lines
         starts = [i for i, line in enumerate(lines) if "PM: suspend entry" in line]
-        if not starts:
+        if not starts or len(lines) - starts[-1] <= cap:
             return [f"({len(lines) - cap} earlier lines left out)"] + lines[-cap:]
-        head = lines[starts[-1]:starts[-1] + cap - 10]
-        tail_from = max(starts[-1] + len(head), len(lines) - 10)
-        out = []
-        if starts[-1]:
-            out.append(f"({starts[-1]} earlier lines left out)")
+        start = starts[-1]
+        head = lines[start:start + cap - 10]
+        tail_from = len(lines) - 10
+        out = [f"({start} earlier lines left out)"] if start else []
         out += head
-        if tail_from > starts[-1] + len(head):
-            out.append(f"({tail_from - starts[-1] - len(head)} lines left out)")
+        out.append(f"({tail_from - start - len(head)} lines left out)")
         return out + lines[tail_from:]
+
+    # NetworkManager, iwd and wpa_supplicant name the network in quotes and
+    # after "ssid"/"SSID". Anything quoted goes, since a profile name is often
+    # a person's own wording.
+    _DIAG_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+    _DIAG_SSID_WORD_RE = re.compile(r"(?i)(ssid[=: ]+)\S+")
+    _DIAG_SERVICE_LINES = 40
+
+    @classmethod
+    def _diag_service_lines(cls, text: str, limit: int) -> list:
+        """The last lines of a service log, each bounded, network names out."""
+        lines = []
+        for raw in text.splitlines():
+            line = cls._DIAG_QUOTED_RE.sub("<name>", raw)
+            line = cls._DIAG_SSID_WORD_RE.sub(r"\1<ssid>", line)
+            lines.append(line[:cls._DIAG_LINE_MAX])
+        if len(lines) > limit:
+            return [f"({len(lines) - limit} earlier lines left out)"] + lines[-limit:]
+        return lines
 
     def _diagnostic_extras(self, driver: str, iface: str) -> dict:
         """What a report needs beyond the device: versions, toggles, backend,
@@ -3297,6 +3334,30 @@ class Plugin:
                     os.close(dfd)
             except OSError:
                 pass
+
+        # What the fixes were during the boot that failed. The dispatcher logs
+        # the driver parameters before it writes them, and this boot's
+        # baseline says what they were before anything of ours ran.
+        extras["pcie_baseline"] = _read_pcie_baseline()
+        extras["mem_sleep"] = read("/sys/power/mem_sleep")
+        journal = ["/usr/bin/journalctl", "--no-hostname", "-o", "short-monotonic",
+                   "--no-pager"]
+        for key, boot in (("plugin_log_this_boot", "0"), ("plugin_log_previous_boot", "-1")):
+            log = self._run_cmd(journal + ["-b", boot, "-t", "wifi-optimizer", "-n", "200"],
+                                timeout=5)
+            extras[key] = (self._diag_service_lines(log.get("stdout", ""), 30)
+                           if log.get("success")
+                           else [f"unavailable: {(log.get('stderr') or '')[:120]}"])
+        log = self._run_cmd(
+            journal + ["-b", "-1", "-u", "NetworkManager", "-u", "iwd", "-u", "wpa_supplicant",
+                       "-n", "2000"],
+            timeout=5,
+        )
+        extras["network_log_previous_boot"] = (
+            self._diag_service_lines(log.get("stdout", ""), self._DIAG_SERVICE_LINES)
+            if log.get("success")
+            else [f"unavailable: {(log.get('stderr') or '')[:120]}"]
+        )
 
         terms = self._DIAG_KERNEL_TERMS
         for name in (iface, driver):

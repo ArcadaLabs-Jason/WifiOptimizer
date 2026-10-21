@@ -5329,6 +5329,15 @@ try:
         def _get_current_backend(self): return "wpa_supplicant"
         def _run_cmd(self, cmd, timeout=5):
             _seen.append(cmd)
+            if cmd[0] == "/usr/bin/journalctl" and "-t" in cmd:
+                return _ok("[  3.100000] wifi-optimizer[812]: driver parameters before applying: "
+                           "disable_lps_deep=N disable_aspm=N\n")
+            if cmd[0] == "/usr/bin/journalctl" and "-u" in cmd:
+                return _ok("[  9.000000] NetworkManager[700]: <info>  device (wlan0): Activation: "
+                           "starting connection 'Smith Family 5G' (1b2c)\n"
+                           "[  9.100000] wpa_supplicant[650]: wlan0: SME: Trying to authenticate with "
+                           "62:e9:31:0d:1f:e7 (SSID=SmithNet freq=5180 MHz)\n"
+                           "[  9.200000] iwd[600]: event: connect-info, ssid: \"Smith Home\"\n")
             if cmd[0] == "/usr/bin/journalctl":
                 host = None if "--no-hostname" in cmd else "AERO-deck"
                 return _ok(_journal(_THIS if cmd[cmd.index("-b") + 1] == "0" else _PREV, host))
@@ -5400,11 +5409,41 @@ try:
        and any("PM: suspend exit" in l for l in _prev)
        and any("failed to leave lps state" in l for l in _prev),
        "a long previous boot still shows the last suspend, the wake and the first error after it")
-    ok(any(l == "(repeated 119 more times)" for l in _prev)
+    ok(any("failed to send h2c" in l and l.endswith("(repeated 119 more times)") for l in _prev)
        and sum("failed to send h2c" in l for l in _prev) == 1,
-       "a repeated driver error is folded into a count")
+       "a repeated driver error is folded into a count on its own line, so trimming cannot part them")
+    ok(_info.get("plugin_log_previous_boot") and "disable_aspm=N" in _info["plugin_log_previous_boot"][-1],
+       "the dispatcher's note of the driver parameters during the boot that failed is in the report")
+    _netlog = " ".join(_info.get("network_log_previous_boot", []))
+    ok("Activation" in _netlog and "Smith" not in _netlog and "62:e9:31" not in _netlog,
+       "and so is the previous boot's NetworkManager/iwd/wpa_supplicant log, with network names and addresses out")
+    ok("pcie_baseline" in _info and "mem_sleep" in _info,
+       "with this boot's baseline and the sleep mode")
     ok(any("late note fj" in l for l in _prev[-3:]) and not any("send auth" in l for l in _prev),
        "the end of the boot is kept and the chatter is not")
+    def _klog(msgs): return "".join(f"[{i:>5}.000000] kernel: {t}\n" for i, t in enumerate(msgs))
+    _near = _klog([f"rtw88_8822ce: note {_words[i]}" for i in range(80)]
+                  + ["PM: suspend entry (deep)", "PM: suspend exit", "rtw88_8822ce: failed to read ASPM, ret=-5"])
+    _nl = m.Plugin._diag_kernel_lines(_near, m.Plugin._DIAG_KERNEL_TERMS)
+    ok(len(_nl) == m.Plugin._DIAG_KERNEL_LINES + 1 and any("suspend entry" in l for l in _nl)
+       and "failed to read ASPM" in _nl[-1],
+       f"a last suspend near the end still gets the whole line budget ({len(_nl)} lines)")
+    _warn = _klog(["------------[ cut here ]------------",
+                   "WARNING: CPU: 2 PID: 9 at drivers/net/wireless/realtek/rtw88/pci.c:1385 rtw_pci_link_ps",
+                   "Modules linked in: rtw88_8822ce rtw88_pci rtw88_core " + "x " * 400,
+                   "Call Trace:"] + [f" rtw_frame_{_words[i]}+0x10/0x20 [rtw88_core]" for i in range(40)]
+                  + ["---[ end trace 0000000000000000 ]---", "rtw88_8822ce: firmware failed to leave lps state"])
+    _wl = m.Plugin._diag_kernel_lines(_warn, m.Plugin._DIAG_KERNEL_TERMS)
+    ok(not any("Modules linked in" in l for l in _wl)
+       and sum("rtw_frame_" in l for l in _wl) == m.Plugin._DIAG_TRACE_FRAMES
+       and "leave lps" in _wl[-1] and all(len(l) <= m.Plugin._DIAG_LINE_MAX for l in _wl),
+       "a WARN's trace is cut to its first frames and no line runs on")
+    ok(len(m.Plugin._diag_kernel_lines(_klog(["wlan0: disassociated from <mac> (Reason: 4)"]),
+                                       m.Plugin._DIAG_KERNEL_TERMS)) == 1,
+       "a disassociation is kept: it is what a failed wake looks like from the radio")
+    ok(len(m.Plugin._diag_kernel_lines(_klog(["ACPI FADT declares the system doesn't support PCIe ASPM, so disable it"]),
+                                       m.Plugin._DIAG_KERNEL_TERMS)) == 1,
+       "and so is the firmware saying ASPM is off")
     _wlp = m.Plugin._diag_kernel_lines(
         "[  5.000000] kernel: wlp1s0: deauthenticated from <mac> (Reason: 3)\n",
         m.Plugin._DIAG_KERNEL_TERMS + "|" + re.escape("wlp1s0"))
