@@ -681,6 +681,42 @@ def _write_no_follow(path: str, data: str) -> bool:
         os.close(dfd)
 
 
+def _replace_no_follow(path: str, data: str) -> bool:
+    """Write a file under a name of its own beside path, then rename it over
+    path, so the file is never missing while it is rewritten.
+
+    For the files the dispatcher reads by whether they exist: it records the
+    system's PCIe values once a boot only while last_enforced is absent, and
+    leaves the fixes off in auto mode while the streaming flag is absent.
+    _write_no_follow removes the old file before creating the new one, and a
+    dispatcher run in that gap took our values for the system's, or a stream
+    for none. Same rules as _write_no_follow: no link followed, the directory
+    opened once and worked in relative to that, and the temporary name is
+    unique, so two writers never share it.
+    """
+    try:
+        dfd = _open_dir_no_follow(os.path.dirname(path))
+    except OSError:
+        return False
+    name = os.path.basename(path)
+    tmp = f".{name}.{os.urandom(6).hex()}.plugin"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o644, dir_fd=dfd)
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(dfd)
+
+
 def _with_pin(settings: dict, prop: str) -> list:
     """settings["pins_owned"] with prop added."""
     owned = list(settings.get("pins_owned", []))
@@ -1896,7 +1932,7 @@ if playing; then
     # Out of time. Restarting now would end the game, so the update stops
     # here with the new files in place, to load at the next restart.
     if playing; then
-        logger -t wifi-optimizer "Update to $LABEL installed, but a game or stream was still running, so Decky was not restarted. Restart the Deck to finish."
+        logger -t wifi-optimizer "Update to $LABEL installed, but a game or stream was still running, so Decky was not restarted. Restart the device to finish."
         exit 1
     fi
 fi
@@ -1906,7 +1942,7 @@ if systemctl restart plugin_loader; then
     set_state done
     logger -t wifi-optimizer "Updated to $LABEL, restarted plugin_loader"
 else
-    logger -t wifi-optimizer "Updated to $LABEL, but Decky did not restart. Restart the Deck to load it."
+    logger -t wifi-optimizer "Updated to $LABEL, but Decky did not restart. Restart the device to load it."
     exit 1
 fi
 """
@@ -9219,7 +9255,9 @@ class Plugin:
             os.makedirs(os.path.dirname(ENFORCED_FILE), mode=0o755, exist_ok=True)
         except OSError:
             pass
-        _write_no_follow(ENFORCED_FILE, str(int(time.time())))
+        # Renamed over, never removed first: the dispatcher reads a missing
+        # file as a boot nothing of ours has touched yet (_replace_no_follow).
+        _replace_no_follow(ENFORCED_FILE, str(int(time.time())))
 
     async def reapply_volatile(self) -> dict:
         """Reapply volatile (non-reconnecting) settings. Safe to call mid-stream."""
@@ -9735,7 +9773,9 @@ class Plugin:
                 os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
             except OSError:
                 pass
-            _write_no_follow(path, f"{int(time.time())}\n")
+            # Renamed over a flag already there, so the dispatcher never
+            # finds it missing mid-stream (_replace_no_follow).
+            _replace_no_follow(path, f"{int(time.time())}\n")
         else:
             try:
                 os.remove(path)

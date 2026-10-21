@@ -10296,5 +10296,84 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+# ---- QA pass 3 merge: where two owners' work meets ----
+section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
+# The dispatcher records the system's PCIe values only while last_enforced is
+# absent (D9), and in auto mode leaves the fixes off while the streaming flag
+# is absent. Removing either before writing it again gave a dispatcher run in
+# between our values as the system's, or no stream mid-stream.
+try:
+    _mg_dir = tempfile.mkdtemp()
+    _mg_saved = (m.ENFORCED_FILE, m.STREAM_FLAG_FILE)
+    m.ENFORCED_FILE = os.path.join(_mg_dir, "last_enforced")
+    m.STREAM_FLAG_FILE = os.path.join(_mg_dir, "streaming")
+    _mg_gaps = []
+    _mg_unlink, _mg_remove = os.unlink, os.remove
+    def _mg_watch(real):
+        def watch(path, *a, **k):
+            real(path, *a, **k)
+            _mg_gaps.append((os.path.exists(m.ENFORCED_FILE), os.path.exists(m.STREAM_FLAG_FILE)))
+        return watch
+    for _f in (m.ENFORCED_FILE, m.STREAM_FLAG_FILE):
+        open(_f, "w").write("1\n")
+    m._save_settings({**m.DEFAULT_SETTINGS, "last_applied": 1700000000})
+    _mg_p = m.Plugin()
+    os.unlink, os.remove = _mg_watch(_mg_unlink), _mg_watch(_mg_remove)
+    try:
+        for _k in range(3):
+            _mg_p._record_reapplied(1700000000)
+            _mg_p._set_stream_flag(True)
+    finally:
+        os.unlink, os.remove = _mg_unlink, _mg_remove
+    ok(all(a and b for a, b in _mg_gaps),
+       f"rewriting either never leaves it missing ({_mg_gaps})")
+    ok(abs(int(open(m.ENFORCED_FILE).read()) - time.time()) < 60
+       and abs(int(open(m.STREAM_FLAG_FILE).read()) - time.time()) < 60,
+       "and both hold the new time afterwards")
+    ok(sorted(os.listdir(_mg_dir)) == ["last_enforced", "streaming"],
+       f"with no temporary file left beside them ({sorted(os.listdir(_mg_dir))})")
+    _mg_p._set_stream_flag(False)
+    ok(not os.path.exists(m.STREAM_FLAG_FILE), "and the flag still comes off")
+    m.ENFORCED_FILE, m.STREAM_FLAG_FILE = _mg_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+    os.unlink, os.remove = _mg_unlink, _mg_remove
+    m.ENFORCED_FILE, m.STREAM_FLAG_FILE = _mg_saved
+m._save_settings(dict(m.DEFAULT_SETTINGS))
+
+section("merge: a Reset that could not undo everything is not shown as a successful one")
+# LIFECYCLE's Reset answers {success: false, error: "partial", message}. The
+# panel shows that message as the Reset error, and only a success says it
+# worked and asks GitHub again (contract C4).
+try:
+    _mg_tsx = open("src/index.tsx").read()
+    _mg_rr = _mg_tsx[_mg_tsx.find("const runReset = async"):]
+    _mg_rr = _mg_rr[:_mg_rr.find("\n  };\n")]
+    _mg_fail = _mg_rr.find("if (!isResult(result) || !result.success)")
+    _mg_else = _mg_rr.find("} else {", _mg_fail)
+    ok(_mg_fail != -1 and _mg_else != -1
+       and "failureText(result)" in _mg_rr[_mg_fail:_mg_else]
+       and "RESET_DONE_TEXT" not in _mg_rr[_mg_fail:_mg_else]
+       and "runUpdateCheck" not in _mg_rr[_mg_fail:_mg_else],
+       "a refused or partial Reset shows the backend's message, without the done text or the update re-check")
+    ok("RESET_DONE_TEXT" in _mg_rr[_mg_else:] and "runUpdateCheck(true)" in _mg_rr[_mg_else:],
+       "and only a successful one says done and checks for updates again")
+    ok('"error": "partial"' in open("main.py").read(),
+       "the backend half: Reset still answers partial when a step could not be undone")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("merge: advice to restart says the device, in the update script too")
+try:
+    _mg_main = open("main.py").read()
+    ok("Restart the Deck" not in _mg_main and "Restart the device to finish." in _mg_main
+       and "Restart the device to load it." in _mg_main,
+       "the update script's log lines say restart the device, as the panel does, on every handheld")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)
