@@ -32,10 +32,10 @@ import type {
   RegdomainInfo,
 } from "./types";
 import { ERROR_MESSAGES } from "./types";
-import { InfoRow } from "./components/InfoRow";
+import { InfoRow, DetailsContext, WORKING_TEXT } from "./components/InfoRow";
 import { StatsGrid } from "./components/StatsGrid";
 import { Banner } from "./components/Banner";
-import { BackendToggleRow } from "./components/BackendToggleRow";
+import { BackendToggleRow, backendResultText } from "./components/BackendToggleRow";
 import { UpdatesSection } from "./components/UpdatesSection";
 import { PanelHeader } from "./components/PanelHeader";
 import { PanelFooter } from "./components/PanelFooter";
@@ -75,8 +75,80 @@ const IWD_PIN_NOTICE =
 const BACKEND_POLL_MAX_FAILURES = 5;
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
+// Prevent lag spikes is saved as off, so it does not come back by itself.
 const RESET_CONFIRM_TEXT =
-  "This puts every setting back to its default and undoes what the plugin changed. Buffer tuning and CAKE go back to the values your system had, and the access point lock, the band preference, the IPv6 setting and custom DNS are removed from every network they were applied to. A WiFi region set here can stay in effect until the next reboot.";
+  "This puts every setting back to its default and turns off what the plugin applied. Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting and custom DNS are removed from the networks they were set on.";
+// Only where the plugin can choose the backend itself. On SteamOS that is
+// Valve's setting, and Reset leaves it alone.
+const RESET_BACKEND_TEXT =
+  " A WiFi backend chosen here goes back to the system default from the next boot.";
+// A backend call that never answers used to leave every control greyed out
+// until the panel was reloaded. The slowest changes take about a minute.
+const CALL_TIMEOUT_MS = 120 * 1000;
+// The refresh after a change is bounded too, for the same reason.
+const REFRESH_WAIT_MS = 15 * 1000;
+const NO_ANSWER_TEXT =
+  "No answer after 2 minutes. The change may still finish, so check this setting again in a moment. If WiFi doesn't come back, restart the device.";
+const UNREACHABLE_TEXT =
+  "Couldn't reach the plugin's backend. Wait a moment and try again. If it keeps happening, restart Steam.";
+// Optimize Safe, Fix now and Force Reapply reconnect only when the lock or a
+// network setting is among what they apply.
+const BATCH_WORKING_TEXT = "Working. WiFi may reconnect, and this can take up to a minute.";
+// For a failure that came with no message of its own.
+const GENERIC_FAIL_TEXT =
+  "That didn't work. Try again. If it keeps failing, use Copy diagnostics at the bottom of this panel and report it.";
+// A setting that is on, but for another network than this one.
+const OTHER_NETWORK_TEXT =
+  "On for another network, so it does nothing here. To use it here, turn it off, then on again.";
+// Drift keys, by the name the panel shows for the setting.
+const DRIFT_LABELS: Record<string, string> = {
+  power_save: "Prevent lag spikes",
+  bssid_lock: "Stop background scanning",
+  buffer_tuning: "Network buffer tuning",
+  band_preference: "The band preference",
+  dns: "Custom DNS",
+  ipv6: "Disable IPv6",
+  cake: "Traffic shaping (CAKE)",
+};
+
+class NoAnswer extends Error {}
+
+function withTimeout<T>(call: Promise<T>, ms: number = CALL_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const id = setTimeout(() => reject(new NoAnswer()), ms);
+    call.then(
+      (value) => {
+        clearTimeout(id);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(id);
+        reject(err);
+      },
+    );
+  });
+}
+
+// What a failed result says, without the raw command output some carry in
+// "detail". That text is for the log, and read as noise in the panel.
+function failureText(result: MethodResult): string {
+  if (result.detail) console.warn("WiFi Optimizer: failure detail", result.detail);
+  return result.message ?? ERROR_MESSAGES[result.error ?? ""] ?? GENERIC_FAIL_TEXT;
+}
+
+function isResult(value: unknown): value is MethodResult {
+  return !!value && typeof (value as MethodResult).success === "boolean";
+}
+
+// Kept across the panel closing and reopening, which can remount it.
+let detailsShown = false;
+let duplicatesDismissed = false;
+// The update script can stop after installing, when a game is still running
+// at its deadline, so a failed update may only need Steam restarted.
+const UPDATE_FAILED_TEXT =
+  "The update didn't finish. Close any game or stream, then restart Steam or try the update again.";
+const UPDATE_SLOW_TEXT =
+  "The update is taking too long. Restart Steam, then check the version at the bottom of this panel. If it didn't change, try the update again.";
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -118,7 +190,7 @@ function getBadge(
 // them: a region set to one that is not here is still shown, by its code.
 const REGION_UNMANAGED = "none";
 const REGION_OPTIONS = [
-  { data: "00", label: "World (00) - most restrictive" },
+  { data: "00", label: "World (00), most restrictive" },
   { data: "AR", label: "Argentina (AR)" },
   { data: "AU", label: "Australia (AU)" },
   { data: "AT", label: "Austria (AT)" },
@@ -232,8 +304,15 @@ function Content() {
   const [status, setStatus] = useState<PluginStatus | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [notices, setNotices] = useState<Record<string, string>>({});
-  const [isBusy, setIsBusy] = useState(false);
+  const [busyState, setIsBusy] = useState(false);
+  // The key of the change running now, for the text on its row.
+  const [working, setWorking] = useState<string | null>(null);
   const [applyingAll, setApplyingAll] = useState(false);
+  // The last status read failed, and when the first one is slow to come.
+  const [statusFailed, setStatusFailed] = useState(false);
+  const [slowLoad, setSlowLoad] = useState(false);
+  const [showDetails, setShowDetails] = useState(detailsShown);
+  const [dupDismissed, setDupDismissed] = useState(duplicatesDismissed);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeSafeResult | null>(null);
   const [regdomain, setRegdomainInfo] = useState<RegdomainInfo | null>(null);
 
@@ -270,8 +349,8 @@ function Content() {
   const [backendSwitch, setBackendSwitch] = useState<BackendSwitchStatus | null>(null);
 
   // --- Refs ---
-  // busyRef is the synchronous re-entrancy guard; isBusy (above) is the React
-  // state mirror so UI can respond. setBusy below writes both together.
+  // busyRef is the synchronous re-entrancy guard; busyState (above) is the
+  // React state mirror so UI can respond. setBusy below writes both together.
   const busyRef = useRef(false);
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
@@ -318,6 +397,7 @@ function Content() {
     try {
       const s = await backend.getStatus();
       if (seq !== statusSeqRef.current) return;
+      setStatusFailed(false);
       setStatus(s);
       if (s.settings) {
         // Only adopt a stored value that exists. Turning DNS off clears
@@ -337,8 +417,16 @@ function Content() {
       }
     } catch (e) {
       console.error("WiFi Optimizer: failed to get status", e);
+      if (seq === statusSeqRef.current) setStatusFailed(true);
     }
   }, []);
+
+  // The refresh at the end of a change, bounded so a backend that stopped
+  // answering cannot keep the panel busy.
+  const refreshAfterChange = useCallback(
+    () => withTimeout(refreshStatus(true), REFRESH_WAIT_MS).catch(() => {}),
+    [refreshStatus],
+  );
 
   const stopBackendPoll = () => {
     if (backendPollRef.current) {
@@ -437,6 +525,25 @@ function Content() {
     };
   }, [refreshStatus]);
 
+  // Say something while the first status is slow to come, rather than show
+  // an empty section with no sign that anything is happening.
+  const loaded = !!status && !status.initializing;
+  useEffect(() => {
+    if (loaded) return;
+    const id = setTimeout(() => setSlowLoad(true), 10 * 1000);
+    return () => clearTimeout(id);
+  }, [loaded]);
+
+  // A dismissed duplicate notice comes back the next time duplicates are
+  // found, not while the same ones are still reported.
+  const hasDuplicates = !!status?.external?.duplicate_profiles;
+  useEffect(() => {
+    if (loaded && !hasDuplicates) {
+      duplicatesDismissed = false;
+      setDupDismissed(false);
+    }
+  }, [loaded, hasDuplicates]);
+
   // One-time init: initial update check and resume backend polling if a switch
   // was already in flight when the panel opened.
   useEffect(() => {
@@ -482,7 +589,7 @@ function Content() {
         setUpdateProgress(progress);
         if (progress?.phase === "failed") {
           setUpdating(false);
-          setUpdateError("The update didn't finish. Try again, or check the plugin log.");
+          setUpdateError(UPDATE_FAILED_TEXT);
         } else if (progress?.phase === "done") {
           // Seen by a panel left open across the reload; the new copy of the
           // plugin is the one running now. Its offer to update is stale too,
@@ -506,9 +613,7 @@ function Content() {
     const id = setTimeout(() => {
       console.error("WiFi Optimizer: update didn't complete in time");
       setUpdating(false);
-      setUpdateError(
-        "Update didn't complete. Try again, or reinstall manually from Konsole."
-      );
+      setUpdateError(UPDATE_SLOW_TEXT);
     }, UPDATE_TIMEOUT_MS);
     return () => clearTimeout(id);
   }, [updating]);
@@ -610,6 +715,7 @@ function Content() {
   ): Promise<MethodResult | undefined> => {
     if (busyRef.current) return undefined;
     setBusy(true);
+    setWorking(key);
     setErrors((prev) => {
       const next = { ...prev };
       delete next[key];
@@ -624,7 +730,11 @@ function Content() {
 
     let outcome: MethodResult | undefined;
     try {
-      const result = await fn();
+      const answer = await withTimeout(fn());
+      // A reply without a success flag is not a result the panel can read.
+      const result: MethodResult = isResult(answer)
+        ? answer
+        : { success: false, message: GENERIC_FAIL_TEXT };
       outcome = result;
       // A setter can succeed and still have done something other than what
       // was asked - locking to the access point you were already on because
@@ -634,8 +744,7 @@ function Content() {
         setNotices((prev) => ({ ...prev, [key]: result.message as string }));
       }
       if (!result.success) {
-        const detail = result.detail ? ` (${result.detail})` : "";
-        const msg = (result.message ?? ERROR_MESSAGES[result.error ?? ""] ?? "Unknown error") + detail;
+        const msg = failureText(result);
         setErrors((prev) => ({ ...prev, [key]: msg }));
       }
       // Wait for WiFi to reconnect before refreshing status
@@ -645,15 +754,17 @@ function Content() {
     } catch (e) {
       // A call that throws (Decky restarting, the backend gone) used to
       // surface as an unhandled rejection with the toggle silently unchanged.
+      console.error(`WiFi Optimizer: ${key} call failed`, e);
       setErrors((prev) => ({
         ...prev,
-        [key]: `Couldn't reach the plugin's backend (${String(e)})`,
+        [key]: e instanceof NoAnswer ? NO_ANSWER_TEXT : UNREACHABLE_TEXT,
       }));
     } finally {
       // Refresh before clearing busy so toggles/badges don't briefly flip to
       // stale pre-operation values in the interim render. Refresh runs even on
       // unexpected errors to keep UI consistent with backend state.
-      await refreshStatus(true);
+      await refreshAfterChange();
+      setWorking(null);
       setBusy(false);
     }
     return outcome;
@@ -671,7 +782,10 @@ function Content() {
     setNotices({});
     setOptimizeResult(null);
     try {
-      const result = await fn();
+      const answer = await withTimeout(fn());
+      const result: OptimizeSafeResult = isResult(answer)
+        ? answer
+        : { success: false, total: 0, applied: 0, results: {}, message: GENERIC_FAIL_TEXT };
       setOptimizeResult(result);
       if (result.results) {
         // Successes can carry a message too, as they do for a single toggle:
@@ -680,9 +794,10 @@ function Content() {
         const newErrors: Record<string, string> = {};
         const newNotices: Record<string, string> = {};
         for (const [k, v] of Object.entries(result.results)) {
-          if (!v.success) {
-            const det = v.detail ? ` (${v.detail})` : "";
-            newErrors[k] = (v.message ?? ERROR_MESSAGES[v.error ?? ""] ?? "Failed") + det;
+          if (!isResult(v)) {
+            newErrors[k] = GENERIC_FAIL_TEXT;
+          } else if (!v.success) {
+            newErrors[k] = failureText(v);
           } else if (v.message) {
             newNotices[k] = v.message;
           }
@@ -698,12 +813,12 @@ function Content() {
       console.error("optimize error", e);
       setOptimizeResult({
         success: false, total: 0, applied: 0, results: {},
-        message: "Something went wrong. Check the Decky log for details.",
+        message: e instanceof NoAnswer ? NO_ANSWER_TEXT : UNREACHABLE_TEXT,
       });
     } finally {
       // Refresh before clearing applyingAll so button doesn't briefly flip to
       // "All good" from stale status. Refresh runs on errors too.
-      await refreshStatus(true);
+      await refreshAfterChange();
       setBusy(false);
       setApplyingAll(false);
     }
