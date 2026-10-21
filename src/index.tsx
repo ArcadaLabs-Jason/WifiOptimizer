@@ -1081,10 +1081,26 @@ function Content() {
   // A status marked initializing is the backend saying a collection is still
   // running and it has nothing to report yet, which is the same situation.
   if (!status || status.initializing) {
-    return <PanelSection title="WiFi Optimizer" />;
+    return (
+      <PanelSection title="WiFi Optimizer">
+        <PanelSectionRow>
+          <div style={{ fontSize: theme.fontSize.body, color: theme.text.secondary }}>
+            {statusFailed
+              ? "Couldn't reach the plugin. It keeps trying. If this stays, restart Steam."
+              : slowLoad
+                ? "Still reading WiFi status. This can take a while just after waking from sleep."
+                : "Loading WiFi status..."}
+          </div>
+        </PanelSectionRow>
+      </PanelSection>
+    );
   }
 
   const s = status?.settings;
+  // A change the backend is still making, which may have outlasted the
+  // panel's own wait for it. Every control waits for it too.
+  const changeRunning = !!status?.profile_change_in_flight;
+  const isBusy = busyState || changeRunning;
   const connected = status?.connected ?? false;
   const supportTier = status?.support_tier ?? 1;
   const driftCount = status?.drift ? Object.keys(status.drift).length : 0;
@@ -1108,6 +1124,20 @@ function Content() {
     setNotices(drop);
   };
   const isDeckLcd = s?.device_family === "deck_lcd";
+  const isDeck = isDeckLcd || s?.device_family === "deck_oled";
+  // The badge and line for a setting that is on for another network.
+  const otherNetworkBadge = { badge: "unknown" as const, text: "other network" };
+  const bandOther = !!status?.live?.band_other_network && !!s?.band_preference_enabled;
+  // A band of 2.4 GHz is only reachable by editing the settings file, or
+  // from an old version. Shown under the 5 GHz toggle, which is the one on.
+  const onBg = !!s?.band_preference_enabled && s?.band_preference === "bg";
+  // What has drifted, by name.
+  const driftNames = Object.keys(status?.drift ?? {}).map((k) => DRIFT_LABELS[k] ?? k);
+  // "Steam Deck OLED, WiFi 6E (QCA206X)", leaving out whichever part is unknown.
+  const deviceParts = [
+    s?.device_label && s.device_label !== "Unknown Device" ? s.device_label : "",
+    s?.chip_label && s.chip_label !== "unknown" ? s.chip_label : "",
+  ].filter(Boolean);
 
   // Streaming auto mode with no stream running: power save, buffer tuning
   // and CAKE are off on purpose. They read as paused, not as off or drifted.
@@ -1139,19 +1169,42 @@ function Content() {
     !status?.drift?.buffer_tuning;
 
   return (
-    <>
+    <DetailsContext.Provider value={showDetails}>
       <PanelHeader
         driver={s?.driver ?? ""}
-        version={status?.version ?? "?"}
         lastApplied={s?.last_applied ?? 0}
         lastEnforced={status?.live?.last_enforced}
         streaming={status?.live}
-        deviceLabel={s?.device_label !== "Unknown Device"
-          ? `${s?.device_label} - ${s?.chip_label}`
-          : s?.chip_label && s.chip_label !== "unknown"
-            ? s.chip_label
-            : undefined}
+        deviceLabel={deviceParts.length ? deviceParts.join(", ") : undefined}
+        showDetails={showDetails}
+        onShowDetails={handleShowDetails}
       />
+
+      {/* A status read failed after the panel had loaded. What is shown is
+          the last status that came through. */}
+      {statusFailed && (
+        <Banner variant="warning">
+          Lost contact with the plugin, so this may be out of date. It keeps
+          trying. If this stays, restart Steam.
+        </Banner>
+      )}
+
+      {/* The settings file could not be saved. Changes then hold until the
+          plugin restarts, and the toggles still read as if they had stuck. */}
+      {status?.settings_unwritable && (
+        <Banner variant="warning">
+          The plugin couldn't save its settings, so changes may not last past
+          a restart. Check that the device has free storage space, then try
+          the change again.
+        </Banner>
+      )}
+
+      {changeRunning && !busyState && (
+        <Banner variant="info">
+          A WiFi change is still finishing. The controls come back when it is
+          done.
+        </Banner>
+      )}
 
       {/* Unknown hardware info */}
       {supportTier === 3 && (
@@ -1176,7 +1229,8 @@ function Content() {
         </PanelSection>
       )}
 
-      {/* Update available */}
+      {/* Update available. A refusal is said here too: the Updates section
+          is far down the panel, and pressing this showed nothing. */}
       {updateInfo?.update_available && !updating && (
         <PanelSection>
           <PanelSectionRow>
@@ -1186,6 +1240,13 @@ function Content() {
                 : `Update to v${updateInfo.latest_version}`}
             </ButtonItem>
           </PanelSectionRow>
+          {updateError && (
+            <PanelSectionRow>
+              <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>
+                {updateError}
+              </div>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       )}
 
