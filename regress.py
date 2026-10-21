@@ -4366,11 +4366,46 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("the backend is read the way NetworkManager reads it")
+try:
+    _nmd = tempfile.mkdtemp()
+    open(os.path.join(_nmd, "10-x.conf"), "w").write("[device]\nwifi.backend=wpa_supplicant\n")
+    class Merged(m.Plugin):
+        _NM_CONF_SOURCES = (_nmd,)
+        asked = 0
+        def _merged_nm_backend(self):
+            Merged.asked += 1; return "iwd"
+        def _configured_backend_from_files(self, *a, **k): return "wpa_supplicant"
+    _mg = Merged()
+    ok(_mg._get_current_backend() == "iwd",
+       "NetworkManager's merged configuration outranks the files this plugin knows about")
+    _mg._get_current_backend(); _mg._get_current_backend()
+    ok(Merged.asked == 1, "and NetworkManager is asked once, not on every status poll")
+    open(os.path.join(_nmd, "50-user.conf"), "w").write("[device]\nwifi.backend=iwd\n")
+    _mg._get_current_backend()
+    ok(Merged.asked == 2, "until a configuration file appears or changes")
+    class NoMerged(Merged):
+        def _merged_nm_backend(self): return None
+    ok(NoMerged()._get_current_backend() == "wpa_supplicant",
+       "and the known files answer when NetworkManager cannot be asked")
+    _units = tempfile.mkdtemp(); _iwd = os.path.join(_units, "iwd.service")
+    class Units(m.Plugin):
+        _IWD_UNITS = (os.path.join(_units, "nothere.service"), _iwd)
+    m._save_settings({**m.DEFAULT_SETTINGS, "distro_id": "cachyos"})
+    ok(Units()._get_backend_method() == "none", "no iwd unit anywhere: no backend switch")
+    open(_iwd, "w").write("")
+    ok(Units()._get_backend_method() == "generic" and Units()._get_backend_method_cached() is True,
+       "an iwd unit in any of systemd's unit directories counts, the same list everywhere")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("SteamOS after 3.9: Valve's holo names")
 try:
     ok(m._HOLO_BACKEND_HELPER == "/usr/bin/holo-polkit-helpers/holo-wifi-set-backend-privileged",
        "the renamed backend helper is known")
-    ok("HOLO_NM_DEFAULT_CONF," in _src_all[_src_all.index("def _get_current_backend"):][:1500],
+    ok("HOLO_NM_DEFAULT_CONF," in _src_all[_src_all.index("def _configured_backend_from_files"):][:1500],
        "and the renamed NetworkManager defaults are read for the backend")
     class Holo(m.Plugin): pass
     _real_open = open

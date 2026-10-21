@@ -149,12 +149,15 @@ DRIVER_PROFILES = {
         "chip_label": "Intel WiFi",
         "supports_6ghz": True,
         "sysfs_power_fixes": [],
-        # iwlmvm is a separate module from iwlwifi, so the modules it may
-        # configure are listed rather than inferred from the driver name.
-        "modules": ["iwlwifi", "iwlmvm"],
+        # iwlmvm and iwlmld are separate modules from iwlwifi, so the modules
+        # it may configure are listed rather than inferred from the driver
+        # name. iwlmld runs the newer cards (BE200 and later) from kernel
+        # 6.15, with its own power_scheme; iwlmvm's never reaches them.
+        "modules": ["iwlwifi", "iwlmvm", "iwlmld"],
         "modprobe_options": [
             "options iwlwifi power_save=0 uapsd_disable=3",
             "options iwlmvm power_scheme=1",
+            "options iwlmld power_scheme=1",
         ],
     },
 }
@@ -1867,7 +1870,7 @@ class Plugin:
             return "steamos_manager"
         if distro == "steamos" and os.path.isfile(BACKEND_HELPER) and os.access(BACKEND_HELPER, os.X_OK):
             return "steamos"
-        if os.path.isfile("/usr/lib/systemd/system/iwd.service"):
+        if self._iwd_installed():
             return "generic"
         return "none"
 
@@ -1887,15 +1890,17 @@ class Plugin:
         settings = _load_settings()
         if settings.get("distro_id") == "steamos" and os.path.isfile(BACKEND_HELPER):
             return True
-        return os.path.isfile("/usr/lib/systemd/system/iwd.service")
+        return self._iwd_installed()
 
     def _get_current_backend(self) -> str | None:
         """Return 'iwd', 'wpa_supplicant', or None if unknown.
 
-        Checks config files in priority order, then falls back to checking
-        which systemd service is active.
+        NetworkManager's own merged configuration first, so a file of the
+        user's or the distro's that this plugin does not know about is read
+        in NetworkManager's order; then the config files we know, in their
+        priority order; then which systemd service is active.
         """
-        found = self._configured_backend_from_files()
+        found = self._merged_nm_backend_cached() or self._configured_backend_from_files()
         if found:
             return found
         # No config found, check which service is running
@@ -9292,6 +9297,42 @@ class Plugin:
         iface = await asyncio.to_thread(self._get_wifi_interface)
         return iface, bool(iface)
 
+    # Everything NetworkManager builds its configuration from. The status
+    # poll asks for the backend every few seconds, and NetworkManager is only
+    # asked again when one of these changes.
+    _NM_CONF_SOURCES = (
+        "/etc/NetworkManager/NetworkManager.conf",
+        "/etc/NetworkManager/conf.d",
+        "/run/NetworkManager/conf.d",
+        "/usr/lib/NetworkManager/conf.d",
+        "/var/lib/NetworkManager/NetworkManager-intern.conf",
+    )
+
+    def _nm_conf_stamp(self) -> tuple:
+        stamp = []
+        for path in self._NM_CONF_SOURCES:
+            try:
+                entries = sorted(os.listdir(path)) if os.path.isdir(path) else [""]
+            except OSError:
+                entries = []
+            for name in entries:
+                full = os.path.join(path, name) if name else path
+                try:
+                    st = os.stat(full)
+                    stamp.append((full, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    stamp.append((full, None, None))
+        return tuple(stamp)
+
+    def _merged_nm_backend_cached(self) -> str | None:
+        stamp = self._nm_conf_stamp()
+        cached = getattr(self, "_merged_backend_seen", None)
+        if cached and cached[0] == stamp:
+            return cached[1]
+        found = self._merged_nm_backend()
+        self._merged_backend_seen = (stamp, found)
+        return found
+
     def _merged_nm_backend(self) -> str | None:
         """The backend NetworkManager's merged configuration names, from NM
         itself, so the order conf.d files are read in is NM's own."""
@@ -9324,6 +9365,10 @@ class Plugin:
         "/etc/systemd/system/iwd.service",
     )
 
+    def _iwd_installed(self) -> bool:
+        """Whether an iwd unit exists in any of the places systemd keeps one."""
+        return any(os.path.exists(unit) for unit in self._IWD_UNITS)
+
     def _heal_orphaned_iwd_conf(self) -> bool:
         """Undo our switch to iwd on a system that no longer has iwd.
 
@@ -9339,7 +9384,7 @@ class Plugin:
             return False
         if not re.search(r"^\s*wifi\.backend\s*=\s*iwd\s*$", text, re.M):
             return False
-        if any(os.path.exists(unit) for unit in self._IWD_UNITS):
+        if self._iwd_installed():
             return False
         try:
             os.remove(GENERIC_BACKEND_CONF)
