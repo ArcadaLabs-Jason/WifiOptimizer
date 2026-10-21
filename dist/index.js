@@ -377,8 +377,10 @@ const EXPLANATION = "Linux handhelds use one of two WiFi backends, and which one
 // "Switched to".
 function backendResultText(r) {
     if (!r.success) {
+        // The backend's own words say whether the switch itself took; this
+        // fallback is true either way.
         if (r.needs_reboot) {
-            return "The switch didn't finish and the WiFi card didn't come back. Restart the device.";
+            return r.message ?? "WiFi didn't come back after the backend switch. Restart the device.";
         }
         return r.message ?? "The backend switch didn't work. If WiFi doesn't come back, restart the device.";
     }
@@ -535,6 +537,185 @@ function PanelHeader({ driver, lastApplied, lastEnforced, deviceLabel, streaming
                         : "Auto mode: no stream, fixes paused" }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Show details", description: "Explains every setting below. You can also tap (i) next to one.", checked: showDetails, onChange: onShowDetails }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["Last changed: ", timeAgo(lastApplied), lastEnforced ? (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx("br", {}), "Auto-applied: ", timeAgo(lastEnforced)] })) : ("")] }) })] }));
 }
 
+const getReportState = callable("get_report_state");
+const previewReport = callable("preview_report");
+const sendReport = callable("send_report");
+const dismissReportNotice = callable("dismiss_report_notice");
+const SEND_FAIL_TEXT = "Couldn't send the report. Try again later, or use Copy diagnostics and post it on GitHub.";
+const PREVIEW_FAIL_TEXT = "Couldn't put the report together. Try again in a moment.";
+// Longer than the backend's own limits (diagnostics, then a 25 second send).
+const CALL_LIMIT_MS = 60000;
+// Shared by the footer button and the wake notice, and kept for as long as
+// the plugin is loaded, so a result stays on screen until it is dismissed
+// even if the panel is closed and opened again.
+let shared$1 = {
+    state: null,
+    working: false,
+    outcome: null,
+};
+const listeners$1 = new Set();
+let loading = null;
+function update(patch) {
+    shared$1 = { ...shared$1, ...patch };
+    listeners$1.forEach((listener) => listener());
+}
+function withLimit(call) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no answer")), CALL_LIMIT_MS);
+        call.then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        }, (error) => {
+            clearTimeout(timer);
+            reject(error);
+        });
+    });
+}
+function refreshReportState() {
+    if (!loading) {
+        loading = withLimit(getReportState())
+            .then((state) => {
+            if (state && typeof state === "object")
+                update({ state });
+        })
+            .catch((e) => console.error("report state error", e))
+            .finally(() => {
+            loading = null;
+        });
+    }
+    return loading;
+}
+function useReportState() {
+    const [, setTick] = SP_REACT.useState(0);
+    SP_REACT.useEffect(() => {
+        const listener = () => setTick((n) => n + 1);
+        listeners$1.add(listener);
+        void refreshReportState();
+        return () => {
+            listeners$1.delete(listener);
+        };
+    }, []);
+    return shared$1;
+}
+// Split into blocks the controller can step through: one long block of text
+// cannot be scrolled with the D-pad, but focus moving from block to block
+// scrolls the box along with it.
+const LINES_PER_BLOCK = 12;
+function ReportPreviewModal({ text, onSend, closeModal, }) {
+    const lines = text.split("\n");
+    const blocks = [];
+    for (let i = 0; i < lines.length; i += LINES_PER_BLOCK) {
+        blocks.push(lines.slice(i, i + LINES_PER_BLOCK).join("\n"));
+    }
+    return (SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Send this report to the developer?", strDescription: "This is everything that will be sent. Network names and addresses are already taken out. Scroll through it, then choose Send.", strOKButtonText: "Send", strCancelButtonText: "Cancel", onOK: onSend, closeModal: closeModal, children: SP_JSX.jsx(DFL.Focusable, { style: {
+                maxHeight: "50vh",
+                overflowY: "auto",
+                marginTop: "8px",
+                padding: "8px",
+                background: theme.surface.md,
+                borderRadius: theme.radius.md,
+            }, children: blocks.map((block, i) => (SP_JSX.jsx(DFL.Focusable, { onActivate: () => { }, style: {
+                    fontFamily: "monospace",
+                    fontSize: theme.fontSize.body,
+                    color: theme.text.primary,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                }, children: block }, i))) }) }));
+}
+async function send(id, from) {
+    update({ working: true, outcome: null });
+    let result = null;
+    try {
+        result = await withLimit(sendReport(id));
+    }
+    catch (e) {
+        console.error("send report error", e);
+    }
+    const status = result?.status;
+    update({
+        working: false,
+        outcome: {
+            text: typeof result?.message === "string" ? result.message : SEND_FAIL_TEXT,
+            tone: status === "sent" ? "success" : status === "queued" ? "info" : "error",
+            from,
+        },
+    });
+    await refreshReportState();
+}
+async function startReport(from) {
+    if (shared$1.working)
+        return;
+    update({ working: true, outcome: null });
+    let preview = null;
+    try {
+        preview = await withLimit(previewReport());
+    }
+    catch (e) {
+        console.error("preview report error", e);
+    }
+    update({ working: false });
+    if (!preview?.success || typeof preview.id !== "string" || !preview.payload) {
+        update({
+            outcome: {
+                text: typeof preview?.message === "string" ? preview.message : PREVIEW_FAIL_TEXT,
+                tone: "error",
+                from,
+            },
+        });
+        return;
+    }
+    const id = preview.id;
+    DFL.showModal(SP_JSX.jsx(ReportPreviewModal, { text: JSON.stringify(preview.payload, null, 2), onSend: () => void send(id, from) }));
+}
+const rowStyle = { fontSize: theme.fontSize.small, color: theme.text.tertiary };
+function OutcomeRows({ outcome }) {
+    const color = outcome.tone === "success"
+        ? theme.success.text
+        : outcome.tone === "error"
+            ? theme.error.text
+            : theme.info.text;
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { ...rowStyle, color }, children: outcome.text }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => update({ outcome: null }), children: "Dismiss" }) })] }));
+}
+// Beside Copy diagnostics, inside the footer's section.
+function SendReportRow() {
+    const { state, working, outcome } = useReportState();
+    if (!state?.enabled)
+        return null;
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: working, onClick: () => void startReport("footer"), children: working ? "Working..." : "Send report to the developer" }) }), outcome?.from === "footer" && SP_JSX.jsx(OutcomeRows, { outcome: outcome }), state.pending && !outcome && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: rowStyle, children: "A report is waiting. It will be sent when WiFi is back." }) })), state.sent_ref && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { ...rowStyle, color: theme.success.text }, children: ["Your saved report was sent. Reference ", state.sent_ref, ". Quote it if you post about this."] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: async () => {
+                                try {
+                                    await dismissReportNotice("sent");
+                                }
+                                catch (e) {
+                                    console.error("dismiss report notice error", e);
+                                }
+                                await refreshReportState();
+                            }, children: "Dismiss" }) })] }))] }));
+}
+// Near the top of the panel, once per wake that left WiFi down.
+function WakeFailureNotice() {
+    const { state, working, outcome } = useReportState();
+    const fromHere = outcome?.from === "wake" ? outcome : null;
+    if (!state?.enabled || (!state.wake_failure && !fromHere))
+        return null;
+    const dismiss = async () => {
+        update({ outcome: null });
+        try {
+            await dismissReportNotice("wake");
+        }
+        catch (e) {
+            console.error("dismiss wake notice error", e);
+        }
+        await refreshReportState();
+    };
+    if (fromHere) {
+        // After a failure the notice comes back with its button, to try again.
+        // Once the report is sent or saved, the notice has done its job.
+        const done = fromHere.tone !== "error";
+        return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: fromHere.tone, children: fromHere.text }), SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => (done ? void dismiss() : update({ outcome: null })), children: "Dismiss" }) }) })] }));
+    }
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(Banner, { variant: "warning", children: "Last time your device woke from sleep, WiFi didn't come back. Sending a report helps find out why." }), SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: working, onClick: () => void startReport("wake"), children: working ? "Working..." : "Send report to the developer" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => void dismiss(), children: "Dismiss" }) })] })] }));
+}
+
 const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
 function PanelFooter({ version }) {
     const [diagState, setDiagState] = SP_REACT.useState("idle");
@@ -597,7 +778,7 @@ function PanelFooter({ version }) {
                     : diagState === "copying"
                         ? "Collecting..."
                         : "Copy diagnostics";
-    return (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["v", version, " by jasonridesabike"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: diagState === "copying", onClick: handleCopyDiagnostics, children: label }) }), (diagState === "save_failed" || diagState === "error") && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { ...rowStyle, color: theme.error.text }, children: "Try again in a moment. If it keeps failing, say so in your report." }) })), savedPath && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { ...rowStyle, wordBreak: "break-all" }, children: ["The clipboard wasn't available, so the diagnostics were saved to this file: ", savedPath] }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => {
+    return (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["v", version, " by jasonridesabike"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: rowStyle, children: ["If WiFi won't reconnect, a reboot usually fixes it.", SP_JSX.jsx("br", {}), "Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer"] }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: diagState === "copying", onClick: handleCopyDiagnostics, children: label }) }), (diagState === "save_failed" || diagState === "error") && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { ...rowStyle, color: theme.error.text }, children: "Try again in a moment. If it keeps failing, say so in your report." }) })), savedPath && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { ...rowStyle, wordBreak: "break-all" }, children: ["The clipboard wasn't available, so the diagnostics were saved to this file: ", savedPath] }) })), SP_JSX.jsx(SendReportRow, {}), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: () => {
                         DFL.Navigation.CloseSideMenus();
                         DFL.Navigation.NavigateToExternalWeb(KOFI_URL);
                     }, children: "Support on Ko-fi" }) })] }));
@@ -2117,7 +2298,7 @@ function Content() {
         status?.live?.dispatcher_installed &&
         (status?.live?.buffer_tuning_applied || (streamingIdle && s?.buffer_tuning_enabled)) &&
         !status?.drift?.buffer_tuning;
-    return (SP_JSX.jsxs(DetailsContext.Provider, { value: showDetails, children: [SP_JSX.jsx(PanelHeader, { driver: s?.driver ?? "", lastApplied: s?.last_applied ?? 0, lastEnforced: status?.live?.last_enforced, streaming: status?.live, deviceLabel: deviceParts.length ? deviceParts.join(", ") : undefined, showDetails: showDetails, onShowDetails: handleShowDetails }), statusFailed && (SP_JSX.jsx(Banner, { variant: "warning", children: "Lost contact with the plugin, so this may be out of date. It keeps trying. If this stays, restart the device." })), status?.settings_unwritable && (SP_JSX.jsx(Banner, { variant: "warning", children: "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again." })), changeRunning && !busyState && (SP_JSX.jsx(Banner, { variant: "info", children: "A WiFi change is still finishing. The controls come back when it is done." })), supportTier === 3 && (SP_JSX.jsx(Banner, { variant: "info", children: "Unknown WiFi hardware detected. Some optimizations may not apply." })), status?.settings_recovered && (SP_JSX.jsx(Banner, { variant: "warning", children: ERROR_MESSAGES.parse_error })), status?.settings_recovered && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleDismissRecovered, children: "Dismiss" }) }) })), updateInfo?.update_available && !updating && (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleApplyUpdate, children: updateInfo.is_downgrade
+    return (SP_JSX.jsxs(DetailsContext.Provider, { value: showDetails, children: [SP_JSX.jsx(PanelHeader, { driver: s?.driver ?? "", lastApplied: s?.last_applied ?? 0, lastEnforced: status?.live?.last_enforced, streaming: status?.live, deviceLabel: deviceParts.length ? deviceParts.join(", ") : undefined, showDetails: showDetails, onShowDetails: handleShowDetails }), statusFailed && (SP_JSX.jsx(Banner, { variant: "warning", children: "Lost contact with the plugin, so this may be out of date. It keeps trying. If this stays, restart the device." })), status?.settings_unwritable && (SP_JSX.jsx(Banner, { variant: "warning", children: "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again." })), changeRunning && !busyState && (SP_JSX.jsx(Banner, { variant: "info", children: "A WiFi change is still finishing. The controls come back when it is done." })), supportTier === 3 && (SP_JSX.jsx(Banner, { variant: "info", children: "Unknown WiFi hardware detected. Some optimizations may not apply." })), status?.settings_recovered && (SP_JSX.jsx(Banner, { variant: "warning", children: ERROR_MESSAGES.parse_error })), status?.settings_recovered && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleDismissRecovered, children: "Dismiss" }) }) })), SP_JSX.jsx(WakeFailureNotice, {}), updateInfo?.update_available && !updating && (SP_JSX.jsxs(DFL.PanelSection, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: handleApplyUpdate, children: updateInfo.is_downgrade
                                 ? `Go back to v${updateInfo.latest_version}`
                                 : `Update to v${updateInfo.latest_version}` }) }), updateError && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.warning.text }, children: updateError }) }))] })), updating && (SP_JSX.jsx(DFL.PanelSection, { children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: theme.fontSize.body, color: theme.info.text }, children: updatingText(updateProgress) }) }) })), connected && !s?.last_applied && (SP_JSX.jsxs(Banner, { variant: "info", children: [alreadyOn.length > 0 &&
                         `${joinNames(alreadyOn)} ${alreadyOn.length > 1 ? "are" : "is"} already on. `, "Tap ", SP_JSX.jsx("strong", { children: "Optimize Safe" }), " to turn on the rest of the recommended settings."] })), hasDuplicates && !dupDismissed && (SP_JSX.jsxs(Banner, { variant: "warning", children: ["This network is saved more than once with different security settings. Which copy is used decides which access points can be reached, so the connection can look inconsistent.", " ", status?.duplicates_prioritized
