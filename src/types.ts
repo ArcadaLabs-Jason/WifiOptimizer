@@ -42,6 +42,10 @@ export interface LiveStatus {
   bssid_lock_other_network?: boolean;
   /** IPv6 is turned off for a different network, not this one. */
   ipv6_other_network?: boolean;
+  /** The band preference is on, but for a different network. */
+  band_other_network?: boolean;
+  /** Custom DNS is on, but not applied on this network. */
+  dns_other_network?: boolean;
   ip_address?: string;
   dns?: string;
   ipv6_method?: string;
@@ -102,6 +106,13 @@ export interface PluginStatus {
   // The settings file did not parse and was moved aside to
   // settings.json.corrupt. Reported until the panel acknowledges it.
   settings_recovered?: boolean;
+  // Sent with the duplicate profile notice: true only when the copy in use
+  // was actually given priority over the others.
+  duplicates_prioritized?: boolean;
+  // The last attempt to save the settings file failed.
+  settings_unwritable?: boolean;
+  // A lock, band, WPA2, DNS, IPv6, Reset or backend change is still running.
+  profile_change_in_flight?: boolean;
   last_applied?: number;
   error?: string;
   message?: string;
