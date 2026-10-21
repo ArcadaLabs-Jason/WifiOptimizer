@@ -852,17 +852,23 @@ function Content() {
       ? { badge: "paused" as const, text: "paused" }
       : getBadge(key, status, errors[key] ?? null);
 
+  // Under iwd Optimize Safe leaves the lock out, so it is not one of the
+  // things to wait for there, or "All good" never came.
+  const lockSafe =
+    status?.live?.wifi_backend === "iwd" ||
+    (s?.bssid_lock_enabled &&
+      !status?.drift?.bssid_lock &&
+      // The lock can be enabled but belong to a different network, in which
+      // case nothing has drifted and it is also doing nothing here. Without
+      // this, the panel reports all clear while one of the four is inert.
+      !status?.live?.bssid_lock_other_network);
+
   // Check if all safe optimizations are already active
   const allSafeActive =
     connected &&
     (status?.live?.power_save_off || (streamingIdle && s?.power_save_disabled)) &&
     !status?.drift?.power_save &&
-    s?.bssid_lock_enabled &&
-    !status?.drift?.bssid_lock &&
-    // The lock can be enabled but belong to a different network, in which
-    // case nothing has drifted and it is also doing nothing here. Without
-    // this, the panel reports all clear while one of the four is inert.
-    !status?.live?.bssid_lock_other_network &&
+    lockSafe &&
     status?.live?.dispatcher_installed &&
     (status?.live?.buffer_tuning_applied || (streamingIdle && s?.buffer_tuning_enabled)) &&
     !status?.drift?.buffer_tuning;

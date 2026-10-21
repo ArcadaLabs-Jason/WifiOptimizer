@@ -45,9 +45,9 @@ Releases are signed. From v0.21.0-beta on, before installing an update, the plug
 ## Getting started
 
 1. Open WiFi Optimizer from the Decky sidebar
-2. Tap **Optimize Safe** - this applies four no-brainer optimizations that are always beneficial:
+2. Tap **Optimize Safe** - this applies four optimizations that suit most setups (three when the WiFi backend is `iwd`, where the BSSID lock is left out):
    - Disables WiFi power save and PCIe power states (prevents lag spikes and streaming degradation)
-   - Locks your BSSID (stops background scanning interruptions)
+   - Locks your BSSID (stops background scanning interruptions, but also stops roaming between access points, see below)
    - Enables auto-fix on wake (reapplies settings after sleep)
    - Tunes network buffers (handles streaming traffic bursts)
 3. That's it. The plugin maintains these settings automatically, even after sleep/wake and OS updates.
