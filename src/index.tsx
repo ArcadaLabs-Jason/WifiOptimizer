@@ -1051,6 +1051,9 @@ function Content() {
     // Forced like the notify toggle. Unforced, it is skipped while another
     // operation holds the panel busy, and the dropdown shows the old channel.
     await refreshStatus(true);
+    // The answer for the old channel was dropped above. Ask again, or the
+    // panel offers nothing for the new channel until the next timed check.
+    await handleCheckForUpdate();
   };
 
   // Custom DNS draft handling
