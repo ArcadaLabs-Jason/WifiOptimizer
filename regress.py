@@ -3184,7 +3184,9 @@ try:
         ok(asyncio.run(_p6.get_device_info())["supports_6ghz"] is True,
            "a card listing a 6 GHz channel is, even one the region has disabled")
         _pf = Phy(); _pf.out = ""
-        ok(asyncio.run(_pf.get_device_info())["supports_6ghz"] is True,
+        # D16: mt7921e also drives the MT7921, so its fallback is False now.
+        ok(asyncio.run(_pf.get_device_info())["supports_6ghz"]
+           is m.DRIVER_PROFILES["mt7921e"]["supports_6ghz"],
            "and when the card cannot be asked the driver's profile decides")
     finally:
         m.SYSFS_NET = _sn
@@ -8067,6 +8069,43 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("D6 the panel is told why WiFi is not connected")
+try:
+    class NotConnected(m.Plugin):
+        def __init__(self, iface="wlan0", radio="enabled", nm="disconnected", stuck=None):
+            super().__init__(); self.iface = iface; self.radio = radio; self.nm = nm
+            if stuck is not None:
+                self._stuck_tools = lambda: set(stuck)
+        def _get_wifi_interface(self): return self.iface
+        def _get_active_connection_uuid(self): return None
+        def _nm_general_state(self): return ("disconnected", self.radio)
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0] == "/usr/bin/nmcli" and "DEVICE,TYPE,STATE" in cmd:
+                return _ok(f"{self.iface or 'eth0'}:{'wifi' if self.iface else 'ethernet'}:{self.nm}\n"
+                           "p2p-dev-wlan0:wifi-p2p:disconnected\n")
+            return _ok()
+    m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88", "distro_id": "steamos"})
+    def _ws(p): return asyncio.run(p.get_status()).get("live", {}).get("wifi_state")
+    ok(_ws(NotConnected(iface=None)) == "no_device", "no wireless interface reads no_device")
+    ok(_ws(NotConnected(radio="disabled")) == "radio_off", "WiFi turned off reads radio_off")
+    ok(_ws(NotConnected(nm="unavailable")) == "unavailable", "a card NetworkManager calls unavailable reads unavailable")
+    ok(_ws(NotConnected(stuck={"iw"})) == "not_responding",
+       "an iw stuck in the driver reads not_responding (contract C2, _stuck_tools)")
+    ok(_ws(NotConnected(stuck={"tc"})) == "disconnected" and _ws(NotConnected()) == "disconnected",
+       "and anything else, including a plugin without _stuck_tools yet, reads disconnected")
+    _rfk = m.Plugin.RFKILL_DIR
+    try:
+        m.Plugin.RFKILL_DIR = tempfile.mkdtemp()
+        os.makedirs(os.path.join(m.Plugin.RFKILL_DIR, "rfkill1"))
+        for _n, _v in (("type", "wlan"), ("soft", "0"), ("hard", "1")):
+            open(os.path.join(m.Plugin.RFKILL_DIR, "rfkill1", _n), "w").write(_v + "\n")
+        ok(_ws(NotConnected()) == "radio_off", "and a WiFi radio switch blocked in hardware reads radio_off")
+    finally:
+        m.Plugin.RFKILL_DIR = _rfk
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("D7 on other systems the backend in use is the one running")
 try:
     class Running(m.Plugin):
@@ -8127,6 +8166,36 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("D8 the plugin's association check reads the radio the driver fixes are for")
+try:
+    _r8 = tempfile.mkdtemp()
+    _d_netdev(_r8, "wlan0", "mt7921u")
+    _d_netdev(_r8, "wlan1", "rtw88_8822ce", operstate="down")
+    class TwoRadios(m.Plugin):
+        def _run_cmd(self, cmd, timeout=5):
+            return _ok("wlan0:wifi\nwlan1:wifi\n") if cmd[0] == "/usr/bin/nmcli" else _ok()
+    _sn8 = m.SYSFS_NET
+    try:
+        m.SYSFS_NET = os.path.join(_r8, "net")
+        m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88"})
+        open(os.path.join(_r8, "net", "wlan1", "operstate"), "w").write("dormant\n")
+        ok(TwoRadios()._wifi_associated() is False,
+           "the plugin's association check reads the netdev bound to the driver, not the first one listed")
+        open(os.path.join(_r8, "net", "wlan1", "operstate"), "w").write("up\n")
+        ok(TwoRadios()._wifi_associated() is True, "and says associated when that one is")
+        TwoRadios()._apply_pcie_aspm_fix(True)
+        _l8 = lambda n, f: open(os.path.join(_r8, "devices", n, *f.split("/"))).read().strip()
+        ok(_l8("wlan1", "link/l1_aspm") == "0" and _l8("wlan1", "power/control") == "on"
+           and _l8("wlan0", "link/l1_aspm") == "1" and _l8("wlan0", "power/control") == "auto",
+           "and the PCIe fix goes to that card too, not to the other radio")
+        if os.path.exists(m.PCIE_BASELINE_FILE): os.remove(m.PCIE_BASELINE_FILE)
+    finally:
+        m.SYSFS_NET = _sn8
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("D9 an upgrade mid-boot does not record our own values as the system's")
 try:
     _first = _d_block("FIRST_RUN=0", "# Apply power save")
@@ -8169,6 +8238,77 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("D11 the PCIe baseline is never missing while the plugin rewrites it")
+try:
+    _gaps = []
+    _real_unlink, _real_remove = os.unlink, os.remove
+    def _watch_unlink(path, *a, **k):
+        _real_unlink(path, *a, **k); _gaps.append(os.path.exists(m.PCIE_BASELINE_FILE))
+    def _watch_remove(path, *a, **k):
+        _real_remove(path, *a, **k); _gaps.append(os.path.exists(m.PCIE_BASELINE_FILE))
+    open(m.PCIE_BASELINE_FILE, "w").write(json.dumps({"/sys/x/link/l1_aspm": "1"}))
+    os.unlink, os.remove = _watch_unlink, _watch_remove
+    try:
+        for _k in range(3):
+            m._save_pcie_baseline({"/sys/x/link/l1_aspm": "1", f"/sys/x/link/l1_{_k}_pcipm": "1"})
+    finally:
+        os.unlink, os.remove = _real_unlink, _real_remove
+    _b11 = m._read_pcie_baseline()
+    ok(all(_gaps) and "/sys/x/link/l1_2_pcipm" in _b11,
+       f"saving never removes the baseline before the new one is in place ({_gaps})")
+    open(m.PCIE_BASELINE_FILE, "w").write(json.dumps({"/sys/x/power/control": "auto"}))
+    m._save_pcie_baseline({"/sys/x/link/l1_aspm": "1"})
+    ok(m._read_pcie_baseline() == {"/sys/x/power/control": "auto", "/sys/x/link/l1_aspm": "1"},
+       "and what the dispatcher recorded meanwhile is kept")
+    os.remove(m.PCIE_BASELINE_FILE)
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+    os.unlink, os.remove = _real_unlink, _real_remove
+
+section("D12 the region notice names the Steam Deck only on one")
+try:
+    for _fam, _want in (("rog_ally", False), ("legion_go", False), ("deck_oled", True), ("deck_lcd", True)):
+        m._save_settings({**base_ap, "device_family": _fam})
+        _msg = asyncio.run(Reg(SELF_MANAGED).set_regdomain("DE")).get("message", "")
+        ok(bool(_msg) and ("Steam Deck" in _msg) is _want,
+           f"on {_fam} the notice {'names' if _want else 'does not name'} the Steam Deck")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D13 an address clash from before the device took its address again is not shown")
+try:
+    class ClashLog(m.Plugin):
+        """journalctl that honours --since, over clashes logged at given times."""
+        def __init__(self, events):
+            super().__init__(); self.events = events; self.since = []
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0] == "/usr/bin/journalctl":
+                since = cmd[cmd.index("--since") + 1]; self.since.append(since)
+                start = time.time() - 600 if since == "-10min" else float(since.lstrip("@"))
+                return _ok("\n".join(line for t, line in self.events() if t >= start) + "\n")
+            return _ok()
+    def _clash(ip): return f"<warn>  [1.0] ipv4acd: conflict detected for IP address {ip} with host 62:E9:31:0D:1F:E7"
+    _t0 = time.time()
+    _boot_clash = [(_t0 - 120, _clash("192.168.1.9"))]
+    cl = ClashLog(lambda: _boot_clash)
+    cl._recheck_address_conflict("192.168.1.9")
+    ok(cl._address_conflict and cl._address_conflict.get("ip") == "192.168.1.9",
+       "a clash logged at boot, before the plugin loaded, is still reported")
+    cl._recheck_address_conflict("192.168.1.20")
+    cl._recheck_address_conflict("192.168.1.9")
+    ok(not cl._address_conflict and cl.since[-1].startswith("@"),
+       f"after the address changed and came back, the clash from before is not ({cl.since[-1]})")
+    _late = _boot_clash + [(time.time() + 1, _clash("192.168.1.9"))]
+    cl.events = lambda: _late
+    cl._conflict_checked_at = 0.0
+    cl._recheck_address_conflict("192.168.1.9")
+    ok(bool(cl._address_conflict), "while a clash logged after it is")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("D14 error text in the log and diagnostics does not carry the home folder")
 try:
     _home_was = getattr(m.decky, "DECKY_USER_HOME", None)
@@ -8197,6 +8337,31 @@ try:
        "an IPv4 address followed by a full stop is redacted")
     ok(m.Plugin._redact_diagnostics("build 1.2.3.4.5 and 10.0.0.1") == "build 1.2.3.4.5 and <ip>",
        "while five numbers in a row are not taken for one")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D16 chip labels and the 6 GHz fallback fit every card a driver serves")
+try:
+    _pr = m.DRIVER_PROFILES
+    ok(_pr["rtw89"]["supports_6ghz"] is False and _pr["mt7921e"]["supports_6ghz"] is False
+       and _pr["iwlwifi"]["supports_6ghz"] is False,
+       "drivers that also run cards with no 6 GHz radio do not claim it when the card cannot be asked")
+    ok("MT7922" not in _pr["mt7921e"]["chip_label"] and "MT792" in _pr["mt7921e"]["chip_label"]
+       and _pr["rtw89"]["chip_label"] != "WiFi 6 (RTL8852)",
+       f"and their labels name the family ({_pr['mt7921e']['chip_label']}, {_pr['rtw89']['chip_label']})")
+    _dmi_was = getattr(m, "DMI_DIR", None)
+    try:
+        m.DMI_DIR = tempfile.mkdtemp()
+        for _prod, _vend, _fam in (("AIR Plus", "AYANEO", "ayaneo"), ("G1617-01", "GPD", "gpd"),
+                                   ("G1618-04", "GPD", "gpd_win"), ("Jupiter", "Valve", "deck_lcd"),
+                                   ("Something", "Acme", "unknown")):
+            open(os.path.join(m.DMI_DIR, "product_name"), "w").write(_prod + "\n")
+            open(os.path.join(m.DMI_DIR, "sys_vendor"), "w").write(_vend + "\n")
+            ok(m.Plugin()._detect_device_family()[1] == _fam,
+               f"product {_prod!r} from vendor {_vend!r} is recognised as {_fam}")
+    finally:
+        if _dmi_was is not None: m.DMI_DIR = _dmi_was
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -8295,6 +8460,41 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("D21 backend and region failures say what to do next")
+try:
+    _rb21, _rc21 = m.BAZZITE_IWD_CONF, m.GENERIC_BACKEND_CONF
+    try:
+        _d21 = tempfile.mkdtemp()
+        m.BAZZITE_IWD_CONF = os.path.join(_d21, "iwd.conf")
+        m.GENERIC_BACKEND_CONF = os.path.join(_d21, "99-wifi-optimizer-backend.conf")
+        open(m.BAZZITE_IWD_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        class Outranked21(m.Plugin):
+            def __init__(self): super().__init__(); self._ensure_backend_switch_state()
+            def _merged_nm_backend(self): return "iwd"
+            def _run_cmd(self, cmd, timeout=5): return _ok()
+        o21 = Outranked21(); asyncio.run(o21._generic_backend_switch_worker("wpa_supplicant"))
+        _m21 = o21._backend_switch["result"].get("message", "")
+        ok(m.BAZZITE_IWD_CONF in _m21 and "change that setting" in _m21,
+           f"a switch another file outranks names that file and what to do ({_m21!r})")
+        os.remove(m.BAZZITE_IWD_CONF)
+        o21 = Outranked21(); asyncio.run(o21._generic_backend_switch_worker("wpa_supplicant"))
+        _m21b = o21._backend_switch["result"].get("message", "")
+        ok("/etc/NetworkManager/conf.d" in _m21b, f"and where to look when it is not one we know ({_m21b!r})")
+    finally:
+        m.BAZZITE_IWD_CONF, m.GENERIC_BACKEND_CONF = _rb21, _rc21
+    m._save_settings(dict(base_ap))
+    _m21c = asyncio.run(Reg(PLAIN, ok_set=False).set_regdomain("DE")).get("message", "")
+    class NoBus(m.Plugin):
+        def __init__(self): super().__init__(); self._ensure_backend_switch_state()
+        def _session_bus_cmd(self, args): return None
+    nb = NoBus(); asyncio.run(nb._steamos_manager_backend_switch_worker("iwd"))
+    _m21d = nb._backend_switch["result"].get("message", "")
+    ok("Try again" in _m21c and "Try again" in _m21d,
+       f"a region that could not be set and an unreachable SteamOS service each give a next step ({_m21c!r}, {_m21d!r})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("J3 the dispatcher stands down while the plugin is disabled in Decky")
 try:
     _tj = _d_template()
@@ -8330,7 +8530,29 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
-
+section("U1 a region the card does not take is said, not shown as set")
+try:
+    m._save_settings(dict(base_ap))
+    asyncio.sleep = _no_sleep
+    try:
+        _ru = asyncio.run(Reg(PLAIN).set_regdomain("DE"))
+        class Takes(Reg):
+            def _run_cmd(self, cmd, timeout=5):
+                if cmd[:3] == ["/usr/bin/iw", "reg", "set"]:
+                    self.reg_text = self.reg_text.replace("country 00", "country " + cmd[3])
+                return super()._run_cmd(cmd, timeout)
+        m._save_settings(dict(base_ap))
+        _rt = asyncio.run(Takes(PLAIN).set_regdomain("DE"))
+    finally:
+        asyncio.sleep = _d_real_sleep
+    ok(_ru.get("success") is True and "(00)" in (_ru.get("message") or "") and "DE" in (_ru.get("message") or ""),
+       f"a card that stays on its own region says so ({_ru.get('message')!r})")
+    ok(_rt.get("success") is True and not _rt.get("message") and _rt.get("governing") == "DE",
+       "and one that takes it says nothing more")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+    asyncio.sleep = _d_real_sleep
 m._save_settings(dict(m.DEFAULT_SETTINGS))
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))

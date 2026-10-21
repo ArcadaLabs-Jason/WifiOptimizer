@@ -131,6 +131,12 @@ HOLO_NM_DEFAULT_CONF = "/usr/lib/NetworkManager/conf.d/10-holo-defaults.conf"
 GENERIC_BACKEND_CONF = "/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf"
 BAZZITE_IWD_CONF = "/etc/NetworkManager/conf.d/iwd.conf"
 
+# chip_label names the family a driver serves, not one chip, and
+# supports_6ghz is only the fallback for when the card cannot be asked
+# (get_device_info asks `iw phy` first). A driver that also runs cards with
+# no 6 GHz radio says False there: offering a band the card lacks pins the
+# profile to a network it cannot join, while hiding it costs nothing until
+# the card answers.
 DRIVER_PROFILES = {
     "rtw88": {
         "chip_label": "WiFi 5 (RTL8822CE)",
@@ -151,8 +157,10 @@ DRIVER_PROFILES = {
         "modprobe_options": [],
     },
     "rtw89": {
-        "chip_label": "WiFi 6 (RTL8852)",
-        "supports_6ghz": True,
+        # RTL8851BE, RTL8852AE/BE/CE and the WiFi 7 RTL8922AE; only some
+        # of them have 6 GHz.
+        "chip_label": "Realtek RTL885x/RTL8922",
+        "supports_6ghz": False,
         "sysfs_power_fixes": [
             "/sys/module/rtw89_pci/parameters/disable_aspm_l1",
             "/sys/module/rtw89_pci/parameters/disable_aspm_l1ss",
@@ -169,8 +177,10 @@ DRIVER_PROFILES = {
         "modprobe_options": [],
     },
     "mt7921e": {
-        "chip_label": "WiFi 6E (MT7922)",
-        "supports_6ghz": True,
+        # The 6E MT7922 (ROG Ally, Legion Go), and also the MT7921 and
+        # MT7902, which have no 6 GHz.
+        "chip_label": "MediaTek MT792x",
+        "supports_6ghz": False,
         "sysfs_power_fixes": [
             "/sys/module/mt7921e/parameters/disable_aspm",
         ],
@@ -179,8 +189,9 @@ DRIVER_PROFILES = {
         ],
     },
     "iwlwifi": {
+        # Every Intel card since 2013, the AX200 and AX201 without 6 GHz.
         "chip_label": "Intel WiFi",
-        "supports_6ghz": True,
+        "supports_6ghz": False,
         "sysfs_power_fixes": [],
         # iwlmvm and iwlmld are separate modules from iwlwifi, so the modules
         # it may configure are listed rather than inferred from the driver
@@ -217,6 +228,16 @@ DMI_SUBSTRING_DEVICES = [
     ("GPD", {"family": "gpd", "label": "GPD Device"}),
     ("G1618", {"family": "gpd_win", "label": "GPD WIN Device"}),
 ]
+
+# AYANEO and GPD put their brand in the DMI vendor, and on many models only
+# the model in the product name ("AIR Plus"), so the vendor is matched as
+# well, after the product name has had its say.
+DMI_VENDOR_DEVICES = [
+    ("AYANEO", {"family": "ayaneo", "label": "AYANEO Device"}),
+    ("AYADEVICE", {"family": "ayaneo", "label": "AYANEO Device"}),
+    ("GPD", {"family": "gpd", "label": "GPD Device"}),
+]
+DMI_DIR = "/sys/devices/virtual/dmi/id"
 
 try:
     SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
@@ -766,11 +787,27 @@ def _read_pcie_baseline() -> dict:
 
 
 def _save_pcie_baseline(baseline: dict):
+    """Write the baseline beside its name and rename it over, so the file
+    is never missing. The dispatcher records the system's values once a boot,
+    when it finds no file: removing it before writing a new one gave a
+    dispatcher run in between the chance to record our own values as the
+    system's. Anything such a run recorded meanwhile is kept, since it was
+    read before either of us wrote."""
     try:
         os.makedirs(os.path.dirname(PCIE_BASELINE_FILE), mode=0o755, exist_ok=True)
     except OSError:
         pass
-    _write_no_follow(PCIE_BASELINE_FILE, json.dumps(baseline))
+    merged = {**baseline, **_read_pcie_baseline()}
+    tmp = PCIE_BASELINE_FILE + ".plugin"
+    if not _write_no_follow(tmp, json.dumps(merged)):
+        return
+    try:
+        os.replace(tmp, PCIE_BASELINE_FILE)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _boot_time() -> int | None:
@@ -2667,8 +2704,10 @@ class Plugin:
         """
         not_applied = []
         try:
-            # Discover WiFi PCI device path dynamically
-            iface = self._get_wifi_interface()
+            # Discover WiFi PCI device path dynamically: the card the driver
+            # fixes are for, not a second radio NetworkManager may list first
+            # (a USB adapter, whose power/control is no PCIe link of ours).
+            iface = self._driver_interface() or self._get_wifi_interface()
             if not iface or not IFACE_RE.match(iface):
                 return not_applied
             device_link = os.path.realpath(os.path.join(SYSFS_NET, iface, "device"))
@@ -2780,8 +2819,13 @@ class Plugin:
         return recorded
 
     def _wifi_associated(self) -> bool:
-        """Whether the WiFi interface is up and associated with a network."""
-        iface = self._get_wifi_interface()
+        """Whether the radio the driver fixes are for is up and associated.
+
+        That is the netdev bound to the settings' driver. With a second radio
+        (a USB adapter) the first one NetworkManager lists can be the other,
+        and its link said nothing about whether this driver's card idles.
+        """
+        iface = self._driver_interface() or self._get_wifi_interface()
         if not iface or not IFACE_RE.match(iface):
             return False
         try:
@@ -2789,6 +2833,36 @@ class Plugin:
                 return f.read(16).strip() == "up"
         except OSError:
             return False
+
+    @staticmethod
+    def _module_profile(module: str) -> str:
+        """The DRIVER_PROFILES key a kernel module belongs to, or the module
+        itself (rtw88_8822ce is rtw88), as _detect_wifi_driver names it."""
+        if module in DRIVER_PROFILES:
+            return module
+        return next((key for key in DRIVER_PROFILES if module.startswith(key)), module)
+
+    def _driver_interface(self) -> str | None:
+        """The wireless netdev whose driver is the one in the settings, or
+        None when no single one is (or the driver is not known)."""
+        driver = _load_settings().get("driver", "")
+        if driver not in DRIVER_PROFILES:
+            return None
+        try:
+            names = sorted(os.listdir(SYSFS_NET))
+        except OSError:
+            return None
+        found = []
+        for name in names:
+            if not IFACE_RE.match(name) or not os.path.exists(
+                    os.path.join(SYSFS_NET, name, "phy80211")):
+                continue
+            module = os.path.join(SYSFS_NET, name, "device", "driver", "module")
+            if not os.path.exists(module):
+                continue
+            if self._module_profile(os.path.basename(os.path.realpath(module))) == driver:
+                found.append(name)
+        return found[0] if len(found) == 1 else None
 
     def _install_dispatcher(self) -> bool:
         try:
@@ -3212,9 +3286,10 @@ class Plugin:
     # ---- Hardware detection ----
 
     def _detect_device_family(self) -> tuple[str, str, str]:
-        """Read DMI product_name and return (raw_product, family_id, display_label)."""
+        """Read DMI product_name (and sys_vendor) and return
+        (raw_product, family_id, display_label)."""
         try:
-            with open("/sys/devices/virtual/dmi/id/product_name", "r") as f:
+            with open(os.path.join(DMI_DIR, "product_name"), "r") as f:
                 product = f.read().strip()
         except Exception:
             return ("unknown", "unknown", "Unknown Device")
@@ -3225,6 +3300,15 @@ class Plugin:
 
         for prefix, info in DMI_SUBSTRING_DEVICES:
             if product.startswith(prefix):
+                return (product, info["family"], info["label"])
+
+        try:
+            with open(os.path.join(DMI_DIR, "sys_vendor"), "r") as f:
+                vendor = f.read(256).strip()
+        except Exception:
+            vendor = ""
+        for prefix, info in DMI_VENDOR_DEVICES:
+            if vendor.upper().startswith(prefix):
                 return (product, info["family"], info["label"])
 
         return (product, "unknown", "Unknown Device")
@@ -3238,13 +3322,7 @@ class Plugin:
             return "unknown"
         try:
             driver_path = os.path.realpath(os.path.join(SYSFS_NET, iface, "device", "driver", "module"))
-            module = os.path.basename(driver_path)
-            if module in DRIVER_PROFILES:
-                return module
-            for key in DRIVER_PROFILES:
-                if module.startswith(key):
-                    return key
-            return module
+            return self._module_profile(os.path.basename(driver_path))
         except Exception:
             return "unknown"
 
@@ -3458,7 +3536,8 @@ class Plugin:
             if not info.get("readable"):
                 return {
                     "success": False, "error": "unreadable",
-                    "message": "Couldn't read the current wireless region.",
+                    "message": ("Couldn't read the current wireless region. Try again "
+                                "in a moment. If it keeps failing, restart the device."),
                 }
             settings = _load_settings()
             previous = settings.get("regdomain_previous", "")
@@ -3482,7 +3561,8 @@ class Plugin:
                 self._log_detail("set_regdomain", (applied.get("stderr") or "")[:200])
                 return {
                     "success": False, "error": "iw_failed",
-                    "message": "Couldn't set the wireless region.",
+                    "message": ("Couldn't set the wireless region. Try again in a "
+                                "moment. If it keeps failing, restart the device."),
                     "detail": (applied.get("stderr") or "")[:200],
                 }
             # Re-read: anything saved while iw ran would otherwise be undone
@@ -3492,6 +3572,14 @@ class Plugin:
             settings["regdomain"] = country
             _save_settings(settings)
             after = await asyncio.to_thread(self._regdomain_info)
+            # The kernel applies a region request from a queue of its own, so
+            # a read straight after can still show the old one. Give it a
+            # moment before saying the card did not follow.
+            for _ in range(2):
+                if not country or after.get("self_managed") or after.get("governing") == country:
+                    break
+                await asyncio.sleep(0.5)
+                after = await asyncio.to_thread(self._regdomain_info)
             result = {
                 "success": True,
                 "regdomain": country,
@@ -3499,14 +3587,28 @@ class Plugin:
                 "self_managed": after.get("self_managed", False),
                 "changeable": after.get("changeable", False),
             }
+            # The Steam Deck is named only on one: the panel shows this on
+            # every device the plugin runs on.
+            on_deck = settings.get("device_family") in ("deck_lcd", "deck_oled")
+            normal = ("That is normal on many handhelds, the Steam Deck included, "
+                      if on_deck else "That is normal on many handhelds, ")
+            governing = after.get("governing", "") or "unknown"
             if after.get("self_managed"):
                 result["message"] = (
                     "This device's WiFi carries its own region "
-                    f"({after.get('governing', 'unknown')}) and ignores this "
+                    f"({governing}) and ignores this "
                     "setting, so the channels available to you have not "
-                    "changed. That is normal on many handhelds, the Steam Deck "
-                    "included, and does not "
-                    "mean a band is missing."
+                    "changed. " + normal + "and does not mean a band is missing."
+                )
+            elif country and after.get("readable") and after.get("governing") != country:
+                # Not self-managed, and still not on the chosen region: a card
+                # that follows the region it was built for (some read one from
+                # the chip itself) can turn the request down, and the
+                # selector would otherwise show a region the radio is not on.
+                result["message"] = (
+                    f"The WiFi card stayed on its own region ({governing}) instead "
+                    f"of {country}, so the channels available to you may not have "
+                    "changed. " + normal + "and nothing else needs doing."
                 )
             decky.logger.info(
                 f"regdomain set to {target!r}: governing="
@@ -3952,8 +4054,8 @@ class Plugin:
 
         rfkill = []
         try:
-            for entry in sorted(os.listdir("/sys/class/rfkill")):
-                base = os.path.join("/sys/class/rfkill", entry)
+            for entry in sorted(os.listdir(self.RFKILL_DIR)):
+                base = os.path.join(self.RFKILL_DIR, entry)
                 rfkill.append(f"{read(os.path.join(base, 'type'))} "
                               f"soft={read(os.path.join(base, 'soft'))} "
                               f"hard={read(os.path.join(base, 'hard'))}")
@@ -6132,8 +6234,22 @@ class Plugin:
         self._address_conflict = None
         if not ip:
             return
+        # A clash logged before the device took the address it holds now was
+        # about an earlier lease: after the router was put right and the
+        # device moved off the address and back, the warning stayed up for up
+        # to ten minutes. So the window starts when the address last changed,
+        # as this process saw it. Not for the first address it sees: that one
+        # was usually taken at boot, before the plugin loaded, which is
+        # exactly when a clash is logged.
+        seen = getattr(self, "_conflict_ip_seen", None)
+        if seen is None or seen[0] != ip:
+            seen = (ip, None if seen is None else time.time())
+            self._conflict_ip_seen = seen
+        since = "-10min"
+        if seen[1] is not None and seen[1] > time.time() - 600:
+            since = f"@{int(seen[1])}"
         log = self._run_cmd(
-            ["/usr/bin/journalctl", "-u", "NetworkManager", "--since", "-10min",
+            ["/usr/bin/journalctl", "-u", "NetworkManager", "--since", since,
              "-o", "cat", "--no-pager"],
             timeout=5,
         )
@@ -6695,6 +6811,67 @@ class Plugin:
                 channel = line
         return channel
 
+    # Where the kernel lists radio switches: each has a type, and soft and hard
+    # block flags.
+    RFKILL_DIR = "/sys/class/rfkill"
+
+    def _report_not_connected(self, status: dict, iface: str | None, timeout: int):
+        """The status's live part when WiFi is not connected: whether the
+        dispatcher is installed, and why there is no connection, so a dead or
+        missing card is not told to connect first (contract C1)."""
+        status["live"]["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
+        status["live"]["wifi_state"] = self._wifi_state(iface, timeout)
+
+    def _wifi_state(self, iface: str | None, timeout: int = 2) -> str:
+        """Why WiFi is not connected, for the panel (contract C1).
+
+        "not_responding" when an earlier iw is still stuck in the driver,
+        "no_device" with no wireless interface, "radio_off" when WiFi is
+        turned off (NetworkManager's radio or an rfkill block), "unavailable"
+        when NetworkManager lists the card as unavailable, and "disconnected"
+        otherwise. Uses only nmcli and sysfs: an iw run into a wedged driver is
+        what would get stuck.
+        """
+        if "iw" in getattr(self, "_stuck_tools", lambda: set())():
+            return "not_responding"
+        if not iface:
+            return "no_device"
+        _state, radio = self._nm_general_state()
+        if radio == "disabled" or self._wifi_rfkill_blocked():
+            return "radio_off"
+        devices = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-e", "no", "-f", "DEVICE,TYPE,STATE",
+             "device", "status"],
+            timeout=timeout,
+        )
+        for line in (devices.get("stdout") or "").splitlines() if devices.get("success") else []:
+            parts = line.split(":")
+            if len(parts) >= 3 and parts[0] == iface and parts[1] == "wifi":
+                if parts[2].startswith("unavailable"):
+                    return "unavailable"
+                break
+        return "disconnected"
+
+    def _wifi_rfkill_blocked(self) -> bool:
+        """Whether a WiFi radio switch is blocked, by software or by hardware."""
+        try:
+            entries = os.listdir(self.RFKILL_DIR)
+        except OSError:
+            return False
+        for entry in entries:
+            base = os.path.join(self.RFKILL_DIR, entry)
+
+            def flag(name: str) -> str:
+                try:
+                    with open(os.path.join(base, name), "r") as f:
+                        return f.read(16).strip()
+                except OSError:
+                    return ""
+
+            if flag("type") == "wlan" and "1" in (flag("soft"), flag("hard")):
+                return True
+        return False
+
     def _status_read_failed(self) -> tuple[dict, dict, list]:
         """What to answer when the status read itself fell over.
 
@@ -6786,9 +6963,7 @@ class Plugin:
                 status["external"]["pin_released"] = True
 
             if not connected:
-                status["live"]["dispatcher_installed"] = os.path.isfile(
-                    DISPATCHER_PATH
-                )
+                self._report_not_connected(status, iface, T)
                 return status, pending, actions
 
             self._propose_precedence(settings, uuid, pending, actions)
