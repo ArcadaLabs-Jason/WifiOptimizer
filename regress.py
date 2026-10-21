@@ -3875,6 +3875,61 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("Reset and uninstall do not strand WiFi on a backend switched from here")
+try:
+    import inspect as _insp
+    _rc, _rb = m.GENERIC_BACKEND_CONF, m.BAZZITE_IWD_CONF
+    class Release(m.Plugin):
+        merged = None
+        def __init__(self): super().__init__(); self.cmds = []
+        def _merged_nm_backend(self): return self.merged
+        def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
+    try:
+        _d = tempfile.mkdtemp()
+        m.GENERIC_BACKEND_CONF = os.path.join(_d, "99-wifi-optimizer-backend.conf")
+        m.BAZZITE_IWD_CONF = os.path.join(_d, "iwd.conf")
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\nwifi.iwd.autoconnect=yes\n")
+        r = Release(); r._release_generic_backend_conf()
+        ok(not os.path.exists(m.GENERIC_BACKEND_CONF)
+           and ["/usr/bin/systemctl", "enable", "wpa_supplicant"] in r.cmds
+           and ["/usr/bin/systemctl", "disable", "iwd"] in r.cmds,
+           "removing our iwd setting turns wpa_supplicant back on for the next boot and iwd off")
+        ok(not any(c[1] in ("stop", "restart", "start") or "--now" in c for c in r.cmds),
+           "without stopping or restarting anything, so the connection in use carries on")
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        open(m.BAZZITE_IWD_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        r = Release(); r._release_generic_backend_conf()
+        ok(r.cmds == [] and not os.path.exists(m.GENERIC_BACKEND_CONF),
+           "when the system's own setting names the same backend, no service is touched")
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=wpa_supplicant\n")
+        r = Release(); r._release_generic_backend_conf()
+        ok(["/usr/bin/systemctl", "enable", "iwd"] in r.cmds
+           and ["/usr/bin/systemctl", "disable", "wpa_supplicant"] in r.cmds,
+           "and when it names the other one, that one is turned back on")
+        os.remove(m.BAZZITE_IWD_CONF)
+        r = Release(); r.merged = "wpa_supplicant"; r._release_generic_backend_conf()
+        ok(r.cmds == [], "with no file of ours there is nothing to do")
+        open(m.GENERIC_BACKEND_CONF, "w").write("[device]\nwifi.backend=wpa_supplicant\n")
+        open(m.BAZZITE_IWD_CONF, "w").write("[device]\nwifi.backend=iwd\n")
+        ok(Release()._configured_backend_from_files() == "iwd",
+           "Bazzite's iwd.conf outranks ours, the order NetworkManager reads them in")
+    finally:
+        m.GENERIC_BACKEND_CONF, m.BAZZITE_IWD_CONF = _rc, _rb
+    ok("self._release_generic_backend_conf" in _insp.getsource(m.Plugin._uninstall)
+       and "self._release_generic_backend_conf" in _insp.getsource(m.Plugin.reset_settings)
+       and "GENERIC_BACKEND_CONF" not in _insp.getsource(m.Plugin._uninstall),
+       "uninstall and Reset both go through that, and neither deletes the file directly")
+    _tm2 = open("defaults/dispatcher.sh.tmpl").read()
+    _gone = _tm2[_tm2.index('if [ ! -d "$PLUGIN_DIR" ]'):]
+    _gone = _gone[:_gone.index("\nfi\n")]
+    ok("99-wifi-optimizer-backend.conf" not in _gone,
+       "the dispatcher's own clean-up leaves the backend setting in place")
+    ok(_gone.index("sleep") < _gone.index("rm -f"),
+       "and looks again before removing anything, since an install swaps the directory briefly")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("Valve's power save setting: ours is not left in it")
 try:
     _real_valve = m.WIFI_BACKEND_CONF

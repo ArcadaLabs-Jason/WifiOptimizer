@@ -16,12 +16,17 @@ IFACE_TYPE=$(/usr/bin/nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | grep "^${
 
 IFACE="$1"
 
-# Self-removal: if plugin directory gone, clean up
+# Self-removal: if plugin directory gone, clean up. An install or update
+# swaps the directory out and back in, so look again after a moment before
+# deciding it is really gone. The backend setting is left alone: our switch
+# disabled the other backend, and removing the file without turning that one
+# back on would leave no WiFi at the next boot.
 if [ ! -d "$PLUGIN_DIR" ]; then
+    sleep 3
+    [ -d "$PLUGIN_DIR" ] && exit 0
     logger -t "$LOG_TAG" "Plugin directory gone, removing dispatcher"
     rm -f "$0"
     rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
-    rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf
     rm -f /etc/modprobe.d/99-wifi-optimizer.conf
     exit 0
 fi

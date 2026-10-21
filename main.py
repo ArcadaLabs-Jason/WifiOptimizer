@@ -1655,13 +1655,33 @@ class Plugin:
     def _get_current_backend(self) -> str | None:
         """Return 'iwd', 'wpa_supplicant', or None if unknown.
 
-        Checks config files in priority order: our own generic conf, Bazzite's
-        iwd conf, SteamOS override, SteamOS defaults. Falls back to checking
+        Checks config files in priority order, then falls back to checking
         which systemd service is active.
         """
+        found = self._configured_backend_from_files()
+        if found:
+            return found
+        # No config found, check which service is running
+        result = self._run_cmd(["/usr/bin/systemctl", "is-active", "iwd"], timeout=3)
+        if result.get("stdout", "").strip() == "active":
+            return "iwd"
+        result = self._run_cmd(
+            ["/usr/bin/systemctl", "is-active", "wpa_supplicant"], timeout=3
+        )
+        if result.get("stdout", "").strip() == "active":
+            return "wpa_supplicant"
+        return None
+
+    def _configured_backend_from_files(self) -> str | None:
+        """The backend the known conf files name, highest priority first.
+
+        NetworkManager reads conf.d in name order and the later file wins, so
+        Bazzite's iwd.conf outranks our 99-wifi-optimizer-backend.conf, which
+        outranks Valve's 99-valve-wifi-backend.conf; /usr/lib defaults last.
+        """
         for path in (
-            GENERIC_BACKEND_CONF,
             BAZZITE_IWD_CONF,
+            GENERIC_BACKEND_CONF,
             WIFI_BACKEND_CONF,
             NM_DEFAULT_CONF,
             HOLO_NM_DEFAULT_CONF,
@@ -1681,16 +1701,50 @@ class Plugin:
                 continue
             except Exception:
                 continue
-        # No config found, check which service is running
-        result = self._run_cmd(["/usr/bin/systemctl", "is-active", "iwd"], timeout=3)
-        if result.get("stdout", "").strip() == "active":
-            return "iwd"
-        result = self._run_cmd(
-            ["/usr/bin/systemctl", "is-active", "wpa_supplicant"], timeout=3
-        )
-        if result.get("stdout", "").strip() == "active":
-            return "wpa_supplicant"
         return None
+
+    def _release_generic_backend_conf(self):
+        """Remove our backend conf file (Reset, uninstall) without stranding WiFi.
+
+        A switch from here disabled the backend it switched away from, and
+        that also removes the D-Bus alias NetworkManager starts wpa_supplicant
+        through. Deleting only the file would send NetworkManager back to its
+        default at the next start with that backend still disabled: no WiFi.
+        So the backend it will fall back to is enabled and the one our file
+        named is disabled. Nothing is stopped or restarted now, so the
+        connection in use carries on and the change lands at the next boot.
+        """
+        try:
+            with open(GENERIC_BACKEND_CONF) as f:
+                text = f.read(4096)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            decky.logger.error(f"Could not read our backend setting: {e}")
+            return
+        found = re.search(r"^\s*wifi\.backend\s*=\s*(iwd|wpa_supplicant)\s*$", text, re.M)
+        try:
+            os.remove(GENERIC_BACKEND_CONF)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            decky.logger.error(f"Could not remove our backend setting: {e}")
+            return
+        if not found:
+            return
+        named = found.group(1)
+        after = (self._merged_nm_backend()
+                 or self._configured_backend_from_files()
+                 or "wpa_supplicant")
+        if after == named:
+            return
+        for cmd in (["/usr/bin/systemctl", "enable", after],
+                    ["/usr/bin/systemctl", "disable", named]):
+            self._run_cmd(cmd, timeout=15)
+        decky.logger.info(
+            f"Removed our backend setting ({named}); NetworkManager uses {after} "
+            f"from the next boot, so {after} is enabled and {named} disabled"
+        )
 
     def _ensure_backend_switch_state(self):
         if not hasattr(self, "_backend_switch"):
@@ -2355,11 +2409,12 @@ class Plugin:
             self._apply_pcie_aspm_fix(False)
             self._revert_queue_tuning(_load_settings())
             self._release_valve_powersave(_load_settings())
+            self._release_generic_backend_conf()
             # The diagnostics file and a settings file set aside as unreadable
             # are ours too, and nothing else would ever remove them.
             users = (SETTINGS_FILE, SETTINGS_FILE + ".corrupt", _diagnostics_path(),
                      LEGACY_ENFORCED_FILE)
-            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH, GENERIC_BACKEND_CONF,
+            for path in [NM_CONF_PATH, MODPROBE_CONF_PATH,
                          *users, ENFORCED_FILE, STREAM_FLAG_FILE, STREAM_HOLD_FILE]:
                 # One that cannot go (the settings directory is the user's,
                 # so anything can sit at these names) does not stop the rest.
@@ -7441,10 +7496,7 @@ class Plugin:
                 pass
             except OSError as e:
                 decky.logger.error(f"reset_settings could not remove diagnostics: {e}")
-            try:
-                os.remove(GENERIC_BACKEND_CONF)
-            except FileNotFoundError:
-                pass
+            await asyncio.to_thread(self._release_generic_backend_conf)
 
             # Repopulate model/driver so the plugin doesn't show as "UNKNOWN /
             # Unsupported device" until the next plugin reload. Mirrors the
