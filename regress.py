@@ -30,6 +30,10 @@ m.STREAM_FLAG_FILE = os.path.join(_run_dir, "streaming")
 m.STREAM_HOLD_FILE = os.path.join(_run_dir, "streaming-hold")
 m.PCIE_BASELINE_FILE = os.path.join(_run_dir, "pcie-baseline")
 m.PROC_DIR = os.path.join(tempfile.mkdtemp(), "no-proc")
+# Nor where the host keeps its tools: a check run on a Mac would otherwise
+# see /usr/bin/sysctl turned into the Mac's /usr/sbin/sysctl.
+_REAL_TOOL_DIRS = getattr(m, "TOOL_DIRS", ())
+m.TOOL_DIRS = ()
 FAILS = []
 def ok(c, l):
     print(("PASS  " if c else "FAIL  ")+l)
@@ -3057,6 +3061,49 @@ try:
        and _tmd.index('[ "$APPLIED" = 1 ] || exit 0') < _tmd.index("last_enforced"),
        "last_enforced is stamped only when something was applied")
     ok("SETTINGS_DIR" not in _tmd, "no unused SETTINGS_DIR")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("tools are found where the distro keeps them, and 6 GHz is the card's own answer")
+try:
+    _tdirs = (tempfile.mkdtemp(), tempfile.mkdtemp())
+    open(os.path.join(_tdirs[1], "iw"), "w").write("")
+    m.TOOL_DIRS = _tdirs; m._TOOL_PATHS.clear()
+    ok(m._tool(os.path.join(_tdirs[0], "iw")) == os.path.join(_tdirs[1], "iw"),
+       "a tool missing from /usr/bin is run from /usr/sbin (Bazzite keeps iw, ip, tc and sysctl there)")
+    ok(m._tool(os.path.join(_tdirs[0], "nothere")) == os.path.join(_tdirs[0], "nothere"),
+       "and one found nowhere keeps the path asked for, so the error names it")
+    ok(m._tool("/opt/x/iw") == "/opt/x/iw", "a path outside the system directories is never redirected")
+    m.TOOL_DIRS = (); m._TOOL_PATHS.clear()
+    _dsp = open("defaults/dispatcher.sh.tmpl").read()
+    ok(not re.search(r"/usr/s?bin/(iw|ip|tc|sysctl|modprobe) ", _dsp),
+       "the dispatcher finds them on its fixed PATH rather than by one distro's layout")
+
+    _phy_net = tempfile.mkdtemp(); os.makedirs(os.path.join(_phy_net, "wlan0", "phy80211"))
+    open(os.path.join(_phy_net, "wlan0", "phy80211", "name"), "w").write("phy0\n")
+    _IW5 = ("Wiphy phy0\n\tBand 2:\n\t\tFrequencies:\n\t\t\t* 5180.0 MHz [36] (23.0 dBm)\n"
+            "\t\t\t* 5885.0 MHz [177] (disabled)\n")
+    _IW6 = _IW5 + "\tBand 4:\n\t\tFrequencies:\n\t\t\t* 5955.0 MHz [1] (disabled)\n"
+    class Phy(m.Plugin):
+        out = _IW5
+        def _get_wifi_interface(self): return "wlan0"
+        def _detect_wifi_driver(self): return "mt7921e"
+        def _run_cmd(self, cmd, timeout=5):
+            return _ok(self.out) if cmd[1:4] == ["phy", "phy0", "info"] else _ok("")
+    _sn = m.SYSFS_NET; m.SYSFS_NET = _phy_net
+    try:
+        ok(asyncio.run(Phy().get_device_info())["supports_6ghz"] is False,
+           "an MT7921 on the mt7921e driver, which lists no 6 GHz channel, is not offered 6 GHz")
+        _p6 = Phy(); _p6.out = _IW6
+        ok(asyncio.run(_p6.get_device_info())["supports_6ghz"] is True,
+           "a card listing a 6 GHz channel is, even one the region has disabled")
+        _pf = Phy(); _pf.out = ""
+        ok(asyncio.run(_pf.get_device_info())["supports_6ghz"] is True,
+           "and when the card cannot be asked the driver's profile decides")
+    finally:
+        m.SYSFS_NET = _sn
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

@@ -118,7 +118,7 @@ fi
 
 # Apply power save
 if [ "$POWER_SAVE" = "True" ]; then
-    /usr/bin/iw dev "$IFACE" set power_save off 2>/dev/null
+    iw dev "$IFACE" set power_save off 2>/dev/null
     WIFI_PCI=$(readlink -f /sys/class/net/"$IFACE"/device 2>/dev/null)
     # Driver-specific sysfs fixes, as in the plugin's DRIVER_PROFILES.
     DRIVER_PARAMS=""
@@ -212,24 +212,24 @@ fi
 
 # Apply buffer tuning
 if [ "$BUFFER_TUNING" = "True" ]; then
-    /usr/bin/sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1
-    /usr/bin/sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1
-    /usr/bin/sysctl -w net.core.rmem_default=1048576 >/dev/null 2>&1
-    /usr/bin/sysctl -w net.core.wmem_default=1048576 >/dev/null 2>&1
-    /usr/bin/sysctl -w net.core.netdev_max_backlog=5000 >/dev/null 2>&1
-    /usr/bin/sysctl -w net.core.netdev_budget=600 >/dev/null 2>&1
-    /usr/bin/sysctl -w net.core.netdev_budget_usecs=8000 >/dev/null 2>&1
-    /usr/bin/sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    /usr/bin/ip link set "$IFACE" txqueuelen 2000 2>/dev/null
+    sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1
+    sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1
+    sysctl -w net.core.rmem_default=1048576 >/dev/null 2>&1
+    sysctl -w net.core.wmem_default=1048576 >/dev/null 2>&1
+    sysctl -w net.core.netdev_max_backlog=5000 >/dev/null 2>&1
+    sysctl -w net.core.netdev_budget=600 >/dev/null 2>&1
+    sysctl -w net.core.netdev_budget_usecs=8000 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
+    ip link set "$IFACE" txqueuelen 2000 2>/dev/null
     APPLIED=1
     logger -t "$LOG_TAG" "buffer tuning applied"
 fi
 
 # Apply CAKE QoS (unlimited: FQ + AQM + ack-filter, no bandwidth shaper)
 if [ "$CAKE" = "True" ]; then
-    /usr/bin/modprobe sch_cake 2>/dev/null || /usr/sbin/modprobe sch_cake 2>/dev/null
-    if /usr/bin/tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter 2>/dev/null; then
-        /usr/bin/ip link set "$IFACE" txqueuelen 256 2>/dev/null
+    modprobe sch_cake 2>/dev/null
+    if tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter 2>/dev/null; then
+        ip link set "$IFACE" txqueuelen 256 2>/dev/null
         APPLIED=1
         logger -t "$LOG_TAG" "CAKE QoS applied (unlimited) on $IFACE"
     else

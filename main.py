@@ -872,6 +872,26 @@ def _first_existing(paths: list[str]) -> str | None:
     return None
 
 
+# Where a system tool lives is distro layout: SteamOS and Arch keep iw, ip,
+# tc and sysctl in /usr/bin, Fedora-based images (Bazzite) in /usr/sbin.
+# Commands are written with the /usr/bin path and looked up here once.
+TOOL_DIRS = ("/usr/bin", "/usr/sbin", "/bin", "/sbin")
+_TOOL_PATHS: dict = {}
+
+
+def _tool(path: str) -> str:
+    """path if it exists, else the same tool in another system directory,
+    else path unchanged (so the error names what was asked for)."""
+    if path in _TOOL_PATHS:
+        return _TOOL_PATHS[path]
+    found = path
+    if not os.path.isfile(path) and os.path.dirname(path) in TOOL_DIRS:
+        name = os.path.basename(path)
+        found = _first_existing([os.path.join(d, name) for d in TOOL_DIRS]) or path
+    _TOOL_PATHS[path] = found
+    return found
+
+
 def _kernel_release() -> str:
     try:
         return os.uname().release
@@ -1642,6 +1662,7 @@ class Plugin:
         rather than the ones bundled inside Decky. See _child_env for why
         this cannot be left to the commands that happen to need it.
         """
+        cmd = [_tool(cmd[0]), *cmd[1:]]
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
@@ -2799,6 +2820,27 @@ class Plugin:
         except Exception:
             return "unknown"
 
+    # A 6 GHz channel: 5955 MHz (channel 1) up to 7115 MHz (channel 233).
+    _SIX_GHZ_FREQ_RE = re.compile(r"^\s*\* (59[5-9]\d|6\d{3}|70\d\d|71[01]\d)(?:\.\d+)? MHz", re.M)
+
+    def _radio_has_6ghz(self) -> bool | None:
+        """Whether the WiFi card lists any 6 GHz channel (even one the region
+        disables), from `iw phy`. None when it cannot be asked."""
+        iface = self._get_wifi_interface()
+        if not iface or not IFACE_RE.match(iface):
+            return None
+        try:
+            with open(os.path.join(SYSFS_NET, iface, "phy80211", "name"), "r") as f:
+                phy = f.read(32).strip()
+        except OSError:
+            return None
+        if not IFACE_RE.match(phy):
+            return None
+        result = self._run_cmd(["/usr/bin/iw", "phy", phy, "info"], timeout=3)
+        if not result.get("success") or "Frequencies" not in result.get("stdout", ""):
+            return None
+        return bool(self._SIX_GHZ_FREQ_RE.search(result["stdout"]))
+
     def _detect_distro(self) -> dict:
         """Detect OS from /etc/os-release. Returns {id, name}."""
         info = {"id": "unknown", "name": "Unknown"}
@@ -2825,7 +2867,12 @@ class Plugin:
             profile = DRIVER_PROFILES.get(driver, {})
 
             chip_label = profile.get("chip_label", "unknown")
-            supports_6ghz = profile.get("supports_6ghz", False)
+            # The card itself says, where it can be asked: one driver serves
+            # chips with and without 6 GHz (mt7921e drives both the MT7921
+            # and the 6E MT7922; iwlwifi every Intel card since 2013).
+            supports_6ghz = self._radio_has_6ghz()
+            if supports_6ghz is None:
+                supports_6ghz = profile.get("supports_6ghz", False)
 
             model = "unknown"
             if device_family == "deck_lcd":
