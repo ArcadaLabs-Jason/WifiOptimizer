@@ -44,10 +44,41 @@ except ImportError:
 _LOG_MAC_RE = re.compile(
     r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){4}([0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2})(?![0-9A-Fa-f])"
 )
+# IP addresses go whole: GitHub names the network's public address in a rate
+# limit refusal, and a private one says nothing a report needs. Neither edge
+# may run on into more digits, but a full stop after the address is still the
+# end of it ("for 10.0.0.1."), and five numbers in a row are not an address.
+_IPV4_RE = re.compile(
+    r"(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d|\.\d)"
+)
+# Either the full eight groups or a form shortened with "::". Requiring one
+# of the two keeps times and channel lists, which also have colons, out of it.
+_IPV6_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:"
+    r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
+    r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::"
+    r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?"
+    r")(?![0-9A-Fa-f:])"
+)
+# A home directory names the desktop account, which on Bazzite and CachyOS is
+# the person's own login. Paths reach the log in error messages.
+_HOME_RE = re.compile(r"(?:/var)?/home/[^/\s'\"),:;]+")
+
+
+def _mask_home(text: str) -> str:
+    """text with the desktop user's home directory written as ~."""
+    home = (getattr(decky, "DECKY_USER_HOME", "") or "").rstrip("/")
+    if len(home) > 1 and home.startswith("/") and not _HOME_RE.fullmatch(home):
+        text = text.replace(home, "~")
+    return _HOME_RE.sub("~", text)
 
 
 def _mask_addresses(text: str) -> str:
-    return _LOG_MAC_RE.sub(lambda m: "xx:xx:xx:xx:" + m.group(1), text)
+    text = _LOG_MAC_RE.sub(lambda m: "xx:xx:xx:xx:" + m.group(1), text)
+    text = _IPV4_RE.sub("<ip>", text)
+    text = _IPV6_RE.sub(lambda m: m.group(0) if m.group(0) == "::" else "<ip>", text)
+    return _mask_home(text)
 
 
 # Any object with a filter method works as a logging filter, so the logging
@@ -3259,15 +3290,21 @@ class Plugin:
 
     async def get_device_info(self) -> dict:
         try:
-            product, device_family, device_label = self._detect_device_family()
-            driver = self._detect_wifi_driver()
+            # Off the event loop: the interface lookup can ask nmcli and the
+            # 6 GHz question runs `iw phy`, which waits out its timeout behind
+            # a wedged driver, and every call the panel makes would wait too.
+            def detect():
+                return (self._detect_device_family(), self._detect_wifi_driver(),
+                        self._radio_has_6ghz())
+
+            (product, device_family, device_label), driver, supports_6ghz = \
+                await asyncio.to_thread(detect)
             profile = DRIVER_PROFILES.get(driver, {})
 
             chip_label = profile.get("chip_label", "unknown")
             # The card itself says, where it can be asked: one driver serves
             # chips with and without 6 GHz (mt7921e drives both the MT7921
             # and the 6E MT7922; iwlwifi every Intel card since 2013).
-            supports_6ghz = self._radio_has_6ghz()
             if supports_6ghz is None:
                 supports_6ghz = profile.get("supports_6ghz", False)
 
@@ -3490,20 +3527,9 @@ class Plugin:
         r"(?<![0-9A-Fa-f-])(?<![0-9A-Fa-f]:)(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}"
         r"(?![0-9A-Fa-f-])(?![:-][0-9A-Fa-f]{2}(?![0-9A-Za-z]))"
     )
-    _DIAG_IPV4_RE = re.compile(
-        r"(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
-        r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])"
-    )
-    # Either the full eight groups or a form shortened with "::". Requiring
-    # one of the two keeps times and channel lists, which also have colons,
-    # out of it.
-    _DIAG_IPV6_RE = re.compile(
-        r"(?<![0-9A-Fa-f:])(?:"
-        r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
-        r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::"
-        r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?"
-        r")(?![0-9A-Fa-f:])"
-    )
+    # The same patterns the plugin log is masked with (see _IPV4_RE).
+    _DIAG_IPV4_RE = _IPV4_RE
+    _DIAG_IPV6_RE = _IPV6_RE
 
     @classmethod
     def _redact_diagnostics(cls, value, ssids: tuple = ()):
@@ -3532,19 +3558,31 @@ class Plugin:
         # IPv4 first: an IPv4-mapped address (::ffff:192.168.1.5) would
         # otherwise lose only its first octet to the IPv6 pattern.
         text = cls._DIAG_IPV4_RE.sub("<ip>", text)
-        return cls._DIAG_IPV6_RE.sub(
+        text = cls._DIAG_IPV6_RE.sub(
             lambda m: m.group(0) if m.group(0) == "::" else "<ip>", text
         )
+        # Error text carries paths, and a home directory names the account.
+        return _mask_home(text)
 
     async def get_diagnostic_info(self) -> dict:
         """Collect system info for remote debugging. Sanitized: no passwords,
         and no network names or addresses (see _redact_diagnostics)."""
         try:
             info = await self.get_device_info()
-            iface = self._get_wifi_interface() or "none"
-            iw_dev = self._run_cmd(["/usr/bin/iw", "dev"], timeout=3)
-            iw_reg = self._run_cmd(["/usr/bin/iw", "reg", "get"], timeout=3)
-            uname = self._run_cmd(["/usr/bin/uname", "-r"], timeout=3)
+
+            def basics():
+                # One trip off the event loop for all four: iw waits up to
+                # its timeout behind a wedged driver, which is exactly when
+                # someone copies a report, and every other call the panel
+                # makes would wait with it.
+                return (
+                    self._get_wifi_interface() or "none",
+                    self._run_cmd(["/usr/bin/iw", "dev"], timeout=3),
+                    self._run_cmd(["/usr/bin/iw", "reg", "get"], timeout=3),
+                    self._run_cmd(["/usr/bin/uname", "-r"], timeout=3),
+                )
+
+            iface, iw_dev, iw_reg, uname = await asyncio.to_thread(basics)
             os_release = ""
             try:
                 with open("/etc/os-release", "r") as f:
@@ -3556,6 +3594,9 @@ class Plugin:
                 found.group(0).split("ssid ", 1)[1]
                 for found in self._DIAG_SSID_LINE_RE.finditer(iw_dev.get("stdout", ""))
             )
+            # The extras redact the service logs with these too, before their
+            # own quote rules run (see _diag_service_lines).
+            self._diag_ssids = ssids
             # The report predates these parts, so one that fails is noted
             # rather than costing the person the whole report.
             try:
@@ -3622,6 +3663,18 @@ class Plugin:
     # Anything else (systemd's "Hostname set to ..." also lands in -k) is left out.
     _DIAG_KERNEL_LINE_RE = re.compile(r"^(\[\s*[\d.]+\]) kernel: (.*)$")
 
+    # A call trace frame: " func+0x1c/0x40 [module]", " ? func+...", or a
+    # context marker such as <TASK>, <IRQ> and their closing forms. The kernel
+    # indents frames by a space; the symbol form is also accepted in case a
+    # journal ever stores the line without it.
+    _DIAG_FRAME_RE = re.compile(
+        r"^(?:[ ?<]|[\w.$]+\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+)"
+    )
+
+    @classmethod
+    def _diag_is_frame(cls, message: str) -> bool:
+        return bool(message) and bool(cls._DIAG_FRAME_RE.match(message))
+
     @classmethod
     def _diag_kernel_lines(cls, text: str, terms: str) -> list:
         """The lines of one boot's kernel log worth reading for a WiFi problem.
@@ -3648,12 +3701,21 @@ class Plugin:
             if message.startswith("Call Trace:"):
                 frames = 0
             elif frames is not None:
-                if "---[ end trace" in message:
+                # Only a WARN or an oops ends its trace with "end trace". A
+                # hung task, a soft lockup, an RCU stall or dump_stack() (what
+                # a wedged rtw88 tends to print) stops at </TASK> or with no
+                # marker at all, so the first line that is not a frame ends
+                # it too, and is read like any other line. Waiting for the
+                # marker used to swallow the rest of the boot: the suspend
+                # and every driver error after the trace.
+                if "---[ end trace" in message or message.strip() == "</TASK>":
                     frames = None
-                else:
+                elif cls._diag_is_frame(message):
                     frames += 1
                     if frames > cls._DIAG_TRACE_FRAMES:
                         continue
+                else:
+                    frames = None
             if message.startswith("Modules linked in:"):
                 continue
             if not wanted.search(message) or cls._DIAG_CHATTER_RE.search(message):
@@ -3682,22 +3744,122 @@ class Plugin:
 
     # NetworkManager, iwd and wpa_supplicant name the network in quotes and
     # after "ssid"/"SSID". Anything quoted goes, since a profile name is often
-    # a person's own wording.
-    _DIAG_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+    # a person's own wording. A name can hold a quote of its own (Jason's
+    # Home), so a quoted value ends only at a quote followed by a space, a
+    # bracket or punctuation, or the end of the line, and starts only at a
+    # quote that does not follow a letter: a name cut at its apostrophe left
+    # the rest of it in the report.
+    _DIAG_QUOTED_RE = re.compile(
+        r"(?<!\w)'.*?'(?=[\s),:;.\]]|$)|(?<!\w)\".*?\"(?=[\s),:;.\]]|$)"
+    )
+    # An opening quote still standing after that has lost its end (a line cut
+    # short): everything after it goes.
+    _DIAG_OPEN_QUOTE_RE = re.compile(r"(?<!\w)['\"].*$")
+    # NetworkManager's own fixed words are quoted too, and they are what says
+    # why a connection failed: (reason 'no-secrets', sys-iface-state: 'managed').
+    _DIAG_NM_WORD_KEY_RE = re.compile(r"(?:\breason |\bsys-iface-state: |\bmanaged-type: )$")
+    _DIAG_NM_WORD_RE = re.compile(r"[a-z0-9-]+")
     _DIAG_SSID_WORD_RE = re.compile(r"(?i)(ssid[=: ]+)\S+")
     _DIAG_SERVICE_LINES = 40
+    # Where a boot that ended in a reboot starts shutting the services down,
+    # and where one of them starts again (a backend switch restarts them
+    # mid-boot, which is not the end of it).
+    _DIAG_SHUTDOWN_RE = re.compile(r"caught SIGTERM|shutting down|: Stopping ")
+    _DIAG_SERVICE_START_RE = re.compile(
+        r"NetworkManager \(version|: Starting |: Started |Successfully initialized wpa_supplicant"
+    )
+    # The lines that say what happened to a connection, kept ahead of routine
+    # ones when there are too many.
+    _DIAG_SERVICE_EVENT_RE = re.compile(
+        r"(?i)state change|fail|error|<warn>|CTRL-EVENT|disconnect|deauth|timed? ?out|reason"
+    )
 
     @classmethod
-    def _diag_service_lines(cls, text: str, limit: int) -> list:
-        """The last lines of a service log, each bounded, network names out."""
+    def _diag_service_lines(cls, text: str, limit: int, names: tuple = (),
+                            events_first: bool = False) -> list:
+        """The last lines of a service log, each bounded, network names out.
+
+        names are the network names known on this device (saved profiles and
+        the SSIDs in view), replaced wherever they appear before anything
+        else is, so a name with a quote in it goes whole. events_first: for
+        the network services' log, see _diag_pick_service_lines.
+        """
+        known = sorted({n for n in names if isinstance(n, str) and len(n) >= 3},
+                       key=len, reverse=True)
+        named = [re.compile(r"(?<![A-Za-z0-9])" + re.escape(n) + r"(?![A-Za-z0-9])")
+                 for n in known]
         lines = []
         for raw in text.splitlines():
-            line = cls._DIAG_QUOTED_RE.sub("<name>", raw)
+            line = raw
+            for pattern in named:
+                line = pattern.sub("<name>", line)
+
+            kept = []
+
+            def quoted(found, line=line):
+                value = found.group(0)[1:-1]
+                if (cls._DIAG_NM_WORD_KEY_RE.search(line[:found.start()])
+                        and cls._DIAG_NM_WORD_RE.fullmatch(value)):
+                    # Held aside so the pass below does not read its opening
+                    # quote as one that lost its end.
+                    kept.append(found.group(0))
+                    return f"\x00{len(kept) - 1}\x00"
+                return "<name>"
+
+            line = cls._DIAG_QUOTED_RE.sub(quoted, line)
+            line = cls._DIAG_OPEN_QUOTE_RE.sub("<name>", line)
+            line = re.sub(r"\x00(\d+)\x00", lambda found: kept[int(found.group(1))], line)
             line = cls._DIAG_SSID_WORD_RE.sub(r"\1<ssid>", line)
             lines.append(line[:cls._DIAG_LINE_MAX])
+        if events_first:
+            return cls._diag_pick_service_lines(lines, limit)
         if len(lines) > limit:
             return [f"({len(lines) - limit} earlier lines left out)"] + lines[-limit:]
         return lines
+
+    @classmethod
+    def _diag_pick_service_lines(cls, lines: list, limit: int) -> list:
+        """The network services' lines worth reading, at most limit of them.
+
+        A boot that ended in a reboot ends in the shutdown, and its last
+        lines were all a report showed. So the shutdown is left out, and of
+        what comes before it the lines about connections (state changes,
+        failures, supplicant events) are kept ahead of routine ones.
+        """
+        out = []
+        last_start = max((i for i, line in enumerate(lines)
+                          if cls._DIAG_SERVICE_START_RE.search(line)), default=-1)
+        stop = next((i for i, line in enumerate(lines)
+                     if i > last_start and cls._DIAG_SHUTDOWN_RE.search(line)), None)
+        if stop is not None:
+            lines, dropped = lines[:stop], len(lines) - stop
+        else:
+            dropped = 0
+        if len(lines) > limit:
+            events = [i for i, line in enumerate(lines)
+                      if cls._DIAG_SERVICE_EVENT_RE.search(line)]
+            keep = set(events[-limit:])
+            for i in range(len(lines) - 1, -1, -1):
+                if len(keep) >= limit:
+                    break
+                keep.add(i)
+            out.append(f"({len(lines) - len(keep)} earlier or routine lines left out)")
+            lines = [lines[i] for i in sorted(keep)]
+        out += lines
+        if dropped:
+            out.append(f"({dropped} lines of the shutdown left out)")
+        return out
+
+    # The dispatcher's marker for the driver parameters as they were when the
+    # driver loaded (defaults/dispatcher.sh.tmpl).
+    _DIAG_AT_LOAD = "driver parameters at load:"
+    _DIAG_PARAMS_NOTE = (
+        "Each value is the module parameter as it reads now. The driver acts on it "
+        "at its own moment: rtw88's disable_aspm at each PCIe power change, its "
+        "disable_lps_deep when the interface next starts, rtw89's at probe and "
+        "resume, mt7921e's only at probe. So a Y written after that is not yet in "
+        "force; plugin_load_values_* say what the driver loaded with."
+    )
 
     def _diagnostic_extras(self, driver: str, iface: str) -> dict:
         """What a report needs beyond the device: versions, toggles, backend,
@@ -3718,7 +3880,13 @@ class Plugin:
         except Exception as e:
             extras["settings"] = f"unreadable: {e}"
         try:
-            extras["wifi_backend"] = self._get_current_backend() or "unknown"
+            # The one running now, and the one configured for the next boot
+            # when that differs (see _backend_in_use).
+            configured = self._get_current_backend()
+            in_use = self._backend_in_use(configured)
+            extras["wifi_backend"] = in_use or "unknown"
+            if configured and in_use and configured != in_use:
+                extras["wifi_backend_next"] = configured
         except Exception as e:
             extras["wifi_backend"] = f"unreadable: {e}"
 
@@ -3742,19 +3910,26 @@ class Plugin:
         extras["driver_params"] = {
             path: read(path) for path in profile.get("sysfs_power_fixes", [])
         }
+        if extras["driver_params"]:
+            # What the file says is not always what the driver is doing:
+            # each one reads its parameter at its own moment.
+            extras["driver_params_note"] = self._DIAG_PARAMS_NOTE
         extras["modprobe_conf"] = read(MODPROBE_CONF_PATH)
         # Options in that file only take effect when the driver loads, so
-        # whether it predates this boot says if they are in force from the
-        # start or were only written into sysfs later.
+        # whether it predates THIS boot says if they were in force from its
+        # start. It says nothing about the boot before, the one a report is
+        # usually about: for that, see plugin_load_values_previous_boot.
         try:
-            with open("/proc/stat", "r") as f:
-                boot = next(int(line.split()[1]) for line in f
-                            if line.startswith("btime "))
-            extras["modprobe_conf_before_boot"] = (
-                os.stat(MODPROBE_CONF_PATH).st_mtime < boot
+            mtime = os.stat(MODPROBE_CONF_PATH).st_mtime
+            extras["modprobe_conf_modified"] = time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC", time.gmtime(mtime))
+            boot = _boot_time()
+            extras["modprobe_conf_before_this_boot"] = (
+                None if boot is None else mtime < boot
             )
-        except (OSError, StopIteration, ValueError, IndexError):
-            extras["modprobe_conf_before_boot"] = None
+        except OSError:
+            extras["modprobe_conf_modified"] = None
+            extras["modprobe_conf_before_this_boot"] = None
         extras["dispatcher_installed"] = os.path.isfile(DISPATCHER_PATH)
 
         pcie = {}
@@ -3765,6 +3940,12 @@ class Plugin:
                 path = os.path.join(device, "link", name)
                 if os.path.exists(path):
                     pcie[name] = read(path)
+            # Clock PM is the one PCIe power feature the fixes leave on, so
+            # it is read too, with the device's power state (D0 is awake).
+            clkpm = os.path.join(device, "link", "clkpm")
+            if os.path.exists(clkpm):
+                pcie["clkpm"] = read(clkpm)
+            pcie["power_state"] = read(os.path.join(device, "power_state"))
             pcie["power_control"] = read(os.path.join(device, "power", "control"))
             pcie["runtime_status"] = read(os.path.join(device, "power", "runtime_status"))
         extras["pcie"] = pcie
@@ -3790,6 +3971,22 @@ class Plugin:
         )
         extras["nm_devices"] = devices.get("stdout", "") or devices.get("stderr", "")
 
+        # Every network name this device knows, for the service logs below:
+        # replaced whole, before the rules for quoted text, so a name with a
+        # quote of its own cannot leave half of itself behind.
+        names = list(getattr(self, "_diag_ssids", ()) or ())
+        saved = self._run_cmd(
+            ["/usr/bin/nmcli", "-t", "-e", "no", "-f", "NAME", "connection", "show"],
+            timeout=3,
+        )
+        if saved.get("success"):
+            names += [n for n in saved.get("stdout", "").split("\n") if n.strip()]
+        try:
+            names.append(_load_settings().get("band_preference_ssid", "") or "")
+        except Exception:
+            pass
+        names = tuple(names)
+
         # The plugins directory sits in the desktop user's home, so it is
         # listed through the same no-follow walk as the settings directory.
         plugins_dir = os.path.dirname(getattr(decky, "DECKY_PLUGIN_DIR", "") or "")
@@ -3811,19 +4008,36 @@ class Plugin:
         extras["mem_sleep"] = read("/sys/power/mem_sleep")
         journal = ["/usr/bin/journalctl", "--no-hostname", "-o", "short-monotonic",
                    "--no-pager"]
-        for key, boot in (("plugin_log_this_boot", "0"), ("plugin_log_previous_boot", "-1")):
+        for key, boot in (("this_boot", "0"), ("previous_boot", "-1")):
             log = self._run_cmd(journal + ["-b", boot, "-t", "wifi-optimizer", "-n", "200"],
                                 timeout=5)
-            extras[key] = (self._diag_service_lines(log.get("stdout", ""), 30)
-                           if log.get("success")
-                           else [f"unavailable: {(log.get('stderr') or '')[:120]}"])
+            extras["plugin_log_" + key] = (
+                self._diag_service_lines(log.get("stdout", ""), 30, names)
+                if log.get("success")
+                else [f"unavailable: {(log.get('stderr') or '')[:120]}"])
+            # The dispatcher's first run of a boot notes the driver parameters
+            # as the driver loaded them, which is whether the fixes were in
+            # force for that whole boot. Later lines read Y because the
+            # dispatcher wrote it, and after a few wakes the first line has
+            # left the tail above, so it is looked for on its own.
+            found = self._run_cmd(
+                journal + ["-b", boot, "-t", "wifi-optimizer", "--grep",
+                           self._DIAG_AT_LOAD, "-n", "5"],
+                timeout=5,
+            )
+            source = found if found.get("success") else log
+            extras["plugin_load_values_" + key] = [
+                line for line in self._diag_service_lines(source.get("stdout", ""), 200, names)
+                if self._DIAG_AT_LOAD in line
+            ][-3:] or ["none logged"]
         log = self._run_cmd(
             journal + ["-b", "-1", "-u", "NetworkManager", "-u", "iwd", "-u", "wpa_supplicant",
                        "-n", "2000"],
             timeout=5,
         )
         extras["network_log_previous_boot"] = (
-            self._diag_service_lines(log.get("stdout", ""), self._DIAG_SERVICE_LINES)
+            self._diag_service_lines(log.get("stdout", ""), self._DIAG_SERVICE_LINES,
+                                     names, events_first=True)
             if log.get("success")
             else [f"unavailable: {(log.get('stderr') or '')[:120]}"]
         )
@@ -9150,7 +9364,10 @@ class Plugin:
                 result = await self._github_api(f"{RELEASES_API}/latest")
 
             if not result["success"] or not result["stdout"]:
-                decky.logger.error(f"Update check: curl failed - rc={result.get('returncode')}, stderr={result.get('stderr', '')[:200]}")
+                decky.logger.error(
+                    f"Update check: curl failed - rc={result.get('returncode')}, "
+                    f"stderr={_mask_addresses(result.get('stderr', '')[:200])}"
+                )
                 return {
                     "success": False,
                     "current_version": current,
@@ -9181,12 +9398,17 @@ class Plugin:
                 }
 
             if not latest:
-                # GitHub explains a refusal (a rate limit) in "message". Its
-                # wording is logged as is but never shown: it is English for
-                # developers, and a rate limit names the network's address.
+                # GitHub explains a refusal (a rate limit) in "message". It is
+                # never shown, being English for developers, and only its kind
+                # is logged: a rate limit names the network's public address,
+                # and people post this log in public threads.
                 raw = data.get("message") if isinstance(data, dict) else None
                 raw = raw if isinstance(raw, str) else ""
-                decky.logger.error(f"Update check: no version - {raw[:200] or 'none given'}")
+                if "rate limit" in raw.lower():
+                    kind = "rate limit"
+                else:
+                    kind = "other: " + (_mask_addresses(raw[:200]) or "none given")
+                decky.logger.error(f"Update check: no version - {kind}")
                 if "rate limit" in raw.lower():
                     msg = ("GitHub is limiting update checks from this network "
                            "for now. Try again in an hour.")

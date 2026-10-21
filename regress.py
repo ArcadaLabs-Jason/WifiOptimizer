@@ -6215,7 +6215,7 @@ try:
            "/sys/module/rtw88_core/parameters/disable_lps_deep",
            "/sys/module/rtw88_pci/parameters/disable_aspm"},
        "the driver's power parameters are read for the radio actually present")
-    ok("modprobe_conf" in _info and "modprobe_conf_before_boot" in _info
+    ok("modprobe_conf" in _info and "modprobe_conf_before_this_boot" in _info
        and "pcie" in _info and "rfkill" in _info and "dispatcher_installed" in _info,
        "with the modprobe file and whether it predates this boot, the PCIe link state and rfkill")
     ok(_info.get("decky_plugins") == ["CSS Loader", "WiFi Optimizer", "decky-wifi-locker"],
@@ -7904,6 +7904,169 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
     asyncio.sleep = _d_real_sleep
 
+section("D2 diagnostics say what the driver loaded with in the boot that failed")
+try:
+    _t2 = _d_template()
+    _ps2 = _t2[_t2.index("# Apply power save"):_t2.index("# Apply buffer tuning")]
+    ok('logger -t "$LOG_TAG" "driver parameters at load:$BEFORE"' in _ps2
+       and _ps2.index('if [ "$FIRST_RUN" = 1 ]; then\n            logger -t "$LOG_TAG" "driver parameters at load:')
+       < _ps2.index("driver parameters before applying"),
+       "the dispatcher's first run of a boot marks its note of the parameters 'at load:'")
+    _marker = "[  3.100000] wifi-optimizer[812]: driver parameters at load: disable_lps_deep=N disable_aspm=N"
+    _plog = [_marker] + [f"[ {10 + i}.000000] wifi-optimizer[9{i:02d}]: driver parameters before applying: "
+                         f"disable_lps_deep=Y disable_aspm=Y" for i in range(49)]
+    class LoadDiag(m.Plugin):
+        grep_works = True
+        def _get_wifi_interface(self): return "wlan0"
+        async def get_device_info(self): return {"success": True, "driver": "rtw88"}
+        def _get_current_backend(self): return "wpa_supplicant"
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0] == "/usr/bin/journalctl" and "-t" in cmd:
+                if "--grep" in cmd:
+                    if not self.grep_works:
+                        return {"success": False, "stdout": "", "returncode": 1,
+                                "stderr": "Compiled without pattern matching support"}
+                    pat = cmd[cmd.index("--grep") + 1]
+                    return _ok("\n".join(l for l in _plog if pat in l) + "\n")
+                return _ok("\n".join(_plog) + "\n")
+            return _ok()
+    for _gw in (True, False):
+        LoadDiag.grep_works = _gw
+        _ld = m.Plugin._diagnostic_extras(LoadDiag(), "rtw88", "wlan0")
+        _lv = _ld.get("plugin_load_values_previous_boot", [])
+        ok(len(_lv) == 1 and "at load: disable_lps_deep=N disable_aspm=N" in _lv[0]
+           and not any("at load" in l for l in _ld.get("plugin_log_previous_boot", [])),
+           f"a first line that scrolled out of the tail is still in the report "
+           f"({'journalctl --grep' if _gw else 'without --grep'}: {_lv})")
+    ok("modprobe_conf_before_this_boot" in _ld and "modprobe_conf_modified" in _ld
+       and "modprobe_conf_before_boot" not in _ld,
+       "the modprobe file's check is named for this boot, with when the file was written")
+    ok("probe" in _ld.get("driver_params_note", "") and "disable_lps_deep" in _ld.get("driver_params_note", ""),
+       "and the driver parameters say when the driver reads them")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D3 a call trace with no end marker does not swallow the rest of the boot")
+try:
+    def _d3_klog(msgs):
+        return "".join(f"[{100 + i:>5}.000000] kernel: {t}\n" for i, t in enumerate(msgs))
+    _rounds = []
+    for _i in range(10):
+        _rounds += [f"PM: suspend entry (s2idle) round{_i}",
+                    f"rtw88_8822ce 0000:01:00.0: failed to send h2c command {_i}",
+                    f"PM: suspend exit round{_i}"]
+    _hung = ["rtw88_8822ce 0000:01:00.0: failed to read ASPM, ret=-5",
+             "INFO: task kworker/u16:3:123 blocked for more than 122 seconds.",
+             "task:kworker/u16:3 state:D stack:0 pid:123 tgid:123 ppid:2 flags:0x00004000",
+             "Workqueue: events_freezable rtw_ips_work [rtw88_core]",
+             "Call Trace:", " <TASK>"] + [f" rtw_frame_{k}+0x10/0x20 [rtw88_core]" for k in "abcdefgh"]
+    for _end, _label in (([" </TASK>"], "</TASK>"), ([], "no marker at all")):
+        _kl = m.Plugin._diag_kernel_lines(_d3_klog(_hung + _end + _rounds), m.Plugin._DIAG_KERNEL_TERMS)
+        _exits = [l for l in _kl if "PM: suspend exit" in l]
+        ok(len(_exits) == 10 and sum("failed to send h2c" in l for l in _kl) == 10,
+           f"every suspend round after a hung-task trace ending in {_label} is kept ({len(_exits)} of 10)")
+    _kl2 = m.Plugin._diag_kernel_lines(_d3_klog(["Call Trace:"] + [f" rtw_frame_{w}+0x1/0x2 [rtw88_core]" for w in _words[:30]]
+                                                + ["rtw88_8822ce: firmware failed to leave lps state"]),
+                                       m.Plugin._DIAG_KERNEL_TERMS)
+    ok(sum("rtw_frame_" in l for l in _kl2) == m.Plugin._DIAG_TRACE_FRAMES and "leave lps" in _kl2[-1],
+       "while a long trace is still cut to its first frames and the line after it is kept")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D4 a GitHub rate limit does not put the public IP in the plugin log")
+try:
+    _d4 = []
+    m.decky.logger.error = staticmethod(lambda msg: _d4.append(str(msg)))
+    m.decky.logger.info = staticmethod(lambda msg: _d4.append(str(msg)))
+    try:
+        class RateLimited(m.Plugin):
+            async def _github_api(self, url):
+                return _ok(json.dumps({"message": "API rate limit exceeded for 203.0.113.7. (But here's "
+                                       "the good news: Authenticated requests get a higher rate limit.)",
+                                       "documentation_url": "https://docs.github.com/rest"}))
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        _r4 = asyncio.run(RateLimited().check_for_update())
+        class OtherRefusal(m.Plugin):
+            async def _github_api(self, url):
+                return _ok(json.dumps({"message": "Blocked for 2001:db8::7 and 198.51.100.4"}))
+        asyncio.run(OtherRefusal().check_for_update())
+    finally:
+        m.decky.logger.error, m.decky.logger.info = _d_real_err, _d_real_info
+    ok(_r4.get("success") is False and _d4 and not any("203.0.113" in l for l in _d4)
+       and any("rate limit" in l for l in _d4),
+       f"the log says it was a rate limit and nothing more ({[l for l in _d4 if 'Update check' in l]})")
+    ok(not any("2001:db8" in l or "198.51.100" in l for l in _d4),
+       "and any other refusal is logged with its addresses taken out")
+    ok(m._mask_addresses("for 203.0.113.7. and fe80::1c2b:3cff:fe4d:5e6f and ::1") ==
+       "for <ip>. and <ip> and <ip>", "every log line has IPv4 and IPv6 addresses masked")
+    ok(m._mask_addresses("v0.24.5 at 12:34:56, kernel 6.11.11, 1.2.3.4.5") ==
+       "v0.24.5 at 12:34:56, kernel 6.11.11, 1.2.3.4.5",
+       "while versions, times and longer dotted numbers are left alone")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+    m.decky.logger.error, m.decky.logger.info = _d_real_err, _d_real_info
+
+section("D5 network names with a quote in them do not leak from the network log")
+try:
+    _apos = ("[ 9.000000] NetworkManager[700]: <info>  policy: set 'Jason's Home' (wlan0) as default for IPv4 routing and DNS\n"
+             "[ 9.100000] wpa_supplicant[650]: wlan0: SME: Trying to authenticate with 62:e9:31:0d:1f:e7 "
+             "(SSID='Jason's Home' freq=5180 MHz)\n"
+             "[ 9.200000] NetworkManager[700]: <info>  device (wlan0): Activation: starting connection "
+             "'O'Brien's WiFi' (1b2c)\n"
+             "[ 9.300000] wpa_supplicant[650]: wlan0: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"O'Brien's WiFi\" auth_failures=1\n"
+             "[ 9.400000] NetworkManager[700]: <info>  device (wlan0): state change: config -> failed "
+             "(reason 'no-secrets', sys-iface-state: 'managed')\n")
+    for _names, _label in (((), "from the quotes alone"), (("Jason's Home", "O'Brien's WiFi"), "and with the saved names")):
+        _sl = " ".join(m.Plugin._diag_service_lines(_apos, 40, _names))
+        ok("Home" not in _sl and "Brien" not in _sl and "Jason" not in _sl,
+           f"a name with an apostrophe goes whole, {_label} ({_sl[:160]!r})")
+        ok("(reason 'no-secrets', sys-iface-state: 'managed')" in _sl,
+           f"while NetworkManager's own reason stays readable, {_label}")
+    _sl2 = " ".join(m.Plugin._diag_service_lines(
+        "[1.0] NetworkManager[1]: <info> (reason 'Jason Home', managed-type: 'full')\n", 40))
+    ok("Jason" not in _sl2 and "'full'" in _sl2, "a name sitting where a reason goes is still taken out")
+    _boot = ([f"[ {i}.0] NetworkManager[700]: <info>  dhcp4 (wlan0): routine renewal note {i}" for i in range(60)]
+             + ["[ 70.0] NetworkManager[700]: <info>  device (wlan0): state change: activated -> failed "
+                "(reason 'supplicant-timeout', managed-type: 'full')",
+                "[ 71.0] wpa_supplicant[650]: wlan0: CTRL-EVENT-DISCONNECTED bssid=62:e9:31:0d:1f:e7 reason=4"]
+             + [f"[ {80 + i}.0] NetworkManager[700]: <info>  dhcp4 (wlan0): routine renewal note {80 + i}" for i in range(20)]
+             + ["[ 900.0] systemd[1]: Stopping Network Manager...",
+                "[ 900.1] NetworkManager[700]: <info>  caught SIGTERM, shutting down normally."]
+             + [f"[ 900.{2 + i}] NetworkManager[700]: <info>  device (p2p-dev-wlan0{i}): state change: disconnected -> unmanaged"
+                for i in range(50)])
+    _picked = m.Plugin._diag_service_lines("\n".join(_boot) + "\n", 40, (), events_first=True)
+    _pj = " ".join(_picked)
+    ok("supplicant-timeout" in _pj and "CTRL-EVENT-DISCONNECTED" in _pj and "caught SIGTERM" not in _pj
+       and "p2p-dev" not in _pj and len(_picked) <= 42,
+       f"a boot that ended in a reboot shows the failure, not the shutdown ({len(_picked)} lines)")
+    _mid = (["[1.0] systemd[1]: Stopping Network Manager...", "[1.1] NetworkManager[7]: <info> caught SIGTERM, shutting down normally.",
+             "[2.0] NetworkManager[8]: <info>  NetworkManager (version 1.46.0) is starting...",
+             "[3.0] NetworkManager[8]: <info>  device (wlan0): state change: config -> failed (reason 'no-secrets', managed-type: 'full')"])
+    _mp = " ".join(m.Plugin._diag_service_lines("\n".join(_mid) + "\n", 40, (), events_first=True))
+    ok("no-secrets" in _mp and "shutdown left out" not in _mp,
+       "and a restart in the middle of the boot (a backend switch) is not taken for its end")
+    class NamesDiag(m.Plugin):
+        def _get_wifi_interface(self): return "wlan0"
+        async def get_device_info(self): return {"success": True, "driver": "rtw88"}
+        def _get_current_backend(self): return "wpa_supplicant"
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[-1:] == ["dev"]: return _ok("phy#0\n\tInterface wlan0\n\t\tssid Al's Cafe\n")
+            if cmd[0] == "/usr/bin/nmcli" and "NAME" in cmd: return _ok("Jason's Home\nwork'n'play\n")
+            if cmd[0] == "/usr/bin/journalctl" and "-u" in cmd:
+                return _ok("[1.0] NetworkManager[7]: <info> policy: set Jason's Home (wlan0) as default\n"
+                           "[1.1] iwd[6]: connected to Al's Cafe now\n"
+                           "[1.2] NetworkManager[7]: <info> joining work'n'play.\n")
+            return _ok()
+    _nj = json.dumps(asyncio.run(NamesDiag().get_diagnostic_info()).get("network_log_previous_boot", []))
+    ok("Jason" not in _nj and "Cafe" not in _nj and "play" not in _nj,
+       f"names the device knows are taken out even where nothing quotes them ({_nj[:200]})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("D7 on other systems the backend in use is the one running")
 try:
     class Running(m.Plugin):
@@ -8006,6 +8169,38 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("D14 error text in the log and diagnostics does not carry the home folder")
+try:
+    _home_was = getattr(m.decky, "DECKY_USER_HOME", None)
+    try:
+        m.decky.DECKY_USER_HOME = "/home/jason"
+        ok(m._mask_addresses("_uninstall could not remove /home/jason/homebrew/settings/WiFi Optimizer/x.json: [Errno 13]")
+           == "_uninstall could not remove ~/homebrew/settings/WiFi Optimizer/x.json: [Errno 13]",
+           "a logged path under the home folder reads ~/")
+        ok("jason" not in m._mask_addresses("Not following the link 'settings' on the way to /var/home/jason/homebrew"),
+           "Bazzite's /var/home too")
+        m.decky.DECKY_USER_HOME = "/data/people/jason"
+        ok(m._mask_addresses("Failed to install dispatcher: [Errno 2] /data/people/jason/x") ==
+           "Failed to install dispatcher: [Errno 2] ~/x", "and a home folder somewhere else")
+        _rd = m.Plugin._redact_diagnostics({"extras_error": "[Errno 13] Permission denied: '/home/jason/homebrew/x'"})
+        ok("jason" not in json.dumps(_rd) and "~/homebrew/x" in _rd["extras_error"],
+           "the diagnostics' error text is masked the same way")
+    finally:
+        m.decky.DECKY_USER_HOME = _home_was
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D15 an address at the end of a sentence is still redacted")
+try:
+    ok(m.Plugin._redact_diagnostics("x 10.0.0.1. y") == "x <ip>. y",
+       "an IPv4 address followed by a full stop is redacted")
+    ok(m.Plugin._redact_diagnostics("build 1.2.3.4.5 and 10.0.0.1") == "build 1.2.3.4.5 and <ip>",
+       "while five numbers in a row are not taken for one")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("D17 a switch request that stops early does not bring back the last result")
 try:
     class EarlyOut(m.Plugin):
@@ -8046,6 +8241,56 @@ try:
     _stuck = _t18[_t18.index("NETLINK_STUCK=0"):_t18.index("# Apply power save")]
     ok('pgrep -O 8 -f "^([^ ]*/)?iw dev $IFACE( |\\$)"' in _stuck and "NETLINK_STUCK=1" in _stuck,
        "an iw on this interface still running after seconds is what marks the netlink path stuck")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D19 copying diagnostics does not run iw on the event loop")
+try:
+    import threading as _thr
+    _on_loop = []
+    class ThreadDiag(m.Plugin):
+        def _get_wifi_interface(self):
+            _on_loop.append(("iface", _thr.current_thread() is _thr.main_thread())); return "wlan0"
+        async def get_device_info(self): return {"success": True, "driver": "rtw88"}
+        def _get_current_backend(self): return "wpa_supplicant"
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0] in ("/usr/bin/iw", "/usr/bin/uname"):
+                _on_loop.append((" ".join(cmd[1:3]), _thr.current_thread() is _thr.main_thread()))
+            return _ok()
+    asyncio.run(ThreadDiag().get_diagnostic_info())
+    ok(_on_loop and not any(on for _w, on in _on_loop) and len(_on_loop) >= 4,
+       f"iw dev, iw reg get, uname and the interface lookup run off the event loop ({_on_loop})")
+    _det = []
+    class ThreadDetect(m.Plugin):
+        def _detect_device_family(self): return ("Galileo", "deck_oled", "Steam Deck OLED")
+        def _detect_wifi_driver(self):
+            _det.append(_thr.current_thread() is _thr.main_thread()); return "ath11k_pci"
+        def _radio_has_6ghz(self):
+            _det.append(_thr.current_thread() is _thr.main_thread()); return True
+    _di = asyncio.run(ThreadDetect().get_device_info())
+    ok(_det == [False, False] and _di.get("driver") == "ath11k_pci" and _di.get("supports_6ghz") is True,
+       f"and so do the driver lookup and the 6 GHz question (iw phy) behind device info ({_det})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D20 diagnostics read Clock PM and the device's power state")
+try:
+    _r20 = tempfile.mkdtemp(); _dev20 = _d_netdev(_r20, "wlan0", "rtw88_8822ce")
+    open(os.path.join(_dev20, "link", "clkpm"), "w").write("1\n")
+    open(os.path.join(_dev20, "power_state"), "w").write("D0\n")
+    _sn20 = m.SYSFS_NET
+    try:
+        m.SYSFS_NET = os.path.join(_r20, "net")
+        class PcieDiag(m.Plugin):
+            def _get_current_backend(self): return "wpa_supplicant"
+            def _run_cmd(self, cmd, timeout=5): return _ok()
+        _p20 = m.Plugin._diagnostic_extras(PcieDiag(), "rtw88", "wlan0").get("pcie", {})
+    finally:
+        m.SYSFS_NET = _sn20
+    ok(_p20.get("clkpm") == "1" and _p20.get("power_state") == "D0" and _p20.get("l1_aspm") == "1",
+       f"the PCIe section has clkpm and power_state beside the ASPM states ({_p20})")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
