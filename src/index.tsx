@@ -580,14 +580,21 @@ function Content() {
       const result = await fn();
       setOptimizeResult(result);
       if (result.results) {
+        // Successes can carry a message too, as they do for a single toggle:
+        // a lock that stayed on the access point you were already on, or a
+        // fix kept for the next stream. Dropping those here hid the reason.
         const newErrors: Record<string, string> = {};
+        const newNotices: Record<string, string> = {};
         for (const [k, v] of Object.entries(result.results)) {
           if (!v.success) {
             const det = v.detail ? ` (${v.detail})` : "";
             newErrors[k] = (v.message ?? ERROR_MESSAGES[v.error ?? ""] ?? "Failed") + det;
+          } else if (v.message) {
+            newNotices[k] = v.message;
           }
         }
         setErrors(newErrors);
+        setNotices(newNotices);
       }
       // optimize_safe contains BSSID lock which reconnects
       if (result.reconnected) {
@@ -1171,6 +1178,7 @@ function Content() {
           checked={s?.auto_fix_on_wake ?? false}
           disabled={isBusy || updating}
           error={errors.auto_fix}
+          notice={notices.auto_fix}
           onChange={(val: boolean) =>
             handleToggle("auto_fix", () => backend.setAutoFix(val))
           }
@@ -1277,7 +1285,10 @@ function Content() {
             error={band6Error}
             notice={
               notices.band_6ghz ??
-              (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+              (on6GHz
+                ? notices.band_preference ??
+                  (status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+                : undefined)
             }
             onChange={(val: boolean) => {
               clearBandMessages();
@@ -1293,6 +1304,7 @@ function Content() {
           checked={s?.dns_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.dns_enabled)}
           error={errors.dns}
+          notice={notices.dns}
           onChange={(val: boolean) => {
             if (!val) resetDnsDraft();
             handleToggle("dns", () =>

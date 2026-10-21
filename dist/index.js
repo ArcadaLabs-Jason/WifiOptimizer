@@ -1319,14 +1319,22 @@ function Content() {
             const result = await fn();
             setOptimizeResult(result);
             if (result.results) {
+                // Successes can carry a message too, as they do for a single toggle:
+                // a lock that stayed on the access point you were already on, or a
+                // fix kept for the next stream. Dropping those here hid the reason.
                 const newErrors = {};
+                const newNotices = {};
                 for (const [k, v] of Object.entries(result.results)) {
                     if (!v.success) {
                         const det = v.detail ? ` (${v.detail})` : "";
                         newErrors[k] = (v.message ?? ERROR_MESSAGES[v.error ?? ""] ?? "Failed") + det;
                     }
+                    else if (v.message) {
+                        newNotices[k] = v.message;
+                    }
                 }
                 setErrors(newErrors);
+                setNotices(newNotices);
             }
             // optimize_safe contains BSSID lock which reconnects
             if (result.reconnected) {
@@ -1629,7 +1637,7 @@ function Content() {
                                 ? IWD_PIN_NOTICE
                                 : status?.external?.bssid_lock
                                     ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
-                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, notice: notices.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: REGION_OPTIONS, selectedOption: regdomain.setting || regdomain.governing || "00", disabled: isBusy || updating, onChange: (option) => {
+                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, notice: notices.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, notice: notices.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: REGION_OPTIONS, selectedOption: regdomain.setting || regdomain.governing || "00", disabled: isBusy || updating, onChange: (option) => {
                                 void handleToggle("regdomain", () => setRegdomain(option.data)).then(refreshRegdomain);
                             } }) })), (errors.regdomain || notices.regdomain) && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.tiny,
@@ -1650,10 +1658,13 @@ function Content() {
                             // Never "6GHz": turning that off leaves it recorded as the band.
                             setBandPreference(val, s?.band_preference === "bg" ? "bg" : "a"));
                         } }), (status?.live?.six_ghz_offered || on6GHz) && (SP_JSX.jsx(InfoRow, { label: "Force 6 GHz band", subtitle: "Stay on 6 GHz where your router has it", explanation: "6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3, so it is only offered when the network can use it here. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect.", ...getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null), checked: on6GHz, disabled: isBusy || updating || (!connected && !on6GHz), error: band6Error, notice: notices.band_6ghz ??
-                            (on6GHz && status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined), onChange: (val) => {
+                            (on6GHz
+                                ? notices.band_preference ??
+                                    (status?.live?.pins_inactive_iwd ? IWD_PIN_NOTICE : undefined)
+                                : undefined), onChange: (val) => {
                             clearBandMessages();
                             handleToggle("band_6ghz", () => setBandPreference(val, "6GHz"));
-                        } })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, onChange: (val) => {
+                        } })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the current WiFi network.", ...getBadge("dns", status, errors.dns ?? null), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), error: errors.dns, notice: notices.dns, onChange: (val) => {
                             if (!val)
                                 resetDnsDraft();
                             handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput));
