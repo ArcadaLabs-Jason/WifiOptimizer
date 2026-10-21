@@ -6083,6 +6083,17 @@ class Plugin:
                 return self._record_paused("power_save_disabled")
             # Auto mode keeps power save to the session: nothing persistent.
             auto = bool(_load_settings().get("streaming_mode_enabled"))
+            # Off is saved before anything comes off. The dispatcher and the
+            # startup apply both act on the setting, so a reconnect landing
+            # part way through put back what was being taken off, and the
+            # fixes stayed on under a toggle that read off.
+            was_on = False
+            if not disabled:
+                settings = _load_settings()
+                was_on = bool(settings.get("power_save_disabled"))
+                if was_on:
+                    settings["power_save_disabled"] = False
+                    _save_settings(settings)
 
             iface = self._get_wifi_interface()
 
@@ -6093,6 +6104,11 @@ class Plugin:
                     ["/usr/bin/iw", "dev", iface, "set", "power_save", state]
                 )
                 if not result["success"]:
+                    if was_on:
+                        # Nothing was taken off, so it is still on.
+                        settings = _load_settings()
+                        settings["power_save_disabled"] = True
+                        _save_settings(settings)
                     return {
                         "success": False,
                         "error": "iw_failed",
@@ -7376,7 +7392,10 @@ class Plugin:
                 # Refusing to disable would leave the setting recorded as on
                 # with a toggle that will not move, which is worse than
                 # recording the user's intent and logging that the restore
-                # did not take.
+                # did not take. Saved before the restore, for the reason
+                # set_power_save gives: a reconnect meanwhile reapplied it.
+                settings["buffer_tuning_enabled"] = False
+                _save_settings(settings)
                 if self._restore_buffer_sysctls(settings) == len(SYSCTL_PARAMS):
                     decky.logger.error(
                         "Could not restore any kernel buffer defaults; recording "
@@ -7450,6 +7469,13 @@ class Plugin:
                 self._run_cmd(["/usr/bin/ip", "link", "set", iface, "txqueuelen", "256"])
                 decky.logger.info(f"CAKE enabled (unlimited) on {iface}")
             else:
+                # Saved off before it comes off, for the reason set_power_save
+                # gives, and put back on below if it would not come off.
+                settings = _load_settings()
+                was_on = bool(settings.get("cake_enabled"))
+                if was_on:
+                    settings["cake_enabled"] = False
+                    _save_settings(settings)
                 removal = self._run_cmd(
                     ["/usr/bin/tc", "qdisc", "del", "dev", iface, "root"]
                 )
@@ -7460,6 +7486,10 @@ class Plugin:
                         f"tc qdisc del on {iface}: {removal.get('stderr', '')[:120]}"
                     )
                     if self._get_cake_status(iface):
+                        if was_on:
+                            settings = _load_settings()
+                            settings["cake_enabled"] = True
+                            _save_settings(settings)
                         return {
                             "success": False,
                             "error": "unexpected",
@@ -8026,12 +8056,25 @@ class Plugin:
         if task is None or task.done():
             self._stream_task = asyncio.create_task(self._streaming_watch())
 
-    def _drop_persistent_power_save(self):
+    async def _drop_persistent_power_save(self):
         """Remove what keeps power save off beyond a session.
 
         NetworkManager's file holds it off on every connect and the modprobe
         options at every module load, both whether or not anything streams.
+
+        The files and NetworkManager's reload are worked in a thread, and
+        what is recorded is saved here on the event loop. Saved from the
+        thread, it raced every setter on the loop: whichever wrote last
+        undid the other's change.
         """
+        found = await asyncio.to_thread(self._remove_persistent_power_save)
+        settings = _load_settings()
+        settings["valve_powersave_before"] = found
+        _save_settings(settings)
+
+    def _remove_persistent_power_save(self) -> str:
+        """_drop_persistent_power_save's file work. Returns what to record as
+        Valve's power save value from before."""
         had_conf = os.path.exists(NM_CONF_PATH)
         for path in (NM_CONF_PATH, MODPROBE_CONF_PATH):
             try:
@@ -8049,10 +8092,7 @@ class Plugin:
         # setting). Recorded, so a later Reset or uninstall leaves it alone
         # rather than taking an unrecorded 2 for ours.
         found = self._valve_powersave()
-        settings["valve_powersave_before"] = (
-            "" if found is None else found if found in _VALVE_POWERSAVE_VALUES else "?"
-        )
-        _save_settings(settings)
+        return "" if found is None else found if found in _VALVE_POWERSAVE_VALUES else "?"
 
     def _reload_nm_conf(self):
         """Have NetworkManager read its config files again.
@@ -8078,7 +8118,7 @@ class Plugin:
             for path in (STREAM_FLAG_FILE, STREAM_HOLD_FILE):
                 self._set_stream_flag(False, path)
             return
-        await asyncio.to_thread(self._drop_persistent_power_save)
+        await self._drop_persistent_power_save()
         await self._stream_pass(settle=True)
         self._start_streaming_watch()
 
@@ -8111,7 +8151,7 @@ class Plugin:
                 settings["streaming_mode_enabled"] = bool(enabled)
                 _save_settings_with_timestamp(settings)
                 if enabled:
-                    await asyncio.to_thread(self._drop_persistent_power_save)
+                    await self._drop_persistent_power_save()
                     # Until now the fixes applied all the time, so they are
                     # on. A settled pass takes them off unless a stream runs.
                     self._set_stream_flag(True)

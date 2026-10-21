@@ -3260,6 +3260,45 @@ r = asyncio.run(StuckCake().set_cake(False))
 ok(r.get("success") is False and m._load_settings()["cake_enabled"] is True,
    "CAKE that is still attached is not reported as removed")
 
+# Turning a fix off saves the setting first. The dispatcher and the startup
+# apply act on it, so a reconnect part way through the revert put back what
+# was coming off, under a toggle that then read off.
+class SeenOff(m.Plugin):
+    """Records what the saved setting said when each revert step ran."""
+    def __init__(self, key, iw_ok=True):
+        super().__init__(); self.key = key; self.iw_ok = iw_ok; self.seen = []
+    def _get_wifi_interface(self): return "wlan0"
+    def _run_cmd(self, cmd, timeout=5):
+        self.seen.append((cmd[0].rsplit("/", 1)[-1], m._load_settings()[self.key]))
+        if cmd[:2] == ["/usr/bin/iw", "dev"] and not self.iw_ok:
+            return {"success": False, "stdout": "", "stderr": "busy", "returncode": 1}
+        return _ok()
+    def _apply_driver_fixes(self, enable, persist=True):
+        self.seen.append(("drivers", m._load_settings()[self.key]))
+    def _apply_pcie_aspm_fix(self, enable, record_all=False):
+        self.seen.append(("pcie", m._load_settings()[self.key])); return []
+    def _valve_powersave(self): return "3"
+_real_nm_off = m.NM_CONF_PATH
+try:
+    m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+    for key, call in [("power_save_disabled", lambda p: p.set_power_save(False)),
+                      ("buffer_tuning_enabled", lambda p: p.set_buffer_tuning(False)),
+                      ("cake_enabled", lambda p: p.set_cake(False))]:
+        open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        m._save_settings({**m.DEFAULT_SETTINGS, key: True})
+        so = SeenOff(key); r = asyncio.run(call(so))
+        ok(r.get("success") is True and so.seen and all(v is False for _, v in so.seen)
+           and m._load_settings()[key] is False,
+           f"turning {key} off saves it off before anything is reverted ({so.seen})")
+    m._save_settings({**m.DEFAULT_SETTINGS, "power_save_disabled": True})
+    open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+    r = asyncio.run(SeenOff("power_save_disabled", iw_ok=False).set_power_save(False))
+    ok(r.get("success") is False and m._load_settings()["power_save_disabled"] is True
+       and os.path.exists(m.NM_CONF_PATH),
+       "and when the radio refuses, nothing came off, so the setting goes back to on")
+finally:
+    m.NM_CONF_PATH = _real_nm_off
+
 section("update script: staged, versioned, one at a time")
 _src = open("main.py").read()
 _script = m.UPDATE_SCRIPT
@@ -4883,14 +4922,14 @@ try:
         m._save_settings({**m.DEFAULT_SETTINGS, "valve_powersave_before": "2"})
         class RealValve(Cmds):
             def _valve_powersave(self): return m.Plugin._valve_powersave(self)
-        c = RealValve(); c._drop_persistent_power_save()
+        c = RealValve(); asyncio.run(c._drop_persistent_power_save())
         ok(["/usr/bin/nmcli", "general", "reload", "conf"] in c.cmds,
            "NetworkManager reads its config again once our file is gone, or it holds power save off until reboot")
         ok(m._load_settings()["valve_powersave_before"] == "2",
            "Steam's own power management setting stays recorded as the user's")
         m.Plugin()._release_valve_powersave(m._load_settings())
         ok(m.Plugin()._valve_powersave() == "2", "so a later Reset or uninstall leaves it alone")
-        c = RealValve(); c._drop_persistent_power_save()
+        c = RealValve(); asyncio.run(c._drop_persistent_power_save())
         ok(["/usr/bin/nmcli", "general", "reload", "conf"] not in c.cmds,
            "and nothing is reloaded when there was no file of ours to remove")
         # QA gate 2026-10-20: with no file of ours, a 2 in Valve's file is the
@@ -4898,7 +4937,7 @@ try:
         # the end of every stream.
         open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=2\n[device]\nwifi.backend=wpa_supplicant\n")
         m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "valve_powersave_before": ""})
-        c = RealValve(); c._drop_persistent_power_save()
+        c = RealValve(); asyncio.run(c._drop_persistent_power_save())
         ok(m.Plugin()._valve_powersave() == "2" and m._load_settings()["valve_powersave_before"] == "2",
            "a load with no file of ours leaves the user's Steam power management setting alone, and records it as theirs")
         m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "power_save_disabled": True,
@@ -4906,6 +4945,26 @@ try:
         c = RealValve(); asyncio.run(c.set_power_save(False))
         ok(m.Plugin()._valve_powersave() == "2",
            "and so does the end of a stream in auto mode, which never writes a file of ours")
+        # Turning auto mode on removes those files in a worker thread. The
+        # save that records Valve's value ran there too, racing every setter
+        # on the event loop for the settings file.
+        import threading as _thr2
+        _save_threads = []; _real_save2 = m._save_settings
+        def _spy_save(data):
+            _save_threads.append(_thr2.current_thread() is _thr2.main_thread()); _real_save2(data)
+        class StreamValve(Stream):
+            def _run_cmd(self, cmd, timeout=5): return _ok()
+            def _valve_powersave(self): return m.Plugin._valve_powersave(self)
+        open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": False}); _flags()
+        m._save_settings = _spy_save
+        try:
+            asyncio.run(StreamValve(None).set_streaming_mode(True))
+        finally:
+            m._save_settings = _real_save2
+            _flags()
+        ok(_save_threads and all(_save_threads) and m._load_settings()["streaming_mode_enabled"] is True,
+           f"turning auto mode on saves the settings on the event loop only ({_save_threads})")
     finally:
         m.WIFI_BACKEND_CONF, m.NM_CONF_PATH, m.MODPROBE_CONF_PATH = _rv, _real_nm2, _real_mp2
 
