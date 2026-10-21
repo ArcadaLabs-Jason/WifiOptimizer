@@ -9,6 +9,10 @@ interface ActionsSectionProps {
   // Reset's outcome when it failed. Force Reapply reports through the
   // result banner at the top of the panel, like Optimize Safe.
   resetError?: string | null;
+  // Reset's outcome when it worked.
+  resetNotice?: string | null;
+  // Said here while Force Reapply or Reset runs, where the button was pressed.
+  workingText?: string | null;
 }
 
 export function ActionsSection({
@@ -17,6 +21,8 @@ export function ActionsSection({
   onForceReapply,
   onReset,
   resetError,
+  resetNotice,
+  workingText,
 }: ActionsSectionProps) {
   return (
     <PanelSection title="Actions">
@@ -34,10 +40,22 @@ export function ActionsSection({
           Reset Settings
         </ButtonItem>
       </PanelSectionRow>
-      {resetError && (
+      {workingText && (
         <PanelSectionRow>
-          <div style={{ fontSize: theme.fontSize.tiny, color: theme.error.text }}>
-            {resetError}
+          <div style={{ fontSize: theme.fontSize.small, color: theme.info.text }}>
+            {workingText}
+          </div>
+        </PanelSectionRow>
+      )}
+      {!workingText && (resetError || resetNotice) && (
+        <PanelSectionRow>
+          <div
+            style={{
+              fontSize: theme.fontSize.small,
+              color: resetError ? theme.error.text : theme.success.text,
+            }}
+          >
+            {resetError ?? resetNotice}
           </div>
         </PanelSectionRow>
       )}
