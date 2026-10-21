@@ -6,7 +6,6 @@
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 SETTINGS_FILE=__SETTINGS_PATH__
-SETTINGS_DIR=$(dirname "$SETTINGS_FILE")
 PLUGIN_DIR=__PLUGIN_DIR__
 LOG_TAG="wifi-optimizer"
 
@@ -18,6 +17,7 @@ IFACE_TYPE=$(/usr/bin/nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | grep "^${
 [ "$IFACE_TYPE" != "wifi" ] && exit 0
 
 IFACE="$1"
+APPLIED=0
 
 # Self-removal: if plugin directory gone, clean up. An install or update
 # swaps the directory out and back in, so look again after a moment before
@@ -64,11 +64,12 @@ try:
             raise ValueError("not a regular file")
         raw = fh.read(65536)
     d = json.loads(raw)
-    print("True" if d.get("power_save_disabled", True) else "False")
-    print("True" if d.get("buffer_tuning_enabled", False) else "False")
+    # Only a real JSON true turns something on: a string "false" is truthy.
+    print("True" if d.get("power_save_disabled", True) is True else "False")
+    print("True" if d.get("buffer_tuning_enabled") is True else "False")
     print(str(d.get("driver", "unknown")).replace("\n", " ")[:64])
-    print("True" if d.get("cake_enabled", False) else "False")
-    print("True" if d.get("streaming_mode_enabled", False) else "False")
+    print("True" if d.get("cake_enabled") is True else "False")
+    print("True" if d.get("streaming_mode_enabled") is True else "False")
 except Exception:
     print("True"); print("False"); print("unknown"); print("False"); print("False")
 ' "$SETTINGS_FILE" 2>/dev/null)
@@ -118,32 +119,67 @@ fi
 # Apply power save
 if [ "$POWER_SAVE" = "True" ]; then
     /usr/bin/iw dev "$IFACE" set power_save off 2>/dev/null
-    # Driver-specific sysfs fixes
-    if [ "$DRIVER" = "rtw88" ]; then
-        echo Y 2>/dev/null > /sys/module/rtw88_core/parameters/disable_lps_deep
-        echo Y 2>/dev/null > /sys/module/rtw88_pci/parameters/disable_aspm
-    elif [ "$DRIVER" = "rtw89" ]; then
-        echo Y 2>/dev/null > /sys/module/rtw89_pci/parameters/disable_aspm_l1
-        echo Y 2>/dev/null > /sys/module/rtw89_pci/parameters/disable_aspm_l1ss
-    elif [ "$DRIVER" = "mt7921e" ]; then
-        echo Y 2>/dev/null > /sys/module/mt7921e/parameters/disable_aspm
-    fi
-    # Disable PCIe ASPM for WiFi device (all drivers)
     WIFI_PCI=$(readlink -f /sys/class/net/"$IFACE"/device 2>/dev/null)
-    if [ -d "$WIFI_PCI/link" ]; then
-        # This runs at boot before the plugin loads, so the plugin only ever
-        # saw our own values. Note what the system had, once per boot and
-        # before the first write, so turning this off puts that back rather
-        # than a guess. Same file and format the plugin reads.
-        if [ ! -e /run/wifi-optimizer/pcie-baseline ]; then
-            python3 - "$WIFI_PCI" <<'PYEOF' 2>/dev/null
+    # Driver-specific sysfs fixes, as in the plugin's DRIVER_PROFILES.
+    DRIVER_PARAMS=""
+    if [ "$DRIVER" = "rtw88" ]; then
+        DRIVER_PARAMS="/sys/module/rtw88_core/parameters/disable_lps_deep /sys/module/rtw88_pci/parameters/disable_aspm"
+    elif [ "$DRIVER" = "rtw89" ]; then
+        DRIVER_PARAMS="/sys/module/rtw89_pci/parameters/disable_aspm_l1 /sys/module/rtw89_pci/parameters/disable_aspm_l1ss"
+    elif [ "$DRIVER" = "mt7921e" ]; then
+        DRIVER_PARAMS="/sys/module/mt7921e/parameters/disable_aspm"
+    fi
+    # What they held before this write, in the journal. When WiFi does not
+    # come back after sleep, the report is read after the reboot that fixed
+    # it, and this says whether the fixes were in force during that boot.
+    if [ -n "$DRIVER_PARAMS" ]; then
+        BEFORE=""
+        for p in $DRIVER_PARAMS; do
+            BEFORE="$BEFORE ${p##*/}=$(cat "$p" 2>/dev/null || echo missing)"
+        done
+        logger -t "$LOG_TAG" "driver parameters before applying:$BEFORE"
+    fi
+    # This runs at boot before the plugin loads, so the plugin only ever
+    # saw our own values. Note what the system had, once per boot and
+    # before the first write, so turning this off puts that back rather
+    # than a guess. Same file and format the plugin reads.
+    if [ ! -e /run/wifi-optimizer/pcie-baseline ]; then
+        python3 -I - "$WIFI_PCI" $DRIVER_PARAMS <<'PYEOF' 2>/dev/null
 import json, os, sys
-dev = sys.argv[1]
-names = ["link/" + n for n in ("l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
-                               "l1_1_pcipm", "l1_2_pcipm")] + ["power/control"]
+dev, params = sys.argv[1], sys.argv[2:]
 base = {}
-for name in names:
-    path = os.path.join(dev, name)
+if dev.startswith("/sys/") and os.path.isdir(dev):
+    names = ["link/" + n for n in ("l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
+                                   "l1_1_pcipm", "l1_2_pcipm")] + ["power/control"]
+    for name in names:
+        path = os.path.join(dev, name)
+        try:
+            with open(path) as f:
+                base[path] = f.read(16).strip()
+        except OSError:
+            pass
+# A parameter our own modprobe file gave the driver when it loaded holds our
+# value, not the system's. Left out, so the plugin works that one out from
+# the system's own configuration instead.
+ours = ""
+try:
+    with open("/proc/stat") as f:
+        boot = next(int(line.split()[1]) for line in f if line.startswith("btime "))
+    conf = "/etc/modprobe.d/99-wifi-optimizer.conf"
+    if os.stat(conf).st_mtime < boot:
+        with open(conf) as f:
+            ours = f.read(65536)
+except Exception:
+    pass
+for path in params:
+    parts = path.split("/")
+    if len(parts) != 6:
+        continue
+    module, param = parts[3], parts[5]
+    if any(line.split()[:2] == ["options", module]
+           and any(word.split("=")[0] == param for word in line.split()[2:])
+           for line in ours.splitlines()):
+        continue
     try:
         with open(path) as f:
             base[path] = f.read(16).strip()
@@ -155,12 +191,22 @@ fd = os.open("/run/wifi-optimizer/pcie-baseline",
 with os.fdopen(fd, "w") as f:
     json.dump(base, f)
 PYEOF
-        fi
+    fi
+    for p in $DRIVER_PARAMS; do
+        echo Y 2>/dev/null > "$p"
+    done
+    # Disable PCIe ASPM for WiFi device (all drivers)
+    if [ -d "$WIFI_PCI/link" ]; then
         for f in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
             echo 0 2>/dev/null > "$WIFI_PCI/link/$f"
         done
+    fi
+    # Runtime power management is the device's own, with or without a link
+    # directory for ASPM, as in the plugin.
+    if [ -f "$WIFI_PCI/power/control" ]; then
         echo on 2>/dev/null > "$WIFI_PCI/power/control"
     fi
+    APPLIED=1
     logger -t "$LOG_TAG" "power_save off applied to $IFACE (driver=$DRIVER)"
 fi
 
@@ -175,6 +221,7 @@ if [ "$BUFFER_TUNING" = "True" ]; then
     /usr/bin/sysctl -w net.core.netdev_budget_usecs=8000 >/dev/null 2>&1
     /usr/bin/sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
     /usr/bin/ip link set "$IFACE" txqueuelen 2000 2>/dev/null
+    APPLIED=1
     logger -t "$LOG_TAG" "buffer tuning applied"
 fi
 
@@ -183,13 +230,16 @@ if [ "$CAKE" = "True" ]; then
     /usr/bin/modprobe sch_cake 2>/dev/null || /usr/sbin/modprobe sch_cake 2>/dev/null
     if /usr/bin/tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter 2>/dev/null; then
         /usr/bin/ip link set "$IFACE" txqueuelen 256 2>/dev/null
+        APPLIED=1
         logger -t "$LOG_TAG" "CAKE QoS applied (unlimited) on $IFACE"
     else
         logger -t "$LOG_TAG" "CAKE QoS failed on $IFACE (sch_cake may not be available)"
     fi
 fi
 
-# Record enforcement timestamp.
+# Record enforcement timestamp, only when something was applied: the panel
+# reads it as "reapplied on connect".
+[ "$APPLIED" = 1 ] || exit 0
 #
 # In /run, which only root can write, not in the settings directory. That one
 # belongs to the desktop user, and any file root creates there can have a

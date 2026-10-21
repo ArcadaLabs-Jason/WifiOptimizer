@@ -71,6 +71,16 @@ DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-wifi-optimizer"
 SYSFS_NET = "/sys/class/net"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-wifi-optimizer.conf"
 MODPROBE_CONF_PATH = "/etc/modprobe.d/99-wifi-optimizer.conf"
+# Where modprobe looks for options, in its order of precedence.
+MODPROBE_DIRS = ("/etc/modprobe.d", "/run/modprobe.d", "/usr/local/lib/modprobe.d",
+                 "/usr/lib/modprobe.d", "/lib/modprobe.d")
+PROC_CMDLINE = "/proc/cmdline"
+# Driver parameters written at runtime only while the radio is associated.
+# rtw88 checks disable_aspm each time it moves the PCIe link in or out of a
+# power state. Set while the link is in one (radio idle, not associated), the
+# way back out is skipped and ASPM stays on while the radio works: the state
+# behind "failed to read ASPM" and an RTL8822CE that only a reboot revives.
+ASSOCIATED_ONLY_PARAMS = ("/sys/module/rtw88_pci/parameters/disable_aspm",)
 # SteamOS after 3.9 moves to Valve's "holo" packaging, which ships the same
 # helper under a new name and nothing at the old path. Resolved once at load;
 # an OS update reboots, so the plugin always loads against the current image.
@@ -676,8 +686,17 @@ def _parse_stream_patterns(text: str) -> tuple[list[str], list[str]]:
 _PCIE_VALUES = {"control": ("on", "auto")}
 
 
+def _baseline_values(path: str) -> tuple:
+    """The values a file named in the baseline can hold. Driver parameters
+    under /sys/module are kernel booleans, which read back as Y or N."""
+    if path.startswith("/sys/module/"):
+        return ("Y", "N")
+    return _PCIE_VALUES.get(os.path.basename(path), ("0", "1"))
+
+
 def _read_pcie_baseline() -> dict:
-    """What the PCIe power files held before we changed them this boot."""
+    """What the PCIe power files and the driver's power parameters held
+    before we changed them this boot."""
     try:
         fd = os.open(PCIE_BASELINE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
@@ -695,8 +714,120 @@ def _read_pcie_baseline() -> dict:
     return {
         k: v for k, v in data.items()
         if isinstance(k, str) and k.startswith(SYSFS_ROOT)
-        and v in _PCIE_VALUES.get(os.path.basename(k), ("0", "1"))
+        and v in _baseline_values(k)
     }
+
+
+def _save_pcie_baseline(baseline: dict):
+    try:
+        os.makedirs(os.path.dirname(PCIE_BASELINE_FILE), mode=0o755, exist_ok=True)
+    except OSError:
+        pass
+    _write_no_follow(PCIE_BASELINE_FILE, json.dumps(baseline))
+
+
+def _boot_time() -> int | None:
+    """When this boot started, in seconds since the epoch."""
+    try:
+        with open("/proc/stat", "r") as f:
+            return next(int(line.split()[1]) for line in f if line.startswith("btime "))
+    except (OSError, StopIteration, ValueError, IndexError):
+        return None
+
+
+def _kernel_bool(value: str | None) -> str | None:
+    """A boolean module parameter as the kernel reads it (kstrtobool), as the
+    Y or N it reads back as. None for anything it would refuse."""
+    if not value:
+        return None
+    first, second = value[0].lower(), value[1:2].lower()
+    if first in "yt1" or (first == "o" and second == "n"):
+        return "Y"
+    if first in "nf0" or (first == "o" and second == "f"):
+        return "N"
+    return None
+
+
+def _param_name(path: str) -> tuple | None:
+    """(module, parameter) for /sys/module/<module>/parameters/<parameter>."""
+    parts = path.split("/")
+    if len(parts) != 6 or parts[1:3] != ["sys", "module"] or parts[4] != "parameters":
+        return None
+    return parts[3], parts[5]
+
+
+def _options_set(text: str, module: str, param: str) -> str | None:
+    """The last value modprobe config text gives module.param, or None.
+    A bare boolean parameter with no value means on."""
+    found = None
+    for line in text.splitlines():
+        words = line.split("#", 1)[0].split()
+        if len(words) < 3 or words[0] != "options":
+            continue
+        if words[1].replace("-", "_") != module:
+            continue
+        for word in words[2:]:
+            key, eq, value = word.partition("=")
+            if key.replace("-", "_") == param:
+                found = value if eq else "Y"
+    return found
+
+
+def _param_from_config(path: str) -> str | None:
+    """What the system's own configuration gives a driver parameter when the
+    module loads, ignoring our file: modprobe.d (the first directory holding
+    a given file name wins, files read in name order, the last setting wins)
+    and then the kernel command line. None when nothing sets it.
+
+    A guide that has people add disable_aspm=Y to a file of their own is the
+    reason this exists: turning our fix off must not write N over that.
+    """
+    names = _param_name(path)
+    if not names:
+        return None
+    module, param = names
+    files = {}
+    for directory in MODPROBE_DIRS:
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            if name.endswith(".conf") and name not in files:
+                files[name] = os.path.join(directory, name)
+    found = None
+    for name in sorted(files):
+        if files[name] == MODPROBE_CONF_PATH:
+            continue
+        try:
+            with open(files[name], "r") as f:
+                value = _options_set(f.read(65536), module, param)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if value is not None:
+            found = value
+    try:
+        with open(PROC_CMDLINE, "r") as f:
+            for word in f.read(8192).split():
+                key, eq, value = word.partition("=")
+                if key.replace("-", "_") == f"{module}.{param}":
+                    found = value if eq else "Y"
+    except OSError:
+        pass
+    return _kernel_bool(found)
+
+
+def _ours_at_boot() -> str:
+    """Our modprobe file's text if it was in place before this boot, so its
+    options were what the driver loaded with; "" otherwise."""
+    boot = _boot_time()
+    try:
+        if boot is None or os.stat(MODPROBE_CONF_PATH).st_mtime >= boot:
+            return ""
+        with open(MODPROBE_CONF_PATH, "r") as f:
+            return f.read(65536)
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def _write_system_conf(path: str, content: str) -> bool:
@@ -2088,17 +2219,39 @@ class Plugin:
             out.append(opt)
         return out
 
-    def _apply_driver_fixes(self, enable: bool, persist: bool = True):
+    def _apply_driver_fixes(self, enable: bool, persist: bool = True,
+                            record_all: bool = False):
         """Apply or revert driver-specific power save fixes from DRIVER_PROFILES.
         Silently no-ops for drivers with no sysfs paths or modprobe options.
 
         persist=False leaves out the modprobe options, which take effect at
-        the next module load and so cannot follow a streaming session."""
+        the next module load and so cannot follow a streaming session.
+
+        Reverting puts back what each parameter held before our first change
+        this boot, or failing that what the system's own configuration gives
+        it, and N only when nothing does. Writing N regardless turned off a
+        disable_aspm=Y the user had set up themselves, which on an RTL8822CE
+        is the remedy for WiFi that does not come back after sleep.
+
+        record_all: as for _apply_pcie_aspm_fix.
+        """
         settings = _load_settings()
         profile = DRIVER_PROFILES.get(settings.get("driver"), {})
+        paths = self._safe_sysfs_fixes(profile)
 
-        val = "Y" if enable else "N"
-        for path in self._safe_sysfs_fixes(profile):
+        baseline = _read_pcie_baseline() if paths else {}
+        if enable and self._record_param_baseline(paths, baseline, record_all):
+            _save_pcie_baseline(baseline)
+        for path in paths:
+            if enable:
+                val = "Y"
+                if path in ASSOCIATED_ONLY_PARAMS and not self._wifi_associated():
+                    decky.logger.info(
+                        f"{path} left for the next connect: the radio is not associated"
+                    )
+                    continue
+            else:
+                val = baseline.get(path) or _param_from_config(path) or "N"
             try:
                 with open(path, "w") as f:
                     f.write(val)
@@ -2164,16 +2317,20 @@ class Plugin:
             ))
 
             # Restoring writes back what the system had, where we saw it
-            # before our first change this boot; the kernel's usual value
-            # otherwise. Streaming auto mode restores after every stream, so
-            # turning on a state the firmware had left off would add up.
+            # before our first change this boot, and leaves a file alone
+            # where we did not: then it already held our value before we
+            # wrote it. Writing "the kernel's usual value" instead turned on
+            # states the firmware or driver keeps off (mt7921e turns its own
+            # ASPM off), and streaming auto mode restores after every stream.
             baseline = _read_pcie_baseline()
             recorded = enable and self._record_pcie_baseline(targets, baseline, record_all)
             for path, val in targets:
                 if not os.path.exists(path):
                     continue
                 if not enable:
-                    val = baseline.get(path, val)
+                    if path not in baseline:
+                        continue
+                    val = baseline[path]
                 try:
                     with open(path, "w") as f:
                         f.write(val)
@@ -2190,11 +2347,7 @@ class Plugin:
                     not_applied.append(os.path.basename(path))
 
             if recorded:
-                try:
-                    os.makedirs(os.path.dirname(PCIE_BASELINE_FILE), mode=0o755, exist_ok=True)
-                except OSError:
-                    pass
-                _write_no_follow(PCIE_BASELINE_FILE, json.dumps(baseline))
+                _save_pcie_baseline(baseline)
             if not_applied:
                 decky.logger.error(
                     f"PCIe power states still enabled on {device_link}: "
@@ -2228,6 +2381,42 @@ class Plugin:
                 baseline[path] = before
                 recorded = True
         return recorded
+
+    @staticmethod
+    def _record_param_baseline(paths: list, baseline: dict, record_all: bool) -> bool:
+        """Note what each driver parameter holds before our first write this
+        boot. A Y already there is only recorded when nothing of ours can
+        have written it (record_all), and never when our own modprobe file
+        gave it at load: that is our value, not the system's, and restoring
+        it would leave the fix on after it was turned off."""
+        ours = _ours_at_boot()
+        recorded = False
+        for path in paths:
+            names = _param_name(path)
+            if path in baseline or not names:
+                continue
+            if ours and _options_set(ours, *names) is not None:
+                continue
+            try:
+                with open(path, "r") as f:
+                    before = _kernel_bool(f.read(16).strip())
+            except OSError:
+                continue
+            if before and (before != "Y" or record_all):
+                baseline[path] = before
+                recorded = True
+        return recorded
+
+    def _wifi_associated(self) -> bool:
+        """Whether the WiFi interface is up and associated with a network."""
+        iface = self._get_wifi_interface()
+        if not iface or not IFACE_RE.match(iface):
+            return False
+        try:
+            with open(os.path.join(SYSFS_NET, iface, "operstate"), "r") as f:
+                return f.read(16).strip() == "up"
+        except OSError:
+            return False
 
     def _install_dispatcher(self) -> bool:
         try:
@@ -5957,12 +6146,11 @@ class Plugin:
                 except FileNotFoundError:
                     pass
 
-            self._apply_driver_fixes(disabled, persist=not auto)
             # Only when auto mode is putting the fixes on from off. Any other
             # call finds them already on, and would record our own values.
-            not_applied = self._apply_pcie_aspm_fix(
-                disabled, record_all=auto and getattr(self, "_gate_opening", False)
-            )
+            record_all = auto and getattr(self, "_gate_opening", False)
+            self._apply_driver_fixes(disabled, persist=not auto, record_all=record_all)
+            not_applied = self._apply_pcie_aspm_fix(disabled, record_all=record_all)
 
             # Save settings only after success
             settings = _load_settings()

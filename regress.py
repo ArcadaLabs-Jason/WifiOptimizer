@@ -2935,8 +2935,131 @@ try:
        "and an odd error on one file no longer stops the rest")
     ok(Pcie()._apply_pcie_aspm_fix(False) == [],
        "restoring is not judged by what firmware chooses to keep off")
+
+    # A state that already held our value had nothing recorded for it. It is
+    # left alone on restore: mt7921e keeps its own ASPM off, and writing the
+    # kernel's usual 1 turned on what the driver had turned off.
+    m.SYSFS_NET, dev = pcie_device(OLED)
+    for f in OLED:
+        open(os.path.join(dev, "link", f), "w").write("0")
+    if os.path.exists(m.PCIE_BASELINE_FILE): os.remove(m.PCIE_BASELINE_FILE)
+    Pcie()._apply_pcie_aspm_fix(True)
+    Pcie()._apply_pcie_aspm_fix(False)
+    ok(all(open(os.path.join(dev, "link", f)).read() == "0" for f in OLED),
+       "a state with nothing recorded is left as it was, not set to the kernel's usual value")
 finally:
     m.SYSFS_NET = _real_sysfs
+    if os.path.exists(m.PCIE_BASELINE_FILE): os.remove(m.PCIE_BASELINE_FILE)
+
+
+section("driver parameters: turning the fix off puts back what the system had")
+try:
+    import builtins as _bi
+    _mod_root = tempfile.mkdtemp()
+    _LPS = "/sys/module/rtw88_core/parameters/disable_lps_deep"
+    _ASPM = "/sys/module/rtw88_pci/parameters/disable_aspm"
+    def _sysmod(path): return os.path.join(_mod_root, path[len("/sys/module/"):])
+    def _param(path, val=None):
+        if val is not None:
+            os.makedirs(os.path.dirname(_sysmod(path)), exist_ok=True)
+            _real_open_dp(_sysmod(path), "w").write(val)
+        return _real_open_dp(_sysmod(path)).read()
+    _real_open_dp = _bi.open
+    def _open_dp(path, *a, **k):
+        if isinstance(path, str) and path.startswith("/sys/module/"):
+            path = _sysmod(path)
+        return _real_open_dp(path, *a, **k)
+    _conf_dir = tempfile.mkdtemp()
+    _saved_dp = (m.MODPROBE_DIRS, m.PROC_CMDLINE, m.MODPROBE_CONF_PATH, m._boot_time,
+                 m.SYSFS_NET)
+    _net_dp = tempfile.mkdtemp(); os.makedirs(os.path.join(_net_dp, "wlan0"))
+    def _operstate(v): open(os.path.join(_net_dp, "wlan0", "operstate"), "w").write(v + "\n")
+    class Drv(m.Plugin):
+        def _get_wifi_interface(self): return "wlan0"
+    def _fresh(lps="N", aspm="N", conf=None, cmdline="", ours=None, ours_before_boot=False):
+        for f in os.listdir(_conf_dir): os.remove(os.path.join(_conf_dir, f))
+        if conf: open(os.path.join(_conf_dir, "50-guide.conf"), "w").write(conf)
+        open(m.PROC_CMDLINE, "w").write(cmdline)
+        if os.path.exists(m.MODPROBE_CONF_PATH): os.remove(m.MODPROBE_CONF_PATH)
+        if ours: open(m.MODPROBE_CONF_PATH, "w").write(ours)
+        _t = os.stat(m.MODPROBE_CONF_PATH).st_mtime if ours else time.time()
+        m._boot_time = (lambda: int(_t) + 60) if ours_before_boot else (lambda: int(_t) - 60)
+        if os.path.exists(m.PCIE_BASELINE_FILE): os.remove(m.PCIE_BASELINE_FILE)
+        _param(_LPS, lps); _param(_ASPM, aspm); _operstate("up")
+        m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88"})
+    m.MODPROBE_DIRS = (_conf_dir,)
+    m.PROC_CMDLINE = os.path.join(tempfile.mkdtemp(), "cmdline")
+    m.MODPROBE_CONF_PATH = os.path.join(_conf_dir, "99-wifi-optimizer.conf")
+    m.SYSFS_NET = _net_dp
+    _bi.open = _open_dp
+    try:
+        _fresh()
+        Drv()._apply_driver_fixes(True, persist=False)
+        ok(_param(_LPS) == "Y" and _param(_ASPM) == "Y", "the fix writes Y")
+        Drv()._apply_driver_fixes(False)
+        ok(_param(_LPS) == "N" and _param(_ASPM) == "N", "and turning it off puts back the N the system had")
+
+        _fresh(aspm="Y", conf="# from a guide\noptions rtw88_pci disable_aspm=Y\n")
+        Drv()._apply_driver_fixes(True, persist=False)
+        Drv()._apply_driver_fixes(False)
+        ok(_param(_ASPM) == "Y" and _param(_LPS) == "N",
+           "a disable_aspm=Y from the user's own modprobe file is not overwritten with N")
+        _fresh(aspm="Y", cmdline="quiet rtw88_pci.disable_aspm=1 splash")
+        Drv()._apply_driver_fixes(True, persist=False); Drv()._apply_driver_fixes(False)
+        ok(_param(_ASPM) == "Y", "nor one from the kernel command line")
+        _fresh(aspm="Y")
+        Drv()._apply_driver_fixes(True, persist=False, record_all=True)
+        Drv()._apply_driver_fixes(False)
+        ok(_param(_ASPM) == "Y",
+           "a Y already there when auto mode first applies the fix is the system's, and is put back")
+        _fresh(lps="Y", aspm="Y", ours_before_boot=True,
+               ours="options rtw88_core disable_lps_deep=Y\noptions rtw88_pci disable_aspm=Y\n")
+        Drv()._apply_driver_fixes(True, persist=False, record_all=True)
+        os.remove(m.MODPROBE_CONF_PATH)
+        Drv()._apply_driver_fixes(False)
+        ok(_param(_LPS) == "N" and _param(_ASPM) == "N",
+           "but a Y our own modprobe file gave the driver at boot is ours, and comes off")
+
+        _fresh(); _operstate("dormant")
+        Drv()._apply_driver_fixes(True, persist=False)
+        ok(_param(_ASPM) == "N" and _param(_LPS) == "Y",
+           "rtw88 disable_aspm is not switched on while the radio is not associated")
+        _operstate("up")
+        Drv()._apply_driver_fixes(True, persist=False)
+        ok(_param(_ASPM) == "Y", "and is once it is")
+
+        ok([m._kernel_bool(v) for v in ("Y", "y", "1", "on", "true", "N", "0", "off", "no", "", None, "x")]
+           == ["Y", "Y", "Y", "Y", "Y", "N", "N", "N", "N", None, None, None],
+           "parameter values are read the way the kernel reads a boolean")
+        ok(m._options_set("options rtw88_pci foo=1 disable_aspm\n", "rtw88_pci", "disable_aspm") == "Y"
+           and m._options_set("options rtw88-pci disable_aspm=0 # was Y\n", "rtw88_pci", "disable_aspm") == "0"
+           and m._options_set("#options rtw88_pci disable_aspm=Y\n", "rtw88_pci", "disable_aspm") is None,
+           "and modprobe lines the way modprobe does (bare flag, dashes, comments)")
+    finally:
+        _bi.open = _real_open_dp
+        (m.MODPROBE_DIRS, m.PROC_CMDLINE, m.MODPROBE_CONF_PATH, m._boot_time,
+         m.SYSFS_NET) = _saved_dp
+        if os.path.exists(m.PCIE_BASELINE_FILE): os.remove(m.PCIE_BASELINE_FILE)
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+
+    _tmd = open("defaults/dispatcher.sh.tmpl").read()
+    _psd = _tmd[_tmd.index("# Apply power save"):_tmd.index("# Apply buffer tuning")]
+    ok("python3 -I - " in _tmd and "python3 - " not in _tmd,
+       "the dispatcher's baseline Python runs isolated too")
+    ok(_psd.index("driver parameters before applying") < _psd.index("pcie-baseline")
+       < _psd.index('echo Y 2>/dev/null > "$p"'),
+       "the dispatcher logs and records the driver parameters before it writes them")
+    _linkblk = _psd[_psd.index('if [ -d "$WIFI_PCI/link" ]'):]
+    _linkblk = _linkblk[:_linkblk.index("\n    fi\n")]
+    ok('if [ -f "$WIFI_PCI/power/control" ]' in _psd and "power/control" not in _linkblk,
+       "and writes power/control whether or not the device has a link directory")
+    ok('[ "$APPLIED" = 1 ] || exit 0' in _tmd
+       and _tmd.index('[ "$APPLIED" = 1 ] || exit 0') < _tmd.index("last_enforced"),
+       "last_enforced is stamped only when something was applied")
+    ok("SETTINGS_DIR" not in _tmd, "no unused SETTINGS_DIR")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
 section("IPv6: only on the networks it was turned off for")
@@ -3966,7 +4089,7 @@ try:
         def _get_wifi_interface(self): return "wlan0"
         def _valve_powersave(self): return self.valve
         def _release_valve_powersave(self, settings): pass
-        def _apply_driver_fixes(self, enable, persist=True): pass
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
         def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
     _rn, _rm, _rs = m.NM_CONF_PATH, m.MODPROBE_CONF_PATH, m.SETTINGS_FILE
     try:
@@ -4139,7 +4262,7 @@ try:
             m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
             class PS(m.Plugin):
                 def _get_wifi_interface(self): return None
-                def _apply_driver_fixes(self, d, persist=True): pass
+                def _apply_driver_fixes(self, d, persist=True, record_all=False): pass
                 def _apply_pcie_aspm_fix(self, d, record_all=False): return []
             open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=3\n[device]\nwifi.backend=wpa_supplicant\n")
             m._save_settings(dict(m.DEFAULT_SETTINGS))
@@ -4641,7 +4764,8 @@ try:
             if cmd[:3] == ["/usr/bin/sysctl", "-n", "net.core.rmem_max"]:
                 return _ok("212992")
             return _ok()
-        def _apply_driver_fixes(self, enable, persist=True): self.drivers.append((enable, persist))
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+            self.drivers.append((enable, persist)); self.driver_record = getattr(self, "driver_record", []) + [record_all]
         def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
         def _valve_powersave(self): return getattr(self, "valve", "3")
     _real_nm, _real_mp = m.NM_CONF_PATH, m.MODPROBE_CONF_PATH
@@ -4785,6 +4909,8 @@ try:
     ok(a.record == [False], "fixes already on are not read as the system's own PCIe values")
     a = Aspm(); a._gate_opening = True; asyncio.run(a.set_power_save(True))
     ok(a.record == [True], "only fixes coming on from off are")
+    ok(getattr(a, "driver_record", None) == [True],
+       "and the same goes for the driver parameters")
 
     st = Stream(None); m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True}); _flags(flag=True)
     st._stream_misses = 0
@@ -5328,7 +5454,7 @@ try:
        f"and so does the queue length that goes with CAKE ({_tx.txq()[-1:]})")
     _drv = {}
     for _name, _body in re.findall(r'"\$DRIVER" = "(\w+)" \]; then\n(.*?)(?=\n\s*(?:elif|fi)\b)', _ps, re.S):
-        _drv[_name] = re.findall(r"> (/sys/module/\S+)", _body)
+        _drv[_name] = re.findall(r"(/sys/module/\S+?)[\s\"]", _body)
     ok(_drv == {n: p["sysfs_power_fixes"] for n, p in m.DRIVER_PROFILES.items() if p["sysfs_power_fixes"]},
        "the dispatcher writes each driver's sysfs fixes from DRIVER_PROFILES, no more, no fewer")
     _case = re.search(r'case "\$DRIVER" in ([\w|]+)\)', _tmpl)
