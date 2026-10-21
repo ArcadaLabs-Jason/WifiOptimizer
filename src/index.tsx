@@ -1272,25 +1272,35 @@ function Content() {
           The old wording here told people to forget the network and rejoin.
           That throws away their settings and gambles on which security the
           new copy gets, when the actual problem is only that the copies rank
-          equally. Say what was done instead, and how to choose the other. */}
-      {status?.external?.duplicate_profiles && (
-        <Banner variant="warning" icon="⚠">
+          equally. Say what was done instead, and how to choose the other.
+          Priority is only claimed when the backend says it was written. */}
+      {hasDuplicates && !dupDismissed && (
+        <Banner variant="warning">
           This network is saved more than once with different security
           settings. Which copy is used decides which access points can be
-          reached, so the connection can look inconsistent. The copy in use
-          has been given priority, so the choice stays the same from now on.
-          To use the other one instead, connect with it once and it takes
-          priority.
+          reached, so the connection can look inconsistent.{" "}
+          {status?.duplicates_prioritized
+            ? "The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority."
+            : "Usually the copy used last is picked next time. If the connection keeps acting up, remove the extra copy in Desktop Mode's network settings."}
         </Banner>
+      )}
+      {hasDuplicates && !dupDismissed && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={handleDismissDuplicates}>
+              Dismiss
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
       )}
 
       {/* The router handed out an address another device already holds. WiFi
           reads as connected while nothing works, and without this the plugin
           is the obvious suspect. */}
       {status?.address_conflict && (
-        <Banner variant="warning" icon="⚠">
-          Another device on your network is using the same address as your
-          handheld ({status.address_conflict.ip}), so the connection may not work. That's
+        <Banner variant="warning">
+          Another device on your network is using the same address as this
+          one ({status.address_conflict.ip}), so the connection may not work. That's
           the router, not a WiFi setting. Restarting the router usually fixes it.
         </Banner>
       )}
@@ -1298,14 +1308,22 @@ function Content() {
       {/* The saved security is shutting the device out of a stronger access
           point on the same network. Without this the only symptom is the
           Deck preferring a distant access point for no visible reason. */}
-      {status?.wpa2_only_stronger && (
+      {/* Kept up for a failed attempt's message as well, as the lock's
+          banner below is: a finding that clears would take the reason away
+          with it. */}
+      {(status?.wpa2_only_stronger || errors.allow_wpa2) && (
         <Banner variant="info">
-          A stronger access point on this network (signal{" "}
-          {status.wpa2_only_stronger.signal} vs{" "}
-          {status.wpa2_only_stronger.current_signal}) only offers WPA2, and this
-          network is saved as WPA3-only, so this device can't use it. Access points
-          that offer WPA3 keep using it. Only allow this if that access point
-          is yours: anyone nearby can broadcast your network's name.
+          {status?.wpa2_only_stronger && (
+            <>
+              A stronger access point on this network (signal{" "}
+              {status.wpa2_only_stronger.signal} of 100, against{" "}
+              {status.wpa2_only_stronger.current_signal} for the one in use) only
+              offers WPA2, and this network is saved as WPA3-only, so this device
+              can't use it. Access points that offer WPA3 keep using it. Only
+              allow this if that access point is yours: anyone nearby can
+              broadcast your network's name. Allowing it reconnects WiFi.
+            </>
+          )}
           {errors.allow_wpa2 && (
             <div style={{ color: theme.error.text }}>{errors.allow_wpa2}</div>
           )}
@@ -1316,7 +1334,16 @@ function Content() {
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleAllowWpa2}>
-              Allow WPA2 here
+              {working === "allow_wpa2" ? WORKING_TEXT : "Allow WPA2 here"}
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+      {errors.allow_wpa2 && (
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleDismissWpa2Error}>
+              Dismiss
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
@@ -1330,12 +1357,13 @@ function Content() {
           with it. That message can be dismissed, and expires like the
           others. */}
       {(status?.lock_weaker || errors.move_bssid_lock) && (
-        <Banner variant="warning" icon="⚠">
+        <Banner variant="warning">
           {status?.lock_weaker && (
             <>
               The access point lock is holding you on a weaker access point
-              (signal {status.lock_weaker.current_signal}). A stronger one is in
-              range (signal {status.lock_weaker.signal}).
+              (signal {status.lock_weaker.current_signal} of 100). A stronger one is in
+              range (signal {status.lock_weaker.signal} of 100). Moving the lock
+              reconnects WiFi for a few seconds.
             </>
           )}
           {errors.move_bssid_lock && (
@@ -1348,7 +1376,7 @@ function Content() {
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleMoveLock}>
-              Move the lock
+              {working === "move_bssid_lock" ? WORKING_TEXT : "Move the lock"}
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
@@ -1363,11 +1391,16 @@ function Content() {
         </PanelSection>
       )}
 
+      {/* A successful move can still say something, such as staying put. */}
+      {notices.move_bssid_lock && (
+        <Banner variant="info">{notices.move_bssid_lock}</Banner>
+      )}
+
       {/* A setting we wrote was the likely reason the device could not
           connect, so it was released. Worth stating plainly: nothing the user
           did caused it, and the preference is not lost. */}
       {status?.external?.pin_released && (
-        <Banner variant="warning" icon="⚠">
+        <Banner variant="warning">
           WiFi could not connect for a while, so the locked access point or
           band preference was released to let it reconnect. The setting is
           still on and applies again to whichever access point works.
@@ -1376,10 +1409,10 @@ function Content() {
 
       {/* Drift alert */}
       {connected && !!s?.last_applied && driftCount > 0 && (
-        <Banner variant="warning" icon="⚠">
+        <Banner variant="warning">
           {driftCount > 1
-            ? `${driftCount} settings no longer match what you set.`
-            : "1 setting no longer matches what you set."}
+            ? `These settings no longer match what you set: ${driftNames.join(", ")}. Fix now puts them back.`
+            : `${driftNames[0]} no longer matches what you set. Fix now puts it back.`}
         </Banner>
       )}
       {connected && !!s?.last_applied && driftCount > 0 && (
@@ -1394,14 +1427,15 @@ function Content() {
 
       {/* Status read failed - say so rather than claiming disconnection */}
       {status?.success === false && (
-        <Banner variant="error" icon="⚠">
-          {status?.message ?? "Couldn't read WiFi status."}
+        <Banner variant="error">
+          {status?.message ?? "Couldn't read WiFi status."} The panel keeps
+          trying. If this stays, restart the device.
         </Banner>
       )}
 
       {/* Disconnected banner */}
       {status?.success !== false && !connected && (
-        <Banner variant="error" icon="✕">
+        <Banner variant="error">
           Not connected to WiFi. Connect first, then optimize.
         </Banner>
       )}
@@ -1412,20 +1446,9 @@ function Content() {
         // Treat reconnect timeout as a warning even when the backend-level
         // switch succeeded - the system is switched but WiFi didn't come back.
         const isWarning = !r.success || r.needs_reboot || r.reconnect_timed_out;
-        let text: string;
-        if (r.needs_reboot) {
-          text = `Backend switched to ${r.target}, but wlan0 didn't come back - reboot required`;
-        } else if (!r.success) {
-          text = r.message ?? "Backend switch failed";
-        } else {
-          const parts = [`Switched to ${r.backend}`];
-          if (r.recovery_performed) parts.push("wlan0 interface recreated");
-          if (r.reconnect_timed_out) parts.push("WiFi didn't reconnect");
-          text = parts.join(", ");
-        }
         return (
-          <Banner variant={isWarning ? "warning" : "success"} icon={isWarning ? "⚠" : "✓"}>
-            {text}
+          <Banner variant={isWarning ? "warning" : "success"}>
+            {backendResultText(r)}
           </Banner>
         );
       })()}
@@ -1436,8 +1459,8 @@ function Content() {
         // it read as "All applied".
         if (optimizeResult.success === false) {
           return (
-            <Banner variant="error" icon="⚠">
-              {optimizeResult.message ?? "Something went wrong."}
+            <Banner variant="error">
+              {optimizeResult.message ?? GENERIC_FAIL_TEXT}
             </Banner>
           );
         }
@@ -1453,7 +1476,7 @@ function Content() {
           <Banner variant={all ? "success" : "warning"}>
             {all
               ? "All applied"
-              : `${optimizeResult.applied}/${optimizeResult.total} applied`}
+              : `${optimizeResult.applied} of ${optimizeResult.total} applied. The settings marked failed below say why.`}
           </Banner>
         );
       })()}
@@ -1463,7 +1486,7 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            disabled={!connected || applyingAll || isBusy}
+            disabled={!connected || applyingAll || isBusy || updating}
             onClick={handleOptimize}
           >
             {applyingAll
@@ -1473,6 +1496,13 @@ function Content() {
                 : "Optimize Safe"}
           </ButtonItem>
         </PanelSectionRow>
+        {applyingAll && (
+          <PanelSectionRow>
+            <div style={{ fontSize: theme.fontSize.small, color: theme.info.text }}>
+              {BATCH_WORKING_TEXT}
+            </div>
+          </PanelSectionRow>
+        )}
       </PanelSection>
 
       {/* Power & stability */}
