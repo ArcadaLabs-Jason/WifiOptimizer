@@ -113,32 +113,58 @@ function getBadge(
 }
 
 // Regions the selector offers. A regulatory domain is a legal constraint on
-// transmit power and which channels may be used, so this is a deliberate
-// short list of ISO country codes rather than free text.
+// transmit power and which channels may be used, so this is a list of ISO
+// country codes rather than free text. It is the common ones, not all of
+// them: a region set to one that is not here is still shown, by its code.
+const REGION_UNMANAGED = "none";
 const REGION_OPTIONS = [
   { data: "00", label: "World (00) - most restrictive" },
-  { data: "US", label: "United States (US)" },
+  { data: "AR", label: "Argentina (AR)" },
+  { data: "AU", label: "Australia (AU)" },
+  { data: "AT", label: "Austria (AT)" },
+  { data: "BE", label: "Belgium (BE)" },
+  { data: "BR", label: "Brazil (BR)" },
   { data: "CA", label: "Canada (CA)" },
-  { data: "GB", label: "United Kingdom (GB)" },
-  { data: "IE", label: "Ireland (IE)" },
-  { data: "DE", label: "Germany (DE)" },
-  { data: "FR", label: "France (FR)" },
-  { data: "ES", label: "Spain (ES)" },
-  { data: "IT", label: "Italy (IT)" },
-  { data: "NL", label: "Netherlands (NL)" },
-  { data: "SE", label: "Sweden (SE)" },
-  { data: "NO", label: "Norway (NO)" },
+  { data: "CL", label: "Chile (CL)" },
+  { data: "CN", label: "China (CN)" },
+  { data: "CO", label: "Colombia (CO)" },
+  { data: "CZ", label: "Czechia (CZ)" },
   { data: "DK", label: "Denmark (DK)" },
   { data: "FI", label: "Finland (FI)" },
+  { data: "FR", label: "France (FR)" },
+  { data: "DE", label: "Germany (DE)" },
+  { data: "GR", label: "Greece (GR)" },
+  { data: "HK", label: "Hong Kong (HK)" },
+  { data: "HU", label: "Hungary (HU)" },
+  { data: "IN", label: "India (IN)" },
+  { data: "ID", label: "Indonesia (ID)" },
+  { data: "IE", label: "Ireland (IE)" },
+  { data: "IL", label: "Israel (IL)" },
+  { data: "IT", label: "Italy (IT)" },
+  { data: "JP", label: "Japan (JP)" },
+  { data: "MY", label: "Malaysia (MY)" },
+  { data: "MX", label: "Mexico (MX)" },
+  { data: "NL", label: "Netherlands (NL)" },
+  { data: "NZ", label: "New Zealand (NZ)" },
+  { data: "NO", label: "Norway (NO)" },
+  { data: "PH", label: "Philippines (PH)" },
   { data: "PL", label: "Poland (PL)" },
   { data: "PT", label: "Portugal (PT)" },
-  { data: "AU", label: "Australia (AU)" },
-  { data: "NZ", label: "New Zealand (NZ)" },
-  { data: "JP", label: "Japan (JP)" },
+  { data: "RO", label: "Romania (RO)" },
+  { data: "SA", label: "Saudi Arabia (SA)" },
+  { data: "SG", label: "Singapore (SG)" },
+  { data: "ZA", label: "South Africa (ZA)" },
   { data: "KR", label: "South Korea (KR)" },
-  { data: "BR", label: "Brazil (BR)" },
-  { data: "MX", label: "Mexico (MX)" },
-  { data: "IN", label: "India (IN)" },
+  { data: "ES", label: "Spain (ES)" },
+  { data: "SE", label: "Sweden (SE)" },
+  { data: "CH", label: "Switzerland (CH)" },
+  { data: "TW", label: "Taiwan (TW)" },
+  { data: "TH", label: "Thailand (TH)" },
+  { data: "TR", label: "Turkey (TR)" },
+  { data: "UA", label: "Ukraine (UA)" },
+  { data: "AE", label: "United Arab Emirates (AE)" },
+  { data: "GB", label: "United Kingdom (GB)" },
+  { data: "US", label: "United States (US)" },
 ];
 
 const DNS_OPTIONS = [
@@ -1306,12 +1332,28 @@ function Content() {
             <DropdownItem
               label="WiFi region"
               description="Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely."
-              rgOptions={REGION_OPTIONS}
-              selectedOption={regdomain.setting || regdomain.governing || "00"}
+              rgOptions={[
+                // Not set by the plugin. Labelled with the region in use.
+                {
+                  data: REGION_UNMANAGED,
+                  label: `Not managed (${regdomain.governing || "unknown"})`,
+                },
+                ...REGION_OPTIONS,
+                ...(regdomain.setting &&
+                !REGION_OPTIONS.some((o) => o.data === regdomain.setting)
+                  ? [{ data: regdomain.setting, label: regdomain.setting }]
+                  : []),
+              ]}
+              selectedOption={regdomain.setting || REGION_UNMANAGED}
               disabled={isBusy || updating}
               onChange={(option: { data: string }) => {
+                const unmanaged = option.data === REGION_UNMANAGED;
+                // "" puts back the region from before the plugin set one,
+                // or World when there was none, so it is only sent to stop
+                // managing a region the plugin did set.
+                if (unmanaged && !regdomain.setting) return;
                 void handleToggle("regdomain", () =>
-                  backend.setRegdomain(option.data)
+                  backend.setRegdomain(unmanaged ? "" : option.data)
                 ).then(refreshRegdomain);
               }}
             />

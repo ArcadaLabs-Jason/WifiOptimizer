@@ -882,32 +882,58 @@ function getBadge(driftKey, status, errorKey) {
     return null;
 }
 // Regions the selector offers. A regulatory domain is a legal constraint on
-// transmit power and which channels may be used, so this is a deliberate
-// short list of ISO country codes rather than free text.
+// transmit power and which channels may be used, so this is a list of ISO
+// country codes rather than free text. It is the common ones, not all of
+// them: a region set to one that is not here is still shown, by its code.
+const REGION_UNMANAGED = "none";
 const REGION_OPTIONS = [
     { data: "00", label: "World (00) - most restrictive" },
-    { data: "US", label: "United States (US)" },
+    { data: "AR", label: "Argentina (AR)" },
+    { data: "AU", label: "Australia (AU)" },
+    { data: "AT", label: "Austria (AT)" },
+    { data: "BE", label: "Belgium (BE)" },
+    { data: "BR", label: "Brazil (BR)" },
     { data: "CA", label: "Canada (CA)" },
-    { data: "GB", label: "United Kingdom (GB)" },
-    { data: "IE", label: "Ireland (IE)" },
-    { data: "DE", label: "Germany (DE)" },
-    { data: "FR", label: "France (FR)" },
-    { data: "ES", label: "Spain (ES)" },
-    { data: "IT", label: "Italy (IT)" },
-    { data: "NL", label: "Netherlands (NL)" },
-    { data: "SE", label: "Sweden (SE)" },
-    { data: "NO", label: "Norway (NO)" },
+    { data: "CL", label: "Chile (CL)" },
+    { data: "CN", label: "China (CN)" },
+    { data: "CO", label: "Colombia (CO)" },
+    { data: "CZ", label: "Czechia (CZ)" },
     { data: "DK", label: "Denmark (DK)" },
     { data: "FI", label: "Finland (FI)" },
+    { data: "FR", label: "France (FR)" },
+    { data: "DE", label: "Germany (DE)" },
+    { data: "GR", label: "Greece (GR)" },
+    { data: "HK", label: "Hong Kong (HK)" },
+    { data: "HU", label: "Hungary (HU)" },
+    { data: "IN", label: "India (IN)" },
+    { data: "ID", label: "Indonesia (ID)" },
+    { data: "IE", label: "Ireland (IE)" },
+    { data: "IL", label: "Israel (IL)" },
+    { data: "IT", label: "Italy (IT)" },
+    { data: "JP", label: "Japan (JP)" },
+    { data: "MY", label: "Malaysia (MY)" },
+    { data: "MX", label: "Mexico (MX)" },
+    { data: "NL", label: "Netherlands (NL)" },
+    { data: "NZ", label: "New Zealand (NZ)" },
+    { data: "NO", label: "Norway (NO)" },
+    { data: "PH", label: "Philippines (PH)" },
     { data: "PL", label: "Poland (PL)" },
     { data: "PT", label: "Portugal (PT)" },
-    { data: "AU", label: "Australia (AU)" },
-    { data: "NZ", label: "New Zealand (NZ)" },
-    { data: "JP", label: "Japan (JP)" },
+    { data: "RO", label: "Romania (RO)" },
+    { data: "SA", label: "Saudi Arabia (SA)" },
+    { data: "SG", label: "Singapore (SG)" },
+    { data: "ZA", label: "South Africa (ZA)" },
     { data: "KR", label: "South Korea (KR)" },
-    { data: "BR", label: "Brazil (BR)" },
-    { data: "MX", label: "Mexico (MX)" },
-    { data: "IN", label: "India (IN)" },
+    { data: "ES", label: "Spain (ES)" },
+    { data: "SE", label: "Sweden (SE)" },
+    { data: "CH", label: "Switzerland (CH)" },
+    { data: "TW", label: "Taiwan (TW)" },
+    { data: "TH", label: "Thailand (TH)" },
+    { data: "TR", label: "Turkey (TR)" },
+    { data: "UA", label: "Ukraine (UA)" },
+    { data: "AE", label: "United Arab Emirates (AE)" },
+    { data: "GB", label: "United Kingdom (GB)" },
+    { data: "US", label: "United States (US)" },
 ];
 const DNS_OPTIONS = [
     { data: "cloudflare", label: "Cloudflare (1.1.1.1)" },
@@ -1723,8 +1749,25 @@ function Content() {
                                 ? IWD_PIN_NOTICE
                                 : status?.external?.bssid_lock
                                     ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
-                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, notice: notices.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, notice: notices.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: REGION_OPTIONS, selectedOption: regdomain.setting || regdomain.governing || "00", disabled: isBusy || updating, onChange: (option) => {
-                                void handleToggle("regdomain", () => setRegdomain(option.data)).then(refreshRegdomain);
+                                    : undefined), onChange: (val) => handleToggle("bssid_lock", () => setBssidLock(val)) }), SP_JSX.jsx(InfoRow, { label: "Auto-fix on wake", subtitle: "Reapplies settings after sleep (NM dispatcher)", explanation: "The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script.", ...getBadge(undefined, status, errors.auto_fix ?? null), checked: s?.auto_fix_on_wake ?? false, disabled: isBusy || updating, error: errors.auto_fix, notice: notices.auto_fix, onChange: (val) => handleToggle("auto_fix", () => setAutoFix(val)) }), SP_JSX.jsx(InfoRow, { label: "Network buffer tuning", subtitle: "Optimize UDP buffers and TX queue for streaming", explanation: "Increases kernel network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings benefit all network interfaces, including ethernet. They reset on every reboot.", ...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled), checked: s?.buffer_tuning_enabled ?? false, disabled: isBusy || updating, error: errors.buffer_tuning, notice: notices.buffer_tuning, onChange: (val) => handleToggle("buffer_tuning", () => setBufferTuning(val)) })] }), SP_JSX.jsxs(DFL.PanelSection, { title: "Advanced", children: [regdomain?.readable && regdomain.changeable && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "WiFi region", description: "Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely.", rgOptions: [
+                                // Not set by the plugin. Labelled with the region in use.
+                                {
+                                    data: REGION_UNMANAGED,
+                                    label: `Not managed (${regdomain.governing || "unknown"})`,
+                                },
+                                ...REGION_OPTIONS,
+                                ...(regdomain.setting &&
+                                    !REGION_OPTIONS.some((o) => o.data === regdomain.setting)
+                                    ? [{ data: regdomain.setting, label: regdomain.setting }]
+                                    : []),
+                            ], selectedOption: regdomain.setting || REGION_UNMANAGED, disabled: isBusy || updating, onChange: (option) => {
+                                const unmanaged = option.data === REGION_UNMANAGED;
+                                // "" puts back the region from before the plugin set one,
+                                // or World when there was none, so it is only sent to stop
+                                // managing a region the plugin did set.
+                                if (unmanaged && !regdomain.setting)
+                                    return;
+                                void handleToggle("regdomain", () => setRegdomain(unmanaged ? "" : option.data)).then(refreshRegdomain);
                             } }) })), (errors.regdomain || notices.regdomain) && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.tiny,
                                 color: errors.regdomain ? theme.error.text : theme.text.tertiary,
