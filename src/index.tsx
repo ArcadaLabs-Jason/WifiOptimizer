@@ -250,6 +250,9 @@ function Content() {
   const backendPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
   const lastUpdateCheckAtRef = useRef<number>(0);
+  // Bumped when the update channel changes, so a check that was already
+  // running for the old channel cannot put its answer back up.
+  const updateCheckSeqRef = useRef(0);
   const statusSeqRef = useRef(0);
 
   const setBusy = useCallback((val: boolean) => {
@@ -266,7 +269,13 @@ function Content() {
       return;
     }
     lastUpdateCheckAtRef.current = now;
-    backend.checkForUpdate().then(setUpdateInfo).catch(() => {});
+    const seq = updateCheckSeqRef.current;
+    backend
+      .checkForUpdate()
+      .then((info) => {
+        if (seq === updateCheckSeqRef.current) setUpdateInfo(info);
+      })
+      .catch(() => {});
   }, []);
 
   const refreshStatus = useCallback(async (force: boolean = false) => {
@@ -818,9 +827,10 @@ function Content() {
     setCheckingUpdate(true);
     setUpdateError(null);
     lastUpdateCheckAtRef.current = Date.now();
+    const seq = updateCheckSeqRef.current;
     try {
       const result = await backend.checkForUpdate();
-      setUpdateInfo(result);
+      if (seq === updateCheckSeqRef.current) setUpdateInfo(result);
     } catch {
       // refreshStatus has its own catch; no need to log here
     }
@@ -849,6 +859,7 @@ function Content() {
         setUpdateError(result.message ?? "Couldn't change the update channel.");
         return;
       }
+      updateCheckSeqRef.current += 1;
       setUpdateError(null);
       setUpdateInfo(null);
     } catch (e) {
@@ -856,7 +867,9 @@ function Content() {
       setUpdateError("Couldn't change the update channel.");
       return;
     }
-    await refreshStatus();
+    // Forced like the notify toggle. Unforced, it is skipped while another
+    // operation holds the panel busy, and the dropdown shows the old channel.
+    await refreshStatus(true);
   };
 
   // Custom DNS draft handling

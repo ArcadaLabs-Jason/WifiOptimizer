@@ -993,6 +993,9 @@ function Content() {
     const backendPollRef = SP_REACT.useRef(null);
     const prevConnectedRef = SP_REACT.useRef(null);
     const lastUpdateCheckAtRef = SP_REACT.useRef(0);
+    // Bumped when the update channel changes, so a check that was already
+    // running for the old channel cannot put its answer back up.
+    const updateCheckSeqRef = SP_REACT.useRef(0);
     const statusSeqRef = SP_REACT.useRef(0);
     const setBusy = SP_REACT.useCallback((val) => {
         busyRef.current = val;
@@ -1007,7 +1010,13 @@ function Content() {
             return;
         }
         lastUpdateCheckAtRef.current = now;
-        checkForUpdate().then(setUpdateInfo).catch(() => { });
+        const seq = updateCheckSeqRef.current;
+        checkForUpdate()
+            .then((info) => {
+            if (seq === updateCheckSeqRef.current)
+                setUpdateInfo(info);
+        })
+            .catch(() => { });
     }, []);
     const refreshStatus = SP_REACT.useCallback(async (force = false) => {
         // Background interval ticks defer while a user operation is in flight;
@@ -1543,9 +1552,11 @@ function Content() {
         setCheckingUpdate(true);
         setUpdateError(null);
         lastUpdateCheckAtRef.current = Date.now();
+        const seq = updateCheckSeqRef.current;
         try {
             const result = await checkForUpdate();
-            setUpdateInfo(result);
+            if (seq === updateCheckSeqRef.current)
+                setUpdateInfo(result);
         }
         catch {
             // refreshStatus has its own catch; no need to log here
@@ -1574,6 +1585,7 @@ function Content() {
                 setUpdateError(result.message ?? "Couldn't change the update channel.");
                 return;
             }
+            updateCheckSeqRef.current += 1;
             setUpdateError(null);
             setUpdateInfo(null);
         }
@@ -1582,7 +1594,9 @@ function Content() {
             setUpdateError("Couldn't change the update channel.");
             return;
         }
-        await refreshStatus();
+        // Forced like the notify toggle. Unforced, it is skipped while another
+        // operation holds the panel busy, and the dropdown shows the old channel.
+        await refreshStatus(true);
     };
     // Custom DNS draft handling
     const resetDnsDraft = () => {
