@@ -2809,7 +2809,8 @@ class Plugin:
                     "This device's WiFi carries its own region "
                     f"({after.get('governing', 'unknown')}) and ignores this "
                     "setting, so the channels available to you have not "
-                    "changed. That is normal on the Steam Deck and does not "
+                    "changed. That is normal on many handhelds, the Steam Deck "
+                    "included, and does not "
                     "mean a band is missing."
                 )
             decky.logger.info(

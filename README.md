@@ -61,7 +61,7 @@ Want to go further? The remaining optimizations are available as individual togg
 | Optimization | What it does |
 |---|---|
 | Prevent lag spikes | Disables WiFi power management and PCIe power states that cause packet batching, latency spikes, and throughput degradation during sustained streaming. |
-| Stop background scanning | Pins your connection to one access point so your device stops scanning for other networks every few minutes. On a mesh it pins the strongest access point your network offers rather than whichever one you happen to be on, preferring 5 GHz where the signal is equal, and stays put if the one you are on is already healthy. If the stronger one turns out not to accept the connection, the previous one is restored. After that the lock keeps you on that one access point, so if you carry the Deck somewhere a much stronger one is in range, the panel says so and **Move the lock** moves it. It never moves on its own, since moving reconnects. If the pinned access point later stops being reachable and the device has been offline for a minute, the pin is released so you can connect again, and reapplied to whichever access point works. It only applies to the network it was turned on for, so other networks you join are left alone. Disable it if you need to roam between access points. Needs the `wpa_supplicant` backend: under `iwd`, NetworkManager can't reconnect a network pinned this way, so the lock is paused, and its pins removed, while `iwd` is in use. |
+| Stop background scanning | Pins your connection to one access point so your device stops scanning for other networks every few minutes. On a mesh it pins the strongest access point your network offers rather than whichever one you happen to be on, preferring 5 GHz where the signal is equal, and stays put if the one you are on is already healthy. If the stronger one turns out not to accept the connection, the previous one is restored. After that the lock keeps you on that one access point, so if you carry your device somewhere a much stronger one is in range, the panel says so and **Move the lock** moves it. It never moves on its own, since moving reconnects. If the pinned access point later stops being reachable and the device has been offline for a minute, the pin is released so you can connect again, and reapplied to whichever access point works. It only applies to the network it was turned on for, so other networks you join are left alone. Disable it if you need to roam between access points. Needs the `wpa_supplicant` backend: under `iwd`, NetworkManager can't reconnect a network pinned this way, so the lock is paused, and its pins removed, while `iwd` is in use. |
 | Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects - works even if Decky isn't running |
 | Network buffer tuning | Increases kernel buffer sizes and TX queue length to handle bursty streaming traffic without dropping packets |
 
@@ -116,7 +116,7 @@ seconds whether a streaming app is running.
 
 ## Uninstall
 
-**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. Power save then follows the plugin's defaults until you uninstall. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. The WiFi backend choice (iwd vs wpa_supplicant) is a system-wide setting and isn't touched by the plugin on uninstall.
+**Before uninstalling:** tap **Reset Settings** in the plugin's Actions section. This undoes buffer tuning and CAKE where they were applied, putting back the values your system had before, and deletes the plugin's own config files. WiFi power save goes back on straight away (unless Steam's own WiFi power management setting has it off), and a WiFi region chosen in the plugin is put back. Power save then follows the plugin's defaults until you uninstall. The BSSID lock, the band preference, the IPv6 setting and custom DNS are undone on every network the plugin applied them to, because a network still pinned to one access point, or to a band it cannot find, stops connecting. If a backend switch made from the plugin copied its power save setting into SteamOS's own WiFi config, that is put back too. On SteamOS the WiFi backend choice (iwd vs wpa_supplicant) is Valve's own setting and is left as it is. On other systems, a backend chosen from the plugin goes back to the system's default from the next boot, and that backend's service is turned back on so WiFi still works. Uninstalling from Decky does the same.
 
 Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Uninstall), or manually:
 
@@ -124,10 +124,11 @@ Then uninstall from Decky's plugin manager (Decky settings > WiFi Optimizer > Un
 sudo rm -rf ~/homebrew/plugins/WiFi\ Optimizer
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-wifi-optimizer
 sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
-sudo rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf
 sudo rm -f /etc/modprobe.d/99-wifi-optimizer.conf
 sudo systemctl restart plugin_loader
 ```
+
+If you switched the WiFi backend from the plugin on a system other than SteamOS, switch it back in the plugin before removing it by hand, or leave `/etc/NetworkManager/conf.d/99-wifi-optimizer-backend.conf` in place: removing that file alone leaves the other backend turned off.
 
 ## Building from source
 
