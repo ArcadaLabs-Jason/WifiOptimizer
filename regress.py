@@ -7738,5 +7738,442 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("Send report: off until there is somewhere to send it")
+# Every check in these sections stubs curl, nmcli and journalctl through
+# _run_cmd and nothing else: the payload, the size cap, the queue file and
+# the wake rule all run as they would on a device.
+try:
+    _rep_dir = os.path.join(tempfile.mkdtemp(), "wifi-optimizer")
+    m.REPORT_DIR = _rep_dir
+    _rep_url_real = getattr(m, "REPORT_URL", None)
+    _REP_URL = "https://reports.example.org/report"
+    _src_main = open("main.py").read()
+    ok(re.search(r'(?m)^REPORT_URL = ""$', _src_main) is not None,
+       "REPORT_URL ships empty, as one line to change when the receiving end is live")
+
+    _REP_DIAG = {
+        "success": True, "plugin_version": "0.24.5-beta",
+        "device_info": {"success": True, "driver": "rtw88"},
+        "iw_dev": "phy#0\n\tInterface wlan0\n\t\tssid <ssid>\n",
+        "kernel_log_previous_boot": ["[  900.000000] PM: suspend exit"],
+        "kernel_log_this_boot": ["[    1.000000] rtw88_8822ce: note"],
+    }
+
+    class RepStub(m.Plugin):
+        """curl, nmcli and journalctl answers; everything else is the plugin."""
+        def __init__(self, curl=None, nm="connected:enabled", journal=None, diag=None):
+            super().__init__()
+            self.curl = list(curl or [])
+            self.nm = nm
+            self.journal = journal
+            self.diag = diag if diag is not None else _REP_DIAG
+            self.calls, self.bodies, self.diag_calls = [], [], 0
+        async def get_diagnostic_info(self):
+            self.diag_calls += 1
+            return json.loads(json.dumps(self.diag))
+        def _run_cmd(self, cmd, timeout=5):
+            self.calls.append((list(cmd), timeout))
+            if cmd[0] == "/usr/bin/curl":
+                at = [a for a in cmd if a.startswith("@")]
+                self.bodies.append(open(at[0][1:]).read() if at else None)
+                answer = self.curl.pop(0) if self.curl else ("", 7)
+                if isinstance(answer[1], int) and answer[1] != 0 and answer[0] == "":
+                    return {"success": False, "stdout": "", "stderr": "curl: (7) Failed to connect",
+                            "returncode": answer[1]}
+                return _ok(f"{answer[0]}\n{answer[1]}")
+            if cmd[0] == "/usr/bin/nmcli":
+                return _ok(self.nm)
+            if cmd[0] == "/usr/bin/journalctl":
+                if self.journal is None:
+                    return {"success": False, "stdout": "", "returncode": 1,
+                            "stderr": "Data from the specified boot (-1) is not available"}
+                return _ok(self.journal)
+            return _ok()
+        def curl_calls(self): return [c for c, _t in self.calls if c[0] == "/usr/bin/curl"]
+
+    def _rep_reset():
+        import shutil
+        shutil.rmtree(_rep_dir, ignore_errors=True)
+
+    def _pending_path(): return os.path.join(_rep_dir, getattr(m, "REPORT_PENDING_NAME", "pending-report.json"))
+
+    m.REPORT_URL = ""
+    _rep_reset()
+    _p = RepStub(journal="")
+    _st = _maybe_run(getattr(_p, "get_report_state", lambda: {})())
+    ok(_st.get("enabled") is False and _st.get("wake_failure") is False and not _p.calls,
+       f"with no URL the panel is told the feature is off, and no log is read ({_st})")
+    _pv = _maybe_run(getattr(_p, "preview_report", lambda: {})())
+    ok(_pv.get("success") is False and _pv.get("error") == "disabled" and _p.diag_calls == 0,
+       "the preview is refused without collecting anything")
+    _p._report_preview = ("x", "{}")
+    _sr = _maybe_run(getattr(_p, "send_report", lambda i: {})("x"))
+    ok(_sr.get("success") is False and _sr.get("error") == "disabled" and not _p.curl_calls(),
+       "and a send is refused without running curl, even with a report in hand")
+    os.makedirs(_rep_dir, mode=0o700, exist_ok=True)
+    open(_pending_path(), "w").write('{"plugin_version":"0.24.5-beta","report":{}}')
+    _maybe_run(getattr(_p, "_send_pending_report_if_due", lambda: None)())
+    ok(hasattr(_p, "_send_pending_report_if_due") and not _p.calls and os.path.exists(_pending_path()),
+       "a waiting report is not sent while the URL is empty, and costs no command")
+    _rep_reset()
+    for _bad in ("http://reports.example.org/report", "https://reports.example.org/report?x=1",
+                 "https://reports.example.org/re port", "https://reports.example.org/report\n",
+                 "https://user@reports.example.org/report", "ftp://reports.example.org/", " "):
+        m.REPORT_URL = _bad
+        ok(getattr(m, "_report_url", lambda: "x")() == "",
+           f"a URL that is not plain https is treated as none ({_bad!r})")
+    m.REPORT_URL = _REP_URL
+    ok(getattr(m, "_report_url", lambda: "")() == _REP_URL, "a plain https URL turns it on")
+
+    _tsx_rep = open("src/components/SendReport.tsx").read() if os.path.exists("src/components/SendReport.tsx") else ""
+    ok("if (!state?.enabled) return null;" in _tsx_rep
+       and "if (!state?.enabled || (!state.wake_failure && !fromHere)) return null;" in _tsx_rep,
+       "the panel renders neither the button nor the wake notice while the backend says off")
+    ok("<SendReportRow />" in open("src/components/PanelFooter.tsx").read()
+       and "onClick={handleCopyDiagnostics}" in open("src/components/PanelFooter.tsx").read()
+       and "<WakeFailureNotice />" in open("src/index.tsx").read(),
+       "the button sits beside Copy diagnostics, which stays, and the notice is in the panel")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Send report: exactly what was shown, and no more than the receiver takes")
+try:
+    _rep_reset()
+    _REF = "WO-7K2M9Q"
+    _p = RepStub(curl=[(json.dumps({"ok": True, "ref": _REF}), "200")])
+    _pv = asyncio.run(_p.preview_report())
+    _sr = asyncio.run(_p.send_report(_pv.get("id", "")))
+    _sent = json.loads(_p.bodies[0]) if _p.bodies and _p.bodies[0] else None
+    ok(_pv.get("success") is True and _sent == _pv.get("payload"),
+       "the body sent is exactly the payload the preview showed")
+    ok(_pv["payload"] == {"plugin_version": m.decky.DECKY_PLUGIN_VERSION, "report": _REP_DIAG},
+       "which is the diagnostics as Copy diagnostics gives them, plus the plugin version")
+    _cc = _p.curl_calls()[0]
+    ok(_cc[1] == "-q" and "--proto" in _cc and _cc[_cc.index("--proto") + 1] == "=https"
+       and _cc[-1] == _REP_URL and "-L" not in _cc and "-sL" not in _cc
+       and not any("plugin_version" in a or "wlan0" in a for a in _cc),
+       f"curl gets https only, no redirects, no curlrc, and the body only as a file ({_cc})")
+    ok("--max-time" in _cc and int(_cc[_cc.index("--max-time") + 1]) <= 30
+       and _p.calls[-1][1] <= 30,
+       "and it is bounded in time")
+    ok(_sr.get("status") == "sent" and _sr.get("ref") == _REF
+       and _sr.get("message") == f"Report sent. Reference {_REF}. Quote it if you post about this.",
+       "a sent report answers with its reference, worded for the panel")
+    ok(not os.path.exists(_pending_path()), "and nothing is left waiting")
+    _again = asyncio.run(_p.send_report(_pv.get("id", "")))
+    ok(_again.get("error") == "stale" and len(_p.curl_calls()) == 1,
+       "the same report is not sent twice from one preview")
+    _p2 = RepStub(curl=[("", 7)])
+    asyncio.run(_p2.preview_report())
+    _r2 = asyncio.run(_p2.send_report("0" * 64))
+    ok(_r2.get("error") == "stale" and not _p2.curl_calls(),
+       "a send that names a report the user was not shown is refused")
+    _bad = RepStub(curl=[('{"ok":true,"ref":"WO-ILOU00"}', "200"), ("<html>portal</html>", "200")])
+    _pv = asyncio.run(_bad.preview_report())
+    _rb = asyncio.run(_bad.send_report(_pv["id"]))
+    ok(_rb.get("status") != "sent" and os.path.exists(_pending_path()),
+       "an answer without a valid reference is not taken as sent; the report is kept")
+    _rep_reset()
+
+    # Larger than the receiver takes: the biggest log section goes first.
+    _big = dict(_REP_DIAG)
+    _big["kernel_log_previous_boot"] = ["[ 1.0] rtw88_8822ce: " + "x" * 280] * 300
+    _big["kernel_log_this_boot"] = ["[ 1.0] rtw88_8822ce: " + "y" * 280] * 200
+    _big["network_log_previous_boot"] = ["NetworkManager: line"] * 10
+    _p = RepStub(curl=[(json.dumps({"ok": True, "ref": _REF}), "200")], diag=_big)
+    _pv = asyncio.run(_p.preview_report())
+    _rep = (_pv.get("payload") or {}).get("report", {})
+    _ascii = len(json.dumps(_rep, separators=(",", ":")))
+    _js = len(json.dumps(_rep, separators=(",", ":"), ensure_ascii=False).encode())
+    ok(_pv.get("success") is True and _ascii <= getattr(m, "REPORT_MAX_BYTES", 0) <= 96 * 1024 - 8 * 1024,
+       f"a report too large for the receiver is cut below its 96 KiB limit ({_ascii} bytes)")
+    ok("kernel_log_previous_boot" not in _rep and "network_log_previous_boot" in _rep
+       and "device_info" in _rep,
+       "by leaving out the biggest log section first, keeping what fits")
+    ok("kernel_log_previous_boot" in str(_rep.get("left_out", "")),
+       "and the report says what was left out")
+    asyncio.run(_p.send_report(_pv["id"]))
+    ok(_p.bodies and len(_p.bodies[0].encode()) < 128 * 1024 and json.loads(_p.bodies[0]) == _pv["payload"],
+       "what is sent is the cut report the preview showed, under the request limit")
+    _wide = dict(_REP_DIAG, os_release="é" * 70000)
+    _made = getattr(m, "_report_payload", lambda i, v: None)(_wide, "1.0.0")
+    _wr = _made[0]["report"] if _made else {}
+    ok(_made is not None and len(json.dumps(_wr, separators=(",", ":"), ensure_ascii=False).encode())
+       <= 96 * 1024 and "os_release" not in _wr,
+       "non-ASCII text is measured as the receiver measures it, never under")
+    _rep_reset()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Send report: kept while offline, one at a time, sent when WiFi is back")
+try:
+    _rep_reset()
+    _p = RepStub(curl=[("", 7)], nm="disconnected:enabled")
+    _pv = asyncio.run(_p.preview_report())
+    _sr = asyncio.run(_p.send_report(_pv["id"]))
+    ok(_sr.get("status") == "queued"
+       and _sr.get("message") == "No connection. It will be sent when WiFi is back.",
+       "with no connection the report is kept and the panel says when it will go")
+    ok(os.path.exists(_pending_path()) and open(_pending_path()).read() == _p.bodies[0],
+       "the waiting report is exactly what was shown")
+    ok(oct(os.stat(_pending_path()).st_mode & 0o777) == "0o600"
+       and oct(os.stat(_rep_dir).st_mode & 0o777) == "0o700",
+       "readable by the plugin's user alone, in a directory nobody else can open")
+    ok(asyncio.run(_p.get_report_state()).get("pending") is True, "the panel is told one is waiting")
+
+    # A second report while one waits replaces it.
+    _p2 = RepStub(curl=[("", 6)], diag=dict(_REP_DIAG, iw_dev="second"))
+    _pv2 = asyncio.run(_p2.preview_report())
+    asyncio.run(_p2.send_report(_pv2["id"]))
+    ok(sorted(os.listdir(_rep_dir)) == [m.REPORT_PENDING_NAME]
+       and json.loads(open(_pending_path()).read())["report"]["iw_dev"] == "second",
+       "at most one waits: a new one replaces it, and no temporary file is left")
+
+    # Background: still offline, nothing is sent.
+    _bg = RepStub(curl=[(json.dumps({"ok": True, "ref": _REF}), "200")], nm="disconnected:enabled")
+    asyncio.run(_bg._send_pending_report_if_due())
+    ok(not _bg.curl_calls() and os.path.exists(_pending_path()),
+       "while NetworkManager says offline, the background watch does not try")
+    _bg.nm = "connected:enabled"
+    asyncio.run(_bg._send_pending_report_if_due())
+    ok(not _bg.curl_calls(), "and it waits two minutes before looking again")
+    _bg._report_retry_at = 0
+    asyncio.run(_bg._send_pending_report_if_due())
+    ok(len(_bg.curl_calls()) == 1 and json.loads(_bg.bodies[0])["report"]["iw_dev"] == "second",
+       "once WiFi is back the waiting report is sent as it was kept")
+    ok(not os.path.exists(_pending_path()), "and then it is no longer kept")
+    _st = asyncio.run(RepStub().get_report_state())
+    ok(_st.get("sent_ref") == _REF and _st.get("pending") is False,
+       "its reference is kept for the panel, across a reload of the plugin")
+    _d = asyncio.run(RepStub().dismiss_report_notice("sent"))
+    ok(_d.get("success") is True and asyncio.run(RepStub().get_report_state()).get("sent_ref") == "",
+       "until the panel dismisses it")
+    _bg._report_retry_at = 0
+    _n = len(_bg.calls)
+    asyncio.run(_bg._send_pending_report_if_due())
+    ok(len(_bg.calls) == _n, "with nothing waiting the watch runs no command at all")
+    ok("await self._send_pending_report_if_due()" in _src_main[_src_main.index("async def _stranded_watch(self)"):
+                                                             _src_main.index("async def _stranded_watch_once")],
+       "the background watch that always runs is what sends it")
+
+    # 400 and 413 are final.
+    for _code, _err in (("400", "refused"), ("413", "too_large")):
+        _rep_reset()
+        _p = RepStub(curl=[('{"ok":false,"error":"x"}', _code)])
+        _pv = asyncio.run(_p.preview_report())
+        _sr = asyncio.run(_p.send_report(_pv["id"]))
+        ok(_sr.get("success") is False and _sr.get("error") == _err and not os.path.exists(_pending_path()),
+           f"a {_code} is not kept for another try")
+        ok("Copy diagnostics" in (_sr.get("message") or ""), f"and the panel says what to do instead ({_code})")
+        _bg = RepStub(curl=[(json.dumps({"ok": True, "ref": _REF}), "200")])
+        asyncio.run(_bg._send_pending_report_if_due())
+        ok(not _bg.curl_calls(), f"so the background never sends it again ({_code})")
+        # And a waiting report refused later is dropped too.
+        os.makedirs(_rep_dir, mode=0o700, exist_ok=True)
+        open(_pending_path(), "w").write(_p.bodies[0])
+        _bg = RepStub(curl=[('{"ok":false}', _code), (json.dumps({"ok": True, "ref": _REF}), "200")])
+        asyncio.run(_bg._send_pending_report_if_due())
+        _bg._report_retry_at = 0
+        asyncio.run(_bg._send_pending_report_if_due())
+        ok(len(_bg.curl_calls()) == 1 and not os.path.exists(_pending_path()),
+           f"a waiting report the receiver refuses with {_code} is dropped, not retried")
+
+    # 429 and 503 keep it, and wait longer before the next try.
+    for _code, _kind, _text in (("503", "unavailable", "The report service is busy."),
+                                ("429", "rate_limited", "Too many reports from this network")):
+        _rep_reset()
+        _p = RepStub(curl=[('{"ok":false}', _code)])
+        _pv = asyncio.run(_p.preview_report())
+        _sr = asyncio.run(_p.send_report(_pv["id"]))
+        ok(_sr.get("status") == "queued" and _text in (_sr.get("message") or "")
+           and os.path.exists(_pending_path()),
+           f"a {_code} keeps the report and says it will go later")
+        _wait = getattr(_p, "_report_retry_at", 0) - time.monotonic()
+        ok(_wait > m.REPORT_RETRY_AFTER["offline"] and abs(_wait - m.REPORT_RETRY_AFTER[_kind]) < 5,
+           f"and the next try waits longer than for no connection ({_code}, {int(_wait)}s)")
+        _p.curl = [(json.dumps({"ok": True, "ref": _REF}), "200")]
+        asyncio.run(_p._send_pending_report_if_due())
+        ok(len(_p.curl_calls()) == 1, f"so the watch does not try again straight away ({_code})")
+    _rep_reset()
+    # Old reports go unsent.
+    os.makedirs(_rep_dir, mode=0o700, exist_ok=True)
+    open(_pending_path(), "w").write('{"plugin_version":"0.24.5-beta","report":{"a":1}}')
+    _old = time.time() - m.REPORT_PENDING_MAX_AGE - 60
+    os.utime(_pending_path(), (_old, _old))
+    _bg = RepStub(curl=[(json.dumps({"ok": True, "ref": _REF}), "200")])
+    asyncio.run(_bg._send_pending_report_if_due())
+    ok(not _bg.curl_calls() and not os.path.exists(_pending_path()),
+       "a report left waiting for two weeks is dropped unsent")
+    open(_pending_path(), "w").write('{"plugin_version":"$(id)","report":{}}')
+    _bg = RepStub(curl=[(json.dumps({"ok": True, "ref": _REF}), "200")])
+    asyncio.run(_bg._send_pending_report_if_due())
+    ok(not _bg.curl_calls() and not os.path.exists(_pending_path()),
+       "and so is a waiting file this plugin did not write")
+    _rep_reset()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Send report: the waiting report is written safely")
+try:
+    _rep_reset()
+    _victim_dir = tempfile.mkdtemp()
+    _victim = os.path.join(_victim_dir, "victim")
+    open(_victim, "w").write("PRECIOUS")
+    os.makedirs(_rep_dir, mode=0o755)
+    os.symlink(_victim, _pending_path())
+    os.symlink(_victim, _pending_path() + ".tmp")
+    ok(getattr(m, "_write_report_file", lambda n, d: False)(m.REPORT_PENDING_NAME, "{}") is True
+       and open(_victim).read() == "PRECIOUS" and not os.path.islink(_pending_path())
+       and open(_pending_path()).read() == "{}",
+       "links planted at the report's names are replaced, never written through")
+    ok(oct(os.stat(_rep_dir).st_mode & 0o777) == "0o700",
+       "a report directory others could open is closed to them first")
+    os.remove(_pending_path())
+    os.symlink(_victim, _pending_path())
+    ok(m._read_report_file(m.REPORT_PENDING_NAME, 1000) == (None, 0),
+       "and a link is never read as a waiting report")
+    _rep_reset()
+    _away = tempfile.mkdtemp()
+    os.symlink(_away, _rep_dir)
+    _p = RepStub(curl=[("", 7)])
+    _pv = asyncio.run(_p.preview_report())
+    _sr = asyncio.run(_p.send_report(_pv["id"]))
+    ok(os.listdir(_away) == [] and _sr.get("error") == "not_kept"
+       and "couldn't be saved" in (_sr.get("message") or ""),
+       "a report directory swapped for a link is refused, and the panel is told it was not kept")
+    ok(_p.bodies and json.loads(_p.bodies[0]) == _pv["payload"],
+       "while the send itself still went from a private file of its own")
+    os.remove(_rep_dir)
+    _left = [p for p in os.listdir(tempfile.gettempdir()) if p.startswith("wifi-optimizer-report-")]
+    ok(not _left, f"which is removed afterwards ({_left})")
+    ok(_src_main.count('REPORT_DIR = "/var/lib/wifi-optimizer"') == 1,
+       "kept under /var/lib, which survives a reboot and only root writes")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Send report: the wake notice, from the previous boot's log")
+try:
+    _rep_reset()
+    def _wj(rows, host=False):
+        return "".join(f"{1700000000 + t}.123456 {'steamdeck ' if host else ''}{who}: {msg}\n"
+                       for t, who, msg in rows)
+    _NM = "NetworkManager[812]"
+    _UP = [(10, "kernel", "wlan0: authenticate with xx:xx:xx:xx:1f:e7 (local address=3c:e9:f7:12:34:56)"),
+           (11, "kernel", "wlan0: associated"),
+           (12, _NM, "<info>  [1700000012.1] device (wlan0): state change: secondaries -> activated "
+                     "(reason 'none', sys-iface-state: 'managed')"),
+           (13, _NM, "<info>  [1700000013.1] device (wlan0): Activation: successful, device activated."),
+           (14, _NM, "<info>  [1700000014.1] policy: set 'Smith Family 5G' (wlan0) as default")]
+    _SLEEP = [(100, "kernel", "PM: suspend entry (s2idle)"), (500, "kernel", "PM: suspend exit")]
+    _FAIL = _UP + _SLEEP + [
+        (501, "kernel", "rtw_8822ce 0000:01:00.0: failed to leave lps state"),
+        (502, "kernel", "rtw_8822ce 0000:01:00.0: failed to send h2c command"),
+        (540, _NM, "<info>  [1700000540.1] device (wlan0): state change: disconnected -> prepare"),
+        (600, _NM, "<info>  [1700000600.1] manager: NetworkManager state is now DISCONNECTED")]
+    _w = getattr(m, "_wake_failure_at", lambda t: -1)
+    ok(_w(_wj(_FAIL)) == 1700000500,
+       "a wake with driver errors and no association after it is found, at the wake's time")
+    ok(_w(_wj(_FAIL, host=True)) == 1700000500, "with or without a host column")
+    for _rows, _why in (
+        (_UP + [(600, "kernel", "rtw_8822ce 0000:01:00.0: failed to send h2c command")], "a boot that never slept"),
+        (_FAIL + [(610, "kernel", "wlan0: associated")], "WiFi back after the wake (kernel)"),
+        (_FAIL + [(610, _NM, "<info>  device (wlp1s0): state change: secondaries -> activated (reason 'none')")],
+         "WiFi back after the wake (NetworkManager, a driver that does its own association)"),
+        ([r for r in _FAIL if "rtw_8822ce" not in r[2]], "no driver error after the wake (WiFi switched off)"),
+        (_UP + _SLEEP + [(503, "kernel", "rtw_8822ce 0000:01:00.0: failed to leave lps state")],
+         "switched off seconds after waking"),
+        ([r for r in _FAIL if r not in _UP], "WiFi never up before the sleep"),
+        (_FAIL + [(700, "kernel", "PM: suspend entry (s2idle)"), (800, "kernel", "PM: suspend exit"),
+                  (801, "kernel", "wlan0: associated"), (900, _NM, "<info> manager: sleep")],
+         "an earlier failed wake, but the last one came back"),
+        (_UP + _SLEEP + [(501, "kernel", "rtw_8822ce 0000:01:00.0: chip_id 0x2 firmware ok"),
+                         (502, "kernel", "usb 1-1: device descriptor read failed"),
+                         (600, _NM, "<info> manager: NetworkManager state is now DISCONNECTED")],
+         "errors from something other than the WiFi driver"),
+        ("", "an empty log"),
+        ("garbage\n\x00\n-- No entries --\n", "lines that are not a log"),
+    ):
+        ok(_w(_rows if isinstance(_rows, str) else _wj(_rows)) == 0, f"no notice for {_why}")
+
+    # The read: one, bounded, of the previous boot, cached for the load.
+    _p = RepStub(journal=_wj(_FAIL))
+    _s1 = asyncio.run(_p.get_report_state())
+    _s2 = asyncio.run(_p.get_report_state())
+    _jc = [c for c, _t in _p.calls if c[0] == "/usr/bin/journalctl"]
+    ok(len(_jc) == 1 and _s1.get("wake_failure") is True and _s2.get("wake_failure") is True,
+       f"the log is read once per load, however often the panel asks ({len(_jc)} reads)")
+    _j = _jc[0] if _jc else []
+    ok("-b" in _j and _j[_j.index("-b") + 1] == "-1" and "-n" in _j
+       and int(_j[_j.index("-n") + 1]) <= 20000 and "--no-hostname" in _j
+       and [t for c, t in _p.calls if c[0] == "/usr/bin/journalctl"][0] <= 10,
+       f"the previous boot only, bounded in lines and time ({_j})")
+    ok(set(_s1) == {"success", "enabled", "pending", "sent_ref", "wake_failure", "wake_failure_at"}
+       and type(_s1["wake_failure"]) is bool and type(_s1["wake_failure_at"]) is int
+       and _s1["wake_failure_at"] == 1700000500,
+       f"the panel gets a yes or no and a time ({_s1})")
+    _flat = json.dumps(_s1)
+    ok(not any(w in _flat for w in ("Smith", "wlan0", "rtw", "3c:e9", "1f:e7", "lps", "kernel")),
+       "and nothing from the log itself")
+    ok(asyncio.run(RepStub(journal=None).get_report_state()).get("wake_failure") is False,
+       "no previous boot in the journal is no notice")
+    _d = asyncio.run(_p.dismiss_report_notice("wake"))
+    ok(_d.get("success") is True and asyncio.run(_p.get_report_state()).get("wake_failure") is False,
+       "dismissed, it goes")
+    ok(asyncio.run(RepStub(journal=_wj(_FAIL)).get_report_state()).get("wake_failure") is False,
+       "and stays gone after the plugin reloads, for that wake")
+    _later = [(t + 2000, w, msg) for t, w, msg in _FAIL]
+    ok(asyncio.run(RepStub(journal=_wj(_later)).get_report_state()).get("wake_failure") is True,
+       "while a later failed wake brings it back")
+    ok("Last time your device woke from sleep, WiFi didn't come back." in _tsx_rep
+       and 'startReport("wake")' in _tsx_rep and 'dismissReportNotice("wake")' in _tsx_rep,
+       "the notice says so plainly, with Send report and Dismiss")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("Send report: the panel shows it, then asks once")
+try:
+    ok("previewReport()" in _tsx_rep and "JSON.stringify(preview.payload, null, 2)" in _tsx_rep
+       and "send(id, from)" in _tsx_rep and 'callable<[id: string], ReportResult>("send_report")' in _tsx_rep,
+       "tapping the button shows the preview's payload, and only its id is sent")
+    ok('strOKButtonText="Send"' in _tsx_rep and 'strCancelButtonText="Cancel"' in _tsx_rep
+       and "overflowY: \"auto\"" in _tsx_rep and "onActivate={() => {}}" in _tsx_rep,
+       "in a box a controller can step through, with one Send to confirm")
+    ok("Dismiss" in _tsx_rep and "update({ outcome: null })" in _tsx_rep
+       and "setTimeout(() => update" not in _tsx_rep,
+       "the result stays on screen until dismissed")
+    _texts = re.findall(r'"([^"\n]{12,})"', _tsx_rep) + re.findall(r">\s*([A-Z][^<>{}]{12,})\s*<", _tsx_rep)
+    _texts += [v for v in getattr(m.Plugin, "_REPORT_MESSAGES", {}).values()]
+    ok(_texts and all(all(ord(ch) < 128 for ch in t) for t in _texts),
+       "the wording is plain ASCII: no curly quotes or long dashes")
+    _readme = open("README.md").read()
+    _sec = _readme[_readme.find("## Send report"):]
+    _sec = _sec[:_sec.find("\n## ", 5)] if "\n## " in _sec[5:] else _sec
+    ok(_readme.count("## Send report") == 1 and "Copy diagnostics" in _sec and "90 days" in _sec
+       and "confirm" in _sec.lower() and "workers" not in _sec.lower()
+       and "cloudflare" not in _sec.lower() and all(ord(ch) < 128 for ch in _sec),
+       "the README says what is sent, where it goes and that nothing goes unconfirmed")
+    # Uninstalling takes the report directory with it.
+    _rep_reset()
+    os.makedirs(_rep_dir, mode=0o700)
+    for _n in (m.REPORT_PENDING_NAME, m.REPORT_SENT_NAME, m.REPORT_WAKE_SEEN_NAME):
+        open(os.path.join(_rep_dir, _n), "w").write("x")
+    ok("_forget_reports" in _src_main[_src_main.index("def _teardown"):_src_main.index("def _stop_update")],
+       "uninstalling removes the report directory")
+    getattr(m, "_forget_reports", lambda: None)()
+    ok(not os.path.exists(_rep_dir), "and the removal takes everything in it")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+finally:
+    try:
+        m.REPORT_URL = _rep_url_real
+    except NameError:
+        pass
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

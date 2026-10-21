@@ -39,6 +39,7 @@ import { BackendToggleRow, backendResultText } from "./components/BackendToggleR
 import { UpdatesSection } from "./components/UpdatesSection";
 import { PanelHeader } from "./components/PanelHeader";
 import { PanelFooter } from "./components/PanelFooter";
+import { WakeFailureNotice } from "./components/SendReport";
 import { ActionsSection } from "./components/ActionsSection";
 import { StreamingSection } from "./components/StreamingSection";
 import {
@@ -1228,6 +1229,7 @@ function Content() {
           </PanelSectionRow>
         </PanelSection>
       )}
+      <WakeFailureNotice />
 
       {/* Update available. A refusal is said here too: the Updates section
           is far down the panel, and pressing this showed nothing. */}
