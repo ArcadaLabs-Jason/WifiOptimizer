@@ -869,13 +869,15 @@ function Content() {
   };
 
   const applyCustomDns = async () => {
-    const result = await handleToggle("dns", () =>
-      backend.setDns(true, "custom", customDnsInput.trim())
-    );
-    if (result?.success) {
-      dnsDirtyRef.current = false;
-      setDnsCustomOpen(false);
-    }
+    const result = await handleToggle("dns", async () => {
+      const r = await backend.setDns(true, "custom", customDnsInput.trim());
+      // Before the refresh that follows, so it adopts the servers as the
+      // backend saved them. Cleared after it, Apply and Cancel stayed up
+      // until the next poll whenever the saved form differed from the typed.
+      if (r.success) dnsDirtyRef.current = false;
+      return r;
+    });
+    if (result?.success) setDnsCustomOpen(false);
   };
 
   // Don't render content until first status arrives (prevents disconnect flash).
