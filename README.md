@@ -145,7 +145,7 @@ pnpm i
 pnpm run build
 ```
 
-To deploy to your Deck, copy `.vscode/defsettings.json` to `.vscode/settings.json`, fill in your Deck's IP and password, then use the VS Code **builddeploy** task (Terminal > Run Task).
+To deploy to your Deck, copy `.vscode/defsettings.json` to `.vscode/settings.json` and fill in your Deck's address, then use the VS Code **builddeploy** task (Terminal > Run Task). It needs SSH access to the Deck (set a password with `passwd` in Desktop Mode, then `sudo systemctl enable --now sshd`). It copies the plugin to `~/wifi-optimizer-dev` on the Deck, then asks for the Deck's sudo password to install it into the plugin folder, which belongs to root, and restart Decky Loader.
 
 ## Support
 

@@ -6532,6 +6532,32 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("R2 the VS Code deploy works against a root-owned plugin folder")
+# The plugin folder belongs to root after install.sh, the updater or Decky
+# 3.1.10+, the folder name has a space, and sudo over ssh needs a terminal.
+try:
+    _tasks = {t["label"]: t for t in json.load(open(".vscode/tasks.json"))["tasks"]}
+    _defs = json.load(open(".vscode/defsettings.json"))
+    ok("pnpm@10" in _tasks["pnpmsetup"]["command"] and "pnpm@9" not in _tasks["pnpmsetup"]["command"],
+       "the setup task installs pnpm 10, as the README and CI use")
+    _dep = _tasks["deploy"]["command"]
+    ok('\\"${config:deckdir}/homebrew/plugins/${config:pluginname}/\\"' in json.dumps(_dep)
+       or '"${config:deckdir}/homebrew/plugins/${config:pluginname}/"' in _dep,
+       "the plugin folder, whose name has a space, is quoted")
+    ok("ssh -t" in _dep and "sudo rsync" in _dep and "sudo chown -R root:root" in _dep,
+       "it installs as root over an ssh session with a terminal, so sudo can ask for the password")
+    ok("--exclude='*'" in _dep and all(x not in _dep for x in (".claude", ".mcp.json", ".kijito_persona", "--exclude node_modules")),
+       "only the plugin's own files are copied, nothing else from the working folder")
+    ok("ssh -t" in _tasks["restartdecky"]["command"], "restarting Decky also runs sudo with a terminal")
+    ok("deckpass" not in _defs and "deckpass" not in json.dumps(_tasks), "no unused password setting")
+    _rd = open("README.md").read()
+    _bfs = _rd[_rd.index("## Building from source"):]
+    _bfs = _bfs[:_bfs.index("\n## ", 5)]
+    ok("pnpm 10" in _bfs and "password" in _bfs and "IP and password" not in _bfs and "sudo" in _bfs,
+       "the README's build section says what the deploy needs")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("R3 install.sh's own usage line fails on an HTTP error")
 try:
     _usage = [l for l in open("install.sh").read().splitlines() if l.startswith("# Usage:")]

@@ -6,7 +6,7 @@
       "type": "shell",
       "group": "none",
       "detail": "Install pnpm",
-      "command": "which pnpm || npm i -g pnpm@9"
+      "command": "which pnpm || npm i -g pnpm@10"
     },
     {
       "label": "depsetup",
@@ -29,24 +29,23 @@
       "label": "deploy",
       "type": "shell",
       "group": "none",
-      "detail": "Deploy to Steam Deck",
-      "command": "rsync -azp --delete --exclude node_modules --exclude .git --exclude .vscode/settings.json . ${config:deckuser}@${config:deckip}:${config:deckdir}/homebrew/plugins/${config:pluginname}/",
+      "detail": "Copy the plugin to the Deck, install it as root and restart Decky (asks for the Deck's sudo password)",
+      "command": "rsync -az --delete --delete-excluded -e 'ssh -p ${config:deckport}' --include='/plugin.json' --include='/package.json' --include='/main.py' --include='/decky.pyi' --include='/LICENSE' --include='/dist/' --include='/dist/**' --include='/defaults/' --include='/defaults/**' --include='/py_modules/' --include='/py_modules/**' --exclude='*' ./ '${config:deckuser}@${config:deckip}:wifi-optimizer-dev/' && ssh -t -p ${config:deckport} '${config:deckuser}@${config:deckip}' 'sudo rsync -a --delete wifi-optimizer-dev/ \"${config:deckdir}/homebrew/plugins/${config:pluginname}/\" && sudo chown -R root:root \"${config:deckdir}/homebrew/plugins/${config:pluginname}\" && sudo systemctl restart plugin_loader'",
       "dependsOn": ["build"]
     },
     {
       "label": "restartdecky",
       "type": "shell",
       "group": "none",
-      "detail": "Restart Decky on Steam Deck",
-      "command": "ssh ${config:deckuser}@${config:deckip} 'sudo systemctl restart plugin_loader'",
-      "dependsOn": ["deploy"]
+      "detail": "Restart Decky on the Deck (asks for the Deck's sudo password)",
+      "command": "ssh -t -p ${config:deckport} '${config:deckuser}@${config:deckip}' 'sudo systemctl restart plugin_loader'"
     },
     {
       "label": "builddeploy",
       "type": "shell",
       "group": "build",
       "detail": "Build, deploy, and restart Decky",
-      "dependsOn": ["restartdecky"]
+      "dependsOn": ["deploy"]
     }
   ]
 }
