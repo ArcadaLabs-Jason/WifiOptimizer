@@ -224,13 +224,13 @@ export type BadgeStatus =
 
 export const ERROR_MESSAGES: Record<string, string> = {
   no_wifi: "Not connected to WiFi. Connect first, then optimize.",
-  iw_failed: "Couldn't change WiFi setting. Try toggling WiFi off/on.",
-  nmcli_failed: "Couldn't update connection. Forget and reconnect to this network.",
-  write_failed: "Couldn't install auto-fix script. The filesystem may be locked.",
+  iw_failed: "Couldn't change a WiFi setting. Turn WiFi off and on, then try again.",
+  nmcli_failed: "Couldn't update this network's saved settings. Try again in a moment. If it keeps failing, restart the device.",
+  write_failed: "Couldn't install the auto-fix script. Restart the device, then try again.",
   // Shown while the backend reports settings_recovered.
   parse_error:
     "The settings file could not be read, so settings were reset to defaults. The old file was kept as settings.json.corrupt.",
-  unexpected: "Something went wrong. Check the Decky log for details.",
+  unexpected: "Something went wrong. Try again. If it keeps happening, use Copy diagnostics at the bottom of this panel and report it.",
 };
 
 export interface RegdomainPhy {
