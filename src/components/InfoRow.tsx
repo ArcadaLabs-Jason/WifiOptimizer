@@ -14,6 +14,24 @@ export const DetailsContext = createContext(false);
 // Those take from a few seconds to about a minute.
 export const WORKING_TEXT = "Working, WiFi will reconnect...";
 
+// An error or notice on a row of its own, under the control it is about,
+// in the colors and size a toggle's own message uses.
+export function MessageRow({ error, notice }: { error?: string | null; notice?: string | null }) {
+  if (!error && !notice) return null;
+  return (
+    <PanelSectionRow>
+      <div
+        style={{
+          fontSize: theme.fontSize.small,
+          color: error ? theme.error.text : theme.info.text,
+        }}
+      >
+        {error || notice}
+      </div>
+    </PanelSectionRow>
+  );
+}
+
 interface InfoRowProps {
   label: string;
   subtitle: string;

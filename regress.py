@@ -10339,7 +10339,7 @@ except Exception as _e:
 
 section("F19 the stranded-release banner is true for the band")
 try:
-    ok("The band\n          preference comes back after about 10 minutes" in _F_IX
+    ok("comes back once the plugin next checks, after about 10 minutes, with\n          an access point on that band in range" in _F_IX
        and "applies again to whichever access point works" not in _F_IX,
        "the band waits about 10 minutes and needs the band in range")
     ok(getattr(m.Plugin, "_RELEASE_NOTICE_SECONDS", None) == 600, "which is the backend's own wait")
@@ -10448,6 +10448,315 @@ try:
        and "Reset settings puts it back to WPA3 only." in _F_IX
        and "| Allow WPA2 here |" in _F_RD, "the WPA2 banner and README are true before and after NetworkManager 1.58.1")
     ok("no IPv4 at all" in _between(_F_IX, 'label="Custom DNS"', "checked="), "the DNS explanation warns about an IPv6-only network")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 4: FRONT ----
+_P4_SR = _src("src/components/SendReport.tsx"); _P4_PH = _src("src/components/PanelHeader.tsx")
+_P4_IR = _src("src/components/InfoRow.tsx"); _P4_UT = _src("src/utils.ts"); _P4_INST = _src("install.sh")
+_P4_URL = re.search(r'(?m)^REPORT_URL = "(.*)"$', _F_MAIN)
+_P4_URL = _P4_URL.group(1) if _P4_URL else None
+
+section("F1 pass 4: the README's Send report section is there exactly when REPORT_URL is set")
+# Read from main.py itself: the Send report sections set m.REPORT_URL while they run.
+try:
+    ok(_P4_URL is not None, "REPORT_URL is one plain line in main.py")
+    ok(("## Send report" in _F_RD) == bool(_P4_URL),
+       f"the section exists iff REPORT_URL is non-empty (REPORT_URL={_P4_URL!r}, "
+       f"section {'present' if '## Send report' in _F_RD else 'absent'})")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F2 pass 4: Send report text ships only with the feature, and is true when it does")
+try:
+    _p4_un = _between(_F_RD, "## Uninstall", "## Building from source")
+    if not _P4_URL:
+        ok(not any(w in _F_RD for w in ("Send report", "/var/lib/wifi-optimizer", "WO-7K2M9Q",
+                                        "woke from sleep WiFi never came back")),
+           "with REPORT_URL empty the README says nothing about the report or the wake notice")
+        ok(not any(w in _F_SEC for w in ("Send report", "/var/lib/wifi-optimizer")),
+           "and neither does SECURITY.md")
+    else:
+        _p4_sec = _between(_F_RD, "## Send report", "\n## Uninstall")
+        _p4_low = _p4_sec.lower()
+        ok("nowhere else" not in _p4_low and "90 days" in _p4_sec and "email" in _p4_low,
+           "where the report is kept and what is emailed, per J-e")
+        ok("cloudflare" in _p4_low and "address" in _p4_low,
+           "the request passes through Cloudflare, which sees the sending address")
+        ok("until you dismiss" in _p4_low and "says so once" not in _p4_low
+           and "only that it happened and when are shown" not in _p4_low,
+           "the wake notice stays until dismissed and shows its date")
+        ok(all(w in _p4_low for w in ("plugins", "kernel", "decky", "rfkill")),
+           "what a report contains, including the installed plugins list")
+        ok("sudo rm -rf /var/lib/wifi-optimizer" in _p4_un, "the manual removal takes the waiting report too")
+        ok("Send report" in _between(_F_SEC, "## In scope", "\n## "), "SECURITY.md lists Send report in scope")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F3 pass 4: every message a setter sends back is shown, Allow WPA2's included")
+try:
+    ok("{notices.allow_wpa2 && (" in _F_IX
+       and '<Banner variant="info">{notices.allow_wpa2}</Banner>' in _F_IX,
+       "Allow WPA2's follow-up message renders as an info banner")
+    ok(0 <= _F_IX.find("{notices.move_bssid_lock && (") < _F_IX.find("{notices.allow_wpa2 && ("),
+       "beside the Move the lock message")
+    _p4_keys = sorted(set(re.findall(r'(?:handleToggle|onToggle)\(\s*"(\w+)"', _F_ALL)))
+    _p4_unshown = [k for k in _p4_keys if f"notices.{k}" not in _F_ALL or f"errors.{k}" not in _F_ALL]
+    ok(len(_p4_keys) > 10 and not _p4_unshown,
+       f"each key a change reports under has its error and notice rendered (unshown: {_p4_unshown})")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F4 pass 4: the report state follows a background send while the panel stays open")
+try:
+    ok('document.addEventListener("visibilitychange", onVisibility)' in _P4_SR
+       and 'document.removeEventListener("visibilitychange", onVisibility)' in _P4_SR,
+       "the state is read again when the panel becomes visible")
+    _p4_sp = _between(_P4_SR, "function schedulePoll()", "\n}")
+    ok("if (pollTimer || !listeners.size) return;" in _p4_sp
+       and "if (shared.state && !shared.state.pending) return;" in _p4_sp
+       and "STATE_POLL_MS" in _p4_sp and re.search(r"STATE_POLL_MS = 20000;", _P4_SR),
+       "and every 20 s while a report waits or no state has come, one timer at a time")
+    ok("schedulePoll();" in _between(_P4_SR, "function refreshReportState()", "\n}")
+       and "stopPoll();" in _between(_P4_SR, "function useReportState()", "\n}"),
+       "each read schedules the next, and the timer stops with the last listener")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F5 pass 4: the wake notice says which boot and when, and goes once answered")
+try:
+    ok("Last time your device woke" not in _P4_SR
+       and "Before the last restart, WiFi didn't come back after your device woke from sleep" in _P4_SR,
+       "it is about the boot before the last restart")
+    ok("wakeNoticeText(state.wake_failure_at)" in _P4_SR and "new Date(at * 1000)" in _P4_SR,
+       "with the wake's date and time")
+    _p4_wn = _between(_P4_SR, "export function WakeFailureNotice()", "\n}")
+    ok("if (!fromHere && (hidden.wake || state.pending)) return null;" in _p4_wn,
+       "hidden while a report waits, or once one was sent or saved")
+    ok('if (noAnswer || status === "sent" || status === "queued") hidden.wake = true;'
+       in _between(_P4_SR, "async function send(", "\n}"), "a sent or saved report answers it")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F6 pass 4: the preview and send get Copy diagnostics' limit, and a slow send is not a failure")
+try:
+    ok("CALL_LIMIT_MS" not in _P4_SR and "withTimeout(previewReport(), CALL_TIMEOUT_MS)" in _P4_SR
+       and "withTimeout(sendReport(id), CALL_TIMEOUT_MS)" in _P4_SR,
+       "both use CALL_TIMEOUT_MS")
+    _p4_ct = re.search(r"CALL_TIMEOUT_MS = (\d+) \* 1000;", _P4_UT)
+    ok(_p4_ct and int(_p4_ct.group(1)) >= 120, "which is at least the 120 s Copy diagnostics has")
+    _p4_sd = _between(_P4_SR, "async function send(", "\n}")
+    ok("noAnswer = e instanceof NoAnswer;" in _p4_sd and "SEND_SLOW_TEXT" in _p4_sd
+       and "await refreshReportState();" in _p4_sd
+       and '"The report may still be sending. Check back here in a minute."' in _P4_SR,
+       "a send with no answer says it may still go, and the state is read again")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F7 pass 4: Dismiss always hides the notice for this load")
+try:
+    _p4_wn = _between(_P4_SR, "export function WakeFailureNotice()", "\n}")
+    _p4_ds = _between(_p4_wn, "const dismiss = async () => {", "};")
+    ok(0 <= _p4_ds.find("hidden.wake = true;") < _p4_ds.find('dismissReportNotice("wake")'),
+       "the wake notice is hidden before the backend is asked, whatever it answers")
+    _p4_rw = _between(_P4_SR, "export function SendReportRow()", "\n}")
+    ok(0 <= _p4_rw.find("hidden.dropped = true;") < _p4_rw.find('dismissReportNotice("dropped")')
+       and 0 <= _p4_rw.find("hidden.sentRef = sentRef;") < _p4_rw.find('dismissReportNotice("sent")'),
+       "and so are the dropped and sent notices")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F8 pass 4: a preview that finishes with the panel closed waits for the panel")
+try:
+    _p4_st = _between(_P4_SR, "async function startReport(", "\n}")
+    ok('if (document.visibilityState === "visible") openPreview(ready);' in _p4_st
+       and "else update({ ready });" in _p4_st, "the modal opens only while the panel is visible")
+    ok('"Report ready. Open it here to review."' in _P4_SR and "onClick={() => openPreview(ready)}" in _P4_SR,
+       "otherwise the panel offers to open it")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F9 pass 4: a waiting report can be withdrawn, and a dropped one is said")
+try:
+    ok('callable<[], { success: boolean }>("cancel_pending_report")' in _P4_SR
+       and "Don't send it" in _P4_SR and "onClick={() => void cancelPending()}" in _P4_SR,
+       "Don't send it removes the waiting report (C5 cancel_pending_report)")
+    ok("A report is waiting to be sent." in _P4_SR and "It will be sent when WiFi is back." not in _P4_SR,
+       "the waiting line does not assume WiFi is down")
+    ok("Your saved report couldn't be sent. Use Copy diagnostics instead." in _P4_SR
+       and "state.dropped && !hidden.dropped" in _P4_SR and "dropped?: boolean;" in _P4_SR,
+       "a dropped report is said until dismissed (C5 dropped)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F10 pass 4: the header says held on only when Keep fixes on holds it")
+try:
+    ok("streaming.streaming_held" in _P4_PH and '"Auto mode: stream running, fixes on"' in _P4_PH
+       and 0 <= _P4_PH.find("streaming.streaming_held") < _P4_PH.find('"Auto mode: held on, fixes on"'),
+       "a stream flagged before its app is named reads as running, not held")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F11 pass 4: a second Copy diagnostics press is not reset mid-collection")
+try:
+    _p4_cd = _between(_F_PF, "const handleCopyDiagnostics = async () => {", "\n  };")
+    ok(0 <= _p4_cd.find("clearTimeout(idleTimer.current)") < _p4_cd.find('setDiagState("copying")')
+       and 'setTimeout(() => setDiagState("idle"), 5000)' not in _F_PF,
+       "the earlier press's idle timer is cleared before the next collection starts")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F12 pass 4: the released-pin banner is true when one setting was released")
+try:
+    _p4_pr = _between(_F_IX, "{status?.external?.pin_released && (", "</Banner>")
+    _p4_pr = re.sub(r"\s+", " ", _p4_pr)
+    ok("Both stay on" not in _p4_pr and "the setting holding it was released" in _p4_pr
+       and "comes back once the plugin next checks, after about 10 minutes" in _p4_pr,
+       "one setting, and the band back at the plugin's next check")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F13 pass 4: the 5 GHz explanation says it is released out of range, as the 6 GHz one claims")
+try:
+    _p4_5 = _between(_F_IX, 'label="Force 5 GHz band"', "checked=")
+    ok("released after about a minute so WiFi can reconnect" in _p4_5
+       and "Like the 5 GHz setting" in _between(_F_IX, 'label="Force 6 GHz band"', "checked="),
+       "both band explanations say it")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F14 pass 4: a process name error shows under the field it is about")
+try:
+    ok('onToggle("streaming_patterns", () => backend.setStreamingPatterns(patterns))' in _F_SS
+       and 'onToggle("streaming", () => backend.setStreamingPatterns' not in _F_SS,
+       "the pattern save reports under its own key")
+    ok(0 <= _F_SS.find("Save process names") < _F_SS.find(
+           "<MessageRow error={errors.streaming_patterns} notice={notices.streaming_patterns} />"),
+       "and its error or notice renders under the Save button")
+    ok('onToggle("streaming_apps"' in _F_SS and 'onToggle("streaming_hold"' in _F_SS
+       and "errors={errors}" in _between(_F_IX, "<StreamingSection", "/>"),
+       "so do the app choices and Keep fixes on")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F15 pass 4: Reset says it turns streaming auto mode off and clears its choices")
+try:
+    _p4_s = "Streaming auto mode is turned off and its app choices and process names are cleared."
+    ok(_p4_s in _between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n")
+       and _p4_s in _between(_F_RD, "**Before uninstalling:**", "\n\n"),
+       "in the confirmation and in the README")
+    _p4_kept = _between(_F_MAIN, 'for key in ("update_channel"', ")")
+    ok(_p4_kept and "streaming" not in _p4_kept and m.DEFAULT_SETTINGS.get("streaming_mode_enabled") is False,
+       "which is what Reset does: it keeps no streaming setting")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F16 pass 4: the README says which scans the lock stops")
+try:
+    ok("scanning for other networks" not in _F_RD
+       and "scanning now and then for a better access point of your network" in _F_RD,
+       "a better access point of the same network, as the panel says")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F17 pass 4: buffer tuning and CAKE say every time they are put back")
+try:
+    _p4_t = "put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
+    ok(_p4_t in _between(_F_IX, 'label="Network buffer tuning"', "checked=")
+       and _p4_t in _between(_F_IX, 'label="Traffic shaping (CAKE)"', "checked="),
+       "at load, after a game launch, and at reconnect with Auto-fix on")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F18 pass 4: IPv6 already off says where it was set, not that it is common")
+try:
+    ok("common for saved networks" not in _F_IX
+       and "IPv6 is already off on this network, set outside this plugin." in _F_IX,
+       "no unsupported claim")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F19 pass 4: a region the card turned down is not shown as the one in use")
+try:
+    _p4_adv = _between(_F_IX, '<PanelSection title="Advanced">', 'label="Force 5 GHz band"')
+    ok("regdomain.governing !== regdomain.setting" in _p4_adv and "(not in effect: the card uses" in _p4_adv,
+       "under the selector, when the region in use differs from the saved one")
+    _p4_gn = _between(_F_IX, "function governingName(", "\n}")
+    ok('"the world default"' in _p4_gn and "a mix of its own region and" in _p4_gn
+       and '"its own region"' in _p4_gn, "with words for 00, 98 and 99, not the bare codes")
+    ok("<MessageRow error={errors.regdomain} notice={notices.regdomain} />" in _p4_adv
+       and "fontSize.tiny" not in _p4_adv.split("<MessageRow error={errors.regdomain}")[1][:400]
+       and "export function MessageRow" in _P4_IR,
+       "and the region's own message uses the shared notice style")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F20 pass 4: install.sh says restart the device")
+try:
+    ok("Restart the Deck" not in _P4_INST and "Restart the device to load it." in _P4_INST,
+       "on every handheld")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F21 F24 pass 4: the README says which Allow WPA2 Reset can undo, and how to undo the rest")
+try:
+    ok('sudo nmcli connection modify "NAME" 802-11-wireless-security.key-mgmt sae' in _F_RD,
+       "the command that puts a network back to WPA3 only")
+    ok("resets that too" not in _F_RD, "rejoining is not claimed to undo it")
+    ok("0.24.5 or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n")
+       and "Reset puts the network back to WPA3 only. |" not in _F_RD
+       and "0.24.5 or later" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
+       "Reset's claim names the versions it holds for, in the paragraph and the table")
+    ok(m.DEFAULT_SETTINGS.get("wpa2_uuids") == [] and "wpa2_uuids" in _F_MAIN,
+       "which is the record this version keeps")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F22 pass 4: NetworkManager asleep has its own text")
+try:
+    ok('wifiState === "asleep"' in _F_IX and '"WiFi is paused by the system. Restart the device."' in _F_IX
+       and '"asleep"' in _between(_F_TY, "wifi_state?:", ";"),
+       "C1's asleep reads as paused by the system, with what to do")
+    _p4_dt = _between(_F_IX, "const disconnectedText =", ";\n")
+    ok(_p4_dt.rstrip().endswith('"Not connected to WiFi. Connect first, then optimize."'),
+       "and any value the panel does not know still reads as plainly disconnected")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F23 pass 4: the README says uninstalling a disabled plugin undoes nothing")
+try:
+    _p4_un = _between(_F_RD, "## Uninstall", "## Building from source")
+    ok("If the plugin is disabled in Decky, enable it again, tap **Reset settings**, then uninstall" in _p4_un
+       and "install it again (its settings are still there)" in _p4_un
+       and "as long as the plugin is enabled in Decky" in _p4_un,
+       "enable, Reset, then uninstall, and what to do if it is too late")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F25 pass 4: auto mode says it leaves out the Realtek driver's load-time settings")
+try:
+    ok('settings?.driver === "rtw88" ? RTW88_AUTO_TEXT : ""' in _F_SS
+       and "doesn't keep the driver's settings between streams" in _F_SS,
+       "the panel says so on the rtw88 card")
+    ok("Realtek (rtw88)" in _F_RD
+       and "doesn't keep the driver's settings between streams" in _between(_F_RD, "**Streaming auto mode**", "## Hardware"),
+       "and the README's streaming section")
+    ok("persist=not auto" in _F_MAIN, "which is what auto mode does (set_power_save never keeps the options file)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F26 F27 F28 pass 4: small panel and README fixes")
+try:
+    ok('applyingAll && batchFrom === "optimize"' in _F_IX and 'applyingAll && batchFrom === "fix"' in _F_IX
+       and 'applyingAll && batchFrom === "reapply"' in _F_IX,
+       "F26 the batch's working text shows under the button that was pressed")
+    ok(_F_IX.count("Under iwd Optimize Safe leaves the lock out") == 1
+       and "Under iwd Optimize Safe leaves the lock out" in _F_IX[:_F_IX.find("const lockSafe =")][-900:],
+       "F27 the iwd note sits with the lockSafe comment")
+    ok("Under the `iwd` WiFi backend the lock is left out.\n" in _F_RD, "F28 the README line ends with a full stop")
+    _p4_new = _F_RD + _P4_SR + _F_SS + _P4_PH + _F_PF + _P4_INST
+    ok(all(ord(ch) < 128 for ch in _p4_new) and "—" not in _p4_new and "–" not in _p4_new,
+       "the changed text is plain ASCII")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -10830,7 +11139,7 @@ try:
     _later = [(t + 2000, w, msg) for t, w, msg in _FAIL]
     ok(asyncio.run(RepStub(journal=_wj(_later)).get_report_state()).get("wake_failure") is True,
        "while a later failed wake brings it back")
-    ok("Last time your device woke from sleep, WiFi didn't come back." in _tsx_rep
+    ok("WiFi didn't come back after your device woke from sleep" in _tsx_rep
        and 'startReport("wake")' in _tsx_rep and 'dismissReportNotice("wake")' in _tsx_rep,
        "the notice says so plainly, with Send report and Dismiss")
 except Exception as _e:
@@ -10855,10 +11164,12 @@ try:
     _readme = open("README.md").read()
     _sec = _readme[_readme.find("## Send report"):]
     _sec = _sec[:_sec.find("\n## ", 5)] if "\n## " in _sec[5:] else _sec
-    ok(_readme.count("## Send report") == 1 and "Copy diagnostics" in _sec and "90 days" in _sec
-       and "confirm" in _sec.lower() and "workers" not in _sec.lower()
-       and "cloudflare" not in _sec.lower() and all(ord(ch) < 128 for ch in _sec),
-       "the README says what is sent, where it goes and that nothing goes unconfirmed")
+    # Only while REPORT_URL is set (pass 4 F1); pass 4 F2 checks the rest of it.
+    ok("## Send report" not in _readme
+       or (_readme.count("## Send report") == 1 and "Copy diagnostics" in _sec and "90 days" in _sec
+           and "confirm" in _sec.lower() and "workers" not in _sec.lower()
+           and all(ord(ch) < 128 for ch in _sec)),
+       "the README, when it has the section, says what is sent, where it goes and that nothing goes unconfirmed")
     # Uninstalling takes the report directory with it.
     _rep_reset()
     os.makedirs(_rep_dir, mode=0o700)

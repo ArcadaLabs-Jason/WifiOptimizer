@@ -120,7 +120,7 @@ rm -rf "$OLD_DIR" || true
 echo "Restarting Decky Loader..."
 if ! systemctl restart plugin_loader; then
     echo ""
-    echo "Installed, but Decky Loader did not restart. Restart the Deck to load it."
+    echo "Installed, but Decky Loader did not restart. Restart the device to load it."
     exit 1
 fi
 

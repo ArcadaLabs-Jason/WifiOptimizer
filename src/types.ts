@@ -69,7 +69,13 @@ export interface LiveStatus {
   streaming_process?: string;
   /** Sent only while not connected: why. Older backends leave it out,
    * which the panel reads as "disconnected". */
-  wifi_state?: "no_device" | "not_responding" | "radio_off" | "unavailable" | "disconnected";
+  wifi_state?:
+    | "no_device"
+    | "not_responding"
+    | "radio_off"
+    | "unavailable"
+    | "asleep"
+    | "disconnected";
   /** On the generic method only: the backend that takes over at the next
    * boot, when it differs from wifi_backend, the one running now. */
   wifi_backend_next?: string;

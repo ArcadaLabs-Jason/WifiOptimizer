@@ -32,7 +32,7 @@ import type {
   RegdomainInfo,
 } from "./types";
 import { ERROR_MESSAGES } from "./types";
-import { InfoRow, DetailsContext, WORKING_TEXT } from "./components/InfoRow";
+import { InfoRow, MessageRow, DetailsContext, WORKING_TEXT } from "./components/InfoRow";
 import { StatsGrid } from "./components/StatsGrid";
 import { Banner } from "./components/Banner";
 import { BackendToggleRow, backendResultText } from "./components/BackendToggleRow";
@@ -85,9 +85,10 @@ const BACKEND_POLL_MAX_FAILURES = 5;
 // Prevent lag spikes is saved as off, so it does not come back by itself.
 // The network settings are written to the saved networks without a
 // reconnect, so the connection in use keeps them until WiFi next connects.
-// The update channel and notices are kept (main.py _reset_locked).
+// The update channel and notices are kept (main.py _reset_locked), and
+// streaming auto mode starts again from its defaults.
 const RESET_CONFIRM_TEXT =
-  "This turns off what the plugin applied and puts its WiFi settings back to their defaults, except that Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are removed from the networks they were set on, from the next time WiFi connects. Update settings are kept.";
+  "This turns off what the plugin applied and puts its WiFi settings back to their defaults, except that Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are removed from the networks they were set on, from the next time WiFi connects. Streaming auto mode is turned off and its app choices and process names are cleared. Update settings are kept.";
 // Reset does not reconnect, so it does not say WiFi will.
 const RESET_WORKING_TEXT = "Working...";
 const RESET_DONE_TEXT = "Done. Settings are reset.";
@@ -249,6 +250,22 @@ const REGION_OPTIONS = [
   { data: "US", label: "United States (US)" },
 ];
 
+// A region's name as the selector shows it, without the code: "Germany".
+function regionName(code: string): string {
+  const option = REGION_OPTIONS.find((o) => o.data === code);
+  return option ? option.label.replace(/ \(\w\w\).*$/, "") : code;
+}
+
+// The region the card uses, in words. The kernel reports three codes that
+// are not countries: 00 the world default, 98 a mix of the card's own
+// region and the one asked for, 99 the card's own.
+function governingName(code: string, asked: string): string {
+  if (code === "00") return "the world default";
+  if (code === "98") return `a mix of its own region and ${regionName(asked)}`;
+  if (code === "99") return "its own region";
+  return regionName(code);
+}
+
 const DNS_OPTIONS = [
   { data: "cloudflare", label: "Cloudflare (1.1.1.1)" },
   { data: "google", label: "Google (8.8.8.8)" },
@@ -318,6 +335,9 @@ function Content() {
   // The key of the change running now, for the text on its row.
   const [working, setWorking] = useState<string | null>(null);
   const [applyingAll, setApplyingAll] = useState(false);
+  // Which button started the batch running now, so its working text shows
+  // under that button only.
+  const [batchFrom, setBatchFrom] = useState<"optimize" | "fix" | "reapply" | null>(null);
   // The last status read failed, and when the first one is slow to come.
   const [statusFailed, setStatusFailed] = useState(false);
   const [slowLoad, setSlowLoad] = useState(false);
@@ -863,10 +883,14 @@ function Content() {
   // several setters and report per setting. Force Reapply used to go through
   // the single-toggle handler, which dropped every per-setting failure and
   // put its own errors under a key nothing displayed.
-  const runBatch = async (fn: () => Promise<OptimizeSafeResult>) => {
+  const runBatch = async (
+    fn: () => Promise<OptimizeSafeResult>,
+    from: "optimize" | "fix" | "reapply",
+  ) => {
     if (busyRef.current) return;
     setBusy(true);
     setApplyingAll(true);
+    setBatchFrom(from);
     setErrors({});
     setNotices({});
     setOptimizeResult(null);
@@ -910,12 +934,13 @@ function Content() {
       await refreshAfterChange();
       setBusy(false);
       setApplyingAll(false);
+      setBatchFrom(null);
     }
   };
 
-  const handleOptimize = () => runBatch(() => backend.optimizeSafe());
-  const handleRepairDrift = () => runBatch(() => backend.repairDrifted());
-  const handleForceReapply = () => runBatch(() => backend.reapplyAll());
+  const handleOptimize = () => runBatch(() => backend.optimizeSafe(), "optimize");
+  const handleRepairDrift = () => runBatch(() => backend.repairDrifted(), "fix");
+  const handleForceReapply = () => runBatch(() => backend.reapplyAll(), "reapply");
 
   const handleAllowWpa2 = () =>
     handleToggle("allow_wpa2", () => backend.allowWpa2());
@@ -1269,8 +1294,6 @@ function Content() {
       ? { badge: "paused" as const, text: "paused" }
       : getBadge(key, status, errors[key] ?? null);
 
-  // Under iwd Optimize Safe leaves the lock out, so it is not one of the
-  // things to wait for there, or "All good" never came.
   // The findings with a Dismiss, unless dismissed.
   const wpa2Shown = !!status?.wpa2_only_stronger && !dismissed.wpa2;
   const lockWeakerShown = !!status?.lock_weaker && !dismissed.lockWeaker;
@@ -1282,22 +1305,28 @@ function Content() {
   ].filter(Boolean);
 
   // Why there is no connection, where the backend can tell (older backends
-  // send nothing, which reads as plainly disconnected). "Connect first,
-  // then optimize" only before anything has been applied.
+  // send nothing, and a value this panel does not know, both of which read
+  // as plainly disconnected). "Connect first, then optimize" only before
+  // anything has been applied. asleep is NetworkManager left paused, most
+  // often after a wake it missed, which a restart clears.
   const wifiState = status?.live?.wifi_state ?? "disconnected";
   const disconnectedText =
     wifiState === "no_device" || wifiState === "not_responding" || wifiState === "unavailable"
       ? "The WiFi card isn't responding. Restart the device."
       : wifiState === "radio_off"
         ? "WiFi is off. Turn it on in Steam's settings."
-        : s?.last_applied
-          ? "Not connected to WiFi."
-          : "Not connected to WiFi. Connect first, then optimize.";
+        : wifiState === "asleep"
+          ? "WiFi is paused by the system. Restart the device."
+          : s?.last_applied
+            ? "Not connected to WiFi."
+            : "Not connected to WiFi. Connect first, then optimize.";
 
-  // A lock that is on for another network counts as done too: Optimize Safe
-  // leaves it where it was set (_lock_held_elsewhere in main.py), so waiting
-  // for it here meant "All good" never came on any other network. The row
-  // itself says the lock does nothing here.
+  // Under iwd Optimize Safe leaves the lock out, so it is not one of the
+  // things to wait for there, or "All good" never came. A lock that is on
+  // for another network counts as done too: Optimize Safe leaves it where it
+  // was set (_lock_held_elsewhere in main.py), so waiting for it here meant
+  // "All good" never came on any other network. The row itself says the
+  // lock does nothing here.
   const lockSafe =
     status?.live?.wifi_backend === "iwd" ||
     (s?.bssid_lock_enabled &&
@@ -1554,17 +1583,23 @@ function Content() {
       {notices.move_bssid_lock && (
         <Banner variant="info">{notices.move_bssid_lock}</Banner>
       )}
+      {/* So can Allow WPA2: the lock it sets again can stay on the access
+          point in use, or not be set again at all. The finding clears on
+          success and takes its banner with it, so this has its own. */}
+      {notices.allow_wpa2 && (
+        <Banner variant="info">{notices.allow_wpa2}</Banner>
+      )}
 
       {/* A setting we wrote was the likely reason the device could not
           connect, so it was released. Worth stating plainly: nothing the user
           did caused it, and the preference is not lost. */}
       {status?.external?.pin_released && (
         <Banner variant="warning">
-          WiFi could not connect for a while, so the access point lock or the
-          band preference was released to let it reconnect. Both stay on. The
-          lock is set again on whichever access point works. The band
-          preference comes back after about 10 minutes, once an access point
-          on that band is in range.
+          WiFi could not connect for a while, so the setting holding it was
+          released to let it reconnect. It stays on: the access point lock is
+          set again on whichever access point works, and a band preference
+          comes back once the plugin next checks, after about 10 minutes, with
+          an access point on that band in range.
         </Banner>
       )}
 
@@ -1583,6 +1618,13 @@ function Content() {
               Fix now
             </ButtonItem>
           </PanelSectionRow>
+          {applyingAll && batchFrom === "fix" && (
+            <PanelSectionRow>
+              <div style={{ fontSize: theme.fontSize.small, color: theme.info.text }}>
+                {BATCH_WORKING_TEXT}
+              </div>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       )}
 
@@ -1669,7 +1711,7 @@ function Content() {
                 : "Optimize Safe"}
           </ButtonItem>
         </PanelSectionRow>
-        {applyingAll && (
+        {applyingAll && batchFrom === "optimize" && (
           <PanelSectionRow>
             <div style={{ fontSize: theme.fontSize.small, color: theme.info.text }}>
               {BATCH_WORKING_TEXT}
@@ -1734,7 +1776,7 @@ function Content() {
         <InfoRow
           label="Network buffer tuning"
           subtitle="Optimize UDP buffers and TX queue for streaming"
-          explanation="Increases the kernel's network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when WiFi connects if Auto-fix on wake is on."
+          explanation="Increases the kernel's network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
           {...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled)}
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
@@ -1789,18 +1831,24 @@ function Content() {
             />
           </PanelSectionRow>
         )}
-        {(errors.regdomain || notices.regdomain) && (
-          <PanelSectionRow>
-            <div
-              style={{
-                fontSize: theme.fontSize.tiny,
-                color: errors.regdomain ? theme.error.text : theme.text.tertiary,
-              }}
-            >
-              {errors.regdomain ?? notices.regdomain}
-            </div>
-          </PanelSectionRow>
-        )}
+        <MessageRow error={errors.regdomain} notice={notices.regdomain} />
+        {/* A region the card turned down is still the saved choice, so the
+            selector keeps showing it once the message above has expired.
+            Say under it that it is not the one in use. */}
+        {regdomain?.readable &&
+          regdomain.changeable &&
+          !errors.regdomain &&
+          !notices.regdomain &&
+          regdomain.setting &&
+          regdomain.governing &&
+          regdomain.governing !== regdomain.setting && (
+            <MessageRow
+              notice={`${regionName(regdomain.setting)} (not in effect: the card uses ${governingName(
+                regdomain.governing,
+                regdomain.setting,
+              )})`}
+            />
+          )}
         {regdomain?.readable && !regdomain.changeable && (
           <PanelSectionRow>
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
@@ -1816,7 +1864,7 @@ function Content() {
           subtitle="Avoid 2.4 GHz Bluetooth interference"
           explanation={`Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only turn this on if your router has 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you. Turning it on or off reconnects WiFi for a few seconds.${
+          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only turn this on if your router has 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you. If you later take the device out of range of this network's 5 GHz access points, it is released after about a minute so WiFi can reconnect. Turning it on or off reconnects WiFi for a few seconds.${
             supports6GHz
               ? status?.live?.six_ghz_offered || on6GHz
                 ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz. To stay on 6 GHz, use Force 6 GHz band below instead."
@@ -1982,7 +2030,7 @@ function Content() {
           notice={
             notices.ipv6 ??
             (status?.external?.ipv6
-              ? "IPv6 is already off on this connection, which is common for saved networks. Nothing to do unless something here needs IPv6. To turn IPv6 back on, turn this on, then off."
+              ? "IPv6 is already off on this network, set outside this plugin. Nothing to do unless something here needs IPv6. To turn IPv6 back on, turn this on, then off."
               : status?.live?.ipv6_other_network
                 ? OTHER_NETWORK_TEXT
                 : undefined)
@@ -1998,7 +2046,7 @@ function Content() {
         <InfoRow
           label="Traffic shaping (CAKE)"
           subtitle="Fair queuing for traffic this device sends"
-          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection, so it does not fix lag that starts there. It does not limit your bandwidth. It is lost on reboot, and put back when WiFi connects if Auto-fix on wake is on."
+          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection, so it does not fix lag that starts there. It does not limit your bandwidth. It is lost on reboot, and put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
           {...gatedBadge("cake", s?.cake_enabled)}
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.cake_enabled)}
@@ -2023,8 +2071,8 @@ function Content() {
         settings={s}
         live={status?.live}
         disabled={isBusy || updating}
-        error={errors.streaming}
-        notice={notices.streaming}
+        errors={errors}
+        notices={notices}
         onToggle={handleToggle}
       />
 
@@ -2049,7 +2097,11 @@ function Content() {
         onReset={handleResetSettings}
         resetError={errors.reset}
         resetNotice={notices.reset}
-        workingText={working === "reset" ? RESET_WORKING_TEXT : applyingAll ? BATCH_WORKING_TEXT : null}
+        workingText={
+          working === "reset" ? RESET_WORKING_TEXT
+            : applyingAll && batchFrom === "reapply" ? BATCH_WORKING_TEXT
+            : null
+        }
       />
 
       <UpdatesSection
