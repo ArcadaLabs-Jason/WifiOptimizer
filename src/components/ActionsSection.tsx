@@ -11,6 +11,9 @@ interface ActionsSectionProps {
   resetError?: string | null;
   // Reset's outcome when it worked.
   resetNotice?: string | null;
+  // The notice is not plain "Done": Reset worked, with networks still to
+  // change, which the plugin retries.
+  resetNoticeInfo?: boolean;
   // Said here while Force Reapply or Reset runs, where the button was pressed.
   workingText?: string | null;
 }
@@ -22,6 +25,7 @@ export function ActionsSection({
   onReset,
   resetError,
   resetNotice,
+  resetNoticeInfo,
   workingText,
 }: ActionsSectionProps) {
   return (
@@ -52,7 +56,11 @@ export function ActionsSection({
           <div
             style={{
               fontSize: theme.fontSize.small,
-              color: resetError ? theme.error.text : theme.success.text,
+              color: resetError
+                ? theme.error.text
+                : resetNoticeInfo
+                  ? theme.info.text
+                  : theme.success.text,
             }}
           >
             {resetError ?? resetNotice}

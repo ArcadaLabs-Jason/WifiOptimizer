@@ -1005,7 +1005,11 @@ function Content() {
       if (!isResult(result) || !result.success) {
         setErrors({ reset: isResult(result) ? failureText(result) : GENERIC_FAIL_TEXT });
       } else {
-        setNotices({ reset: RESET_DONE_TEXT });
+        // Networks Reset could not change yet are retried while the plugin
+        // runs, so Reset worked, but "Done" alone would not be true.
+        setNotices({
+          reset: result.pins_left && result.message ? result.message : RESET_DONE_TEXT,
+        });
         // Reset keeps the update channel, but an older backend put it back
         // to Stable. Either way the offer on screen may be for a channel no
         // longer chosen, so it is dropped and asked for again.
@@ -2097,6 +2101,7 @@ function Content() {
         onReset={handleResetSettings}
         resetError={errors.reset}
         resetNotice={notices.reset}
+        resetNoticeInfo={!!notices.reset && notices.reset !== RESET_DONE_TEXT}
         workingText={
           working === "reset" ? RESET_WORKING_TEXT
             : applyingAll && batchFrom === "reapply" ? BATCH_WORKING_TEXT

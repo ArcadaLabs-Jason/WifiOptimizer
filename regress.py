@@ -13155,6 +13155,44 @@ finally:
         pass
 
 
+# ---- QA pass 4 merge: where two owners' work meets ----
+section("merge p4: Reset says when networks are left for later, and the new errors read as plain advice")
+# LIFECYCLE's Reset can now succeed with pins_left and a message of its own
+# (L5), and set_power_save / the lock / Reset answer two new error codes,
+# not_responding (L4) and settings_unreadable (L14). The panel has to show
+# Reset's own message instead of the fixed "Done", and have words for the
+# codes should a result ever come without its message.
+try:
+    _mp_main = open("main.py").read()
+    _mp_flat = re.sub(r'"\s*\n\s*"', "", _mp_main)
+    _mp_tsx = open("src/index.tsx").read()
+    _mp_types = open("src/types.ts").read()
+    _mp_acts = open("src/components/ActionsSection.tsx").read()
+    _mp_rr = _mp_tsx[_mp_tsx.find("const runReset = async"):]
+    _mp_rr = _mp_rr[:_mp_rr.find("\n  };\n")]
+    _mp_ok = _mp_rr[_mp_rr.find("} else {"):_mp_rr.find("} catch")]
+    _mp_left = re.search(r'"pins_left": True,\s*"message": \("([^)]*)"\)', _mp_flat)
+    ok(_mp_left is not None and "couldn't be changed yet" in _mp_left.group(1),
+       "the backend half: a Reset that left networks for later says so in its own message")
+    ok("result.pins_left && result.message ? result.message : RESET_DONE_TEXT" in _mp_ok,
+       "a successful Reset with networks left shows that message, not the fixed done text")
+    ok("resetNoticeInfo={!!notices.reset && notices.reset !== RESET_DONE_TEXT}" in _mp_tsx
+       and "resetNoticeInfo" in _mp_acts and "theme.info.text" in _mp_acts,
+       "and shows it as information, not in the colour of a clean success")
+    ok("pins_left?: boolean" in _mp_types, "the result type carries pins_left")
+    for _mp_code in ("not_responding", "settings_unreadable"):
+        _mp_back = re.findall(r'"error": "' + _mp_code + r'",\s*"message": \(?"([^"]*)"', _mp_flat)
+        _mp_front = re.search(r"\n  " + _mp_code + r':\s*"([^"]*)"', _mp_types)
+        _mp_text = _mp_front.group(1) if _mp_front else ""
+        ok(bool(_mp_back) and all(t == _mp_text for t in _mp_back)
+           and all(ord(ch) < 128 for ch in _mp_text)
+           and ("Restart the device" in _mp_text or "try Reset again" in _mp_text),
+           f"{_mp_code}: the panel's own words match the backend's message and say what to do next "
+           f"({_mp_text!r}, backend {_mp_back})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast

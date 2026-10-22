@@ -138,6 +138,8 @@ export interface MethodResult {
   reconnected?: boolean;
   /** Saved in streaming auto mode with no stream running: applies later. */
   paused?: boolean;
+  /** Reset worked, but some networks still carry a setting; message says so. */
+  pins_left?: boolean;
   [key: string]: unknown;
 }
 
@@ -241,6 +243,11 @@ export const ERROR_MESSAGES: Record<string, string> = {
   iw_failed: "Couldn't change a WiFi setting. Turn WiFi off and on, then try again.",
   nmcli_failed: "Couldn't update this network's saved settings. Try again in a moment. If it keeps failing, restart the device.",
   write_failed: "Couldn't install the auto-fix script. Restart the device, then try again.",
+  // An earlier iw is still stuck in the driver: only a restart clears it.
+  not_responding: "The WiFi card isn't responding. Restart the device.",
+  // Reset could neither read the settings file nor move it aside.
+  settings_unreadable:
+    "The settings file can't be read or replaced. Remove ~/homebrew/settings/WiFi Optimizer/settings.json, then try Reset again.",
   // Shown while the backend reports settings_recovered.
   parse_error:
     "The settings file could not be read, so settings went back to their defaults. Turn your settings back on, or tap Optimize Safe. The old file was kept as settings.json.corrupt.",
