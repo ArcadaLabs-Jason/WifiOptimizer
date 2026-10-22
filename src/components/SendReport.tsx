@@ -1,6 +1,7 @@
 import { ButtonItem, ConfirmModal, Focusable, PanelSection, PanelSectionRow, showModal } from "@decky/ui";
 import { callable } from "@decky/api";
 import { useEffect, useState } from "react";
+import { previewBlocks, previewLines } from "../reportPreview";
 import { theme } from "../theme";
 import { CALL_TIMEOUT_MS, NoAnswer, withTimeout } from "../utils";
 import { Banner } from "./Banner";
@@ -70,32 +71,50 @@ type Ready = { id: string; text: string; from: Outcome["from"] };
 // Shared by the footer button and the wake notice, and kept for as long as
 // the plugin is loaded, so a result stays on screen until it is dismissed
 // even if the panel is closed and opened again.
+// inFlight counts the preview, send and cancel calls under way, so the
+// buttons stay disabled until the last of them has ended, not the first.
 let shared: {
   state: ReportState | null;
-  working: boolean;
+  inFlight: number;
   outcome: Outcome | null;
   ready: Ready | null;
   cancelFailed: boolean;
 } = {
   state: null,
-  working: false,
+  inFlight: 0,
   outcome: null,
   ready: null,
   cancelFailed: false,
 };
 const listeners = new Set<() => void>();
 let loading: Promise<void> | null = null;
+// The one read chained after a read under way (refreshReportState).
+let again: Promise<void> | null = null;
+// Counts the actions that have ended (a send, a cancel, a dismiss), and the
+// count a read under way started at.
+let actionSeq = 0;
+let loadingSeq = 0;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Notices dismissed during this load. They stay hidden whatever the backend
 // answered, so Dismiss never looks as if it did nothing. One the backend
 // could not record comes back after a reload. The wake notice also goes once
-// a report has been sent or saved, which answers it.
-const hidden = { wake: false, dropped: false, sentRef: "" };
+// a report has been sent or saved, which answers it, and comes back if that
+// saved report is withdrawn, unless Dismiss hid it (wakeDismissed).
+const hidden = { wake: false, wakeDismissed: false, dropped: false, sentRef: "" };
 
 function update(patch: Partial<typeof shared>) {
   shared = { ...shared, ...patch };
   listeners.forEach((listener) => listener());
+}
+
+function begin(patch: Partial<typeof shared> = {}) {
+  update({ ...patch, inFlight: shared.inFlight + 1 });
+}
+
+function end(patch: Partial<typeof shared> = {}) {
+  actionSeq += 1;
+  update({ ...patch, inFlight: Math.max(0, shared.inFlight - 1) });
 }
 
 // One timer at a time, only while something here is on screen.
@@ -120,22 +139,35 @@ function onVisibility() {
   if (document.visibilityState === "visible") void refreshReportState();
 }
 
+// Read the state again. A read already under way is shared by whoever asks
+// while it runs, unless an action has ended since it started: it may then
+// answer with the state from before the action, so one more read is chained
+// after it (only one, however many ask).
 function refreshReportState(): Promise<void> {
-  if (!loading) {
-    loading = withTimeout(getReportState(), STATE_LIMIT_MS)
-      .then((state) => {
-        if (!state || typeof state !== "object") return;
-        // A dropped report the backend no longer reports was dismissed for
-        // good, so the next one is shown again.
-        if (!state.dropped) hidden.dropped = false;
-        update({ state });
-      })
-      .catch((e) => console.error("report state error", e))
-      .finally(() => {
-        loading = null;
-        schedulePoll();
+  if (loading) {
+    if (loadingSeq === actionSeq) return loading;
+    if (!again) {
+      again = loading.then(() => {
+        again = null;
+        return refreshReportState();
       });
+    }
+    return again;
   }
+  loadingSeq = actionSeq;
+  loading = withTimeout(getReportState(), STATE_LIMIT_MS)
+    .then((state) => {
+      if (!state || typeof state !== "object") return;
+      // A dropped report the backend no longer reports was dismissed for
+      // good, so the next one is shown again.
+      if (!state.dropped) hidden.dropped = false;
+      update({ state });
+    })
+    .catch((e) => console.error("report state error", e))
+    .finally(() => {
+      loading = null;
+      schedulePoll();
+    });
   return loading;
 }
 
@@ -159,9 +191,8 @@ function useReportState() {
 
 // Split into blocks the controller can step through: one long block of text
 // cannot be scrolled with the D-pad, but focus moving from block to block
-// scrolls the box along with it.
-const LINES_PER_BLOCK = 12;
-
+// scrolls the box along with it. previewBlocks keeps each block short enough
+// to fit the box, and the block in focus is outlined.
 function ReportPreviewModal({
   text,
   onSend,
@@ -171,11 +202,8 @@ function ReportPreviewModal({
   onSend: () => void;
   closeModal?: () => void;
 }) {
-  const lines = text.split("\n");
-  const blocks: string[] = [];
-  for (let i = 0; i < lines.length; i += LINES_PER_BLOCK) {
-    blocks.push(lines.slice(i, i + LINES_PER_BLOCK).join("\n"));
-  }
+  const blocks = previewBlocks(text.split("\n"));
+  const [focused, setFocused] = useState(-1);
   return (
     <ConfirmModal
       strTitle="Send this report to the developer?"
@@ -199,12 +227,19 @@ function ReportPreviewModal({
           <Focusable
             key={i}
             onActivate={() => {}}
+            onGamepadFocus={() => setFocused(i)}
+            onGamepadBlur={() => setFocused((f) => (f === i ? -1 : f))}
+            onFocus={() => setFocused(i)}
+            onBlur={() => setFocused((f) => (f === i ? -1 : f))}
             style={{
               fontFamily: "monospace",
               fontSize: theme.fontSize.body,
               color: theme.text.primary,
               whiteSpace: "pre-wrap",
               wordBreak: "break-all",
+              padding: "2px 4px",
+              borderRadius: theme.radius.sm,
+              outline: focused === i ? `2px solid ${theme.info.text}` : "none",
             }}
           >
             {block}
@@ -216,7 +251,7 @@ function ReportPreviewModal({
 }
 
 async function send(id: string, from: Outcome["from"]) {
-  update({ working: true, outcome: null, ready: null });
+  begin({ outcome: null, ready: null });
   let result: ReportResult | null = null;
   let noAnswer = false;
   try {
@@ -227,8 +262,7 @@ async function send(id: string, from: Outcome["from"]) {
   }
   const status = result?.status;
   if (noAnswer || status === "sent" || status === "queued") hidden.wake = true;
-  update({
-    working: false,
+  end({
     outcome: noAnswer
       ? { text: SEND_SLOW_TEXT, tone: "info", from }
       : {
@@ -247,15 +281,15 @@ function openPreview(ready: Ready) {
 }
 
 async function startReport(from: Outcome["from"]) {
-  if (shared.working) return;
-  update({ working: true, outcome: null, ready: null });
+  if (shared.inFlight) return;
+  begin({ outcome: null, ready: null });
   let preview: ReportPreview | null = null;
   try {
     preview = await withTimeout(previewReport(), CALL_TIMEOUT_MS);
   } catch (e) {
     console.error("preview report error", e);
   }
-  update({ working: false });
+  end();
   if (!preview?.success || typeof preview.id !== "string" || !preview.payload) {
     update({
       outcome: {
@@ -266,7 +300,7 @@ async function startReport(from: Outcome["from"]) {
     });
     return;
   }
-  const ready = { id: preview.id, text: JSON.stringify(preview.payload, null, 2), from };
+  const ready = { id: preview.id, text: previewLines(preview.payload).join("\n"), from };
   // Collecting can take a minute or more. If the panel was closed in the
   // meantime, the preview would open over whatever is on screen, a game
   // included, so it waits here until the panel is opened again.
@@ -275,16 +309,19 @@ async function startReport(from: Outcome["from"]) {
 }
 
 async function cancelPending() {
-  if (shared.working) return;
-  update({ working: true, cancelFailed: false });
+  if (shared.inFlight) return;
+  begin({ cancelFailed: false });
   let done = false;
   try {
     done = (await withTimeout(cancelPendingReport(), STATE_LIMIT_MS))?.success === true;
   } catch (e) {
     console.error("cancel report error", e);
   }
-  // A result that said the report was saved for later is no longer true.
-  update({ working: false, cancelFailed: !done, outcome: done ? null : shared.outcome });
+  // A result that said the report was saved for later is no longer true,
+  // and the wake notice that report answered is open again (the backend
+  // shows it again too, D17), unless it was dismissed.
+  if (done && !hidden.wakeDismissed) hidden.wake = false;
+  end({ cancelFailed: !done, outcome: done ? null : shared.outcome });
   await refreshReportState();
 }
 
@@ -311,14 +348,14 @@ function OutcomeRows({ outcome }: { outcome: Outcome }) {
   );
 }
 
-function ReadyRows({ ready }: { ready: Ready }) {
+function ReadyRows({ ready, working }: { ready: Ready; working: boolean }) {
   return (
     <>
       <PanelSectionRow>
         <div style={{ ...rowStyle, color: theme.info.text }}>{READY_TEXT}</div>
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => openPreview(ready)}>
+        <ButtonItem layout="below" disabled={working} onClick={() => openPreview(ready)}>
           Open the report
         </ButtonItem>
       </PanelSectionRow>
@@ -328,7 +365,8 @@ function ReadyRows({ ready }: { ready: Ready }) {
 
 // Beside Copy diagnostics, inside the footer's section.
 export function SendReportRow() {
-  const { state, working, outcome, ready, cancelFailed } = useReportState();
+  const { state, inFlight, outcome, ready, cancelFailed } = useReportState();
+  const working = inFlight > 0;
   if (!state?.enabled) return null;
   const sentRef = state.sent_ref && state.sent_ref !== hidden.sentRef ? state.sent_ref : "";
   return (
@@ -338,7 +376,11 @@ export function SendReportRow() {
           {working ? "Working..." : "Send report to the developer"}
         </ButtonItem>
       </PanelSectionRow>
-      {ready?.from === "footer" && <ReadyRows ready={ready} />}
+      {/* A preview started from the wake notice is offered here once the
+          notice is not on screen to offer it, or it would be lost. */}
+      {ready && (ready.from === "footer" || !wakeNoticeOffersReady(state, outcome)) && (
+        <ReadyRows ready={ready} working={working} />
+      )}
       {outcome?.from === "footer" && <OutcomeRows outcome={outcome} />}
       {state.pending && (
         <>
@@ -375,6 +417,7 @@ export function SendReportRow() {
                 } catch (e) {
                   console.error("dismiss report notice error", e);
                 }
+                actionSeq += 1;
                 await refreshReportState();
               }}
             >
@@ -401,6 +444,7 @@ export function SendReportRow() {
                 } catch (e) {
                   console.error("dismiss report notice error", e);
                 }
+                actionSeq += 1;
                 await refreshReportState();
               }}
             >
@@ -425,25 +469,37 @@ function wakeNoticeText(at: number): string {
           minute: "2-digit",
         })})`
       : "";
-  return `Before the last restart, WiFi didn't come back after your device woke from sleep${when}. Sending a report helps find out why.`;
+  return `Before this device last started up, WiFi didn't come back after it woke from sleep${when}. Sending a report helps find out why.`;
+}
+
+// Whether the wake notice is on screen with its own buttons, where a preview
+// it started is offered. The same conditions WakeFailureNotice renders by.
+function wakeNoticeOffersReady(state: ReportState | null, outcome: Outcome | null): boolean {
+  if (!state?.enabled || outcome?.from === "wake") return false;
+  return state.wake_failure && !hidden.wake && !state.pending;
 }
 
 // Near the top of the panel, for a wake in the previous boot that left WiFi
 // down, until dismissed or answered with a report.
 export function WakeFailureNotice() {
-  const { state, working, outcome, ready } = useReportState();
+  const { state, inFlight, outcome, ready } = useReportState();
+  const working = inFlight > 0;
   const fromHere = outcome?.from === "wake" ? outcome : null;
   if (!state?.enabled || (!state.wake_failure && !fromHere)) return null;
   // A report already sent, saved or waiting answers the notice.
   if (!fromHere && (hidden.wake || state.pending)) return null;
   const dismiss = async () => {
     hidden.wake = true;
-    update({ outcome: null });
+    hidden.wakeDismissed = true;
+    // Only the notice's own result goes with it, not one the footer shows.
+    if (shared.outcome?.from === "wake") update({ outcome: null });
+    else update({});
     try {
       await withTimeout(dismissReportNotice("wake"), STATE_LIMIT_MS);
     } catch (e) {
       console.error("dismiss wake notice error", e);
     }
+    actionSeq += 1;
     await refreshReportState();
   };
   if (fromHere) {
@@ -471,7 +527,7 @@ export function WakeFailureNotice() {
       <Banner variant="warning">{wakeNoticeText(state.wake_failure_at)}</Banner>
       <PanelSection>
         {ready?.from === "wake" ? (
-          <ReadyRows ready={ready} />
+          <ReadyRows ready={ready} working={working} />
         ) : (
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={working} onClick={() => void startReport("wake")}>

@@ -80,13 +80,17 @@ const MESSAGE_TTL_MS = 2 * 60 * 1000;
 const IWD_PIN_NOTICE =
   "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
+// An iw stuck in the driver, or a card the system can no longer use.
+const NOT_RESPONDING_TEXT = "The WiFi card isn't responding. Restart the device.";
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
 // Prevent lag spikes is saved as off, so it does not come back by itself.
 // The network settings are written to the saved networks without a
 // reconnect, so the connection in use keeps them until WiFi next connects.
 // The update channel and notices are kept (main.py _reset_locked), and
-// streaming auto mode starts again from its defaults.
+// streaming auto mode starts again from its defaults. Allow WPA2 is only
+// recorded from 0.24.5-beta on (wpa2_uuids), so one allowed on 0.23.0 to
+// 0.24.4-beta stays allowed, and the text says so.
 const RESET_CONFIRM_TEXT =
   "This turns off what the plugin applied and puts its WiFi settings back to their defaults, except that Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are removed from the networks they were set on, from the next time WiFi connects. Allow WPA2 is only put back where it was allowed with this version or later, since older versions kept no record of it (the README has the command for the rest). Streaming auto mode is turned off and its app choices and process names are cleared. Update settings are kept.";
 // Reset does not reconnect, so it does not say WiFi will.
@@ -261,7 +265,9 @@ function regionName(code: string): string {
 // region and the one asked for, 99 the card's own.
 function governingName(code: string, asked: string): string {
   if (code === "00") return "the world default";
-  if (code === "98") return `a mix of its own region and ${regionName(asked)}`;
+  // With nothing asked for here, the other half is the system's own choice.
+  if (code === "98")
+    return asked ? `a mix of its own region and ${regionName(asked)}` : "a mix of its own region and the system's";
   if (code === "99") return "its own region";
   return regionName(code);
 }
@@ -1314,16 +1320,20 @@ function Content() {
   // anything has been applied. asleep is NetworkManager left paused, most
   // often after a wake it missed, which a restart clears.
   const wifiState = status?.live?.wifi_state ?? "disconnected";
+  // no_device is no wireless card in sysfs at all: an adapter unplugged, or a
+  // built-in card that fell off the bus, which only a restart brings back.
   const disconnectedText =
-    wifiState === "no_device" || wifiState === "not_responding" || wifiState === "unavailable"
-      ? "The WiFi card isn't responding. Restart the device."
-      : wifiState === "radio_off"
-        ? "WiFi is off. Turn it on in Steam's settings."
-        : wifiState === "asleep"
-          ? "WiFi is paused by the system. Restart the device."
-          : s?.last_applied
-            ? "Not connected to WiFi."
-            : "Not connected to WiFi. Connect first, then optimize.";
+    wifiState === "no_device"
+      ? "No WiFi card was found. If this device has one built in, restart the device."
+      : wifiState === "not_responding" || wifiState === "unavailable"
+        ? NOT_RESPONDING_TEXT
+        : wifiState === "radio_off"
+          ? "WiFi is off. Turn it on in Steam's settings."
+          : wifiState === "asleep"
+            ? "WiFi is paused by the system. Restart the device."
+            : s?.last_applied
+              ? "Not connected to WiFi."
+              : "Not connected to WiFi. Connect first, then optimize.";
 
   // Under iwd Optimize Safe leaves the lock out, so it is not one of the
   // things to wait for there, or "All good" never came. A lock that is on
@@ -1353,6 +1363,7 @@ function Content() {
         lastApplied={s?.last_applied ?? 0}
         lastEnforced={status?.live?.last_enforced}
         streaming={status?.live}
+        fixesOn={!!(s?.power_save_disabled || s?.buffer_tuning_enabled || s?.cake_enabled)}
         deviceLabel={deviceParts.length ? deviceParts.join(", ") : undefined}
         showDetails={showDetails}
         onShowDetails={handleShowDetails}
@@ -1388,6 +1399,8 @@ function Content() {
       {supportTier === 3 && (
         <Banner variant="info">
           Unknown WiFi hardware detected. Some optimizations may not apply.
+          Use Copy diagnostics at the bottom of this panel and report it on
+          GitHub.
         </Banner>
       )}
 
@@ -1507,11 +1520,12 @@ function Content() {
               {status.wpa2_only_stronger.signal} of 100, against{" "}
               {status.wpa2_only_stronger.current_signal} for the one in use) only
               offers WPA2, and this network is saved as WPA3-only, so this device
-              can't use it. Access points that offer both keep using WPA3, but
-              one that offers only WPA3 may then not be joined automatically.
-              Only allow this if that access point is yours:
-              anyone nearby can broadcast your network's name. Allowing it
-              reconnects WiFi. Reset settings puts it back to WPA3 only.
+              can't use it. Only allow this if that access point is yours:
+              anyone nearby can broadcast your network's name. The network then
+              accepts WPA2 from any access point with its name, which makes its
+              password easier to attack. An access point that offers only WPA3
+              may then not be joined automatically. Allowing it reconnects
+              WiFi. Reset settings puts it back to WPA3 only.
             </>
           )}
           {errors.allow_wpa2 && (
@@ -1645,6 +1659,11 @@ function Content() {
       {status?.success !== false && !connected && (
         <Banner variant="error">{disconnectedText}</Banner>
       )}
+      {/* NetworkManager can still say connected while an iw is stuck in the
+          driver (C1 (c)), and nothing then works until a restart. */}
+      {status?.success !== false && connected && status?.live?.wifi_state === "not_responding" && (
+        <Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>
+      )}
 
       {/* Backend switch result banner */}
       {backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
@@ -1729,7 +1748,7 @@ function Content() {
         <InfoRow
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
-          explanation="The OS saves WiFi power in several places: the wireless chip, the PCIe link between the chip and the CPU, and low power modes in the driver. These can cause latency spikes, packets sent in batches, and lower throughput during a long stream. This turns them off, so the WiFi hardware stays fully awake. It uses a little more battery."
+          explanation="The OS saves WiFi power in several places: the wireless chip, the PCIe link between the chip and the CPU, and low power modes in the driver. These can cause latency spikes, packets sent in batches, and lower throughput during a long stream. This turns them off, so the WiFi hardware stays fully awake. It uses a little more battery. On some cards part of it needs a restart to take effect."
           {...gatedBadge("power_save", s?.power_save_disabled)}
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
@@ -1741,8 +1760,8 @@ function Content() {
         />
         <InfoRow
           label="Stop background scanning"
-          subtitle="Pins one access point. Turn off to roam."
-          explanation="While connected, your device scans now and then for a better access point. Each scan takes the radio off your channel for a moment, which can drop packets and make a game stream stutter. Pinning the connection to one access point turns off these roaming scans. It picks the strongest access point of your network, unless the one you are on is already good. The lock only applies to the network you turn it on for, so other networks are not affected. On that network you stay on the pinned access point until you turn this off or move the lock. Turning it on or off reconnects WiFi for a few seconds."
+          subtitle="The access point lock: pins one access point. Turn off to roam."
+          explanation="While connected, your device scans now and then for a better access point. Each scan takes the radio off your channel for a moment, which can drop packets and make a game stream stutter. Pinning the connection to one access point turns off these roaming scans. It picks the strongest access point of your network, unless the one you are on is already good. It only applies to the network you turn it on for. You stay on that access point until you turn this off or move the lock. After a wake, if it is weak, the lock moves to a clearly stronger one of this network, unless a game or stream is running. Turning it on or off reconnects WiFi for a few seconds."
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
             ? otherNetworkBadge
             : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
@@ -1812,7 +1831,9 @@ function Content() {
                   data: REGION_UNMANAGED,
                   label: regdomain.setting
                     ? "Not managed (put back the region from before)"
-                    : `Not managed (${regdomain.governing || "unknown"})`,
+                    : `Not managed (${
+                        regdomain.governing ? governingName(regdomain.governing, regdomain.setting) : "unknown"
+                      })`,
                 },
                 ...REGION_OPTIONS,
                 ...(regdomain.setting &&
@@ -1856,7 +1877,8 @@ function Content() {
         {regdomain?.readable && !regdomain.changeable && (
           <PanelSectionRow>
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
-              WiFi region: {regdomain.governing || "unknown"}. This device's
+              WiFi region: the card uses{" "}
+              {regdomain.governing ? governingName(regdomain.governing, regdomain.setting) : "an unknown region"}. This device's
               WiFi card sets its own region, so it cannot be changed here. That
               is normal for many cards{isDeck ? ", the Steam Deck's included," : ""} and
               does not mean a band is missing.
@@ -1866,7 +1888,7 @@ function Content() {
         <InfoRow
           label="Force 5 GHz band"
           subtitle="Avoid 2.4 GHz Bluetooth interference"
-          explanation={`Bluetooth operates on the 2.4 GHz band${
+          explanation={`This is the band preference. Bluetooth operates on the 2.4 GHz band${
             isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
           }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only turn this on if your router has 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you. If you later take the device out of range of this network's 5 GHz access points, it is released after about a minute so WiFi can reconnect. Turning it on or off reconnects WiFi for a few seconds.${
             supports6GHz
@@ -1914,7 +1936,7 @@ function Content() {
           <InfoRow
             label="Force 6 GHz band"
             subtitle="Stay on 6 GHz where your router has it"
-            explanation="6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Turning it on or off reconnects WiFi. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
+            explanation="This is the band preference. 6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Turning it on or off reconnects WiFi. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
             {...(bandOther && on6GHz && !band6Error
               ? otherNetworkBadge
               : getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null))}
@@ -2027,7 +2049,7 @@ function Content() {
         <InfoRow
           label="Disable IPv6"
           subtitle="Use IPv4 only on this network"
-          explanation="Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only turn this on if you have one of those problems. Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for a few seconds."
+          explanation="This is the IPv6 setting. Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only turn this on if you have one of those problems. Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for a few seconds."
           {...(status?.live?.ipv6_other_network && s?.ipv6_disabled && !errors.ipv6
             ? otherNetworkBadge
             : getBadge("ipv6", status, errors.ipv6 ?? null))}

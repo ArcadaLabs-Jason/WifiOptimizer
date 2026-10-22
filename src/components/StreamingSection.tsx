@@ -25,12 +25,15 @@ interface StreamingSectionProps {
   onToggle: (key: string, fn: () => Promise<MethodResult>) => Promise<MethodResult | undefined>;
 }
 
-// On the Realtek (rtw88) card of the Steam Deck LCD, auto mode never keeps
-// the driver options file, so the options that take effect only when the
-// driver loads are not in effect in auto mode (main.py set_power_save,
-// persist=not auto).
-const RTW88_AUTO_TEXT =
-  " On the Steam Deck LCD and other devices with this Realtek WiFi card, auto mode also doesn't keep the driver's settings between streams. Some of them only take effect when the driver loads at startup, and those are meant to make waking from sleep more reliable, so in auto mode they are not in effect.";
+// Auto mode never keeps the driver options file (main.py set_power_save,
+// persist=not auto, and _drop_persistent_power_save), so on every driver
+// whose profile has options read only when the driver loads, those options
+// are not in effect in auto mode. These are the DRIVER_PROFILES keys with
+// modprobe_options (regress.py ties the two): rtw88 and rtw89 (Realtek),
+// mt7921e (MediaTek), iwlwifi (Intel).
+export const LOAD_TIME_DRIVERS = ["rtw88", "rtw89", "mt7921e", "iwlwifi"];
+const LOAD_TIME_AUTO_TEXT =
+  " On Realtek, MediaTek and Intel cards (the Steam Deck LCD, ROG Ally and Legion Go among them), driver settings that only apply at startup are not in effect in auto mode.";
 
 // Streaming auto mode: when the fixes apply, rather than another fix. Placed
 // after Advanced for that reason. Most of what is here is about making it
@@ -98,14 +101,19 @@ export function StreamingSection({
     governed.length > 1
       ? `${governed.slice(0, -1).join(", ")} and ${governed[governed.length - 1]}`
       : governed[0] ?? "";
+  // With none of them on, a stream has nothing to turn on either.
+  const fixesText = governed.length
+    ? " Fixes are on."
+    : " Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) are all off, so there is nothing to turn on.";
   let stateText: string;
   if (active && app) {
-    stateText = `Streaming: ${app} (${process}). Fixes are on.`;
+    stateText = `Streaming: ${app} (${process}).${fixesText}`;
   } else if (active && held) {
-    stateText = "Held on by you. Fixes are on until you turn this off or restart the device.";
+    const until = "until you turn off Keep fixes on or restart the device.";
+    stateText = governed.length ? `Held on by you. Fixes are on ${until}` : `Held on by you ${until}${fixesText}`;
   } else if (active) {
     // Flagged as running before the app has been named, just after a reload.
-    stateText = "A stream is running. Fixes are on.";
+    stateText = `A stream is running.${fixesText}`;
   } else if (governed.length) {
     stateText = `No streaming app running. ${governedList} ${
       governed.length > 1 ? "are" : "is"
@@ -125,7 +133,7 @@ export function StreamingSection({
             : "Off: enabled fixes apply all the time"
         }
         explanation={`Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.${
-          settings?.driver === "rtw88" ? RTW88_AUTO_TEXT : ""
+          LOAD_TIME_DRIVERS.includes(settings?.driver ?? "") ? LOAD_TIME_AUTO_TEXT : ""
         } If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.`}
         checked={enabled}
         disabled={disabled}

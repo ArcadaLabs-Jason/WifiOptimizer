@@ -10554,7 +10554,8 @@ section("F23 the README's install and update claims hold for the versions they n
 try:
     ok("curl -fsSL" in _F_RD and "curl -sL" not in _F_RD, "the one-liner fails on an HTTP error")
     _upd = _between(_F_RD, "**Updating:**", "\n\n")
-    ok("From v0.19.0-beta on" in _upd and "From v0.24.2 on" in _upd and "Keep fixes on" in _upd,
+    # Pass 5 F1: the game refusal first shipped in v0.24.2-beta.
+    ok("From v0.19.0-beta on" in _upd and "From v0.24.2-beta on" in _upd and "Keep fixes on" in _upd,
        "reload and the game refusal are version-qualified, and Keep fixes on is named")
     ok("from late 2024 or newer" in _F_RD, "the zip-over-install claim names the Decky it holds for")
 except Exception as _e:
@@ -10699,9 +10700,10 @@ except Exception as _e:
 
 section("F5 pass 4: the wake notice says which boot and when, and goes once answered")
 try:
+    # Pass 5 F13: the previous boot may have ended in a power-off, not a restart.
     ok("Last time your device woke" not in _P4_SR
-       and "Before the last restart, WiFi didn't come back after your device woke from sleep" in _P4_SR,
-       "it is about the boot before the last restart")
+       and "Before this device last started up, WiFi didn't come back after it woke from sleep" in _P4_SR,
+       "it is about the boot before this device last started up")
     ok("wakeNoticeText(state.wake_failure_at)" in _P4_SR and "new Date(at * 1000)" in _P4_SR,
        "with the wake's date and time")
     _p4_wn = _between(_P4_SR, "export function WakeFailureNotice()", "\n}")
@@ -10819,7 +10821,8 @@ try:
     ok("only put back where it was allowed with this version or later" in _rw
        and "older versions kept no record" in _rw,
        "the confirmation does not promise to undo Allow WPA2 set by a version that kept no record")
-    ok("version 0.24.5 or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n"),
+    # Pass 5 F1: the README names 0.24.5-beta, the first release with the record.
+    ok("version 0.24.5-beta or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n"),
        "which matches the README's exception")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -10888,9 +10891,10 @@ try:
     ok('sudo nmcli connection modify "NAME" 802-11-wireless-security.key-mgmt sae' in _F_RD,
        "the command that puts a network back to WPA3 only")
     ok("resets that too" not in _F_RD, "rejoining is not claimed to undo it")
-    ok("0.24.5 or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n")
+    # Pass 5 F1: the record ships first in 0.24.5-beta, which sorts below 0.24.5.
+    ok("0.24.5-beta or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n")
        and "Reset puts the network back to WPA3 only. |" not in _F_RD
-       and "0.24.5 or later" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
+       and "0.24.5-beta or later" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
        "Reset's claim names the versions it holds for, in the paragraph and the table")
     ok(m.DEFAULT_SETTINGS.get("wpa2_uuids") == [] and "wpa2_uuids" in _F_MAIN,
        "which is the record this version keeps")
@@ -10920,11 +10924,12 @@ except Exception as _e:
 
 section("F25 pass 4: auto mode says it leaves out the Realtek driver's load-time settings")
 try:
-    ok('settings?.driver === "rtw88" ? RTW88_AUTO_TEXT : ""' in _F_SS
-       and "doesn't keep the driver's settings between streams" in _F_SS,
-       "the panel says so on the rtw88 card")
-    ok("Realtek (rtw88)" in _F_RD
-       and "doesn't keep the driver's settings between streams" in _between(_F_RD, "**Streaming auto mode**", "## Hardware"),
+    # Pass 5 F2: every driver with load-time options, not rtw88 alone.
+    ok('LOAD_TIME_DRIVERS.includes(settings?.driver ?? "") ? LOAD_TIME_AUTO_TEXT : ""' in _F_SS
+       and "not in effect in auto mode" in _between(_F_SS, "const LOAD_TIME_AUTO_TEXT", ";\n"),
+       "the panel says so on the rtw88 card, and on every card with load-time options")
+    ok("driver settings that only apply at startup are not in effect in auto mode"
+       in _between(_F_RD, "**Streaming auto mode**", "## Hardware"),
        "and the README's streaming section")
     ok("persist=not auto" in _F_MAIN, "which is what auto mode does (set_power_save never keeps the options file)")
 except Exception as _e:
@@ -10942,6 +10947,296 @@ try:
     _p4_new = _F_RD + _P4_SR + _F_SS + _P4_PH + _F_PF + _P4_INST
     ok(all(ord(ch) < 128 for ch in _p4_new) and "—" not in _p4_new and "–" not in _p4_new,
        "the changed text is plain ASCII")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 5: FRONT ----
+import subprocess as _p5f_sp, shutil as _p5f_sh
+_P5F_SR = _src("src/components/SendReport.tsx"); _P5F_PH = _src("src/components/PanelHeader.tsx")
+_P5F_RP = _src("src/reportPreview.ts")
+def _p5f_flat(text):
+    return re.sub(r"\s+", " ", text)
+
+section("F1 pass 5: Reset and the README name the releases that carry what they describe")
+try:
+    _p5f_rc = _between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n")
+    # The released wording (e86517b) already covers this: it promises Allow WPA2
+    # back only where this version or a later one recorded it.
+    ok("Allow WPA2 is only put back where it was allowed with this version or later" in _p5f_rc
+       and "older versions kept no record of it" in _p5f_rc,
+       "the Reset confirmation says which Allow WPA2 it can take off (not one allowed on 0.23.0 to 0.24.4-beta)")
+    ok("0.24.5-beta or later" in _between(_F_RD, "| Allow WPA2 here |", "\n")
+       and "0.24.5-beta or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n")
+       and "with a version before 0.24.5-beta wasn't recorded" in _F_RD,
+       "the README's three Allow WPA2 version notes name 0.24.5-beta, the first release with the record")
+    ok(not re.search(r"0\.24\.5(?!-beta)", _F_RD), "no README line names a 0.24.5 that is not the beta")
+    ok("from v0.24.0-beta on also twice a day" in _F_RD and "v0.24.0 on" not in _F_RD,
+       "the background update check names v0.24.0-beta (there is no v0.24.0)")
+    ok("From v0.24.2-beta on, the button won't start an update" in _F_RD,
+       "the game check on the update button names v0.24.2-beta, which carries it")
+    ok("From v0.24.3-beta on, releases also carry `wifi-optimizer.zip`" in _F_SEC,
+       "SECURITY.md names v0.24.3-beta as the first release with the zip")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F2 pass 5: the auto mode caveat covers every driver with load-time options")
+try:
+    _p5f_ld = re.search(r"LOAD_TIME_DRIVERS = \[([^\]]*)\]", _F_SS)
+    _p5f_set = set(re.findall(r'"(\w+)"', _p5f_ld.group(1))) if _p5f_ld else set()
+    _p5f_prof = {k for k, v in m.DRIVER_PROFILES.items() if v.get("modprobe_options")}
+    ok(_p5f_set and _p5f_set == _p5f_prof,
+       f"the panel's LOAD_TIME_DRIVERS {sorted(_p5f_set)} are the profiles with modprobe options {sorted(_p5f_prof)}")
+    ok({"mt7921e", "iwlwifi", "rtw88", "rtw89"} <= _p5f_set and "ath11k_pci" not in _p5f_set,
+       "so it shows for mt7921e and iwlwifi too, and not for ath11k_pci")
+    _p5f_ex = _between(_F_SS, 'label="Only fix while streaming"', "checked=")
+    ok('LOAD_TIME_DRIVERS.includes(settings?.driver ?? "") ? LOAD_TIME_AUTO_TEXT : ""' in _p5f_ex
+       and 'settings?.driver === "rtw88"' not in _F_SS,
+       "the explanation keys the caveat on that list, not on rtw88 alone")
+    _p5f_t = _between(_F_SS, "const LOAD_TIME_AUTO_TEXT", ";\n")
+    ok(all(w in _p5f_t for w in ("Realtek", "MediaTek", "Intel")) and "not in effect in auto mode" in _p5f_t,
+       "and names the three vendors")
+    _p5f_st = _between(_F_RD, "**Streaming auto mode**", "## Hardware")
+    ok(all(w in _p5f_st for w in ("Realtek, MediaTek and Intel", "not in effect in auto mode"))
+       and "Realtek (rtw88)" not in _F_RD, "the README's streaming section says the same")
+    ok("On some cards part of it needs a restart to take effect."
+       in _between(_F_IX, 'label="Prevent lag spikes"', "checked=")
+       and "On some cards part of it needs a restart to take effect."
+       in _between(_F_RD, "| Prevent lag spikes |", "\n"),
+       "Prevent lag spikes says part of it waits for the next restart on some cards, in the panel and the README")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F3 pass 5: auto mode names the fixes only when one is on")
+try:
+    ok("fixesOn: boolean;" in _P5F_PH and '"Auto mode: no stream"' in _P5F_PH
+       and '"Auto mode: held on"' in _P5F_PH and '"Auto mode: stream running"' in _P5F_PH
+       and '${fixesOn ? ", fixes on" : ""}' in _P5F_PH,
+       "the header leaves out fixes on and fixes paused when none is on")
+    ok("fixesOn={!!(s?.power_save_disabled || s?.buffer_tuning_enabled || s?.cake_enabled)}"
+       in _between(_F_IX, "<PanelHeader", "/>"), "the panel tells it whether any of the three is on")
+    ok("until you turn this off" not in _F_SS
+       and 'const until = "until you turn off Keep fixes on or restart the device.";' in _F_SS
+       and "`Held on by you. Fixes are on ${until}`" in _F_SS,
+       "the held line names Keep fixes on")
+    _p5f_state = _between(_F_SS, "let stateText: string;", "return (")
+    ok("Fixes are on." not in _p5f_state and "${fixesText}" in _p5f_state
+       and "there is nothing to turn on" in _between(_F_SS, "const fixesText", ";\n"),
+       "the streaming lines say fixes are on only when one is")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F4 pass 5: the region is named in words, not 00, 98 or 99")
+try:
+    _p5f_adv = _between(_F_IX, '<PanelSection title="Advanced">', 'label="Force 5 GHz band"')
+    ok('Not managed (${regdomain.governing || "unknown"})' not in _p5f_adv
+       and "WiFi region: {regdomain.governing" not in _p5f_adv,
+       "neither the Not managed option nor the fixed-region line shows the bare code")
+    ok(_p5f_adv.count("governingName(regdomain.governing, regdomain.setting)") >= 2,
+       "both go through governingName")
+    ok("the system's" in _between(_F_IX, "function governingName(", "\n}"),
+       "98 with nothing asked for here still reads as a sentence")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F5 pass 5: the names the messages use are given at the controls")
+try:
+    ok('subtitle="The access point lock: pins one access point. Turn off to roam."' in _F_IX,
+       "Stop background scanning is the access point lock")
+    ok("This is the band preference." in _between(_F_IX, 'label="Force 5 GHz band"', "checked=")
+       and "This is the band preference." in _between(_F_IX, 'label="Force 6 GHz band"', "checked="),
+       "both band toggles are the band preference")
+    ok("This is the IPv6 setting." in _between(_F_IX, 'label="Disable IPv6"', "checked="),
+       "Disable IPv6 is the IPv6 setting")
+    ok("| Stop background scanning | The access point lock." in _F_RD
+       and "| Force 5 GHz band | The band preference." in _F_RD
+       and "| Force 6 GHz band | The band preference, for 6 GHz." in _F_RD
+       and "| Disable IPv6 | The IPv6 setting." in _F_RD,
+       "and the README's table gives the same names its Reset and uninstall text use")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F6 pass 5: no card found is not a card not responding, and a stuck card shows while connected")
+try:
+    _p5f_dt = _between(_F_IX, "const disconnectedText =", ";\n")
+    ok(re.search(r'wifiState === "no_device"\s*\? "No WiFi card was found\. If this device has one built in, restart the device\."', _p5f_dt)
+       and '"no_device" || wifiState === "not_responding"' not in _p5f_dt,
+       "no_device has its own text")
+    ok('connected && status?.live?.wifi_state === "not_responding" && (' in _F_IX
+       and '<Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>' in _F_IX
+       and 'const NOT_RESPONDING_TEXT = "The WiFi card isn\'t responding. Restart the device.";' in _F_IX,
+       "C1 (c): not_responding on the connected path shows the restart text")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F7 pass 5: unknown hardware says what to do")
+try:
+    ok("Unknown WiFi hardware detected. Some optimizations may not apply. Use Copy diagnostics at the bottom of this panel and report it on GitHub."
+       in _p5f_flat(_between(_F_IX, "{supportTier === 3 && (", "</Banner>")),
+       "the tier-3 banner points at Copy diagnostics and GitHub")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F8 pass 5: SECURITY.md says the beta channel can offer an older signed release")
+try:
+    ok("On the beta channel the updater offers the newest release GitHub lists. If newer releases are taken down, that is an older signed one, offered as Go back to. Nothing installs without your tap, and the stable channel never goes back."
+       in _between(_F_SEC, "## Signed releases", "Release key"),
+       "the rollback a signature does not prevent is said")
+    ok("update_available = latest != current" in _F_MAIN and "latest_tuple > current_tuple" in _F_MAIN,
+       "which is what the update check does on each channel")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F9 pass 5: Allow WPA2 says it is for the whole network until Reset")
+try:
+    _p5f_w = _p5f_flat(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"))
+    ok("The network then accepts WPA2 from any access point with its name, which makes its password easier to attack."
+       in _p5f_w and "Reset settings puts it back to WPA3 only." in _p5f_w, "in the banner")
+    ok("The network then accepts WPA2 from any access point with its name, which makes its password easier to attack."
+       in _between(_F_RD, "| Allow WPA2 here |", "\n"), "and in the README")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F10 pass 5: the README says disabling leaves Prevent lag spikes' files in force (J-g)")
+try:
+    _p5f_un = _between(_F_RD, "## Uninstall", "## Building from source")
+    ok("stops it from applying its changes again" not in _F_RD
+       and "the files behind Prevent lag spikes stay in force" in _p5f_un
+       and "tap **Reset settings** first, then disable it, then restart the device." in _p5f_un,
+       "what stays in force, and the order Reset, disable, restart")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F11 pass 5: Send report panel state edge cases")
+try:
+    _p5f_wn = _between(_P5F_SR, "export function WakeFailureNotice()", "\n}")
+    _p5f_ds = _between(_p5f_wn, "const dismiss = async () => {", "};")
+    ok('if (shared.outcome?.from === "wake") update({ outcome: null });' in _p5f_ds
+       and "update({ outcome: null });\n    try" not in _p5f_ds,
+       "N-1 dismissing the wake notice clears only its own result, not the footer's")
+    _p5f_rw = _between(_P5F_SR, "export function SendReportRow()", "\n}")
+    ok('ready && (ready.from === "footer" || !wakeNoticeOffersReady(state, outcome)) && (' in _p5f_rw
+       and 'ready?.from === "footer" && <ReadyRows' not in _p5f_rw,
+       "N-2 a preview from the wake notice is offered in the footer once the notice is gone")
+    _p5f_wo = _between(_P5F_SR, "function wakeNoticeOffersReady(", "\n}")
+    ok('outcome?.from === "wake"' in _p5f_wo and "state.wake_failure && !hidden.wake && !state.pending" in _p5f_wo
+       and "if (!fromHere && (hidden.wake || state.pending)) return null;" in _p5f_wn,
+       "by the same conditions the notice renders by")
+    _p5f_rs = _between(_P5F_SR, "function refreshReportState()", "\n}")
+    ok(0 <= _p5f_rs.find("if (loading) {") < _p5f_rs.find("if (loadingSeq === actionSeq) return loading;")
+       < _p5f_rs.find("again = loading.then(") < _p5f_rs.find("loadingSeq = actionSeq;")
+       and "return refreshReportState();" in _between(_p5f_rs, "again = loading.then(", "return again;"),
+       "N-4 a read under way that started before an action ended is followed by one fresh read")
+    ok("actionSeq += 1;" in _between(_P5F_SR, "function end(", "\n}")
+       and all(0 <= _between(_P5F_SR, k, "Dismiss\n").find("actionSeq += 1;")
+               < _between(_P5F_SR, k, "Dismiss\n").find("await refreshReportState();")
+               for k in ('dismissReportNotice("dropped")', 'dismissReportNotice("sent")'))
+       and 0 <= _p5f_ds.find("actionSeq += 1;") < _p5f_ds.find("await refreshReportState();"),
+       "N-4 a send, a cancel and every Dismiss count as an action before the state is read again")
+    ok("working: boolean;" not in _P5F_SR and "inFlight: number;" in _P5F_SR
+       and "inFlight: shared.inFlight + 1" in _P5F_SR and "Math.max(0, shared.inFlight - 1)" in _P5F_SR
+       and "update({ working: false" not in _P5F_SR,
+       "N-5 operations in flight are counted, so the first to end does not re-enable the buttons")
+    ok('<ButtonItem layout="below" disabled={working} onClick={() => openPreview(ready)}>' in _P5F_SR,
+       "N-5 Open the report is disabled while something is working")
+    _p5f_cp = _between(_P5F_SR, "async function cancelPending()", "\n}")
+    ok("if (done && !hidden.wakeDismissed) hidden.wake = false;" in _p5f_cp
+       and "hidden.wakeDismissed = true;" in _p5f_ds,
+       "N-3 withdrawing a saved report brings the wake notice back, unless Dismiss hid it (D17)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F12 pass 5: the report preview can be read with the D-pad")
+try:
+    ok("previewBlocks(text.split(\"\\n\"))" in _P5F_SR and "LINES_PER_BLOCK" not in _P5F_SR
+       and "JSON.stringify(preview.payload, null, 2)" not in _P5F_SR
+       and 'previewLines(preview.payload).join("\\n")' in _P5F_SR,
+       "the preview is built line by line and cut into short blocks")
+    ok("outline: focused === i ?" in _P5F_SR and "onGamepadFocus={() => setFocused(i)}" in _P5F_SR
+       and "onFocus={() => setFocused(i)}" in _P5F_SR,
+       "the block in focus is outlined")
+    _p5f_node = _p5f_sh.which("node")
+    if not _P5F_RP:
+        ok(False, "src/reportPreview.ts holds the preview builder")
+    elif not _p5f_node:
+        if os.environ.get("REGRESS_REQUIRE_LINUX"):
+            ok(False, "node is needed to run the preview builder")
+        else:
+            print("SKIP  no node here to run the preview builder; CI runs it")
+    else:
+        _p5f_dir = tempfile.mkdtemp()
+        _p5f_js = os.path.join(_p5f_dir, "run.mjs")
+        _p5f_payload = {
+            "success": True,
+            "device_info": {"driver": "rtw88", "iw_dev": "phy#0\n\tInterface wlan0\n\t\ttype managed\n",
+                            "os_release": "NAME=\"SteamOS\"\nVERSION_ID=3.8\n"},
+            "extras": {"kernel_log": ["x" * 1500, "short"], "empty": {}, "none": None, "ctl": "a\x01b\nc"},
+        }
+        open(_p5f_js, "w").write(
+            "import { pathToFileURL } from 'node:url';\n"
+            "const mod = await import(pathToFileURL(process.argv[2]).href);\n"
+            "const payload = JSON.parse(process.argv[3]);\n"
+            "const lines = mod.previewLines(payload);\n"
+            "console.log(JSON.stringify({lines, blocks: mod.previewBlocks(lines),"
+            " max: [mod.BLOCK_LINES, mod.BLOCK_CHARS]}));\n")
+        _p5f_r = _p5f_sp.run([_p5f_node, "--experimental-strip-types", "--no-warnings", _p5f_js,
+                              os.path.abspath("src/reportPreview.ts"), json.dumps(_p5f_payload)],
+                             capture_output=True, text=True, timeout=60)
+        ok(_p5f_r.returncode == 0, f"the preview builder runs under node ({_p5f_r.stderr.strip()[:200]})")
+        _p5f_out = json.loads(_p5f_r.stdout) if _p5f_r.returncode == 0 else {"lines": [], "blocks": [], "max": [0, 0]}
+        _p5f_lines, _p5f_blocks = _p5f_out["lines"], _p5f_out["blocks"]
+        ok(_p5f_out["max"] == [6, 600], "blocks are capped at 6 lines and 600 characters")
+        ok("iw_dev:" in [l.strip() for l in _p5f_lines] and any(l.strip() == "Interface wlan0" for l in _p5f_lines)
+           and any(l.strip() == "type managed" for l in _p5f_lines)
+           and not any("\\n" in l or "\\t" in l for l in _p5f_lines),
+           "a multi-line value is shown as its lines, with no \\n or \\t escapes")
+        ok(any(l.strip() == 'NAME="SteamOS"' for l in _p5f_lines) and any("a\\u0001b" in l for l in _p5f_lines),
+           "its text is kept, with a control character shown escaped")
+        ok(_p5f_blocks and all(len(b.split("\n")) <= 6 and len(b) <= 600 + 5 for b in _p5f_blocks),
+           f"no block is over 6 lines or about 600 characters (largest {max((len(b) for b in _p5f_blocks), default=0)})")
+        ok("".join(_p5f_blocks).count("x") >= 1500 and "\n".join(_p5f_blocks).replace("\n", "")
+           == "".join(_p5f_lines), "the long line is cut across blocks, and nothing is lost")
+        ok(any(l.strip() == "empty: {}" for l in _p5f_lines) and any(l.strip() == "none: null" for l in _p5f_lines)
+           and any(l.strip() == "success: true" for l in _p5f_lines), "empty objects, null and booleans are shown")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F13 pass 5: the wake notice does not assume a restart")
+try:
+    ok("Before the last restart" not in _P5F_SR
+       and "Before this device last started up, WiFi didn't come back after it woke from sleep${when}. Sending a report helps find out why."
+       in _P5F_SR, "the previous boot may have ended in a power-off")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F15 pass 5: the README says how to use 6 GHz on NetworkManager 1.58.0 with a network saved for WPA2")
+try:
+    _p5f_6 = _between(_F_RD, "| Force 6 GHz band |", "\n")
+    ok("a network saved for WPA2 works from NetworkManager 1.58.1" in _p5f_6
+       and "(expected with SteamOS 3.9)" in _p5f_6, "the version notes are kept")
+    ok("On 1.58.0, set your router to WPA3 only, then forget the network and join it again so it is saved for WPA3."
+       in _p5f_6, "and forgetting and joining again with the router on WPA3 only is the way out on 1.58.0")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F16 pass 5: the access point lock says it moves to a clearly stronger access point after a wake")
+try:
+    ok("After a wake, if it is weak, the lock moves to a clearly stronger one of this network, unless a game or stream is running."
+       in _between(_F_IX, 'label="Stop background scanning"', "checked="), "in the lock's explanation")
+    _p5f_l16r = _between(_F_RD, "| Stop background scanning |", "\n")
+    ok("it only moves on its own after a wake, and only from a weak access point to a clearly stronger one, never during a game or stream."
+       in _p5f_l16r and "It never moves on its own" not in _p5f_l16r,
+       "and in the README's row, which no longer says it never moves on its own")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F pass 5: the changed text is plain ASCII with no dashes as punctuation")
+try:
+    _p5f_new = _F_RD + _F_SEC + _F_IX + _F_SS + _P5F_PH + _P5F_SR + _P5F_RP + _F_TY
+    ok(all(ord(ch) < 128 for ch in _p5f_new), "plain ASCII")
+    ok(not re.search(r"\w -{1,2} \w", _p5f_flat(_between(_F_RD, "**Streaming auto mode**", "## Hardware")
+                                                  + _between(_F_RD, "## Uninstall", "## Building from source"))),
+       "no spaced hyphen used as a dash in the changed README sections")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -11324,7 +11619,8 @@ try:
     _later = [(t + 2000, w, msg) for t, w, msg in _FAIL]
     ok(asyncio.run(RepStub(journal=_wj(_later)).get_report_state()).get("wake_failure") is True,
        "while a later failed wake brings it back")
-    ok("WiFi didn't come back after your device woke from sleep" in _tsx_rep
+    # Pass 5 F13: worded for a previous boot that may have ended in a power-off.
+    ok("WiFi didn't come back after it woke from sleep" in _tsx_rep
        and 'startReport("wake")' in _tsx_rep and 'dismissReportNotice("wake")' in _tsx_rep,
        "the notice says so plainly, with Send report and Dismiss")
 except Exception as _e:
@@ -11333,7 +11629,8 @@ except Exception as _e:
 
 section("Send report: the panel shows it, then asks once")
 try:
-    ok("previewReport()" in _tsx_rep and "JSON.stringify(preview.payload, null, 2)" in _tsx_rep
+    # Pass 5 F12: the payload is shown line by line (previewLines), not as one JSON.stringify.
+    ok("previewReport()" in _tsx_rep and "previewLines(preview.payload)" in _tsx_rep
        and "send(id, from)" in _tsx_rep and 'callable<[id: string], ReportResult>("send_report")' in _tsx_rep,
        "tapping the button shows the preview's payload, and only its id is sent")
     ok('strOKButtonText="Send"' in _tsx_rep and 'strCancelButtonText="Cancel"' in _tsx_rep
