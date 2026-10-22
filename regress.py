@@ -11478,8 +11478,12 @@ try:
                 f"Name:\t{comm}\nPPid:\t{ppid}\n")
             open(os.path.join(m.PROC_DIR, str(pid), "comm"), "w").write(comm + "\n")
 
-        # The script exactly as launched (systemd starts it, so its parent is 1).
-        _l1_proc(70001, _l1_argv, 1, "bash")
+        # The script exactly as launched (systemd starts it, so its parent is
+        # init). In a container these checks can themselves run as PID 1,
+        # and then PID 1 is "this backend", whose children the search skips
+        # on purpose, so init is played by a PID that is not ours.
+        _l1_init = 1 if os.getpid() != 1 else 69999
+        _l1_proc(70001, _l1_argv, _l1_init, "bash")
         # The pgrep it runs carries every pattern on its own command line.
         _l1_proc(70002, ["pgrep", "-if", "steamlaunch appid=|" + _l1_pattern], 70001, "pgrep")
         # Something this backend started (nmcli, curl, systemd-run) whose
@@ -11490,7 +11494,7 @@ try:
         ok(_l1_found is None,
            f"the plugin's stream search skips the update script, what it runs, and what the "
            f"plugin itself started ({_l1_found})")
-        _l1_proc(70004, ["/usr/bin/moonlight", "stream", "host"], 1, "moonlight")
+        _l1_proc(70004, ["/usr/bin/moonlight", "stream", "host"], _l1_init, "moonlight")
         _l1_found = m.Plugin()._find_stream(m.Plugin()._stream_patterns(m._load_settings()))
         ok(bool(_l1_found) and _l1_found.get("app") == "Moonlight",
            f"while a real Moonlight beside them is still found ({_l1_found})")
