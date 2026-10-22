@@ -36,6 +36,9 @@ if [ ! -d "$PLUGIN_DIR" ]; then
     rm -f "$0"
     rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
     rm -f /etc/modprobe.d/99-wifi-optimizer.conf
+    # A report waiting to be sent, and the wake notice's record of the
+    # wake it last showed: nothing is left to send them or read them.
+    rm -rf /var/lib/wifi-optimizer
     exit 0
 fi
 
@@ -45,6 +48,17 @@ if ! command -v python3 >/dev/null 2>&1; then
     logger -t "$LOG_TAG" "python3 not found, settings unreadable, nothing applied"
     exit 0
 fi
+
+# One at a time with the plugin, which holds the same lock while it saves a
+# setting off and then takes that fix off: a connect in between read the old
+# setting and put the fix back. Held until this script exits. With no flock,
+# or still busy after ten seconds, carry on as before.
+if command -v flock >/dev/null 2>&1 && mkdir -p -m 0755 /run/wifi-optimizer/ 2>/dev/null \
+        && { exec 8>>/run/wifi-optimizer/apply.lock; } 2>/dev/null; then
+    flock -w 10 8 || logger -t "$LOG_TAG" "the plugin held the apply lock for 10 s, going ahead"
+fi
+# iw, ip and tc below run with the lock's descriptor closed: one that gets
+# stuck in a wedged driver would otherwise hold the lock for good.
 
 # Read all settings in a single Python call for speed (<50ms).
 #
@@ -140,9 +154,78 @@ if [ "$(plugin_disabled)" = "yes" ]; then
     exit 0
 fi
 
+# Whether $IFACE is the card the settings' driver drives: a PCI device whose
+# module is that driver or a variant of it (rtw88_8822ce is rtw88). A second
+# radio coming up, a USB adapter, is not the card the driver fixes and the
+# PCIe baseline are about, even one of the same family (rtw88_8821cu).
+iface_module() {
+    m=$(readlink -f "$SYS_NET/$1/device/driver/module" 2>/dev/null)
+    printf '%s' "${m##*/}"
+}
+iface_bus() {
+    b=$(readlink -f "$SYS_NET/$1/device/subsystem" 2>/dev/null)
+    printf '%s' "${b##*/}"
+}
+OUR_CARD=0
+if [ "$(iface_bus "$IFACE")" = "pci" ]; then
+    case "$(iface_module "$IFACE")" in
+        "$DRIVER"*) OUR_CARD=1 ;;
+    esac
+    # With no driver profile there is nothing to tell the cards apart by,
+    # and the PCIe writes go to whichever came up, as long as it is on PCI.
+    [ "$DRIVER" = "unknown" ] && OUR_CARD=1
+fi
+
+# Driver-specific sysfs fixes, as in the plugin's DRIVER_PROFILES.
+DRIVER_PARAMS=""
+if [ "$DRIVER" = "rtw88" ]; then
+    DRIVER_PARAMS="/sys/module/rtw88_core/parameters/disable_lps_deep /sys/module/rtw88_pci/parameters/disable_aspm"
+elif [ "$DRIVER" = "rtw89" ]; then
+    DRIVER_PARAMS="/sys/module/rtw89_pci/parameters/disable_aspm_l1 /sys/module/rtw89_pci/parameters/disable_aspm_l1ss"
+elif [ "$DRIVER" = "mt7921e" ]; then
+    DRIVER_PARAMS="/sys/module/mt7921e/parameters/disable_aspm"
+fi
+[ "$OUR_CARD" = 1 ] || DRIVER_PARAMS=""
+
+# The driver parameters as they read now, " name=value" each.
+params_now() {
+    for p in $DRIVER_PARAMS; do
+        printf ' %s=%s' "${p##*/}" "$(cat "$p" 2>/dev/null || echo missing)"
+    done
+}
+# Whether this run is the one to log the parameters "at load": what the
+# driver loaded with, which is whether the fixes were in force for the whole
+# boot. When WiFi does not come back after sleep, the report is read after
+# the reboot that fixed it, and this line is how it says so. Whichever of
+# this script and the plugin is about to write a parameter first creates
+# the marker and logs it, once a boot. last_enforced with no marker was
+# written by a version from before the marker, so the values are ours then.
+claim_at_load() {
+    mkdir -p -m 0755 /run/wifi-optimizer/ 2>/dev/null
+    ( set -C; : > /run/wifi-optimizer/at-load-logged ) 2>/dev/null \
+        && [ ! -e /run/wifi-optimizer/last_enforced ]
+}
+log_at_load() {
+    [ -n "$DRIVER_PARAMS" ] && claim_at_load \
+        && logger -t "$LOG_TAG" "driver parameters at load:$(params_now)"
+}
+
+# The first run of a boot that nothing of ours ran before: no PCIe baseline
+# yet, and no last_enforced either. A dispatcher from 0.24.3 or older wrote its
+# values and last_enforced without a baseline, and the plugin writes
+# last_enforced when it applies at startup, so with that file present the
+# values here are ours, not the system's, and are not recorded as the system's.
+# A second radio's run writes no last_enforced (see the end), so it cannot
+# take the card's first run from it.
+FIRST_RUN=0
+if [ ! -e /run/wifi-optimizer/pcie-baseline ] && [ ! -e /run/wifi-optimizer/last_enforced ]; then
+    FIRST_RUN=1
+fi
+
 # Streaming auto mode: these fixes are only for while a stream runs, which
 # the plugin marks with a file in /run. Without it, leave them off.
 if [ "$STREAM_MODE" = "True" ] && [ ! -f /run/wifi-optimizer/streaming ]; then
+    log_at_load
     logger -t "$LOG_TAG" "streaming auto mode: no stream running, fixes left off"
     exit 0
 fi
@@ -160,70 +243,32 @@ if pgrep -O 8 -f "^([^ ]*/)?iw dev $IFACE( |\$)" >/dev/null 2>&1; then
     logger -t "$LOG_TAG" "an earlier iw on $IFACE is still stuck, so iw, ip and tc are left out this time"
 fi
 
-# Whether $IFACE is the radio the settings' driver drives: its module is that
-# driver or a variant of it (rtw88_8822ce is rtw88). A second radio coming up,
-# a USB adapter, is not the card the driver fixes and the PCIe baseline are
-# about.
-iface_module() {
-    m=$(readlink -f "$SYS_NET/$1/device/driver/module" 2>/dev/null)
-    printf '%s' "${m##*/}"
-}
-OUR_CARD=0
-case "$(iface_module "$IFACE")" in
-    "$DRIVER"*) OUR_CARD=1 ;;
-esac
-# With no driver profile there is nothing to tell the radios apart by, and the
-# PCIe writes go to whichever came up, as they always did.
-[ "$DRIVER" = "unknown" ] && OUR_CARD=1
-
-# The first run of a boot that nothing of ours ran before: no PCIe baseline
-# yet, and no last_enforced either. A dispatcher from 0.24.3 or older wrote its
-# values and last_enforced without a baseline, and the plugin writes
-# last_enforced when it applies at startup, so with that file present the
-# values here are ours, not the system's, and are not recorded as the system's.
-FIRST_RUN=0
-if [ ! -e /run/wifi-optimizer/pcie-baseline ] && [ ! -e /run/wifi-optimizer/last_enforced ]; then
-    FIRST_RUN=1
-fi
-
 # Apply power save
 if [ "$POWER_SAVE" = "True" ]; then
     # What took and what did not, so the log and last_enforced say only what
     # really happened: every write here is silent on failure.
     TOOK=0
     FAILED=0
+    # Whether power save is now off on the radio, from iw itself.
+    PS_OFF=0
     if [ "$NETLINK_STUCK" = 1 ]; then
         :
-    elif iw dev "$IFACE" set power_save off 2>/dev/null; then
+    elif iw dev "$IFACE" set power_save off 2>/dev/null 8>&-; then
         TOOK=$((TOOK + 1))
+        PS_OFF=1
     else
         FAILED=$((FAILED + 1))
     fi
     WIFI_PCI=$(readlink -f "$SYS_NET/$IFACE/device" 2>/dev/null)
-    # Another radio's PCIe device is not the one the plugin manages and
+    # Another radio's device is not the one the plugin manages and
     # restores, so its files are left alone (no path, nothing below matches).
     [ "$OUR_CARD" = 1 ] || WIFI_PCI=""
-    # Driver-specific sysfs fixes, as in the plugin's DRIVER_PROFILES.
-    DRIVER_PARAMS=""
-    if [ "$DRIVER" = "rtw88" ]; then
-        DRIVER_PARAMS="/sys/module/rtw88_core/parameters/disable_lps_deep /sys/module/rtw88_pci/parameters/disable_aspm"
-    elif [ "$DRIVER" = "rtw89" ]; then
-        DRIVER_PARAMS="/sys/module/rtw89_pci/parameters/disable_aspm_l1 /sys/module/rtw89_pci/parameters/disable_aspm_l1ss"
-    elif [ "$DRIVER" = "mt7921e" ]; then
-        DRIVER_PARAMS="/sys/module/mt7921e/parameters/disable_aspm"
-    fi
-    [ "$OUR_CARD" = 1 ] || DRIVER_PARAMS=""
-    # What they held before this write, in the journal. When WiFi does not
-    # come back after sleep, the report is read after the reboot that fixed
-    # it, and this says whether the fixes were in force during that boot. The
-    # first run of a boot marks its line "at load": that is what the driver
-    # loaded with, and later lines read Y because this script wrote it.
+    # What they held before this write, in the journal: "at load" from the
+    # run that claims it (see claim_at_load), later lines read Y because
+    # this script wrote it.
     if [ -n "$DRIVER_PARAMS" ]; then
-        BEFORE=""
-        for p in $DRIVER_PARAMS; do
-            BEFORE="$BEFORE ${p##*/}=$(cat "$p" 2>/dev/null || echo missing)"
-        done
-        if [ "$FIRST_RUN" = 1 ]; then
+        BEFORE=$(params_now)
+        if claim_at_load; then
             logger -t "$LOG_TAG" "driver parameters at load:$BEFORE"
         else
             logger -t "$LOG_TAG" "driver parameters before applying:$BEFORE"
@@ -283,15 +328,26 @@ with os.fdopen(fd, "w") as f:
     json.dump(base, f)
 PYEOF
     fi
-    # Only while associated, as the plugin does (ASSOCIATED_ONLY_PARAMS):
-    # rtw88 reads disable_aspm each time the PCIe link changes power state,
-    # and a Y written while the radio idles in one leaves ASPM stuck on.
-    if [ -n "$DRIVER_PARAMS" ] && [ "$(cat "$SYS_NET/$IFACE/operstate" 2>/dev/null)" != "up" ]; then
-        logger -t "$LOG_TAG" "$IFACE is not associated: driver parameters left for the next connect"
-        DRIVER_PARAMS=""
-    fi
     for p in $DRIVER_PARAMS; do
         [ -e "$p" ] || continue
+        # rtw88 reads disable_aspm each time the PCIe link changes power
+        # state, and a Y written while the chip sits in its own power save
+        # (LPS) leaves ASPM stuck on. So, as the plugin does
+        # (ASSOCIATED_ONLY_PARAMS), only once iw turned power save off and
+        # only while associated. The other parameters are read at probe or
+        # at the next start of the interface, and are written regardless.
+        case "$p" in
+            */rtw88_pci/parameters/disable_aspm)
+                if [ "$PS_OFF" != 1 ]; then
+                    logger -t "$LOG_TAG" "power save not confirmed off: disable_aspm left for the next connect"
+                    continue
+                fi
+                if [ "$(cat "$SYS_NET/$IFACE/operstate" 2>/dev/null)" != "up" ]; then
+                    logger -t "$LOG_TAG" "$IFACE is not associated: disable_aspm left for the next connect"
+                    continue
+                fi
+                ;;
+        esac
         if echo Y 2>/dev/null > "$p"; then
             TOOK=$((TOOK + 1))
         else
@@ -329,6 +385,8 @@ PYEOF
     else
         logger -t "$LOG_TAG" "power_save off: nothing took on $IFACE (driver=$DRIVER, $FAILED writes refused)"
     fi
+else
+    log_at_load
 fi
 
 # Apply buffer tuning
@@ -343,7 +401,7 @@ if [ "$BUFFER_TUNING" = "True" ]; then
     sysctl -w net.core.netdev_budget=600 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
     sysctl -w net.core.netdev_budget_usecs=8000 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
     sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
-    [ "$NETLINK_STUCK" = 1 ] || ip link set "$IFACE" txqueuelen 2000 2>/dev/null
+    [ "$NETLINK_STUCK" = 1 ] || ip link set "$IFACE" txqueuelen 2000 2>/dev/null 8>&-
     if [ "$TOOK" -gt 0 ]; then
         APPLIED=1
         if [ "$FAILED" -gt 0 ]; then
@@ -361,8 +419,8 @@ if [ "$CAKE" = "True" ] && [ "$NETLINK_STUCK" = 1 ]; then
     logger -t "$LOG_TAG" "CAKE QoS left out on $IFACE: an earlier iw is stuck"
 elif [ "$CAKE" = "True" ]; then
     modprobe sch_cake 2>/dev/null
-    if tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter 2>/dev/null; then
-        ip link set "$IFACE" txqueuelen 256 2>/dev/null
+    if tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter 2>/dev/null 8>&-; then
+        ip link set "$IFACE" txqueuelen 256 2>/dev/null 8>&-
         APPLIED=1
         logger -t "$LOG_TAG" "CAKE QoS applied (unlimited) on $IFACE"
     else
@@ -373,6 +431,10 @@ fi
 # Record enforcement timestamp, only when something was applied: the panel
 # reads it as "reapplied on connect".
 [ "$APPLIED" = 1 ] || exit 0
+# Only for the card the plugin manages: a second radio's connect is not a
+# reapply of the fixes the panel shows, and its stamp would make the card's
+# own first run of the boot look like a later one (FIRST_RUN above).
+[ "$OUR_CARD" = 1 ] || exit 0
 #
 # In /run, which only root can write, not in the settings directory. That one
 # belongs to the desktop user, and any file root creates there can have a
