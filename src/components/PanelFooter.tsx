@@ -1,7 +1,7 @@
 import { PanelSection, PanelSectionRow, ButtonItem, Navigation } from "@decky/ui";
 import { theme } from "../theme";
 import * as backend from "../backend";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { withTimeout } from "../utils";
 import { SendReportRow } from "./SendReport";
 
@@ -19,12 +19,32 @@ export function PanelFooter({ version }: PanelFooterProps) {
   // the button is pressed again: it is the only place the path is said, and
   // five seconds is not long enough to note it down.
   const [savedPath, setSavedPath] = useState("");
+  // The timer that puts the button back to idle after a result. Cleared on
+  // each press: one left from an earlier press set the button back to idle
+  // in the middle of the next collection, which let a second one start.
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+    },
+    [],
+  );
+  const backToIdle = () => {
+    idleTimer.current = setTimeout(() => {
+      idleTimer.current = null;
+      setDiagState("idle");
+    }, 5000);
+  };
   const rowStyle: React.CSSProperties = {
     fontSize: theme.fontSize.small,
     color: theme.text.tertiary,
   };
 
   const handleCopyDiagnostics = async () => {
+    if (idleTimer.current) {
+      clearTimeout(idleTimer.current);
+      idleTimer.current = null;
+    }
     setDiagState("copying");
     setSavedPath("");
     try {
@@ -53,10 +73,10 @@ export function PanelFooter({ version }: PanelFooterProps) {
           setDiagState("save_failed");
         }
       }
-      setTimeout(() => setDiagState("idle"), 5000);
+      backToIdle();
     } catch {
       setDiagState("error");
-      setTimeout(() => setDiagState("idle"), 5000);
+      backToIdle();
     }
   };
 

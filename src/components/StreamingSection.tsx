@@ -8,19 +8,29 @@ import {
 } from "@decky/ui";
 import type { LiveStatus, MethodResult, PluginSettings, StreamingApp } from "../types";
 import * as backend from "../backend";
-import { InfoRow } from "./InfoRow";
+import { InfoRow, MessageRow } from "./InfoRow";
 import { theme } from "../theme";
 
 interface StreamingSectionProps {
   settings: PluginSettings | undefined;
   live: LiveStatus | undefined;
   disabled: boolean;
-  error?: string;
-  notice?: string;
+  // The panel's errors and notices, by key: "streaming" for the mode itself,
+  // "streaming_hold", "streaming_apps" and "streaming_patterns" for the
+  // controls below it, each shown under its own control.
+  errors: Record<string, string>;
+  notices: Record<string, string>;
   // The panel's own toggle handler, so busy state, errors and the status
   // refresh behave as they do for every other toggle.
   onToggle: (key: string, fn: () => Promise<MethodResult>) => Promise<MethodResult | undefined>;
 }
+
+// On the Realtek (rtw88) card of the Steam Deck LCD, auto mode never keeps
+// the driver options file, so the options that take effect only when the
+// driver loads are not in effect in auto mode (main.py set_power_save,
+// persist=not auto).
+const RTW88_AUTO_TEXT =
+  " On the Steam Deck LCD and other devices with this Realtek WiFi card, auto mode also doesn't keep the driver's settings between streams. Some of them only take effect when the driver loads at startup, and those are meant to make waking from sleep more reliable, so in auto mode they are not in effect.";
 
 // Streaming auto mode: when the fixes apply, rather than another fix. Placed
 // after Advanced for that reason. Most of what is here is about making it
@@ -30,8 +40,8 @@ export function StreamingSection({
   settings,
   live,
   disabled,
-  error,
-  notice,
+  errors,
+  notices,
   onToggle,
 }: StreamingSectionProps) {
   const enabled = settings?.streaming_mode_enabled ?? false;
@@ -54,7 +64,7 @@ export function StreamingSection({
 
   const toggleApp = async (id: string, watched: boolean) => {
     setApps((prev) => prev.map((a) => (a.id === id ? { ...a, watched } : a)));
-    const result = await onToggle("streaming", () => backend.setStreamingApp(id, watched));
+    const result = await onToggle("streaming_apps", () => backend.setStreamingApp(id, watched));
     if (!result?.success) {
       backend.listStreamingApps().then((r) => r.success && setApps(r.apps)).catch(() => {});
     }
@@ -67,7 +77,7 @@ export function StreamingSection({
   };
 
   const savePatterns = async () => {
-    const result = await onToggle("streaming", () => backend.setStreamingPatterns(patterns));
+    const result = await onToggle("streaming_patterns", () => backend.setStreamingPatterns(patterns));
     if (result?.success) {
       setPatternsDirty(false);
       setPatterns(String(result.patterns ?? ""));
@@ -114,11 +124,13 @@ export function StreamingSection({
             ? "Fixes apply while a streaming app runs"
             : "Off: enabled fixes apply all the time"
         }
-        explanation="Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream. If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr."
+        explanation={`Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.${
+          settings?.driver === "rtw88" ? RTW88_AUTO_TEXT : ""
+        } If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.`}
         checked={enabled}
         disabled={disabled}
-        error={error}
-        notice={notice}
+        error={errors.streaming}
+        notice={notices.streaming}
         onChange={(val: boolean) => onToggle("streaming", () => backend.setStreamingMode(val))}
       />
       {enabled && (
@@ -140,10 +152,11 @@ export function StreamingSection({
               checked={held}
               disabled={disabled}
               onChange={(val: boolean) =>
-                onToggle("streaming", () => backend.setStreamingHold(val))
+                onToggle("streaming_hold", () => backend.setStreamingHold(val))
               }
             />
           </PanelSectionRow>
+          <MessageRow error={errors.streaming_hold} notice={notices.streaming_hold} />
           {apps.map((a) => (
             <PanelSectionRow key={a.id}>
               <ToggleField
@@ -154,6 +167,7 @@ export function StreamingSection({
               />
             </PanelSectionRow>
           ))}
+          <MessageRow error={errors.streaming_apps} notice={notices.streaming_apps} />
           <PanelSectionRow>
             <TextField
               label="Other process names (space-separated)"
@@ -178,6 +192,9 @@ export function StreamingSection({
               </PanelSectionRow>
             </>
           )}
+          {/* Under the Save button, and still there once it has gone: a
+              name that was refused is said beside the field it is in. */}
+          <MessageRow error={errors.streaming_patterns} notice={notices.streaming_patterns} />
         </>
       )}
     </PanelSection>

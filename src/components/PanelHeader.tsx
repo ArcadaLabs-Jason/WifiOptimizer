@@ -60,10 +60,15 @@ export function PanelHeader({
               borderRadius: theme.radius.pill,
             }}
           >
+            {/* The same three cases the streaming section tells apart: an
+                app named, Keep fixes on, or a stream flagged before the app
+                has been named, just after a reload. */}
             {streaming.streaming_active
               ? streaming.streaming_app
                 ? `Auto mode: streaming ${streaming.streaming_app}, fixes on`
-                : "Auto mode: held on, fixes on"
+                : streaming.streaming_held
+                  ? "Auto mode: held on, fixes on"
+                  : "Auto mode: stream running, fixes on"
               : "Auto mode: no stream, fixes paused"}
           </span>
         </PanelSectionRow>
