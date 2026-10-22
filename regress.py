@@ -9069,8 +9069,8 @@ try:
     ok(_r27.get("success") and _argv27[6:7] == ["v0.24.5"],
        f"a stable release offered on the beta channel is not called beta ({_argv27[6:7]})")
     ok(_argv26[6:7] == ["beta v0.24.6-beta"], "and a beta release is")
-    # The script's own command line carries the patterns, so it must not
-    # count itself as the stream it waits for.
+    # The script must not count itself as the stream it waits for (the
+    # end to end form of this, with the real pgrep, is in L1 and R1).
     import subprocess as _l_sp
     _fn26 = m.UPDATE_SCRIPT[m.UPDATE_SCRIPT.index("playing() {"):]
     _fn26 = _fn26[:_fn26.index("\n}\n") + 3]
@@ -13189,6 +13189,58 @@ try:
            and ("Restart the device" in _mp_text or "try Reset again" in _mp_text),
            f"{_mp_code}: the panel's own words match the backend's message and say what to do next "
            f"({_mp_text!r}, backend {_mp_back})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("merge p4: the update script and apply_update agree on seven arguments and the streams file")
+# LIFECYCLE's L1 moved the stream patterns off the command line into a 0600
+# streams file in the script's own 0700 directory, so the script takes seven
+# arguments. RELEASE's R1 runs the script end to end with whatever argv and
+# files apply_update hands it, and matches two of its log lines. Checked here
+# so neither side can drift from the other without a failure.
+try:
+    import stat as _mp_stat
+    _mp_us = m.UPDATE_SCRIPT
+    _mp_pos = sorted({int(n) for n in re.findall(r"\$\{?([0-9]+)", _mp_us)})
+    ok(_mp_pos == [1, 2, 3, 4, 5, 6, 7],
+       f"the script reads seven arguments and no eighth ({_mp_pos})")
+    ok('[ -f "$SELF_DIR/streams" ] && IFS= read -r STREAM_PATTERNS < "$SELF_DIR/streams"' in _mp_us,
+       "and takes the patterns from the streams file in its own directory, without a fork")
+
+    class _MpUp(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.launched = []
+        async def check_for_update(self):
+            return {"success": True, "update_available": True, "channel": "stable",
+                    "latest_version": "9.9.9"}
+        async def _signed_release(self, version):
+            return {"ok": True, "url": f"https://example.invalid/wifi-optimizer-v{version}.tar.gz",
+                    "sha256": "0" * 64}
+        def _launch_updater(self, argv): self.launched.append(list(argv))
+
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_custom_patterns": "mystreamer"})
+    _mp_p = _MpUp()
+    _mp_r = asyncio.run(_mp_p.apply_update("9.9.9"))
+    _mp_argv = _mp_p.launched[0] if _mp_p.launched else []
+    _mp_dir = _mp_argv[2] if len(_mp_argv) > 2 else ""
+    ok(_mp_r.get("success") and _mp_argv[:1] == ["/bin/bash"] and len(_mp_argv[2:]) == 7
+       and os.path.dirname(_mp_argv[1]) == _mp_dir,
+       f"apply_update starts it with exactly those seven, the first its own directory ({_mp_argv[2:]})")
+    _mp_sf = os.path.join(_mp_dir, "streams")
+    _mp_st = os.lstat(_mp_sf) if os.path.exists(_mp_sf) else None
+    ok(_mp_st is not None and _mp_stat.S_ISREG(_mp_st.st_mode)
+       and _mp_stat.S_IMODE(_mp_st.st_mode) == 0o600
+       and _mp_stat.S_IMODE(os.stat(_mp_dir).st_mode) == 0o700
+       and "mystreamer" in open(_mp_sf).read(),
+       "where the 0600 streams file in the 0700 directory holds the user's own names")
+    ok("waiting for the game or stream" in _mp_us and '"Update already running"' in _mp_us,
+       "the two log lines the end to end run (R1) matches are still the script's words")
+    if _mp_dir and os.path.isdir(_mp_dir):
+        import shutil as _mp_sh
+        _mp_sh.rmtree(_mp_dir, ignore_errors=True)
+    _mp_p._update_dir = None
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
