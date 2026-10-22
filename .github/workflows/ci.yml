@@ -6,7 +6,10 @@ name: CI
 # reason to push either branch. It runs on a pushed release tag (which
 # release.sh requires to have passed before it publishes), on a pull request,
 # or by hand from the Actions tab, and never on a branch push. The branches
-# are moved to the tag only after release.sh has published it.
+# are moved to the tag only after release.sh has published it. A release tag
+# can never be moved, so a release commit gets CI before it is tagged, from a
+# draft pull request that is never merged; release.sh --pre-tag requires that
+# run to have passed.
 on:
   push:
     tags: ['v*']
@@ -50,5 +53,11 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit -p .
 
+      # Some checks need Linux tools (procps pgrep, flock) and print SKIP on
+      # a Mac. Here they must run: the update script a release ships is the
+      # one that installs the next release, so it is run end to end here
+      # before any tag is published.
       - name: Backend checks
+        env:
+          REGRESS_REQUIRE_LINUX: "1"
         run: python3 regress.py
