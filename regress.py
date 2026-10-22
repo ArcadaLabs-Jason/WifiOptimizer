@@ -6613,6 +6613,180 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("R1 the update script this version ships finishes an update, run end to end with real pgrep and flock")
+# The update script a release ships is the one that installs whatever comes
+# after it, so a defect in it cannot be fixed by the next release. Here it is
+# written and started exactly as apply_update does it (the same file in the
+# same wifi-optimizer-update-* directory, the same argv, and whatever else
+# apply_update hands it), then run with the real pgrep, flock and sha256sum.
+# Only the network (curl), the journal (logger), systemctl and the length of
+# each sleep are stubbed; its /run paths move to scratch and its 14 minute
+# deadline is cut to 10 s. Needs procps pgrep and flock, so Linux: CI
+# (ubuntu-latest) sets REGRESS_REQUIRE_LINUX, which turns a missing tool into
+# a failure instead of a SKIP.
+try:
+    import io as _r1_io, tarfile as _r1_tar, hashlib as _r1_hl, shutil as _r1_sh
+    import signal as _r1_sig, subprocess as _r1_sp
+    _r1_wf = open(".github/workflows/ci.yml").read()
+    _r1_step = re.search(r"- name: Backend checks\n((?:        .*\n)*)", _r1_wf)
+    _r1_step = _r1_step.group(1) if _r1_step else ""
+    ok(re.search(r'^          REGRESS_REQUIRE_LINUX: "1"$', _r1_step, re.M) is not None
+       and "python3 regress.py" in _r1_step,
+       "CI runs this file with REGRESS_REQUIRE_LINUX, so the Linux-only checks never SKIP there")
+
+    def _r1_out(cmd):
+        try:
+            return _r1_sp.run(cmd, capture_output=True, text=True, timeout=10).stdout
+        except (OSError, _r1_sp.SubprocessError):
+            return ""
+    _r1_missing = [name for name, there in [
+        ("procps pgrep", "procps" in _r1_out(["pgrep", "--version"])),
+        ("flock", bool(_r1_sh.which("flock"))),
+        ("sha256sum", bool(_r1_sh.which("sha256sum"))),
+        ("/bin/bash", os.path.exists("/bin/bash"))] if not there]
+    if _r1_missing and os.environ.get("REGRESS_REQUIRE_LINUX"):
+        ok(False, f"the update script's end to end run needs {', '.join(_r1_missing)}, and CI must run it")
+    elif _r1_missing:
+        print(f"SKIP  the update script's end to end run needs {', '.join(_r1_missing)} (Linux); CI runs it")
+    else:
+        _r1_fx = tempfile.mkdtemp()
+        _r1_payload = os.path.join(_r1_fx, "payload.tar.gz")
+        with _r1_tar.open(_r1_payload, "w:gz") as _r1_tf:
+            for _r1_name, _r1_body in [("plugin.json", "{}"), ("main.py", "# new\n"), ("decky.pyi", ""),
+                                       ("dist/index.js", "// new\n"), ("dist/index.js.map", "{}"),
+                                       ("defaults/dispatcher.sh.tmpl", "#!/bin/sh\n"),
+                                       ("package.json", '{\n  "version": "9.9.9"\n}\n')]:
+                _r1_data = _r1_body.encode()
+                _r1_info = _r1_tar.TarInfo(f"WifiOptimizer-9.9.9/{_r1_name}"); _r1_info.size = len(_r1_data)
+                _r1_tf.addfile(_r1_info, _r1_io.BytesIO(_r1_data))
+        _r1_sha = _r1_hl.sha256(open(_r1_payload, "rb").read()).hexdigest()
+        # Functions, so they win over the script's pinned PATH. The script is
+        # then exec'd, so the process carries exactly apply_update's argv.
+        _R1_STUBS = r'''
+curl() { local o=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && o="$2"; shift; done; cp "$R1_FX/payload.tar.gz" "$o"; }
+logger() { echo "$*" >> "$R1_FX/log"; }
+systemctl() { echo "$*" >> "$R1_FX/systemctl"; return 0; }
+sleep() { case "$1" in 1) command sleep 0.1 ;; 15) command sleep 1 ;; *) : ;; esac; }
+export -f curl logger systemctl sleep
+exec /bin/bash "$0" "$@"
+'''
+
+        class _R1(m.Plugin):
+            def __init__(self):
+                super().__init__(); self.launched = []
+            async def check_for_update(self):
+                return {"success": True, "update_available": True, "channel": "stable",
+                        "latest_version": "9.9.9"}
+            async def _signed_release(self, version):
+                return {"ok": True, "url": f"https://example.invalid/wifi-optimizer-v{version}.tar.gz",
+                        "sha256": _r1_sha}
+            def _launch_updater(self, argv): self.launched.append(list(argv))
+
+        def _r1_run(settings, ack=False, hold_lock=False):
+            """Approve the update through apply_update, then run the script it
+            wrote with the argv it built. ack: the new backend answers
+            "loaded", through the plugin's own _acknowledge_update."""
+            for _f in ("log", "systemctl"):
+                if os.path.exists(os.path.join(_r1_fx, _f)): os.remove(os.path.join(_r1_fx, _f))
+            run_dir = tempfile.mkdtemp(); plugin = tempfile.mkdtemp()
+            open(os.path.join(plugin, "main.py"), "w").write("# old\n")
+            open(os.path.join(plugin, "plugin.json"), "w").write("{}")
+            saved = (m.decky.DECKY_PLUGIN_DIR, m.decky.DECKY_PLUGIN_VERSION, m.UPDATE_STATE_FILE)
+            holder = None
+            out = {"rc": None, "state": "", "log": "", "restarted": False, "main": "", "argv": [],
+                   "self_left": None, "err": ""}
+            try:
+                m.decky.DECKY_PLUGIN_DIR = plugin
+                m._save_settings(settings)
+                p = _R1()
+                r = asyncio.run(p.apply_update("9.9.9"))
+                if not (r.get("success") and p.launched):
+                    out["err"] = f"apply_update: {r}"
+                    return out
+                argv = out["argv"] = p.launched[0]
+                script, self_dir = argv[1], argv[2]
+                text = open(script).read()
+                text = text.replace("/run/wifi-optimizer", os.path.join(run_dir, "wo"))
+                text = text.replace("BUDGET=840", "BUDGET=10")
+                open(script, "w").write(text)
+                state_file = os.path.join(run_dir, "wo", "update-state")
+                m.UPDATE_STATE_FILE = state_file
+                m.decky.DECKY_PLUGIN_VERSION = "9.9.9"
+                if hold_lock:
+                    lock = os.path.join(run_dir, "wo-update.lock")
+                    holder = _r1_sp.Popen(["flock", lock, "sleep", "60"])
+                    for _ in range(200):
+                        if _r1_sp.run(["flock", "-n", lock, "true"]).returncode != 0:
+                            break
+                        time.sleep(0.02)
+                proc = _r1_sp.Popen(["/bin/bash", "-c", _R1_STUBS, *argv[1:]],
+                                    stdout=_r1_sp.DEVNULL, stderr=_r1_sp.PIPE, text=True,
+                                    start_new_session=True, env={**os.environ, "R1_FX": _r1_fx})
+                deadline = time.monotonic() + 90
+                while proc.poll() is None and time.monotonic() < deadline:
+                    if ack and m._read_update_state()[:2] == ("swapped", "9.9.9"):
+                        p._acknowledge_update()
+                    time.sleep(0.01)
+                if proc.poll() is None:
+                    os.killpg(proc.pid, _r1_sig.SIGKILL); proc.wait()
+                    out["err"] = "timed out"
+                out["rc"] = proc.returncode
+                out["err"] += proc.stderr.read()[-300:]
+                out["state"] = open(state_file).read().strip() if os.path.exists(state_file) else ""
+                out["log"] = (open(os.path.join(_r1_fx, "log")).read()
+                              if os.path.exists(os.path.join(_r1_fx, "log")) else "")
+                out["restarted"] = (os.path.exists(os.path.join(_r1_fx, "systemctl"))
+                                    and "restart plugin_loader" in open(os.path.join(_r1_fx, "systemctl")).read())
+                out["main"] = open(os.path.join(plugin, "main.py")).read()
+                out["self_left"] = os.path.exists(self_dir)
+                return out
+            finally:
+                if holder is not None:
+                    holder.kill(); holder.wait()
+                m.decky.DECKY_PLUGIN_DIR, m.decky.DECKY_PLUGIN_VERSION, m.UPDATE_STATE_FILE = saved
+                _r1_sh.rmtree(plugin, ignore_errors=True); _r1_sh.rmtree(run_dir, ignore_errors=True)
+
+        def _r1_says(o):
+            return f"rc {o['rc']}, {o['state']!r}, log {o['log'][-160:]!r}, {o['err'][-160:]!r}"
+
+        _r1_o = _r1_run(dict(m.DEFAULT_SETTINGS), ack=True)
+        ok(_r1_o["rc"] == 0 and _r1_o["state"] == "done 9.9.9" and not _r1_o["restarted"]
+           and _r1_o["main"] == "# new\n" and _r1_o["self_left"] is False,
+           f"reload path: the new backend answers, the update ends done, Decky is not restarted ({_r1_says(_r1_o)})")
+        _r1_o = _r1_run(dict(m.DEFAULT_SETTINGS))
+        ok(_r1_o["rc"] == 0 and _r1_o["state"] == "done 9.9.9" and _r1_o["restarted"]
+           and _r1_o["main"] == "# new\n" and "waiting for the game or stream" not in _r1_o["log"],
+           f"fallback path, default settings, nothing running: no reload answer, so it restarts "
+           f"plugin_loader and ends done, without waiting for a stream ({_r1_says(_r1_o)})")
+        _r1_o = _r1_run({**m.DEFAULT_SETTINGS, "streaming_custom_patterns": "wifi-optimizer-update"})
+        ok(_r1_o["rc"] == 0 and _r1_o["state"] == "done 9.9.9" and _r1_o["restarted"],
+           f"and the same with a custom process name that matches the script's own directory "
+           f"({_r1_says(_r1_o)})")
+        # The control: a real stream must still hold the restart back, or the
+        # checks above would pass with a pgrep that finds nothing at all.
+        _r1_bin = tempfile.mkdtemp()
+        _r1_moon = os.path.join(_r1_bin, "moonlight")
+        _r1_sh.copy(_r1_sh.which("sleep"), _r1_moon)
+        _r1_mp = _r1_sp.Popen([_r1_moon, "120"])
+        try:
+            _r1_o = _r1_run(dict(m.DEFAULT_SETTINGS))
+        finally:
+            _r1_mp.kill(); _r1_mp.wait()
+            _r1_sh.rmtree(_r1_bin, ignore_errors=True)
+        ok(_r1_o["rc"] not in (0, None) and not _r1_o["restarted"] and _r1_o["state"] == "failed 9.9.9"
+           and _r1_o["main"] == "# new\n" and "waiting for the game or stream" in _r1_o["log"],
+           f"while a real moonlight process runs, it waits, leaves the update installed and does not "
+           f"restart Decky ({_r1_says(_r1_o)})")
+        _r1_o = _r1_run(dict(m.DEFAULT_SETTINGS), hold_lock=True)
+        ok(_r1_o["rc"] == 0 and _r1_o["main"] == "# old\n" and not _r1_o["restarted"]
+           and _r1_o["state"] == "" and "Update already running" in _r1_o["log"],
+           f"with another update holding the lock (real flock), it changes nothing ({_r1_says(_r1_o)})")
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+        _r1_sh.rmtree(_r1_fx, ignore_errors=True)
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("release signatures: checked strictly, and required for every update")
 try:
     import base64, hashlib
