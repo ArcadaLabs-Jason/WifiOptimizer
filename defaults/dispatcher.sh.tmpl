@@ -52,13 +52,29 @@ fi
 # One at a time with the plugin, which holds the same lock while it saves a
 # setting off and then takes that fix off: a connect in between read the old
 # setting and put the fix back. Held until this script exits. With no flock,
-# or still busy after ten seconds, carry on as before.
+# or still busy after ten seconds, carry on as before. The file is root's
+# alone (0600): anyone who could open it could hold it, and every connect
+# would wait out the ten seconds. One left 0644 by an older version is
+# tightened.
+LOCK_UMASK=$(umask)
 if command -v flock >/dev/null 2>&1 && mkdir -p -m 0755 /run/wifi-optimizer/ 2>/dev/null \
-        && { exec 8>>/run/wifi-optimizer/apply.lock; } 2>/dev/null; then
+        && { umask 077; exec 8>>/run/wifi-optimizer/apply.lock; } 2>/dev/null; then
+    umask "$LOCK_UMASK"
+    chmod 600 /run/wifi-optimizer/apply.lock 2>/dev/null
     flock -w 10 8 || logger -t "$LOG_TAG" "the plugin held the apply lock for 10 s, going ahead"
+    # Uninstalling takes the same lock and removes this script under it. A
+    # run that waited for it is from before: the fixes are being taken off,
+    # and putting them back now would leave them on until a reboot.
+    if [ ! -f "$0" ]; then
+        logger -t "$LOG_TAG" "the plugin was uninstalled while this connect waited, nothing applied"
+        exit 0
+    fi
 fi
-# iw, ip and tc below run with the lock's descriptor closed: one that gets
-# stuck in a wedged driver would otherwise hold the lock for good.
+umask "$LOCK_UMASK"
+# iw, ip and tc below run through netlink(): in the background with the lock's
+# descriptor closed, and waited for 5 s at most. One stuck in a wedged driver
+# would otherwise keep this script, the apply lock and NetworkManager's queue
+# of dispatcher runs waiting on it for up to NetworkManager's own limit.
 
 # Read all settings in a single Python call for speed (<50ms).
 #
@@ -84,7 +100,10 @@ try:
         raw = fh.read(65536)
     d = json.loads(raw)
     # Only a real JSON true turns something on: a string "false" is truthy.
-    print("True" if d.get("power_save_disabled", True) is True else "False")
+    # Except power save off, which is on unless it is a real false: a value
+    # of the wrong type reads as the default, as the plugin reads it.
+    ps = d.get("power_save_disabled", True)
+    print("False" if ps is False else "True")
     print("True" if d.get("buffer_tuning_enabled") is True else "False")
     print(str(d.get("driver", "unknown")).replace("\n", " ")[:64])
     print("True" if d.get("cake_enabled") is True else "False")
@@ -210,6 +229,30 @@ log_at_load() {
         && logger -t "$LOG_TAG" "driver parameters at load:$(params_now)"
 }
 
+# Runs one netlink command (iw, ip, tc) in the background with the apply
+# lock's descriptor closed and its output nowhere, and waits for it 5 s at
+# most. One still running then is stuck in the driver: it is left behind,
+# NETLINK_STUCK=1 skips every later one, and this run goes on with the sysfs
+# writes. Its exit status otherwise. Called with no redirection of its own:
+# bash keeps a copy of a descriptor it redirects around a function call, and
+# a command started inside inherits that copy, the lock's included.
+netlink() {
+    [ "$NETLINK_STUCK" = 1 ] && return 1
+    "$@" </dev/null >/dev/null 2>&1 8>&- &
+    nl_pid=$!
+    nl_waited=0
+    while kill -0 "$nl_pid" 2>/dev/null; do
+        if [ "$nl_waited" -ge 50 ]; then
+            NETLINK_STUCK=1
+            logger -t "$LOG_TAG" "$1 did not finish within 5 s on $IFACE, so iw, ip and tc are left out this time"
+            return 1
+        fi
+        sleep 0.1
+        nl_waited=$((nl_waited + 1))
+    done
+    wait "$nl_pid"
+}
+
 # The first run of a boot that nothing of ours ran before: no PCIe baseline
 # yet, and no last_enforced either. A dispatcher from 0.24.3 or older wrote its
 # values and last_enforced without a baseline, and the plugin writes
@@ -232,15 +275,19 @@ fi
 
 # A WiFi driver that wedged on a bad wake leaves iw stuck in the kernel for
 # good, and every iw, ip or tc started for it after that joins it, holding
-# this connect, and NetworkManager's queue of dispatcher runs behind it. An iw
-# for this interface still running after several seconds is that, not a slow
-# command (the plugin's own give up within five). The sysfs writes below do
-# not go through the driver's netlink path, so they still run. A pgrep too old
-# to know -O fails, which reads as nothing stuck, as before.
+# this connect, and NetworkManager's queue of dispatcher runs behind it. One
+# of the plugin's own netlink commands (or this script's), run by root, still
+# running after several seconds is that, not a slow command (the plugin's own
+# give up within five): iw for this interface, iw reg or iw phy, tc qdisc and
+# ip link set. Only root's, since anyone can start a process with any name;
+# never iw event or ip monitor, which run for good on purpose. The sysfs
+# writes below do not go through the driver's netlink path, so they still
+# run. A pgrep too old to know -O fails, which reads as nothing stuck.
 NETLINK_STUCK=0
-if pgrep -O 8 -f "^([^ ]*/)?iw dev $IFACE( |\$)" >/dev/null 2>&1; then
+if pgrep -u 0 -O 8 -f "^([^ ]*/)?(iw (dev $IFACE( |\$)|reg |phy[^ ]* )|tc qdisc |ip link set )" \
+        >/dev/null 2>&1 8>&-; then
     NETLINK_STUCK=1
-    logger -t "$LOG_TAG" "an earlier iw on $IFACE is still stuck, so iw, ip and tc are left out this time"
+    logger -t "$LOG_TAG" "an earlier iw, ip or tc is still stuck, so iw, ip and tc are left out this time"
 fi
 
 # Apply power save
@@ -253,7 +300,7 @@ if [ "$POWER_SAVE" = "True" ]; then
     PS_OFF=0
     if [ "$NETLINK_STUCK" = 1 ]; then
         :
-    elif iw dev "$IFACE" set power_save off 2>/dev/null 8>&-; then
+    elif netlink iw dev "$IFACE" set power_save off; then
         TOOK=$((TOOK + 1))
         PS_OFF=1
     else
@@ -401,7 +448,7 @@ if [ "$BUFFER_TUNING" = "True" ]; then
     sysctl -w net.core.netdev_budget=600 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
     sysctl -w net.core.netdev_budget_usecs=8000 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
     sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 && TOOK=$((TOOK + 1)) || FAILED=$((FAILED + 1))
-    [ "$NETLINK_STUCK" = 1 ] || ip link set "$IFACE" txqueuelen 2000 2>/dev/null 8>&-
+    [ "$NETLINK_STUCK" = 1 ] || netlink ip link set "$IFACE" txqueuelen 2000
     if [ "$TOOK" -gt 0 ]; then
         APPLIED=1
         if [ "$FAILED" -gt 0 ]; then
@@ -416,11 +463,11 @@ fi
 
 # Apply CAKE QoS (unlimited: FQ + AQM + ack-filter, no bandwidth shaper)
 if [ "$CAKE" = "True" ] && [ "$NETLINK_STUCK" = 1 ]; then
-    logger -t "$LOG_TAG" "CAKE QoS left out on $IFACE: an earlier iw is stuck"
+    logger -t "$LOG_TAG" "CAKE QoS left out on $IFACE: an earlier iw, ip or tc is stuck"
 elif [ "$CAKE" = "True" ]; then
     modprobe sch_cake 2>/dev/null
-    if tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter 2>/dev/null 8>&-; then
-        ip link set "$IFACE" txqueuelen 256 2>/dev/null 8>&-
+    if netlink tc qdisc replace dev "$IFACE" root cake unlimited diffserv4 nat ack-filter; then
+        netlink ip link set "$IFACE" txqueuelen 256
         APPLIED=1
         logger -t "$LOG_TAG" "CAKE QoS applied (unlimited) on $IFACE"
     else
@@ -440,6 +487,20 @@ fi
 # belongs to the desktop user, and any file root creates there can have a
 # symlink swapped in between creating it and writing it, however it is done.
 mkdir -p -m 0755 /run/wifi-optimizer 2>/dev/null
+# The "at load" line is claimed before last_enforced is written, whatever
+# this run applied: once that file is there, a later claim takes it for an
+# older version's and logs nothing, and the boot has no line at all.
+if claim_at_load; then
+    if [ -n "$DRIVER_PARAMS" ]; then
+        AT_LOAD="$(params_now)"
+    else
+        case "$DRIVER" in
+            unknown) AT_LOAD=" not known (no driver profile)" ;;
+            *) AT_LOAD=" none (the driver profile has no parameters)" ;;
+        esac
+    fi
+    logger -t "$LOG_TAG" "driver parameters at load:$AT_LOAD"
+fi
 date +%s > /run/wifi-optimizer/last_enforced 2>/dev/null
 
 exit 0
