@@ -88,7 +88,7 @@ const BACKEND_POLL_MAX_FAILURES = 5;
 // The update channel and notices are kept (main.py _reset_locked), and
 // streaming auto mode starts again from its defaults.
 const RESET_CONFIRM_TEXT =
-  "This turns off what the plugin applied and puts its WiFi settings back to their defaults, except that Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are removed from the networks they were set on, from the next time WiFi connects. Streaming auto mode is turned off and its app choices and process names are cleared. Update settings are kept.";
+  "This turns off what the plugin applied and puts its WiFi settings back to their defaults, except that Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are removed from the networks they were set on, from the next time WiFi connects. Allow WPA2 is only put back where it was allowed with this version or later, since older versions kept no record of it (the README has the command for the rest). Streaming auto mode is turned off and its app choices and process names are cleared. Update settings are kept.";
 // Reset does not reconnect, so it does not say WiFi will.
 const RESET_WORKING_TEXT = "Working...";
 const RESET_DONE_TEXT = "Done. Settings are reset.";

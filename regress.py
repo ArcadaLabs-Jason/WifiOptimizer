@@ -10813,6 +10813,17 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("Reset confirm: Allow WPA2 is only put back where this version recorded it")
+try:
+    _rw = _between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n")
+    ok("only put back where it was allowed with this version or later" in _rw
+       and "older versions kept no record" in _rw,
+       "the confirmation does not promise to undo Allow WPA2 set by a version that kept no record")
+    ok("version 0.24.5 or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n"),
+       "which matches the README's exception")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("F15 pass 4: Reset says it turns streaming auto mode off and clears its choices")
 try:
     _p4_s = "Streaming auto mode is turned off and its app choices and process names are cleared."
