@@ -13245,6 +13245,67 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("merge p4: a waiting report can be withdrawn and a dropped one is said, panel to backend")
+# Contract C5: DEVICES' get_report_state adds dropped, dismiss_report_notice
+# takes "dropped", and cancel_pending_report is new; FRONT's panel reads the
+# first and calls the other two. Each side was built before the other
+# existed, so here they meet: every name the panel calls is a backend
+# method, every state field it reads is one the backend sends, and the
+# round trips do what the panel's words say.
+try:
+    _mp_calls = set()
+    for _mp_dp, _mp_dn, _mp_fs in os.walk("src"):
+        for _mp_f in _mp_fs:
+            _mp_calls |= set(re.findall(r'callable<[^;]*?>\("([a-z_]+)"\)',
+                                        open(os.path.join(_mp_dp, _mp_f)).read()))
+    _mp_missing = sorted(n for n in _mp_calls if not asyncio.iscoroutinefunction(getattr(m.Plugin, n, None)))
+    ok("cancel_pending_report" in _mp_calls and not _mp_missing,
+       f"every backend call the panel makes, cancel_pending_report among them, is a backend method "
+       f"({len(_mp_calls)} calls, missing {_mp_missing})")
+    _mp_sr = open("src/components/SendReport.tsx").read()
+    _mp_iface = _mp_sr[_mp_sr.find("export interface ReportState"):]
+    _mp_iface = _mp_iface[:_mp_iface.find("}")]
+    _mp_fields = set(re.findall(r"(?m)^  ([a-z_]+)\??:", _mp_iface))
+    m.REPORT_URL = _REP_URL
+    _rep_reset()
+    _mp_rp = RepStub(journal="")
+    _mp_state = asyncio.run(_mp_rp.get_report_state())
+    ok("dropped" in _mp_fields and _mp_fields == set(_mp_state),
+       f"the panel's report state is exactly what the backend sends ({sorted(_mp_fields)} / {sorted(_mp_state)})")
+    ok('dismissReportNotice("dropped")' in _mp_sr and "state.dropped" in _mp_sr
+       and "cancelPendingReport()" in _mp_sr,
+       "the panel shows a dropped report, dismisses it as dropped, and its Don't send it calls the backend")
+    os.makedirs(_rep_dir, mode=0o700, exist_ok=True)
+    _mp_body = '{"plugin_version":"0.24.5-beta","report":{"success":true}}'
+    open(_pending_path(), "w").write(_mp_body)
+    _mp_before = asyncio.run(_mp_rp.get_report_state())
+    _mp_cancel = asyncio.run(_mp_rp.cancel_pending_report())
+    _mp_after = asyncio.run(_mp_rp.get_report_state())
+    ok(_mp_before.get("pending") is True and _mp_cancel == {"success": True}
+       and not os.path.exists(_pending_path()) and _mp_after.get("pending") is False
+       and _mp_after.get("dropped") is False and not _mp_rp.curl_calls(),
+       f"Don't send it: the waiting report is gone, never sent, and the panel is told ({_mp_before}, {_mp_after})")
+    open(_pending_path(), "w").write(_mp_body)
+    _mp_ref = RepStub(journal="", curl=[(json.dumps({"ok": False, "error": "bad_request"}), "400")])
+    asyncio.run(_mp_ref._send_pending_report_if_due())
+    _mp_dropped = asyncio.run(_mp_ref.get_report_state())
+    _mp_dis = asyncio.run(_mp_ref.dismiss_report_notice("dropped"))
+    _mp_gone = asyncio.run(_mp_ref.get_report_state())
+    ok(len(_mp_ref.curl_calls()) == 1 and _mp_dropped.get("dropped") is True
+       and _mp_dropped.get("pending") is False and _mp_dis == {"success": True}
+       and _mp_gone.get("dropped") is False,
+       f"a waiting report the receiver refused is dropped, said once, and Dismiss clears it "
+       f"({_mp_dropped}, {_mp_dis}, {_mp_gone})")
+    _rep_reset()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+finally:
+    try:
+        m.REPORT_URL = _rep_url_real
+    except NameError:
+        pass
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
