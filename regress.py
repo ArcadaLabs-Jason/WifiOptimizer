@@ -5453,7 +5453,7 @@ try:
         found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
                                                      "streaming_apps": {"moonlight": False}}))
         ok(found is None, "an app the user unticked is not")
-        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS,
+        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
             "streaming_apps": {"moonlight": False}, "streaming_custom_patterns": "sunshine-client"}))
         ok(found and found["process"] == "sunshine-client", "a pattern of the user's own is")
         shutil_rm = __import__("shutil").rmtree
@@ -16692,6 +16692,10 @@ def _p6_proc_dir():
     """An empty stand-in /proc, and a maker of processes in it."""
     root = tempfile.mkdtemp()
     def mk(pid, ppid, argv, comm, fifo=False):
+        # init is played by a PID that is not this one: run as PID 1 (a
+        # container), init would be "this backend", whose children are skipped.
+        if ppid == 1 and os.getpid() == 1:
+            ppid = 69999
         d = os.path.join(root, str(pid)); os.makedirs(d, exist_ok=True)
         open(os.path.join(d, "status"), "w").write(f"Name:\t{comm}\nPPid:\t{ppid}\n")
         open(os.path.join(d, "comm"), "w").write(comm + "\n")
