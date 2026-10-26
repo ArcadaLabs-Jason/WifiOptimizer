@@ -115,7 +115,7 @@ without it: the dispatcher script, whenever WiFi reconnects; a reapply of the
 volatile settings shortly after a game launches; a check every 20 seconds,
 while the access point lock or a band preference is on, that releases a pin
 keeping the device offline and, after a wake, moves the lock off a weak access
-point (never during a game or stream); and the update check twice a day, unless **Tell me
+point (never during a game or stream, and not yet on the Steam Deck LCD); and the update check twice a day, unless **Tell me
 about updates** is off. In streaming auto mode the plugin also checks every few
 seconds whether a streaming app is running.
 

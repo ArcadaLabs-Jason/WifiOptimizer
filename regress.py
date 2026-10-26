@@ -11563,7 +11563,8 @@ try:
        and "or when the pinned one has been out of reach for a minute." in _p6f_lr
        and "it only moves on its own after a wake, and only" not in _p6f_lr,
        "the row names the after-wake move and the stranded release together")
-    ok("after a wake, moves the lock off a weak access point (never during a game or stream)"
+    # Merge p6: the list also says the LCD exception (K-d), so the parenthesis goes on.
+    ok("after a wake, moves the lock off a weak access point (never during a game or stream"
        in _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n")),
        "and what runs without the panel includes the after-wake move")
 except Exception as _e:
@@ -17882,6 +17883,45 @@ finally:
         m.REPORT_URL = _rep_url_real
     except NameError:
         pass
+
+# ---- QA pass 6 merge: where two owners' work meets ----
+section("merge p6: the panel and the README leave out the after-wake move where the backend skips it (K-d)")
+# FRONT keys the lock's (i) on settings.driver and the README names the
+# Steam Deck LCD; LIFECYCLE skips the move on the settings' driver (rtw88 in
+# any of its names) or the locked interface's own module. The value the panel
+# tests must be the one the backend records and skips on, and every other
+# driver the panel knows must still move, as its (i) says.
+try:
+    _mp6k_m = re.search(r's\?\.driver === "([^"]+)"\s*\?\s*"It stays there until you move or turn off the lock\."',
+                        _between(_F_IX, 'label="Stop background scanning"', "checked="))
+    _mp6k_drv = _mp6k_m.group(1) if _mp6k_m else ""
+    ok(bool(_mp6k_drv), "the lock's (i) leaves out the after-wake clause for one driver value")
+    ok(_mp6k_drv and m.Plugin._module_profile("rtw88_8822ce") == _mp6k_drv
+       and m.Plugin._module_profile("rtw88_pci") == _mp6k_drv,
+       f"that value is the name the backend records for the LCD's card ({_mp6k_drv!r})")
+    _mp6k_info = m.decky.logger.info
+    _mp6k_got = {}
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: None)
+        for _mp6k_d in [_mp6k_drv or "rtw88", "rtw89", "mt7921e", "iwlwifi", "ath11k"]:
+            _w6_locked(driver=_mp6k_d); _mp6k_p = _W6()
+            asyncio.run(_mp6k_p._move_lock_after_wake())
+            _mp6k_got[_mp6k_d] = _mp6k_p.pin.upper() == _W6STRONG
+    finally:
+        m.decky.logger.info = _mp6k_info
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+    ok(_mp6k_got.get(_mp6k_drv or "rtw88") is False,
+       f"the real move leaves the lock where the panel says it does not move ({_mp6k_got})")
+    ok(all(_mp6k_got.get(d) for d in ("rtw89", "mt7921e", "iwlwifi", "ath11k")),
+       f"and moves on every other card, where the (i) says it does ({_mp6k_got})")
+    _mp6k_row = _between(_F_RD, "| Stop background scanning |", "\n")
+    _mp6k_list = _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
+    ok("(never during a game or stream, and not yet on the Steam Deck LCD)" in _mp6k_row
+       and "(never during a game or stream, and not yet on the Steam Deck LCD)" in _mp6k_list,
+       "both README places that name the after-wake move say it does not happen on the LCD")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("this file: no section rebinds a helper the others share")
 try:
