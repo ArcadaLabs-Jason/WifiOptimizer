@@ -1,4 +1,4 @@
-import { PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
+import { PanelSection, PanelSectionRow } from "@decky/ui";
 import { theme } from "../theme";
 import { timeAgo } from "../utils";
 import type { LiveStatus } from "../types";
@@ -9,9 +9,9 @@ interface PanelHeaderProps {
   lastEnforced?: number;
   deviceLabel?: string;
   streaming?: LiveStatus;
-  // Every setting's explanation open at once, for reading with a controller.
-  showDetails: boolean;
-  onShowDetails: (on: boolean) => void;
+  // Whether any fix auto mode governs (Prevent lag spikes, buffer tuning,
+  // CAKE) is turned on. With none on there is nothing to pause or hold.
+  fixesOn: boolean;
 }
 
 export function PanelHeader({
@@ -20,8 +20,7 @@ export function PanelHeader({
   lastEnforced,
   deviceLabel,
   streaming,
-  showDetails,
-  onShowDetails,
+  fixesOn,
 }: PanelHeaderProps) {
   const modelLabel = deviceLabel && deviceLabel !== "unknown"
     ? deviceLabel
@@ -62,25 +61,18 @@ export function PanelHeader({
           >
             {/* The same three cases the streaming section tells apart: an
                 app named, Keep fixes on, or a stream flagged before the app
-                has been named, just after a reload. */}
+                has been named, just after a reload. The fixes are only
+                mentioned when one of them is turned on. */}
             {streaming.streaming_active
               ? streaming.streaming_app
-                ? `Auto mode: streaming ${streaming.streaming_app}, fixes on`
+                ? `Auto mode: streaming ${streaming.streaming_app}${fixesOn ? ", fixes on" : ""}`
                 : streaming.streaming_held
-                  ? "Auto mode: held on, fixes on"
-                  : "Auto mode: stream running, fixes on"
-              : "Auto mode: no stream, fixes paused"}
+                  ? fixesOn ? "Auto mode: held on, fixes on" : "Auto mode: held on"
+                  : fixesOn ? "Auto mode: stream running, fixes on" : "Auto mode: stream running"
+              : fixesOn ? "Auto mode: no stream, fixes paused" : "Auto mode: no stream"}
           </span>
         </PanelSectionRow>
       )}
-      <PanelSectionRow>
-        <ToggleField
-          label="Show details"
-          description="Explains every setting below. You can also tap (i) next to one."
-          checked={showDetails}
-          onChange={onShowDetails}
-        />
-      </PanelSectionRow>
       <PanelSectionRow>
         <div style={rowStyle}>
           Last changed: {timeAgo(lastApplied)}

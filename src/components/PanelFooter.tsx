@@ -1,4 +1,4 @@
-import { PanelSection, PanelSectionRow, ButtonItem, Navigation } from "@decky/ui";
+import { PanelSection, PanelSectionRow, ButtonItem, Navigation, ToggleField } from "@decky/ui";
 import { theme } from "../theme";
 import * as backend from "../backend";
 import { useEffect, useRef, useState } from "react";
@@ -9,9 +9,15 @@ const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
 
 interface PanelFooterProps {
   version: string;
+  // Every setting's explanation open at once, for reading with a controller.
+  // Down here with the other secondary controls: the top of the panel is for
+  // status and the first useful action, and the (i) next to each setting
+  // already explains that one.
+  showDetails: boolean;
+  onShowDetails: (on: boolean) => void;
 }
 
-export function PanelFooter({ version }: PanelFooterProps) {
+export function PanelFooter({ version, showDetails, onShowDetails }: PanelFooterProps) {
   const [diagState, setDiagState] = useState<
     "idle" | "copying" | "done" | "saved" | "error" | "save_failed"
   >("idle");
@@ -104,6 +110,9 @@ export function PanelFooter({ version }: PanelFooterProps) {
           <br />
           Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer
         </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField label="Show details" checked={showDetails} onChange={onShowDetails} />
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem

@@ -67,8 +67,9 @@ export interface LiveStatus {
   /** What was detected: the app's name and the process that matched. */
   streaming_app?: string;
   streaming_process?: string;
-  /** Sent only while not connected: why. Older backends leave it out,
-   * which the panel reads as "disconnected". */
+  /** While not connected: why. Older backends leave it out, which the
+   * panel reads as "disconnected". While connected it is sent only as
+   * "not_responding", for an iw stuck in the driver (C1 (c)). */
   wifi_state?:
     | "no_device"
     | "not_responding"
