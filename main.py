@@ -308,6 +308,15 @@ ENFORCED_FILE = "/run/wifi-optimizer/last_enforced"
 # ASCII digits only: \d would also accept digits from other scripts.
 VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?\Z")
 
+# The oldest release the updater installs. Someone holding the GitHub account
+# but not the signing key could otherwise delete newer releases and offer a
+# signed one from before a security fix as the beta channel's "go back to".
+# 0.24.5-beta is the first with the settings-link and dispatcher hardening of
+# QA passes 3 and 4. The release procedure raises it whenever a security fix
+# ships; release.sh reads it in exactly this shape. Older ones still install
+# by hand (install.sh, or the zip from Decky).
+MIN_INSTALL_VERSION = "0.24.5-beta"
+
 # How far the update script has got, as "<phase> <version>". In /run for the
 # same reason as ENFORCED_FILE: the panel acts on what it says, so only root
 # may write it.
@@ -703,6 +712,12 @@ def _log_refused_link(path: str, name: str, st: os.stat_result):
     """
     if (st.st_mode & 0o170000) != 0o120000:
         return
+    # On the way to the settings: every save fails, and the panel says why
+    # (contract C16) instead of asking for free storage space.
+    target = os.path.abspath(path)
+    if (os.path.abspath(SETTINGS_FILE).startswith(target.rstrip("/") + "/")
+            or os.path.abspath(SETTINGS_FILE) == target):
+        _SETTINGS_STATE["link_refused"] = True
     if path in _REFUSED_LINKS:
         return
     _REFUSED_LINKS.add(path)
@@ -1299,7 +1314,47 @@ def _corrupt_settings_identity() -> list | None:
     return [st.st_ino, st.st_mtime_ns, st.st_size]
 
 
+# Settings are loaded, changed and saved from the event loop and from worker
+# threads alike. A save made from a copy loaded before someone else's save
+# would undo it (buffer tuning off springing back on), so every load records
+# what it read and every save, under one lock, writes only what its caller
+# changed on top of what is in the file now. Every writer goes through this,
+# whichever thread it runs on.
+_SETTINGS_LOCK = threading.RLock()
+_SETTINGS_GEN = [0]          # saves made by this process so far
+_MISSING = object()
+
+
+class _LoadedSettings(dict):
+    """The settings as _load_settings read them, remembering what that was
+    (_base) and how many saves had been made then (_gen), so _save_settings
+    can tell this caller's changes from what others saved meanwhile."""
+
+    def __init__(self, data: dict, gen: int):
+        super().__init__(data)
+        self._gen = gen
+        self._base = copy.deepcopy(data)
+
+
 def _load_settings() -> dict:
+    with _SETTINGS_LOCK:
+        gen = _SETTINGS_GEN[0]
+        settings = _read_settings_file()
+    return _LoadedSettings(settings, gen)
+
+
+def _modify_settings(change, stamp: bool = False) -> dict:
+    """Load, change and save the settings as one step: change(settings)
+    edits the dict in place. stamp also sets "Last changed". The saved
+    settings are returned."""
+    with _SETTINGS_LOCK:
+        settings = _load_settings()
+        change(settings)
+        (_save_settings_with_timestamp if stamp else _save_settings)(settings)
+        return settings
+
+
+def _read_settings_file() -> dict:
     try:
         # Bounded read. This file belongs to the desktop user and root parses
         # it on every status poll, so an oversized one is a way to make the
@@ -1402,7 +1457,7 @@ def _unread_settings_in_place() -> bool:
 # aside_failed: the identity of the last set-aside that failed (see
 # _set_aside_corrupt_settings), so it is neither retried nor logged again.
 _SETTINGS_STATE = {"read_failed": False, "save_failed": False, "unread": None,
-                   "aside_failed": None}
+                   "aside_failed": None, "link_refused": False}
 
 
 def _default_settings() -> dict:
@@ -1531,15 +1586,42 @@ def _save_settings(data: dict):
     Refused while the file at the name could not be read: what is being
     saved was built on the defaults that stood in for it.
     """
-    if _unread_settings_in_place():
-        _SETTINGS_STATE["save_failed"] = True
-        raise SettingsSaveError("settings not saved: the file there could not be read")
-    try:
-        _write_settings(data)
-    except Exception as e:
-        _SETTINGS_STATE["save_failed"] = True
-        raise SettingsSaveError(f"settings not saved: {e}") from e
-    _SETTINGS_STATE["save_failed"] = False
+    with _SETTINGS_LOCK:
+        if _unread_settings_in_place():
+            _SETTINGS_STATE["save_failed"] = True
+            raise SettingsSaveError("settings not saved: the file there could not be read")
+        merged = data
+        if isinstance(data, _LoadedSettings) and data._gen != _SETTINGS_GEN[0]:
+            # Saved over since this copy was loaded: only what this caller
+            # changed goes on top of what is there now.
+            merged = _read_settings_file()
+            if _unread_settings_in_place():
+                _SETTINGS_STATE["save_failed"] = True
+                raise SettingsSaveError("settings not saved: the file there could not be read")
+            for key in set(data) | set(data._base):
+                mine = data.get(key, _MISSING)
+                if mine == data._base.get(key, _MISSING):
+                    continue
+                if mine is _MISSING:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = copy.deepcopy(mine)
+        try:
+            _write_settings(merged)
+        except Exception as e:
+            _SETTINGS_STATE["save_failed"] = True
+            raise SettingsSaveError(f"settings not saved: {e}") from e
+        _SETTINGS_STATE["save_failed"] = False
+        _SETTINGS_STATE["link_refused"] = False
+        _SETTINGS_GEN[0] += 1
+        if isinstance(data, _LoadedSettings):
+            # The caller's copy is what the file now says, so a second save
+            # of it changes only what changed after this one.
+            if merged is not data:
+                data.clear()
+                data.update(merged)
+            data._gen = _SETTINGS_GEN[0]
+            data._base = copy.deepcopy(dict(data))
 
 
 def _write_settings(data: dict):
@@ -1549,8 +1631,8 @@ def _write_settings(data: dict):
     # Write to a temp file then rename, so a crash cannot leave a half-written
     # settings file. The temp name is unique per call rather than fixed: with a
     # shared name, two writers race and the loser's os.replace finds its own
-    # file already renamed away. Every caller is on the event loop today, but
-    # that is not something a future change should have to know.
+    # file already renamed away. _save_settings also holds _SETTINGS_LOCK,
+    # since settings are saved from worker threads as well as the event loop.
     tmp_name = f".settings-{os.urandom(6).hex()}.tmp"
     try:
         fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -5111,12 +5193,16 @@ class Plugin:
                 # that follows the region it was built for (some read one from
                 # the chip itself) can turn the request down, and the
                 # selector would otherwise show a region the radio is not on.
-                where = (f"is on {self._region_words(governing, country)}, not {country} alone"
-                         if governing == "98" else
-                         f"stayed on {self._region_words(governing, country)} instead of {country}")
+                # A real code is named as it is: it can be a region chosen
+                # earlier, here or elsewhere, not the card's own.
+                named = (governing if re.fullmatch(r"[A-Z]{2}", governing or "")
+                         and governing not in ("00", "98", "99")
+                         else self._region_words(governing, country))
+                where = (f"is on {named}" if governing == "98"
+                         else f"stayed on {named} instead of {country}")
                 result["message"] = (
-                    f"The WiFi card {where}, so the channels available to you may not "
-                    "have changed. " + normal + "and nothing else needs doing."
+                    f"The WiFi card {where}. That is normal on some cards, "
+                    "and nothing else needs doing."
                 )
             decky.logger.info(
                 f"regdomain set to {target!r}: governing="
@@ -6111,6 +6197,9 @@ class Plugin:
         between polls.
         """
         status["settings_unwritable"] = bool(_SETTINGS_STATE["save_failed"])
+        # Contract C16: the reason is a link the plugin will not follow on
+        # the way to the settings folder, not a full disk.
+        status["settings_link_refused"] = bool(_SETTINGS_STATE.get("link_refused"))
         status["profile_change_in_flight"] = (
             self._profile_change_in_flight() or self._backend_switch_running()
         )
@@ -10446,8 +10535,7 @@ class Plugin:
             )
 
     def _record_relock(self, bssid: str):
-        """Record the address _relock_pin wrote. On the event loop: a save
-        from a worker thread races every setter's save there."""
+        """Record the address _relock_pin wrote."""
         settings = _load_settings()
         settings["bssid_lock_value"] = bssid
         _save_settings(settings)
@@ -13098,6 +13186,13 @@ class Plugin:
             # "update available", one press silently replaces a newer build
             # with an older one and nothing tells the user which way it goes.
             going_back = update_available and self._is_older(latest, current)
+            # Not offered at all below the floor _signed_release holds to:
+            # a button that can only be refused is no way home.
+            if going_back and self._is_older(latest, MIN_INSTALL_VERSION):
+                decky.logger.info(
+                    f"Update check: v{latest} is older than v{MIN_INSTALL_VERSION}, "
+                    "the oldest this installs; not offered")
+                update_available = going_back = False
 
             decky.logger.info(
                 f"Update check: current={current}, latest={latest}, "
@@ -13190,6 +13285,9 @@ class Plugin:
 
         if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
             return refuse("Received an unexpected version from GitHub.", f"version {version!r}")
+        if self._is_older(version, MIN_INSTALL_VERSION):
+            return refuse(f"Versions before v{MIN_INSTALL_VERSION} can't be installed from here.",
+                          f"older than v{MIN_INSTALL_VERSION}, the oldest this installs")
         base = f"{RELEASE_DOWNLOAD}/v{version}"
         deadline = time.monotonic() + RELEASE_FETCH_BUDGET
         sums = await asyncio.to_thread(self._fetch_release_file, f"{base}/SHA256SUMS", RELEASE_SUMS_MAX, deadline)
@@ -14471,6 +14569,13 @@ class Plugin:
                 decky.logger.error(f"Could not remove the backend switch marker: {e}")
             finally:
                 os.close(dfd)
+            # And the directory, when the marker was all it held (contract
+            # C15): with no report waiting, nothing of the plugin's is left
+            # in /var/lib. Report files share it once Send report is on.
+            try:
+                os.rmdir(os.path.dirname(BACKEND_SWITCH_MARKER))
+            except OSError:
+                pass
             return
         boot = self._boot_id()
         data = (f"{text} {boot}" if boot else text) + "\n"

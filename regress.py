@@ -45,6 +45,11 @@ m.Plugin.RFKILL_DIR = os.path.join(tempfile.mkdtemp(), "no-rfkill")
 # see /usr/bin/sysctl turned into the Mac's /usr/sbin/sysctl.
 _REAL_TOOL_DIRS = getattr(m, "TOOL_DIRS", ())
 m.TOOL_DIRS = ()
+# Nor the version floor the updater holds to (K-f pass 6): the update
+# checks below use made-up older versions. The K-f section checks the real one.
+_REAL_MIN_INSTALL_VERSION = getattr(m, "MIN_INSTALL_VERSION", None)
+if _REAL_MIN_INSTALL_VERSION is not None:
+    m.MIN_INSTALL_VERSION = "0.0.0"
 FAILS = []
 def ok(c, l):
     print(("PASS  " if c else "FAIL  ")+l)
@@ -56,6 +61,32 @@ def _maybe_run(result):
     """Run a coroutine to its end; anything else is already the result.
     For calls that became coroutines, so older code still runs the check."""
     return asyncio.run(result) if asyncio.iscoroutine(result) else result
+
+class _RegressPid1(Exception):
+    """Raised by a section that cannot run with regress as PID 1."""
+
+_REGRESS_PID1_SAID = []
+
+def _regress_is_pid1():
+    """Whether regress runs as PID 1 (Docker without --init). Stand-in
+    processes from other sections then re-parent to regress itself, the PID
+    apply_update names as the plugin's backend, so the process-search
+    sections would count them as the plugin's own and fail for no fault of
+    the plugin. Said once, as one FAIL line naming the fix."""
+    if os.getpid() != 1:
+        return False
+    if not _REGRESS_PID1_SAID:
+        _REGRESS_PID1_SAID.append(True)
+        ok(False, "regress is PID 1: run Docker with --init")
+    return True
+
+def _reap(pid):
+    """Collect a killed stand-in process when it is ours to collect, so none
+    is left behind for a later section's process search."""
+    try:
+        os.waitpid(pid, 0)
+    except (ChildProcessError, OSError):
+        pass
 
 section("security: driver profile validation")
 p = m.Plugin()
@@ -2605,7 +2636,7 @@ for good in ("a", "bg"):
     res = asyncio.run(d.set_band_preference(True, good))
     ok(res.get("success") is True and wrote(d, BU, good), f"band {good!r} is applied")
 
-# ⭐ The network is established BEFORE anything is written, so a failure here
+# The network is established BEFORE anything is written, so a failure here
 # needs no rollback. Recording the preference as on with no network attached
 # would leave it enforced nowhere while the toggle reads on, and would let
 # Force Reapply write the band into an unrelated network.
@@ -2642,7 +2673,7 @@ ok(s.get("band_preference_ssid") == "Home",
 ok(BU in s.get("band_preference_uuids", []),
    "and the profile is tracked, so it can be cleared later")
 
-# ⭐ THE SUBTLE ONE: reapply_all calls this setter too, so re-claiming the
+# The subtle one: reapply_all calls this setter too, so re-claiming the
 # network on every call would move a preference set at home onto whatever
 # network Force Reapply happened to be pressed on.
 m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
@@ -2715,7 +2746,7 @@ ok(d.mods.index((BU, "802-11-wireless.band", "a"))
    < d.mods.index((BU, "802-11-wireless.bssid", "")),
    "the band is written before the pin is released, so no window has neither")
 
-# ⭐ AND IF THE RELEASE FAILS, the band write is undone rather than left beside
+# And if the release fails, the band write is undone rather than left beside
 # an address from the other band - the combination nothing can satisfy.
 m._save_settings(band_settings(bssid_lock_enabled=True,
                                bssid_lock_value="02:00:00:00:00:99",
@@ -2742,7 +2773,7 @@ try:
     ok(m._load_settings().get("bssid_lock_value") == "02:00:00:00:00:42",
        "and the recorded pin matches what was written")
 
-    # ⭐ A reconnect can land on a DIFFERENT profile - a duplicate for the same
+    # A reconnect can land on a DIFFERENT profile - a duplicate for the same
     # network, which is the situation this plugin exists to handle. Pinning what
     # we see onto the profile we meant to change would write a foreign address,
     # possibly from the other band, into a profile that now demands this one.
@@ -2863,7 +2894,7 @@ class NthFails(Band):
 
 asyncio.sleep = _no_sleep
 try:
-    # ⭐ THE WORST CASE: the pin will not release, so the band write is rolled
+    # The worst case: the pin will not release, so the band write is rolled
     # back - and the rollback fails too. The profile is then left demanding a
     # band with an address from possibly the other band beside it, which is the
     # combination nothing satisfies. Nothing here can fix it; the log line is
@@ -6754,6 +6785,12 @@ exec /bin/bash "$0" "$@"
                 if proc.poll() is None:
                     os.killpg(proc.pid, _r1_sig.SIGKILL); proc.wait()
                     out["err"] = "timed out"
+                # L19 pass 6: anything the script left running in its session
+                # goes too, so no later process search finds it.
+                try:
+                    os.killpg(proc.pid, _r1_sig.SIGKILL)
+                except OSError:
+                    pass
                 out["rc"] = proc.returncode
                 out["err"] += proc.stderr.read()[-300:]
                 out["state"] = open(state_file).read().strip() if os.path.exists(state_file) else ""
@@ -11825,6 +11862,8 @@ finally:
 
 section("L1 the update script never takes itself for a stream, with the real pgrep")
 try:
+    if _regress_is_pid1():
+        raise _RegressPid1()
     import shutil as _l1_sh, subprocess as _l1_sp
     # Pass 4's X-S1: the patterns rode on the script's own command line
     # (argv 8), and playing() ran pgrep inside $(...), whose subshell is a
@@ -11935,6 +11974,7 @@ try:
                     os.kill(_l1_moon, 9)
                 except OSError:
                     pass
+                _reap(_l1_moon)
             ok(_l1_live == "yes", f"and a real moonlight process running is one ({_l1_live})")
     _l1_sh.rmtree(_l1_dir, ignore_errors=True)
     _l1p._update_dir = None
@@ -11976,6 +12016,8 @@ try:
     finally:
         m.PROC_DIR = _l1_saved_proc
     m._save_settings(dict(m.DEFAULT_SETTINGS))
+except _RegressPid1:
+    pass
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -15011,6 +15053,8 @@ except Exception as _e:
 
 section("L6 pass 5 Decky's plugin backends, PluginLoader and the plugin's own processes are never a stream")
 try:
+    if _regress_is_pid1():
+        raise _RegressPid1()
     _v = m._stream_pattern_verdicts("caféstream moonlight")
     ok(("caféstream", "ascii") in _v[1] and "moonlight" in _v[0],
        f"a name with a letter outside plain ASCII is refused as such ({_v})")
@@ -15091,8 +15135,11 @@ try:
                     os.kill(_pid, 9)
                 except OSError:
                     pass
+                _reap(_pid)
             _p5_sp.run(["pkill", "-9", "-f", "optimizer-probe"], capture_output=True)
     m._save_settings(dict(m.DEFAULT_SETTINGS))
+except _RegressPid1:
+    pass
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -16797,6 +16844,217 @@ try:
                                                     "streaming_apps": {"moonlight": False}})}
     ok(_kg_moon and _kg_moon <= _kg_off, "auto mode off: an app unticked earlier still counts as a stream")
     ok(not (_kg_moon & _kg_on), "auto mode on: the ticks the panel shows are honoured")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L9 pass 6 a settings change saved from a worker thread and one from the event loop both stay")
+try:
+    class _L9(m.Plugin):
+        def _run_cmd(self, cmd, timeout=5): return _ok("")
+        def _get_wifi_interface(self): return None
+        def _restore_buffer_sysctls(self, settings): return 0
+    _l9_real_write = m._write_settings
+    _p9 = _L9()
+    _l9_done = _p6_thr.Event()
+    _l9_started = []
+
+    def _l9_write(data):
+        # The event loop's save of update notices, slowed: buffer tuning is
+        # turned on from a worker thread while it is under way.
+        if _p6_thr.current_thread() is _p6_thr.main_thread() and not _l9_started:
+            _l9_started.append(_p6_thr.Thread(
+                target=lambda: (_p9._buffer_tuning_work(True, False), _l9_done.set()), daemon=True))
+            _l9_started[0].start()
+            _l9_done.wait(0.5)
+        return _l9_real_write(data)
+    m._save_settings({**base_ap, "buffer_tuning_enabled": False, "update_notify": True})
+    try:
+        m._write_settings = _l9_write
+        asyncio.run(_p9.set_update_notify(False))
+        _l9_done.wait(5)
+    finally:
+        m._write_settings = _l9_real_write
+    _s9 = m._load_settings()
+    ok(_s9.get("buffer_tuning_enabled") is True and _s9.get("update_notify") is False,
+       f"both changes are in the file (buffer tuning {_s9.get('buffer_tuning_enabled')}, "
+       f"update notices {_s9.get('update_notify')})")
+
+    # Many at once, both ways round.
+    _l9_flip = []
+    def _l9_slow(data):
+        time.sleep(0.001)
+        return _l9_real_write(data)
+    m._save_settings({**base_ap, "buffer_tuning_enabled": False, "update_notify": True})
+    async def _l9_many():
+        def worker():
+            for i in range(100):
+                _p9._buffer_tuning_work(i % 2 == 1, False)     # ends on
+        async def loop_side():
+            for i in range(100):
+                await _p9.set_update_notify(i % 2 == 0)          # ends off
+                await asyncio.sleep(0)
+        await asyncio.gather(asyncio.to_thread(worker), loop_side())
+    try:
+        m._write_settings = _l9_slow
+        asyncio.run(_l9_many())
+    finally:
+        m._write_settings = _l9_real_write
+    _s9 = m._load_settings()
+    ok(_s9.get("buffer_tuning_enabled") is True and _s9.get("update_notify") is False,
+       "and after a hundred of each at once, both last values")
+    _src9 = open("main.py").read()
+    ok("Every caller is on the event loop today" not in _src9
+       and "On the event loop: a save\n        from a worker thread races" not in _src9,
+       "and no comment still says every save is made on the event loop")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L20 pass 6 an unknown stream answer has the WPA2-reach check look again at the very next poll")
+try:
+    class _L20(PinnedReach):
+        """Whether a stream runs: not known at the first poll, then no."""
+        def __init__(self):
+            super().__init__("sae", JASONS_ROOM); self.answers = [None]; self.polled_at = []
+        def _stream_running_now(self, settings):
+            return self.answers.pop(0) if self.answers else False
+        def _stream_running(self, settings):
+            return self._stream_running_now(settings)
+        def _run_cmd(self, cmd, timeout=5):
+            if "rescan" in cmd: self.polled_at.append(_l20_clock[0] - 1000.0)
+            return _ok()
+    _l20_clock = [1000.0]
+    _l20_mono = m.time.monotonic
+    try:
+        m.time.monotonic = lambda: _l20_clock[0]
+        _p20 = _L20()
+        for _poll in range(5):                 # a status poll every 3 s
+            _p20._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+            _l20_clock[0] += 3
+    finally:
+        m.time.monotonic = _l20_mono
+    ok(_p20.polled_at[:1] == [3.0],
+       f"not known at 0 s: no scan then, and the scan is asked for at the next poll, 3 s ({_p20.polled_at})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L16 pass 6 a settings folder behind a link the plugin will not follow is said as such (C16)")
+try:
+    _l16_top = tempfile.mkdtemp(); _l16_away = tempfile.mkdtemp()
+    os.symlink(_l16_away, os.path.join(_l16_top, "settings"))     # the user's own link
+    _l16_saved = m.SETTINGS_FILE
+    _l16_real_err = m.decky.logger.error
+    try:
+        m.decky.logger.error = staticmethod(lambda msg: None)
+        m.SETTINGS_FILE = os.path.join(_l16_top, "settings", "WiFi Optimizer", "settings.json")
+        m._load_settings()
+        try:
+            m._save_settings({"x": 1})
+        except OSError:
+            pass
+        _st16 = m.Plugin()._with_activity({"live": {}})
+        ok(_st16.get("settings_link_refused") is True and _st16.get("settings_unwritable") is True,
+           f"the status says the settings sit behind a link ({_st16.get('settings_link_refused')})")
+    finally:
+        m.SETTINGS_FILE = _l16_saved
+        m.decky.logger.error = _l16_real_err
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    ok(m.Plugin()._with_activity({"live": {}}).get("settings_link_refused") is False,
+       "and once a save lands again, no longer")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L17 pass 6 the backend switch marker's folder goes with it when it is empty (C15)")
+try:
+    _l17_dir = os.path.join(tempfile.mkdtemp(), "wifi-optimizer")
+    _l17_saved = m.BACKEND_SWITCH_MARKER
+    try:
+        m.BACKEND_SWITCH_MARKER = os.path.join(_l17_dir, "backend-switch")
+        _p17b = m.Plugin()
+        _p17b._set_backend_marker("iwd wpa_supplicant")
+        _had17 = os.path.exists(m.BACKEND_SWITCH_MARKER)
+        _p17b._set_backend_marker(None)
+        ok(_had17 and not os.path.exists(_l17_dir),
+           f"set, then cleared: no folder left ({os.path.exists(_l17_dir)})")
+        _p17b._set_backend_marker("iwd wpa_supplicant")
+        open(os.path.join(_l17_dir, "report-1.json"), "w").write("{}")
+        _p17b._set_backend_marker(None)
+        ok(os.path.isdir(_l17_dir) and not os.path.exists(m.BACKEND_SWITCH_MARKER),
+           "with something else in it, the folder stays")
+    finally:
+        m.BACKEND_SWITCH_MARKER = _l17_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L18 pass 6 a region chosen earlier is named, not called the card's own")
+try:
+    _L18OWN = ("global\ncountry US: DFS-FCC\n\t(2400 - 2472 @ 40), (N/A, 30), (N/A)\n")
+    m._save_settings(dict(base_ap))
+    asyncio.sleep = _no_sleep
+    try:
+        _m18 = asyncio.run(Reg(_L18OWN.replace("country US", "country DE")).set_regdomain("US")).get("message", "")
+    finally:
+        asyncio.sleep = _d_real_sleep
+    ok("its own region" not in _m18 and "stayed on DE instead of US" in _m18,
+       f"the region in force is named as it is ({_m18!r})")
+    ok(_m18 == "The WiFi card stayed on DE instead of US. That is normal on some cards, "
+               "and nothing else needs doing.", "in two short sentences")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("K-f pass 6 the updater installs nothing older than MIN_INSTALL_VERSION")
+try:
+    _kf_src = open("main.py").read()
+    _kf_m = re.search(r'^MIN_INSTALL_VERSION = "([0-9]+\.[0-9]+\.[0-9]+(?:-beta)?)"$', _kf_src, re.M)
+    ok(bool(_kf_m), "the floor is one module-level line, in the shape release.sh reads")
+    _kf_floor = _kf_m.group(1) if _kf_m else "0.24.5-beta"
+    ok(_REAL_MIN_INSTALL_VERSION == _kf_floor, "and that is the value the module holds")
+    m.MIN_INSTALL_VERSION = _kf_floor
+
+    class _KF(m.Plugin):
+        def __init__(self, newest="", current="0.24.6-beta"):
+            super().__init__(); self.fetched = []; self.newest = newest; self.current = current
+        def _fetch_release_file(self, url, cap, deadline):
+            self.fetched.append(url); return {"missing": True, "data": None}
+        async def _github_api(self, url):
+            return _ok(json.dumps([{"tag_name": "v" + self.newest, "prerelease": True,
+                                    "draft": False}]))
+        def _newest_release(self, data): return self.newest
+    _kf = _KF()
+    _rkf = asyncio.run(_kf._signed_release("0.24.4-beta"))
+    ok(_rkf.get("ok") is False and not _kf.fetched,
+       f"a release older than the floor is refused before anything is downloaded ({_rkf})")
+    ok(_kf_floor in _rkf.get("message", ""), "and the refusal names the floor")
+    _kf = _KF()
+    asyncio.run(_kf._signed_release(_kf_floor))
+    ok(_kf.fetched, "the floor itself is fetched and checked as before")
+
+    m._save_settings({**m.DEFAULT_SETTINGS, "update_channel": "beta"})
+    _kf_ver = m.decky.DECKY_PLUGIN_VERSION
+    try:
+        m.decky.DECKY_PLUGIN_VERSION = "0.24.6-beta"
+        _ukf = asyncio.run(_KF(newest="0.24.2-beta").check_for_update())
+        _vkf = asyncio.run(_KF(newest="0.24.5-beta").check_for_update())
+    finally:
+        m.decky.DECKY_PLUGIN_VERSION = _kf_ver
+    ok(_ukf.get("update_available") is False,
+       f"the beta channel's 'go back to' is not offered below the floor ({_ukf})")
+    ok(_vkf.get("update_available") is True and _vkf.get("is_downgrade") is True,
+       f"and is at the floor ({_vkf})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    m.MIN_INSTALL_VERSION = "0.0.0"
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
