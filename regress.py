@@ -15707,6 +15707,56 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("merge p5: withdrawing a saved report brings the wake notice back, in the backend and on the panel")
+# DEVICES D17: cancel_pending_report makes get_report_state answer
+# wake_failure true again, unless Dismiss recorded the notice as seen or a
+# report about it already went. FRONT F11 N-3: the panel's cancelPending()
+# lets the notice show again by the same rule. Each was built without the
+# other; here the backend's answers meet the panel's conditions.
+try:
+    m.REPORT_URL = _REP_URL
+    _rep_reset()
+    _mp5w_j = _p4_unix(_P4_UP + _p4_cycle(1000, errors=_P4_LCD_ERRORS))
+    _mp5w = RepStub(curl=[("", 7)], nm="disconnected:enabled", journal=_mp5w_j)
+    _mp5w_first = asyncio.run(_mp5w.get_report_state())
+    _mp5w_sr = asyncio.run(_mp5w.send_report(asyncio.run(_mp5w.preview_report())["id"]))
+    _mp5w_q = asyncio.run(_mp5w.get_report_state())
+    _mp5w_c = asyncio.run(_mp5w.cancel_pending_report())
+    _mp5w_back = asyncio.run(_mp5w.get_report_state())
+    ok(_mp5w_first.get("wake_failure") is True and _mp5w_sr.get("status") == "queued"
+       and _mp5w_q.get("wake_failure") is False and _mp5w_q.get("pending") is True
+       and _mp5w_c == {"success": True}
+       and _mp5w_back.get("wake_failure") is True and _mp5w_back.get("pending") is False,
+       f"backend: queued hides the notice, withdrawing the report shows it again "
+       f"({_mp5w_q.get('wake_failure')}, {_mp5w_back.get('wake_failure')}, {_mp5w_back.get('pending')})")
+    _mp5w_cp = _between(_P5F_SR, "async function cancelPending()", "\n}")
+    _mp5w_offer = _between(_P5F_SR, "function wakeNoticeOffersReady(", "\n}")
+    _mp5w_sent = _between(_P5F_SR, 'if (noAnswer || status === "sent" || status === "queued")', "\n")
+    ok("hidden.wake = true" in _mp5w_sent
+       and 0 <= _mp5w_cp.find("if (done && !hidden.wakeDismissed) hidden.wake = false;")
+       < _mp5w_cp.find("await refreshReportState();")
+       and "state.wake_failure && !hidden.wake && !state.pending" in _mp5w_offer,
+       "panel: a queued report hides the notice, a withdrawn one lets it show again once the state is read")
+    _rep_reset()
+    _mp5d = RepStub(curl=[("", 7)], nm="disconnected:enabled", journal=_mp5w_j)
+    asyncio.run(_mp5d.get_report_state())
+    asyncio.run(_mp5d.dismiss_report_notice("wake"))
+    asyncio.run(_mp5d.send_report(asyncio.run(_mp5d.preview_report())["id"]))
+    asyncio.run(_mp5d.cancel_pending_report())
+    _mp5d_st = asyncio.run(_mp5d.get_report_state())
+    _mp5w_dis = _between(_P5F_SR, "const dismiss = async () => {", "};")
+    ok(_mp5d_st.get("wake_failure") is False and "hidden.wakeDismissed = true;" in _mp5w_dis,
+       f"dismissed first: the backend keeps it hidden after a withdrawal, and so does the panel ({_mp5d_st})")
+    _rep_reset()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+finally:
+    try:
+        m.REPORT_URL = _rep_url_real
+    except NameError:
+        pass
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
