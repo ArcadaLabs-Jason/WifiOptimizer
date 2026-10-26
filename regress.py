@@ -10767,8 +10767,8 @@ try:
     else:
         _p4_sec = _between(_F_RD, "## Send report", "\n## Uninstall")
         _p4_low = _p4_sec.lower()
-        ok("nowhere else" not in _p4_low and "90 days" in _p4_sec and "email" in _p4_low,
-           "where the report is kept and what is emailed, per J-e")
+        ok("nowhere else" not in _p4_low and "30 days" in _p4_sec and "email" in _p4_low,
+           "where the report is kept and what is emailed, per J-e and J-h")
         ok("cloudflare" in _p4_low and "address" in _p4_low,
            "the request passes through Cloudflare, which sees the sending address")
         ok("until you dismiss" in _p4_low and "says so once" not in _p4_low
@@ -11781,7 +11781,7 @@ try:
     _sec = _sec[:_sec.find("\n## ", 5)] if "\n## " in _sec[5:] else _sec
     # Only while REPORT_URL is set (pass 4 F1); pass 4 F2 checks the rest of it.
     ok("## Send report" not in _readme
-       or (_readme.count("## Send report") == 1 and "Copy diagnostics" in _sec and "90 days" in _sec
+       or (_readme.count("## Send report") == 1 and "Copy diagnostics" in _sec and "30 days" in _sec
            and "confirm" in _sec.lower() and "workers" not in _sec.lower()
            and all(ord(ch) < 128 for ch in _sec)),
        "the README, when it has the section, says what is sent, where it goes and that nothing goes unconfirmed")
@@ -15818,6 +15818,18 @@ try:
         m._save_settings(dict(m.DEFAULT_SETTINGS))
 except Exception as _e:
     import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("merge p5: the README checks for Send report ask for the 30 days a report is kept")
+# Contract C11 with J-h: reports are kept 30 days, not 90. The receiving end
+# (KEEP_DAYS) and its email already say 30; the README section is held back
+# until REPORT_URL is set (J-a), and the two checks that read it then still
+# asked for 90, so the section written to pass them would have been wrong.
+try:
+    _mp5k = re.findall(r'"(\d+) days" in _(?:p4_)?sec\b', open(__file__).read())
+    ok(len(_mp5k) == 2 and set(_mp5k) == {"30"},
+       f"both checks of the README's Send report section ask for 30 days ({_mp5k})")
+except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("this file: no section rebinds a helper the others share")
