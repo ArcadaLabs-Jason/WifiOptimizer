@@ -283,12 +283,75 @@ fi
 # never iw event or ip monitor, which run for good on purpose. The sysfs
 # writes below do not go through the driver's netlink path, so they still
 # run. A pgrep too old to know -O fails, which reads as nothing stuck.
+#
+# The search itself reads every process's command line, and one of those
+# can hang behind the same wedged driver. So it runs as netlink() runs iw:
+# in the background with the lock's descriptor closed, waited for 3 s at
+# most, and left behind after that, which counts as stuck. Its output goes
+# to SEARCH_OUT and its exit status is returned, 124 when it did not answer.
+# Called with no redirection of its own, for the reason netlink() gives.
 NETLINK_STUCK=0
-if pgrep -u 0 -O 8 -f "^([^ ]*/)?(iw (dev $IFACE( |\$)|reg |phy[^ ]* )|tc qdisc |ip link set )" \
-        >/dev/null 2>&1 8>&-; then
-    NETLINK_STUCK=1
-    logger -t "$LOG_TAG" "an earlier iw, ip or tc is still stuck, so iw, ip and tc are left out this time"
-fi
+search() {
+    SEARCH_OUT=""
+    exec 9< <(exec </dev/null 2>/dev/null 8>&-; "$@"; echo "exit=$?")
+    sr_rc=124
+    while read -t 3 -r sr_line <&9; do
+        case "$sr_line" in
+            exit=*) sr_rc=${sr_line#exit=}; break ;;
+            *) SEARCH_OUT="$SEARCH_OUT $sr_line" ;;
+        esac
+    done
+    exec 9<&-
+    return "$sr_rc"
+}
+NETLINK_RE="^([^ ]*/)?(iw (dev $IFACE( |\$)|reg |phy[^ ]* )|tc qdisc |ip link set )"
+search pgrep -u 0 -O 8 -f "$NETLINK_RE"
+case $? in
+    124)
+        NETLINK_STUCK=1
+        logger -t "$LOG_TAG" "the search for a stuck iw, ip or tc did not finish within 3 s, so iw, ip and tc are left out this time"
+        ;;
+    0)
+        # Some pgrep versions (procps-ng 4.0.4) match a command started a
+        # moment ago despite -O 8, such as the panel's own status iw. A match
+        # counts only when ps gives its age as 8 s or more, or, where ps
+        # cannot say, when the same process is still there a second later.
+        FOUND="$SEARCH_OUT"
+        UNSURE=""
+        for pid in $FOUND; do
+            case "$pid" in ''|*[!0-9]*) continue ;; esac
+            search ps -o etimes= -p "$pid"
+            sr=$?
+            age=${SEARCH_OUT// /}
+            if [ "$sr" = 124 ]; then
+                NETLINK_STUCK=1
+                break
+            elif [ "$sr" = 0 ] && [ -n "$age" ] && [ -z "${age//[0-9]/}" ]; then
+                if [ "$age" -ge 8 ]; then
+                    NETLINK_STUCK=1
+                    break
+                fi
+            else
+                UNSURE="$UNSURE $pid"
+            fi
+        done
+        if [ "$NETLINK_STUCK" = 0 ] && [ -n "$UNSURE" ]; then
+            sleep 1
+            search pgrep -u 0 -O 8 -f "$NETLINK_RE"
+            sr=$?
+            if [ "$sr" = 124 ]; then
+                NETLINK_STUCK=1
+            elif [ "$sr" = 0 ]; then
+                for pid in $UNSURE; do
+                    case " $SEARCH_OUT " in *" $pid "*) NETLINK_STUCK=1 ;; esac
+                done
+            fi
+        fi
+        if [ "$NETLINK_STUCK" = 1 ]; then
+            logger -t "$LOG_TAG" "an earlier iw, ip or tc is still stuck, so iw, ip and tc are left out this time"
+        fi
+        ;;
+esac
 
 # Apply power save
 if [ "$POWER_SAVE" = "True" ]; then
