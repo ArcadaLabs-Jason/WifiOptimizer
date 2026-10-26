@@ -1,4 +1,4 @@
-import { PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
+import { PanelSection, PanelSectionRow } from "@decky/ui";
 import { theme } from "../theme";
 import { timeAgo } from "../utils";
 import type { LiveStatus } from "../types";
@@ -12,9 +12,6 @@ interface PanelHeaderProps {
   // Whether any fix auto mode governs (Prevent lag spikes, buffer tuning,
   // CAKE) is turned on. With none on there is nothing to pause or hold.
   fixesOn: boolean;
-  // Every setting's explanation open at once, for reading with a controller.
-  showDetails: boolean;
-  onShowDetails: (on: boolean) => void;
 }
 
 export function PanelHeader({
@@ -24,8 +21,6 @@ export function PanelHeader({
   deviceLabel,
   streaming,
   fixesOn,
-  showDetails,
-  onShowDetails,
 }: PanelHeaderProps) {
   const modelLabel = deviceLabel && deviceLabel !== "unknown"
     ? deviceLabel
@@ -78,14 +73,6 @@ export function PanelHeader({
           </span>
         </PanelSectionRow>
       )}
-      <PanelSectionRow>
-        <ToggleField
-          label="Show details"
-          description="Explains every setting below. You can also tap (i) next to one."
-          checked={showDetails}
-          onChange={onShowDetails}
-        />
-      </PanelSectionRow>
       <PanelSectionRow>
         <div style={rowStyle}>
           Last changed: {timeAgo(lastApplied)}

@@ -1365,8 +1365,6 @@ function Content() {
         streaming={status?.live}
         fixesOn={!!(s?.power_save_disabled || s?.buffer_tuning_enabled || s?.cake_enabled)}
         deviceLabel={deviceParts.length ? deviceParts.join(", ") : undefined}
-        showDetails={showDetails}
-        onShowDetails={handleShowDetails}
       />
 
       {/* A status read failed after the panel had loaded. What is shown is
@@ -2147,7 +2145,11 @@ function Content() {
         busy={isBusy}
       />
 
-      <PanelFooter version={status?.version ?? "?"} />
+      <PanelFooter
+        version={status?.version ?? "?"}
+        showDetails={showDetails}
+        onShowDetails={handleShowDetails}
+      />
     </DetailsContext.Provider>
   );
 }

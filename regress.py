@@ -11230,6 +11230,25 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("F17 pass 5: Show details is a plain toggle at the bottom, not the first control of the panel")
+try:
+    _p5f_hd = _src("src/components/PanelHeader.tsx")
+    ok("Show details" not in _p5f_hd and "ToggleField" not in _p5f_hd,
+       "the header holds no Show details toggle")
+    _p5f_main = _between(_F_IX, "<DetailsContext.Provider value={showDetails}>", "</DetailsContext.Provider>")
+    ok(0 <= _p5f_main.find("<PanelHeader") < _p5f_main.find('"Optimize Safe"') < _p5f_main.find("<PanelFooter")
+       and "showDetails={showDetails}" in _between(_p5f_main, "<PanelFooter", "/>")
+       and "showDetails" not in _between(_p5f_main, "<PanelHeader", "/>"),
+       "the panel hands Show details to the footer, after Optimize Safe and every setting")
+    _p5f_tg = re.search(r"<ToggleField([^>]*)/>", _F_PF)
+    ok(_p5f_tg and 'label="Show details"' in _p5f_tg.group(1) and "description=" not in _p5f_tg.group(1),
+       "where it is a plain toggle with no subtitle")
+    ok(0 <= _F_PF.find('label="Show details"') < _F_PF.find("{label}"),
+       "next to Copy diagnostics")
+    ok("**Show details** at the bottom of the panel" in _F_RD, "and the README says where it is")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("F pass 5: the changed text is plain ASCII with no dashes as punctuation")
 try:
     _p5f_new = _F_RD + _F_SEC + _F_IX + _F_SS + _P5F_PH + _P5F_SR + _P5F_RP + _F_TY
