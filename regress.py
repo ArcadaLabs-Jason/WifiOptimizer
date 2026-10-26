@@ -45,6 +45,11 @@ m.Plugin.RFKILL_DIR = os.path.join(tempfile.mkdtemp(), "no-rfkill")
 # see /usr/bin/sysctl turned into the Mac's /usr/sbin/sysctl.
 _REAL_TOOL_DIRS = getattr(m, "TOOL_DIRS", ())
 m.TOOL_DIRS = ()
+# Nor the version floor the updater holds to (K-f pass 6): the update
+# checks below use made-up older versions. The K-f section checks the real one.
+_REAL_MIN_INSTALL_VERSION = getattr(m, "MIN_INSTALL_VERSION", None)
+if _REAL_MIN_INSTALL_VERSION is not None:
+    m.MIN_INSTALL_VERSION = "0.0.0"
 FAILS = []
 def ok(c, l):
     print(("PASS  " if c else "FAIL  ")+l)
@@ -56,6 +61,32 @@ def _maybe_run(result):
     """Run a coroutine to its end; anything else is already the result.
     For calls that became coroutines, so older code still runs the check."""
     return asyncio.run(result) if asyncio.iscoroutine(result) else result
+
+class _RegressPid1(Exception):
+    """Raised by a section that cannot run with regress as PID 1."""
+
+_REGRESS_PID1_SAID = []
+
+def _regress_is_pid1():
+    """Whether regress runs as PID 1 (Docker without --init). Stand-in
+    processes from other sections then re-parent to regress itself, the PID
+    apply_update names as the plugin's backend, so the process-search
+    sections would count them as the plugin's own and fail for no fault of
+    the plugin. Said once, as one FAIL line naming the fix."""
+    if os.getpid() != 1:
+        return False
+    if not _REGRESS_PID1_SAID:
+        _REGRESS_PID1_SAID.append(True)
+        ok(False, "regress is PID 1: run Docker with --init")
+    return True
+
+def _reap(pid):
+    """Collect a killed stand-in process when it is ours to collect, so none
+    is left behind for a later section's process search."""
+    try:
+        os.waitpid(pid, 0)
+    except (ChildProcessError, OSError):
+        pass
 
 section("security: driver profile validation")
 p = m.Plugin()
@@ -493,7 +524,8 @@ class Reach(m.Plugin):
 
 r = Reach("sae", JASONS_ROOM)
 r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
-ok(r._wpa2_blocked == {"signal": 100, "current_signal": 52},
+# K-b pass 6 (contract C20): and the last two octets of its address.
+ok(r._wpa2_blocked == {"signal": 100, "current_signal": 52, "bssid_tail": "C7:D1"},
    "WPA3-only profile, WPA2-only radio far stronger: reported with both signals")
 r = Reach("wpa-psk", JASONS_ROOM)
 r._recheck_security_reach(WU, "wlan0", "Home", "62:e9:31:0d:1f:e7")
@@ -555,7 +587,8 @@ r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
 ok(len(r.scans) == 1 and r.reads == 0, "and the next poll, before it can land, neither scans again nor reads")
 reach_later(r, m.Plugin._LOCK_SCAN_SETTLE_SECONDS + 3)
 r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
-ok(r.reads == 1 and r._wpa2_blocked == {"signal": 100, "current_signal": 52} and len(r.scans) == 1,
+ok(r.reads == 1 and r._wpa2_blocked == {"signal": 100, "current_signal": 52, "bssid_tail": "C7:D1"}
+   and len(r.scans) == 1,
    "once the scan has landed it is read, and the finding made from it")
 r._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
 ok(r.reads == 1, "then the usual five-minute throttle applies")
@@ -600,7 +633,10 @@ class Allow(m.Plugin):
     def __init__(self, km="sae", connects=True, lock=False, found=True, **extra):
         super().__init__(); self.km = km; self.connects = connects
         self.writes = []; self.lock_calls = 0
-        m._save_settings({"bssid_lock_enabled": lock, **extra})
+        # L5 pass 6: a lock that is on is on for this profile, as the
+        # lock setter records it; one for another network is not re-chosen.
+        m._save_settings({"bssid_lock_enabled": lock,
+                          **({"bssid_lock_connection_uuid": WU} if lock else {}), **extra})
         # What the status poll found, which is what the panel's button acts on.
         if found:
             self._wpa2_blocked = {"signal": 80, "current_signal": 40}
@@ -677,7 +713,8 @@ try:
     # access point here, so the finding stands (J1 gates it below 1.58.1).
     _w2r = Wpa2Reach(); _w2r._nm_version_seen = (1, 58, 1)
     _find = getattr(_w2r, "_wpa2_finding", lambda *_a: "missing")
-    ok(_find("wlan0", "Home", "aa:00:00:00:00:01", {}) == {"signal": 85, "current_signal": 40},
+    ok(_find("wlan0", "Home", "aa:00:00:00:00:01", {}) == {"signal": 85, "current_signal": 40,
+                                                         "bssid_tail": "00:02"},
        "a much stronger WPA2-only access point is found")
     ok(_find("wlan0", "Home", "aa:00:00:00:00:01", _six) is None,
        "but not one on another band than the network is held to")
@@ -2599,7 +2636,7 @@ for good in ("a", "bg"):
     res = asyncio.run(d.set_band_preference(True, good))
     ok(res.get("success") is True and wrote(d, BU, good), f"band {good!r} is applied")
 
-# ⭐ The network is established BEFORE anything is written, so a failure here
+# The network is established BEFORE anything is written, so a failure here
 # needs no rollback. Recording the preference as on with no network attached
 # would leave it enforced nowhere while the toggle reads on, and would let
 # Force Reapply write the band into an unrelated network.
@@ -2636,7 +2673,7 @@ ok(s.get("band_preference_ssid") == "Home",
 ok(BU in s.get("band_preference_uuids", []),
    "and the profile is tracked, so it can be cleared later")
 
-# ⭐ THE SUBTLE ONE: reapply_all calls this setter too, so re-claiming the
+# The subtle one: reapply_all calls this setter too, so re-claiming the
 # network on every call would move a preference set at home onto whatever
 # network Force Reapply happened to be pressed on.
 m._save_settings(band_settings(band_preference_enabled=True, band_preference="a",
@@ -2709,7 +2746,7 @@ ok(d.mods.index((BU, "802-11-wireless.band", "a"))
    < d.mods.index((BU, "802-11-wireless.bssid", "")),
    "the band is written before the pin is released, so no window has neither")
 
-# ⭐ AND IF THE RELEASE FAILS, the band write is undone rather than left beside
+# And if the release fails, the band write is undone rather than left beside
 # an address from the other band - the combination nothing can satisfy.
 m._save_settings(band_settings(bssid_lock_enabled=True,
                                bssid_lock_value="02:00:00:00:00:99",
@@ -2736,7 +2773,7 @@ try:
     ok(m._load_settings().get("bssid_lock_value") == "02:00:00:00:00:42",
        "and the recorded pin matches what was written")
 
-    # ⭐ A reconnect can land on a DIFFERENT profile - a duplicate for the same
+    # A reconnect can land on a DIFFERENT profile - a duplicate for the same
     # network, which is the situation this plugin exists to handle. Pinning what
     # we see onto the profile we meant to change would write a foreign address,
     # possibly from the other band, into a profile that now demands this one.
@@ -2857,7 +2894,7 @@ class NthFails(Band):
 
 asyncio.sleep = _no_sleep
 try:
-    # ⭐ THE WORST CASE: the pin will not release, so the band write is rolled
+    # The worst case: the pin will not release, so the band write is rolled
     # back - and the rollback fails too. The profile is then left demanding a
     # band with an address from possibly the other band beside it, which is the
     # combination nothing satisfies. Nothing here can fix it; the log line is
@@ -5054,8 +5091,13 @@ try:
     m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": False})
     rl = Relock(); _relock_both(rl, "u")
     ok(not rl.mods, "a lock turned off while the band changed is not put back")
-    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True})
-    rl = Relock(); _relock_both(rl, "u")
+    # L5 pass 6: on for this profile, as the lock setter records it (a
+    # real profile id: the settings keep no other).
+    _rl_u = "dddddddd-0000-0000-0000-0000000000e5"
+    class _RelockHere(Relock):
+        def _get_active_connection_uuid(self): return _rl_u
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True, "bssid_lock_connection_uuid": _rl_u})
+    rl = _RelockHere(); _relock_both(rl, _rl_u)
     ok(("802-11-wireless.bssid", "02:00:00:00:00:22") in rl.mods, "one still on is")
 
     # Two cleanups for one list in one pass must both land.
@@ -5407,14 +5449,16 @@ try:
         found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS}))
         ok(found == {"app": "Moonlight", "process": "moonlight"},
            f"a streaming app is found by its command line ({found})")
-        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS,
+        # K-g pass 6: the ticks count while auto mode is on, where they show.
+        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
                                                      "streaming_apps": {"moonlight": False}}))
         ok(found is None, "an app the user unticked is not")
-        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS,
+        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
             "streaming_apps": {"moonlight": False}, "streaming_custom_patterns": "sunshine-client"}))
         ok(found and found["process"] == "sunshine-client", "a pattern of the user's own is")
         shutil_rm = __import__("shutil").rmtree
         shutil_rm(os.path.join(_proc, "100"))
+        time.sleep(1.1)   # L11 pass 6: a search under a second old is answered from again
         ok(pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS})) is None,
            "and the plugin's own process does not count, nor do kernel threads")
     finally:
@@ -6741,6 +6785,12 @@ exec /bin/bash "$0" "$@"
                 if proc.poll() is None:
                     os.killpg(proc.pid, _r1_sig.SIGKILL); proc.wait()
                     out["err"] = "timed out"
+                # L19 pass 6: anything the script left running in its session
+                # goes too, so no later process search finds it.
+                try:
+                    os.killpg(proc.pid, _r1_sig.SIGKILL)
+                except OSError:
+                    pass
                 out["rc"] = proc.returncode
                 out["err"] += proc.stderr.read()[-300:]
                 out["state"] = open(state_file).read().strip() if os.path.exists(state_file) else ""
@@ -8091,7 +8141,9 @@ try:
         lock_on()
         g = mesh_pinned(scan=NEAR)
         r = asyncio.run(g.move_bssid_lock())
-        ok(r.get("error") == "no_better_ap" and not any(k == "802-11-wireless.bssid" for k, _ in g.mods),
+        # L15 pass 6: an outcome, so success with no error.
+        ok(r.get("success") is True and not r.get("error")
+           and not any(k == "802-11-wireless.bssid" for k, _ in g.mods),
            "nothing clearly stronger on a fresh look writes nothing and does not reconnect")
         ok(g._lock_weaker is None and getattr(g, "_profile_change_depth", 0) == 0,
            "and still clears the notice and releases the claim")
@@ -8879,7 +8931,8 @@ try:
             if cmd[-1] == "link":
                 self.iw_on_loop.append(_l_thr.current_thread() is _main_thread)
             return _ok("Connected to 02:00:00:00:00:72 (on wlan0)\n\tfreq: 5180\n")
-    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True})
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                      "bssid_lock_connection_uuid": _U17})   # L5 pass 6: this network's lock
     asyncio.sleep = _no_sleep17
     try:
         _b17 = _L17Band(); asyncio.run(_b17.set_band_preference(True, "a"))
@@ -9168,8 +9221,9 @@ try:
         p._update_dir = None
         return r, argv
     _moon = [pt for app, _l, pts in m.STREAMING_APPS if app == "moonlight" for pt in pts]
+    # K-g pass 6: the ticks count while auto mode is on, where they show.
     m._save_settings({**m.DEFAULT_SETTINGS, "streaming_apps": {"moonlight": False},
-                      "streaming_custom_patterns": "mystreamer"})
+                      "streaming_mode_enabled": True, "streaming_custom_patterns": "mystreamer"})
     _r26, _argv26 = _l26_apply("0.24.6-beta")
     ok(_r26.get("success") and _argv26 and "mystreamer" in _argv26[-1]
        and not any(pt.replace(".", "\\.") in _argv26[-1] for pt in _moon),
@@ -9304,7 +9358,8 @@ try:
         def _nmcli_modify(self, uuid, key, value, timeout=5): self.km = value; return _ok()
         async def _reconnected_to(self, uuid): return True
         async def set_bssid_lock(self, enabled): return dict(m.Plugin._BUSY_RESULT)
-    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True})
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                      "bssid_lock_connection_uuid": _W31})   # L5 pass 6: this network's lock
     _r31 = asyncio.run(_L31().allow_wpa2())
     ok(_r31.get("success") is True and "stayed where it was" in (_r31.get("message") or ""),
        f"WPA2 is allowed, and the panel is told the lock stayed put ({_r31})")
@@ -9324,7 +9379,8 @@ try:
     ok("wpa_supplicant" in ((_r32.get("results") or {}).get("bssid_lock") or {}).get("message", "")
        and _r32.get("total") == 3 and _r32.get("applied") == 3,
        f"the lock's result says why it was left out ({(_r32.get('results') or {}).get('bssid_lock')})")
-    ok(m.Plugin._NEEDS_WPA_SUPPLICANT.rstrip().endswith("Switch to wpa_supplicant in Advanced to use it."),
+    # L21 pass 6: the shorter text, still ending with what to do.
+    ok(m.Plugin._NEEDS_WPA_SUPPLICANT.rstrip().endswith("Switch to it in Advanced."),
        "and the iwd refusal ends with what to do")
 except Exception as _e:
     import traceback; traceback.print_exc()
@@ -9463,7 +9519,8 @@ try:
     ok(_old1._wpa2_finding("wlan0", "Home", "aa:00:00:00:00:01", {}) is None,
        "with a WPA3-only access point in sight on NetworkManager 1.56 it is not offered")
     _new1 = _J1Reach(); _new1._nm_version_seen = (1, 58, 1)
-    ok(_new1._wpa2_finding("wlan0", "Home", "aa:00:00:00:00:01", {}) == {"signal": 85, "current_signal": 40},
+    ok(_new1._wpa2_finding("wlan0", "Home", "aa:00:00:00:00:01", {}) == {"signal": 85, "current_signal": 40,
+                                                                         "bssid_tail": "00:02"},
        "on 1.58.1, which joins WPA3-only access points with it, it is")
     class _J1Mixed(_J1Reach):
         def _visible_access_points(self, iface, ssid, cached_only=False):
@@ -11805,6 +11862,8 @@ finally:
 
 section("L1 the update script never takes itself for a stream, with the real pgrep")
 try:
+    if _regress_is_pid1():
+        raise _RegressPid1()
     import shutil as _l1_sh, subprocess as _l1_sp
     # Pass 4's X-S1: the patterns rode on the script's own command line
     # (argv 8), and playing() ran pgrep inside $(...), whose subshell is a
@@ -11915,6 +11974,7 @@ try:
                     os.kill(_l1_moon, 9)
                 except OSError:
                     pass
+                _reap(_l1_moon)
             ok(_l1_live == "yes", f"and a real moonlight process running is one ({_l1_live})")
     _l1_sh.rmtree(_l1_dir, ignore_errors=True)
     _l1p._update_dir = None
@@ -11956,6 +12016,8 @@ try:
     finally:
         m.PROC_DIR = _l1_saved_proc
     m._save_settings(dict(m.DEFAULT_SETTINGS))
+except _RegressPid1:
+    pass
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -12409,7 +12471,8 @@ try:
             async def set_bssid_lock(self, enabled):
                 return {"success": True, "bssid_locked": True,
                         "message": "Locked to the access point in use; the stronger one would not take."}
-        m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True})
+        m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                          "bssid_lock_connection_uuid": _W10})   # L5 pass 6: this network's lock
         _p10 = _L10(); _r10 = asyncio.run(_p10.allow_wpa2())
         ok(_r10.get("success") and "stronger one would not take" in (_r10.get("message") or ""),
            f"a relock that went through with a note of its own is passed on ({_r10})")
@@ -14990,6 +15053,8 @@ except Exception as _e:
 
 section("L6 pass 5 Decky's plugin backends, PluginLoader and the plugin's own processes are never a stream")
 try:
+    if _regress_is_pid1():
+        raise _RegressPid1()
     _v = m._stream_pattern_verdicts("caféstream moonlight")
     ok(("caféstream", "ascii") in _v[1] and "moonlight" in _v[0],
        f"a name with a letter outside plain ASCII is refused as such ({_v})")
@@ -15070,8 +15135,11 @@ try:
                     os.kill(_pid, 9)
                 except OSError:
                     pass
+                _reap(_pid)
             _p5_sp.run(["pkill", "-9", "-f", "optimizer-probe"], capture_output=True)
     m._save_settings(dict(m.DEFAULT_SETTINGS))
+except _RegressPid1:
+    pass
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -15413,8 +15481,9 @@ try:
     m._save_settings({**m.DEFAULT_SETTINGS, "supports_6ghz": True, "distro_id": "steamos"})
     _r16 = _P16()._six_ghz_refusal("dddddddd-0000-0000-0000-0000000000c6") or {}
     _msg16 = _r16.get("message", "")
-    ok("forget the network and join it again" in _msg16 and "WPA3 only" in _msg16
-       and "1.58.1 or newer" in _msg16 and "SteamOS" not in _msg16,
+    # L6 pass 6: the way on, said as steps, with no internals in it.
+    ok("forget this network and join it again" in _msg16 and "WPA3 only" in _msg16
+       and "NetworkManager" not in _msg16 and "1.58.1" not in _msg16 and "SteamOS" not in _msg16,
        f"the refusal gives the way on: forget and join again with the router on WPA3 only ({_msg16!r})")
     ok(all(ord(c) < 128 for c in _msg16) and " - " not in _msg16, "in plain ASCII, no dashes")
     m._save_settings(dict(m.DEFAULT_SETTINGS))
@@ -15830,6 +15899,1179 @@ try:
     ok(len(_mp5k) == 2 and set(_mp5k) == {"30"},
        f"both checks of the README's Send report section ask for 30 days ({_mp5k})")
 except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 6, LIFECYCLE ----
+import threading as _p6_thr, ast as _p6_ast
+
+_W6U = "eeeeeeee-0000-0000-0000-0000000000b6"
+_W6WEAK, _W6STRONG = "02:00:00:00:00:11", "02:00:00:00:00:51"
+_W6BUSY = "The access point lock is moving after sleep. Try again in a moment."
+
+
+class _W6(m.Plugin):
+    """The lock holding at -84 dBm on a weak access point after a wake, a
+    clearly stronger one of the same network in range. NetworkManager and iw
+    modelled; the game check, the scans and the radio cycles are the
+    plugin's own, only the commands under them answer from the model."""
+    def __init__(self, game_delay=0.0, reachable=True, refused_stays=True, slow=False):
+        super().__init__()
+        self.slow = slow
+        self.pin = _W6WEAK; self.on = _W6WEAK; self.mods = []; self.cycles = []
+        self.game_delay = game_delay; self.game = False; self.reachable = reachable
+        self.refused_stays = refused_stays; self.on_scan = None; self.on_cycle = None
+        self._ASSOCIATION_WAIT_SECONDS = 0.5
+    def _get_wifi_interface(self): return "wlan0"
+    def _get_active_connection_uuid(self): return _W6U
+    def _get_profile_ssid(self, uuid, timeout=5): return "Net"
+    def _profile_key_mgmt(self, uuid): return "wpa-psk"
+    def _read_profile_field(self, uuid, field, timeout=5):
+        return self.pin.replace(":", "\\:") if field == "802-11-wireless.bssid" else ""
+    def _nm_general_state(self): return ("connected", "enabled")
+    def _backend_is_iwd(self): return False
+    def _nmcli_modify(self, u, k, v, timeout=5):
+        if self.slow: time.sleep(0.2)
+        self.mods.append((k, v))
+        if k == "802-11-wireless.bssid": self.pin = v
+        return _ok()
+    def _hard_reconnect(self, uuid=None):
+        self.cycles.append(self.game)
+        if self.on_cycle: self.on_cycle(self)
+        want = (self.pin or _W6STRONG).upper()
+        if self.reachable or want == _W6WEAK:
+            self.on = want.lower()
+        elif not self.refused_stays:
+            self.on = ""
+        return True
+    def _game_or_stream_known(self, settings):
+        time.sleep(self.game_delay); return self.game
+    def _run_cmd(self, cmd, timeout=5):
+        if cmd[:2] == ["/usr/bin/iw", "dev"] and cmd[-1] == "link":
+            if not self.on: return _ok("Not connected.\n")
+            sig = -84 if self.on.upper() == _W6WEAK else -50
+            return _ok(f"Connected to {self.on} (on wlan0)\n\tfreq: 5745\n\tsignal: {sig} dBm\n")
+        if "wifi" in cmd and "list" in cmd:
+            if self.on_scan: self.on_scan(self)
+            if self.slow: time.sleep(0.5)   # a real scan takes seconds
+            return _ok("Net:02\\:00\\:00\\:00\\:00\\:11:30:5745 MHz:WPA2\n"
+                       "Net:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2\n")
+        return _ok()
+
+
+def _w6_locked(**extra):
+    m._save_settings({**base_ap, "bssid_lock_enabled": True, "bssid_lock_value": _W6WEAK,
+                      "bssid_lock_connection_uuid": _W6U, "bssid_lock_uuids": [_W6U],
+                      "pins_owned": ["802-11-wireless.bssid"], "last_connection_uuid": _W6U,
+                      "last_applied": 1234, **extra})
+
+
+class _W6Reset(_W6):
+    """Reset's slow helpers answered at once; its own guard and pin clearing real."""
+    async def get_device_info(self):
+        await asyncio.sleep(1.0)   # it asks the card, which takes a while
+        return {"driver": "ath11k_pci"}
+    def _detect_distro(self): return {"id": "steamos", "name": "SteamOS"}
+    def _release_power_save(self, *a, **k): return True
+    def _release_regdomain(self, *a, **k): return True
+    def _revert_queue_tuning(self, *a, **k): return True
+    def _release_generic_backend_conf(self, *a, **k): return True
+    def _remove_dispatcher(self, *a, **k): return True
+    def _install_dispatcher(self, *a, **k): return True
+
+
+section("L1 pass 6 the after-wake lock move takes the profile-change guard before its first await")
+try:
+    async def _l1_race(p, at, user):
+        async def later():
+            await asyncio.sleep(at)
+            return await user(p)
+        return await asyncio.gather(p._move_lock_after_wake(), later())
+
+    for _l1_at in (0.3, 0.9):
+        _w6_locked(); _p1 = _W6Reset(game_delay=1.0, slow=True)
+        _m1, _r1 = asyncio.run(_l1_race(_p1, _l1_at, lambda p: p.reset_settings()))
+        _s1 = m._load_settings()
+        ok(_r1.get("error") == "busy" or (_s1.get("bssid_lock_enabled") is False and not _p1.pin),
+           f"Reset {_l1_at} s into the move's game check is refused as busy, or wins "
+           f"({_r1.get('message')!r}; lock {_s1.get('bssid_lock_enabled')}, pin {_p1.pin!r})")
+        _w6_locked(); _p1 = _W6(game_delay=1.0, slow=True)
+        _m1, _r1 = asyncio.run(_l1_race(_p1, _l1_at, lambda p: p.set_bssid_lock(False)))
+        _s1 = m._load_settings()
+        ok(_r1.get("error") == "busy" or (_s1.get("bssid_lock_enabled") is False and not _p1.pin),
+           f"lock off {_l1_at} s into the game check is refused as busy, or stays off "
+           f"({_r1.get('message')!r}; lock {_s1.get('bssid_lock_enabled')}, pin {_p1.pin!r})")
+
+    class _W6Update(_W6):
+        def _update_blocker(self, settings): return "BLOCKER REACHED"
+    _w6_locked(); _p1 = _W6Update(game_delay=1.0)
+    _m1, _r1 = asyncio.run(_l1_race(_p1, 0.3, lambda p: p.apply_update("0.99.0")))
+    ok(_r1.get("success") is False and "BLOCKER" not in (_r1.get("message") or "")
+       and not getattr(_p1, "_update_starting", False),
+       f"an update started 0.3 s into the game check is refused before it claims anything ({_r1})")
+
+    # The rule, structural: wherever a guard check precedes the claim it
+    # guards, nothing awaits between the two.
+    _l1_checks = {"_profile_change_refused", "_profile_change_in_flight",
+                  "_backend_switch_running", "_update_running"}
+
+    def _l1_is_claim(n):
+        if isinstance(n, _p6_ast.Expr) and isinstance(n.value, _p6_ast.Call) \
+                and getattr(n.value.func, "attr", "") == "update" and n.value.args \
+                and isinstance(n.value.args[0], _p6_ast.Dict):
+            return any(isinstance(k, _p6_ast.Constant) and k.value == "in_progress"
+                       and isinstance(v, _p6_ast.Constant) and v.value is True
+                       for k, v in zip(n.value.args[0].keys, n.value.args[0].values))
+        if not isinstance(n, (_p6_ast.Assign, _p6_ast.AugAssign)):
+            return False
+        for t in (n.targets if isinstance(n, _p6_ast.Assign) else [n.target]):
+            if isinstance(t, _p6_ast.Attribute) and t.attr == "_profile_change_depth":
+                if isinstance(n, _p6_ast.AugAssign) or not (
+                        isinstance(n.value, _p6_ast.Call) and getattr(n.value.func, "id", "") == "max"):
+                    return True
+            if isinstance(t, _p6_ast.Attribute) and t.attr == "_update_starting" \
+                    and isinstance(n.value, _p6_ast.Constant) and n.value.value is True:
+                return True
+            if isinstance(t, _p6_ast.Subscript) and isinstance(t.slice, _p6_ast.Constant) \
+                    and t.slice.value == "in_progress" \
+                    and isinstance(n.value, _p6_ast.Constant) and n.value.value is True:
+                return True
+        return False
+
+    _l1_bad, _l1_pairs = [], 0
+    for _fn in _p6_ast.walk(_p6_ast.parse(open("main.py").read())):
+        if not isinstance(_fn, _p6_ast.AsyncFunctionDef):
+            continue
+        _inner = set()
+        for _n in _p6_ast.walk(_fn):
+            if _n is not _fn and isinstance(_n, (_p6_ast.FunctionDef, _p6_ast.AsyncFunctionDef, _p6_ast.Lambda)):
+                _inner.update(id(x) for x in _p6_ast.walk(_n))
+        _nodes = [n for n in _p6_ast.walk(_fn) if n is not _fn and id(n) not in _inner]
+        _chk = sorted(n.lineno for n in _nodes
+                      if isinstance(n, _p6_ast.Call) and getattr(n.func, "attr", "") in _l1_checks)
+        _aw = sorted(n.lineno for n in _nodes if isinstance(n, _p6_ast.Await))
+        for _c in sorted(n.lineno for n in _nodes if _l1_is_claim(n)):
+            _k = [k for k in _chk if k < _c]
+            if not _k:
+                continue
+            _l1_pairs += 1
+            if any(_k[-1] < a < _c for a in _aw):
+                _l1_bad.append((_fn.name, _k[-1], _c))
+    ok(_l1_pairs >= 9 and not _l1_bad,
+       f"no await sits between a guard check and its claim, in any of {_l1_pairs} ({_l1_bad})")
+    _src1 = open("main.py").read()
+    _mv1 = _src1[_src1.index("    async def _move_lock_after_wake"):_src1.index("    def _game_or_stream_known")]
+    ok("Reset and the other profile setters wait" not in _mv1, "and the comment no longer says the setters wait")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L2 pass 6 the after-wake move asks again for a game right before each radio cycle")
+try:
+    # (1) A game launched while the move scans: nothing is written, nothing cycled.
+    _w6_locked(); _p2 = _W6()
+    def _l2_launch(p): p.game = True
+    _p2.on_scan = _l2_launch
+    asyncio.run(_p2._move_lock_after_wake())
+    ok(not any(k == "802-11-wireless.bssid" for k, _ in _p2.mods) and not _p2.cycles,
+       f"a game started during the scan: no pin written, no radio cycle ({_p2.mods}, {_p2.cycles})")
+    ok(m._load_settings().get("bssid_lock_value") == _W6WEAK, "and the lock stays where it was")
+
+    # (2) The stronger one refuses, a game started meanwhile, still connected
+    # elsewhere: the previous pin goes back without a second radio cycle.
+    _w6_locked(); _p2 = _W6(reachable=False, refused_stays=True)
+    def _l2_after_cycle(p): p.game = True
+    _p2.on_cycle = _l2_after_cycle
+    asyncio.run(_p2._move_lock_after_wake())
+    ok(_p2.pin.upper() == _W6WEAK and len(_p2.cycles) == 1,
+       f"refused while a game started and still associated: previous pin back, one radio cycle only "
+       f"(pin {_p2.pin}, cycles {_p2.cycles})")
+    ok(m._load_settings().get("bssid_lock_value") == _W6WEAK, "and the settings name the previous one")
+
+    # (3) Not associated at all: offline anyway, so the rollback reconnects.
+    _w6_locked(); _p2 = _W6(reachable=False, refused_stays=False)
+    _p2.on_cycle = _l2_after_cycle
+    asyncio.run(_p2._move_lock_after_wake())
+    ok(_p2.pin.upper() == _W6WEAK and len(_p2.cycles) == 2,
+       f"refused and not associated: the rollback reconnects ({_p2.cycles})")
+
+    # The band preference wanting another band than the one in use: the
+    # lock's own band settling would cycle the radio before any game check.
+    class _W2Band(_W6):
+        def _band_is_reachable(self, iface, uuid, band): return True
+    _w6_locked(band_preference_enabled=True, band_preference="bg", band_preference_ssid="Net",
+               band_preference_uuids=[_W6U])
+    _p2 = _W2Band()
+    asyncio.run(_p2._move_lock_after_wake())
+    ok(not _p2.cycles and not any(k == "802-11-wireless.bssid" for k, _ in _p2.mods),
+       f"a band to settle first: no radio cycle after a wake, the lock left as it is ({_p2.cycles})")
+
+    # Steam starting a game (poke_detection) counts before its process shows.
+    _p2 = m.Plugin()
+    async def _l2_poke(p):
+        p._stream_pass = lambda: asyncio.sleep(0)
+        return await p.poke_detection()
+    asyncio.run(_l2_poke(_p2))
+    ok(_p2._game_or_stream_known(dict(m.DEFAULT_SETTINGS)) is True,
+       "right after Steam starts or stops a game, a game counts as running")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L7 pass 6 the after-wake move is named while it runs, said after, and is not 'Last changed'")
+try:
+    # (1) A move that lands.
+    _w6_locked(); _p7 = _W6()
+    asyncio.run(_p7._move_lock_after_wake())
+    _s7 = m._load_settings()
+    _st7 = _p7._with_activity({"live": {}})
+    ok(_s7.get("bssid_lock_value") == _W6STRONG and _s7.get("last_applied") == 1234,
+       f"a move that lands leaves 'Last changed' alone ({_s7.get('last_applied')})")
+    ok((_st7["live"].get("lock_move_after_wake") or {}).get("outcome") == "moved"
+       and isinstance(_st7["live"]["lock_move_after_wake"].get("at"), int),
+       f"and the status says it moved ({_st7['live'].get('lock_move_after_wake')})")
+    _p7._wake_move_outcome = (_p7._wake_move_outcome[0], _p7._wake_move_outcome[1],
+                              _p7._wake_move_outcome[2] - 121)
+    ok("lock_move_after_wake" not in _p7._with_activity({"live": {}})["live"],
+       "for two minutes, then no more")
+
+    # (2) While it runs.
+    _w6_locked(); _p7 = _W6(game_delay=0.6)
+    async def _l7_during(p):
+        async def look():
+            await asyncio.sleep(0.2)
+            return p._with_activity({"live": {}}), await p.set_bssid_lock(False)
+        return await asyncio.gather(p._move_lock_after_wake(), look())
+    _mv7, (_st7, _r7) = asyncio.run(_l7_during(_p7))
+    ok(_st7.get("activity") == "lock_move_after_wake" and _st7.get("profile_change_in_flight") is True,
+       f"during the attempt the status names it ({_st7.get('activity')!r})")
+    ok(_r7.get("error") == "busy" and _r7.get("message") == _W6BUSY,
+       f"and a toggle answers that the lock is moving after sleep ({_r7.get('message')!r})")
+    ok("activity" not in _p7._with_activity({"live": {}}), "and not once it is over")
+
+    # (3) The stronger one refuses: back where it was, said, unstamped.
+    _w6_locked(); _p7 = _W6(reachable=False, refused_stays=False)
+    asyncio.run(_p7._move_lock_after_wake())
+    _s7 = m._load_settings()
+    _st7 = _p7._with_activity({"live": {}})
+    ok((_st7["live"].get("lock_move_after_wake") or {}).get("outcome") == "back"
+       and _s7.get("last_applied") == 1234 and _s7.get("bssid_lock_value") == _W6WEAK,
+       f"a refused move: outcome back, 'Last changed' untouched ({_st7['live'].get('lock_move_after_wake')}, "
+       f"{_s7.get('last_applied')})")
+
+    # (4) Nothing better: nothing to say.
+    class _W7Near(_W6):
+        def _run_cmd(self, cmd, timeout=5):
+            if "wifi" in cmd and "list" in cmd:
+                return _ok("Net:02\\:00\\:00\\:00\\:00\\:11:30:5745 MHz:WPA2\n"
+                           "Net:02\\:00\\:00\\:00\\:00\\:51:32:5180 MHz:WPA2\n")
+            return _W6._run_cmd(self, cmd, timeout)
+    _w6_locked(); _p7 = _W7Near()
+    asyncio.run(_p7._move_lock_after_wake())
+    ok("lock_move_after_wake" not in _p7._with_activity({"live": {}})["live"] and not _p7.cycles,
+       "nothing clearly stronger: no reconnect, no outcome")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L14 pass 6 a settings save that fails after the lock's pin write puts the pin back")
+try:
+    _l14_real_save = m._save_settings
+
+    def _l14_save(data):
+        if data.get("bssid_lock_value", "").upper() == _W6STRONG:
+            raise m.SettingsSaveError("settings not saved: read-only")
+        return _l14_real_save(data)
+    _w6_locked(); _p14 = _W6()
+    _l14_off = [0.0]
+    _p14._suspend_offset = lambda: _l14_off[0]
+    async def _l14_go(p):
+        await p._wake_lock_check()
+        _l14_off[0] += 600
+        await p._wake_lock_check()
+    _l14_raised = None
+    try:
+        m._save_settings = _l14_save
+        try:
+            asyncio.run(_l14_go(_p14))
+        except Exception as _e14:
+            _l14_raised = _e14
+    finally:
+        m._save_settings = _l14_real_save
+    ok(_p14.pin.upper() == _W6WEAK and m._load_settings().get("bssid_lock_value") == _W6WEAK,
+       f"the profile's pin goes back to the access point the settings name ({_p14.pin})")
+    ok(getattr(_p14, "_wake_lock_pending", "unset") is None and _l14_raised is None,
+       f"and the wake's one attempt is over ({getattr(_p14, '_wake_lock_pending', 'unset')}, {_l14_raised!r})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L15 pass 6 Move the lock finding nothing clearly stronger is an outcome, not an error")
+try:
+    class _W15(_W6):
+        def _run_cmd(self, cmd, timeout=5):
+            if "wifi" in cmd and "list" in cmd:
+                return _ok("Net:02\\:00\\:00\\:00\\:00\\:11:30:5745 MHz:WPA2\n"
+                           "Net:02\\:00\\:00\\:00\\:00\\:51:33:5180 MHz:WPA2\n")
+            return _W6._run_cmd(self, cmd, timeout)
+    _w6_locked(); _p15 = _W15()
+    _r15 = asyncio.run(_p15.move_bssid_lock())
+    ok(_r15.get("success") is True and not _r15.get("error")
+       and _r15.get("message") == "No clearly stronger access point found, so the lock stayed.",
+       f"success, with what happened ({_r15})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("K-d pass 6 no automatic after-wake lock move on rtw88")
+try:
+    _kd_logged = []
+    _kd_real_info = m.decky.logger.info
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: _kd_logged.append(msg))
+        _w6_locked(driver="rtw88"); _pd = _W6()
+        asyncio.run(_pd._move_lock_after_wake())
+        ok(not _pd.mods and not _pd.cycles and _pd.pin.upper() == _W6WEAK,
+           f"the Steam Deck LCD's card: the lock stays, no radio cycle ({_pd.mods}, {_pd.cycles})")
+        ok(any(l.startswith("After waking, the BSSID lock was left as it is") for l in _kd_logged),
+           "and one line says it was left")
+        # The card behind the locked interface, whatever the settings recorded.
+        _kd_sys = tempfile.mkdtemp(); _kd_real_sys = m.SYSFS_NET
+        os.makedirs(os.path.join(_kd_sys, "wlan0", "device", "driver"))
+        os.makedirs(os.path.join(_kd_sys, "mod", "rtw88_pci"))
+        os.symlink(os.path.join(_kd_sys, "mod", "rtw88_pci"),
+                   os.path.join(_kd_sys, "wlan0", "device", "driver", "module"))
+        try:
+            m.SYSFS_NET = _kd_sys
+            _w6_locked(); _pd = _W6()
+            asyncio.run(_pd._move_lock_after_wake())
+        finally:
+            m.SYSFS_NET = _kd_real_sys
+        ok(not _pd.mods and not _pd.cycles, "nor when the interface's own driver is rtw88")
+        _w6_locked(); _pd = _W6()
+        asyncio.run(_pd._move_lock_after_wake())
+        ok(_pd.pin.upper() == _W6STRONG, "while other cards still move")
+    finally:
+        m.decky.logger.info = _kd_real_info
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+class _L5Net(m.Plugin):
+    """Two networks: the lock on for A (its record and pin), the device on
+    B or on A. Every profile write recorded with the profile it went to."""
+    A, B = "aaaaaaaa-0000-0000-0000-0000000000a5", "bbbbbbbb-0000-0000-0000-0000000000b5"
+    def __init__(self, here, freq=5180, nm_delay=0.0):
+        super().__init__()
+        self.here = here; self.freq = freq; self.writes = []; self.km = {self.A: "sae", self.B: "sae"}
+        self.relocks = 0; self.nm_delay = nm_delay
+        self._wpa2_blocked = {"signal": 80, "current_signal": 40, "bssid_tail": "00:B2"}
+        self._reach_checked_for = here
+    def _nm(self):
+        if self.nm_delay: time.sleep(self.nm_delay)
+    def _backend_is_iwd(self): return False
+    def _get_wifi_interface(self): return "wlan0"
+    def _get_active_connection_uuid(self): return self.here
+    def _resolve_uuid(self, msg=None): self._nm(); return self.here, None
+    def _get_profile_ssid(self, uuid, timeout=5):
+        self._nm(); return "NetA" if uuid == self.A else "NetB"
+    def _profile_key_mgmt(self, uuid): self._nm(); return self.km.get(uuid, "")
+    def _profile_band(self, uuid): self._nm(); return ""
+    def _read_profile_field(self, uuid, field, timeout=5): self._nm(); return ""
+    def _band_presence(self, iface, uuid, band): return True
+    def _six_ghz_refusal(self, uuid, quiet=False): return None
+    def _nmcli_modify(self, uuid, key, value, timeout=5):
+        self._nm(); self.writes.append((uuid, key, value))
+        if key == "802-11-wireless-security.key-mgmt": self.km[uuid] = value
+        return _ok()
+    def _hard_reconnect(self, uuid=None): return True
+    async def _reconnected_to(self, uuid): return True
+    def _run_cmd(self, cmd, timeout=5):
+        if cmd[-1:] == ["link"]:
+            mac = "02:00:00:00:00:a2" if self.here == self.A else "02:00:00:00:00:b2"
+            return _ok(f"Connected to {mac} (on wlan0)\n\tfreq: {self.freq}\n\tsignal: -50 dBm\n")
+        return _ok()
+
+
+def _l5_locked_for_a():
+    m._save_settings({**base_ap, "bssid_lock_enabled": True, "bssid_lock_value": "02:00:00:00:00:A1",
+                      "bssid_lock_connection_uuid": _L5Net.A, "bssid_lock_uuids": [_L5Net.A],
+                      "pins_owned": ["802-11-wireless.bssid"], "supports_6ghz": True})
+
+
+section("L5 pass 6 Allow WPA2 and the band toggles leave a lock that is on for another network alone")
+try:
+    _l5_real_sleep = asyncio.sleep
+    async def _l5_no_sleep(*_a, **_k): return None
+    asyncio.sleep = _l5_no_sleep
+    try:
+        class _L5Relock(_L5Net):
+            async def set_bssid_lock(self, enabled):
+                self.relocks += 1
+                return await m.Plugin.set_bssid_lock(self, enabled)
+
+        def _l5_untouched(p, what):
+            s = m._load_settings()
+            ok(s.get("bssid_lock_value") == "02:00:00:00:00:A1"
+               and s.get("bssid_lock_connection_uuid") == _L5Net.A
+               and not any(u == _L5Net.B and k == "802-11-wireless.bssid" for u, k, _ in p.writes),
+               f"{what} on network B: the lock's record stays on A and B's pin is never written "
+               f"({s.get('bssid_lock_value')}, {[w for w in p.writes if w[1] == '802-11-wireless.bssid']})")
+
+        _l5_locked_for_a(); _p5 = _L5Relock(_L5Net.B)
+        _r5 = asyncio.run(_p5.allow_wpa2())
+        ok(_r5.get("success") is True and _p5.relocks == 0, f"Allow WPA2 on B goes through without a relock ({_r5})")
+        _l5_untouched(_p5, "Allow WPA2")
+
+        _l5_locked_for_a(); _p5 = _L5Net(_L5Net.B)
+        _r5 = asyncio.run(_p5.set_band_preference(True, "a"))
+        ok(_r5.get("success") is True, f"Force 5 GHz on B goes through ({_r5})")
+        _l5_untouched(_p5, "Force 5 GHz")
+
+        # 6 GHz that does not land: _confirm_six_ghz puts the band back and
+        # would re-pin the lock where the device lands.
+        _l5_locked_for_a(); _p5 = _L5Net(_L5Net.B, freq=5180)
+        _r5 = asyncio.run(_p5.set_band_preference(True, "6GHz"))
+        ok(_r5.get("error") == "band_unavailable", f"Force 6 GHz on B that does not land is put back ({_r5})")
+        _l5_untouched(_p5, "Force 6 GHz")
+
+        # On A itself the lock is re-chosen as before.
+        _l5_locked_for_a(); _p5 = _L5Relock(_L5Net.A)
+        asyncio.run(_p5.allow_wpa2())
+        ok(_p5.relocks == 1, "on A itself, Allow WPA2 still re-chooses the lock")
+        _l5_locked_for_a(); _p5 = _L5Net(_L5Net.A)
+        asyncio.run(_p5.set_band_preference(True, "a"))
+        _pins5 = [w for w in _p5.writes if w[1] == "802-11-wireless.bssid"]
+        ok(_pins5 and _pins5[0] == (_L5Net.A, "802-11-wireless.bssid", "")
+           and _pins5[-1][2].upper() == "02:00:00:00:00:A2"
+           and m._load_settings().get("bssid_lock_value").upper() == "02:00:00:00:00:A2",
+           f"and Force 5 GHz unpins and re-pins it on the new band ({_pins5})")
+    finally:
+        asyncio.sleep = _l5_real_sleep
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L6 pass 6 Force 6 GHz says first whether a 6 GHz access point is there, then what to do")
+try:
+    _L6U = "cccccccc-0000-0000-0000-0000000000c6"
+
+    class _L6(m.Plugin):
+        def __init__(self, version=(1, 58, 0), km="wpa-psk", present=False):
+            super().__init__(); self.version = version; self.km = km; self.present = present
+            self.writes = []
+        def _backend_is_iwd(self): return False
+        def _resolve_uuid(self, msg=None): return _L6U, None
+        def _get_profile_ssid(self, uuid, timeout=5): return "Home"
+        def _get_wifi_interface(self): return "wlan0"
+        def _nm_version(self): return self.version
+        def _profile_key_mgmt(self, uuid): return self.km
+        def _band_presence(self, iface, uuid, band): return self.present
+        def _nmcli_modify(self, *a, **k): self.writes.append(a); return _ok()
+
+    def _l6_ask(**kw):
+        p = _L6(**kw)
+        r = asyncio.run(p.set_band_preference(True, "6GHz"))
+        return r, p
+
+    m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos"})
+    _r6, _p6 = _l6_ask(present=False)
+    ok(_r6.get("message", "").startswith("No 6 GHz access point") and "WPA3" not in _r6.get("message", "")
+       and not _p6.writes,
+       f"no 6 GHz access point in range: that is the answer, not a router change ({_r6.get('message')!r})")
+    _r6, _p6 = _l6_ask(present=True)
+    ok(_r6.get("message") == "6 GHz needs this network saved for WPA3. Set your router to WPA3 only, "
+                             "then forget this network and join it again."
+       and "NetworkManager" not in _r6.get("message", ""),
+       f"one in range and the profile saved for WPA2: the steps, plainly ({_r6.get('message')!r})")
+    m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos", "wpa2_uuids": [_L6U]})
+    _r6, _p6 = _l6_ask(present=True)
+    ok(_r6.get("message") == "6 GHz needs WPA3 only, and WPA2 is allowed on this network. "
+                             "Reset settings puts WPA3 only back."
+       and "forget" not in _r6.get("message", ""),
+       f"WPA2 allowed by the plugin itself: no advice to forget the network ({_r6.get('message')!r})")
+    m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos"})
+    _r6, _p6 = _l6_ask(version=(1, 56, 0), present=True)
+    ok(_r6.get("message") == "6 GHz needs SteamOS 3.9 or newer.",
+       f"NetworkManager too old on SteamOS: the version that has it ({_r6.get('message')!r})")
+    m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "bazzite"})
+    _r6, _p6 = _l6_ask(version=(1, 56, 0), present=True)
+    ok(_r6.get("message") == "6 GHz needs NetworkManager 1.58 or newer.",
+       f"and elsewhere, the NetworkManager version ({_r6.get('message')!r})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("K-c pass 6 a profile Force 6 GHz would refuse is said in the status, with the reason (C14)")
+try:
+    _KCU = "cccccccc-0000-0000-0000-0000000000c7"
+
+    class _KC(m.Plugin):
+        def __init__(self, km):
+            super().__init__(); self.km = km; self._nm_version_seen = (1, 58, 0); self.logged = 0
+        def _nm_version(self): return self._nm_version_seen
+        def _profile_key_mgmt(self, uuid): return self.km
+    m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos"})
+    _report6 = getattr(_KC, "_report_six_ghz", None)
+    _st_kc = {"live": {"wifi_backend": "wpa_supplicant"}}
+    if _report6:
+        _KC("wpa-psk")._report_six_ghz(m._load_settings(), _st_kc, _KCU, "")
+    ok(_st_kc["live"].get("six_ghz_offered") is True
+       and (_st_kc["live"].get("six_ghz_refusal") or "").startswith("6 GHz needs this network saved for WPA3"),
+       f"offered, but refused for the profile in use: the reason is in live ({_st_kc['live']})")
+    _st_kc = {"live": {"wifi_backend": "wpa_supplicant"}}
+    if _report6:
+        _KC("sae")._report_six_ghz(m._load_settings(), _st_kc, _KCU, "")
+    ok("six_ghz_refusal" not in _st_kc["live"] and _st_kc["live"].get("six_ghz_offered") is True,
+       "a WPA3 profile: nothing refused")
+    _st_kc = {"live": {"wifi_backend": "wpa_supplicant"}}
+    if _report6:
+        _KC("wpa-psk")._report_six_ghz(m._load_settings(), _st_kc, _KCU, "6GHz")
+    ok("six_ghz_refusal" not in _st_kc["live"], "already on 6 GHz: nothing to say")
+    _src_kc = open("main.py").read()
+    _col_kc = _src_kc[_src_kc.index("    def _collect_status"):]
+    ok("self._report_six_ghz(settings, status, uuid, live_band)" in _col_kc[:20000],
+       "and the status collector asks it")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("K-b pass 6 the WPA2-only finding carries the access point's last two octets (C20)")
+try:
+    class _KB(m.Plugin):
+        def _visible_access_points(self, iface, ssid, cached_only=False, rescan=False):
+            return [("D8:07:B6:90:C7:D1", 100, 5180, "WPA2"),
+                    ("62:E9:31:0D:1F:E7", 52, 5745, "WPA2 WPA3")]
+    _kb = _KB(); _kb._nm_version_seen = (1, 58, 1)
+    _f_kb = _kb._wpa2_finding("wlan0", "Home", "62:e9:31:0d:1f:e7", {}) or {}
+    ok(_f_kb.get("bssid_tail") == "C7:D1" and _f_kb.get("signal") == 100,
+       f"the finding names the WPA2-only access point by its last two octets ({_f_kb})")
+    ok(len(_f_kb.get("bssid_tail", "")) == 5, "and no more of its address")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L13 pass 6 the lock, Allow WPA2 and band paths keep nmcli off the event loop")
+try:
+    def _l13_max_stall(coro_fn):
+        """The longest the event loop went without running a 50 ms ticker
+        while coro_fn ran."""
+        async def go():
+            stalls = [0.0]; done = [False]
+            async def tick():
+                last = time.monotonic()
+                while not done[0]:
+                    await asyncio.sleep(0.05)
+                    now = time.monotonic()
+                    stalls[0] = max(stalls[0], now - last); last = now
+            t = asyncio.ensure_future(tick())
+            await asyncio.sleep(0.06)   # the ticker running before the call starts
+            try:
+                await coro_fn()
+            finally:
+                done[0] = True
+                await t
+            return stalls[0]
+        return asyncio.run(go())
+
+    class _L13Lock(_W6):
+        """The after-wake model, every nmcli call taking 1 s."""
+        def _get_profile_ssid(self, uuid, timeout=5): time.sleep(1.0); return "Net"
+        def _read_profile_field(self, uuid, field, timeout=5):
+            time.sleep(1.0); return _W6._read_profile_field(self, uuid, field, timeout)
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            time.sleep(1.0); return _W6._nmcli_modify(self, u, k, v, timeout)
+    _w6_locked(); _p13 = _L13Lock()
+    _st13 = _l13_max_stall(lambda: _p13._lock_onto_best("wlan0", _W6U, moving=True, after_wake=True))
+    ok(_st13 < 0.5 and _p13.pin.upper() == _W6STRONG,
+       f"moving the lock: the event loop never waits on nmcli (longest stall {_st13:.2f} s)")
+
+    _l5_locked_for_a(); _p13 = _L5Net(_L5Net.A, nm_delay=1.0)
+    _p13.set_bssid_lock = lambda enabled: asyncio.sleep(0, result={"success": True})
+    _st13 = _l13_max_stall(_p13.allow_wpa2)
+    ok(_st13 < 0.5, f"Allow WPA2: the same (longest stall {_st13:.2f} s)")
+
+    _l5_locked_for_a(); _p13 = _L5Net(_L5Net.A, nm_delay=1.0)
+    _st13 = _l13_max_stall(lambda: _p13.set_band_preference(True, "a"))
+    ok(_st13 < 0.5, f"Force 5 GHz: the same (longest stall {_st13:.2f} s)")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+class _R6(m.Plugin):
+    """The real volatile setters; only the radio, the driver's files and the
+    host's NetworkManager answered by the model. iw records what it was told."""
+    def __init__(self, iw_delay=0.0):
+        super().__init__(); self.log = []; self.iw_delay = iw_delay
+    def _power_save_radios(self): return ("wlan0", "wlan0")
+    def _iw_power_save(self, disabled, a, b):
+        if self.iw_delay: time.sleep(self.iw_delay)
+        self.log.append(f"iw power_save {'off' if disabled else 'on'}")
+        return {"success": True, "stderr": ""}, disabled
+    def _apply_driver_fixes(self, on, **k): self.log.append(f"driver fixes {'on' if on else 'off'}")
+    def _apply_pcie_aspm_fix(self, on, **k): self.log.append(f"PCIe fixes {'on' if on else 'off'}"); return []
+    def _valve_powersave(self): return None
+    def _claim_at_load(self, *a, **k): return False
+    def _get_wifi_interface(self): return "wlan0"
+    def _get_active_connection_uuid(self): return ""
+    def _get_profile_ssid(self, uuid, timeout=5): return ""
+    def _backend_is_iwd(self): return False
+    def _run_cmd(self, cmd, timeout=5):
+        self.log.append(" ".join(cmd[:3])); return _ok()
+
+
+def _r6_paths():
+    """Temp homes for the files set_power_save and auto mode write."""
+    d = tempfile.mkdtemp()
+    saved = {k: getattr(m, k) for k in ("NM_CONF_PATH", "MODPROBE_CONF_PATH", "STREAM_FLAG_FILE",
+                                        "STREAM_HOLD_FILE")}
+    m.NM_CONF_PATH = os.path.join(d, "nm.conf"); m.MODPROBE_CONF_PATH = os.path.join(d, "modprobe.conf")
+    m.STREAM_FLAG_FILE = os.path.join(d, "streaming"); m.STREAM_HOLD_FILE = os.path.join(d, "hold")
+    def restore():
+        for k, v in saved.items():
+            setattr(m, k, v)
+    return restore
+
+
+section("L3 pass 6 a stream that starts during a profile change gets its fixes")
+try:
+    _r3_restore = _r6_paths()
+    try:
+        _r3_moon = {"app": "Moonlight", "process": "moonlight"}
+        m._save_settings({**base_ap, "streaming_mode_enabled": True, "power_save_disabled": True})
+        _p3 = _R6(); _p3._profile_change_depth = 1          # the after-wake move under way
+        async def _l3_pass(p):
+            async with p._stream_guard():
+                await p._stream_pass_locked(False, _r3_moon)
+        asyncio.run(_l3_pass(_p3))
+        ok(os.path.isfile(m.STREAM_FLAG_FILE) and "iw power_save off" in _p3.log,
+           f"Moonlight found during a profile change: the fixes go on ({_p3.log})")
+
+        # The panel's game-launch reapply, the same.
+        m._save_settings({**base_ap, "power_save_disabled": True})
+        _p3 = _R6(); _p3._profile_change_depth = 1
+        _r3 = asyncio.run(_p3.reapply_volatile())
+        ok(_r3.get("applied", 0) >= 1 and "iw power_save off" in _p3.log,
+           f"the panel's reapply during a profile change applies ({_r3})")
+
+        # A backend switch is a reason to wait, not to forget.
+        os.path.isfile(m.STREAM_FLAG_FILE) and os.remove(m.STREAM_FLAG_FILE)
+        m._save_settings({**base_ap, "streaming_mode_enabled": True, "power_save_disabled": True})
+        _p3 = _R6(); _p3._ensure_backend_switch_state(); _p3._backend_switch["in_progress"] = True
+        _l3_logged = []
+        _l3_real_info = m.decky.logger.info
+        async def _l3_switch(p):
+            await _l3_pass(p)
+            during = list(p.log)
+            ender = getattr(p, "_end_backend_switch", None)
+            if ender:
+                ender()
+                task = getattr(p, "_owed_reapply_task", None)
+                if task:
+                    await task
+            else:
+                p._backend_switch["in_progress"] = False
+            return during
+        try:
+            m.decky.logger.info = staticmethod(lambda msg: _l3_logged.append(msg))
+            _l3_during = asyncio.run(_l3_switch(_p3))
+        finally:
+            m.decky.logger.info = _l3_real_info
+        ok("iw power_save off" not in _l3_during
+           and any("owed until the backend switch ends" in l for l in _l3_logged)
+           and not any("applying the fixes" in l for l in _l3_logged),
+           f"during a backend switch nothing is applied, and the log says the fixes are owed ({_l3_logged})")
+        ok("iw power_save off" in _p3.log,
+           f"and once the switch ends they are applied, with no new stream event ({_p3.log})")
+    finally:
+        _r3_restore()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L8 pass 6 Force reapply and Fix now count what auto mode holds, and wait out a profile change")
+try:
+    _r8_restore = _r6_paths()
+    try:
+        m._save_settings({**base_ap, "streaming_mode_enabled": True, "power_save_disabled": True,
+                          "auto_fix_on_wake": False})
+        _p8 = _R6()
+        _r8 = asyncio.run(_p8.reapply_all())
+        ok(_r8.get("total") == 1
+           and ((_r8.get("results") or {}).get("power_save") or {}).get("message")
+           == "On. It applies while a streaming app is running.",
+           f"Prevent lag spikes on, auto mode on, no stream: counted, with the paused message ({_r8})")
+        ok("iw power_save off" not in _p8.log, "and nothing applied")
+
+        class _R8Drift(_R6):
+            async def get_status(self): return {"drift": {"power_save": True}}
+        m._save_settings({**base_ap, "power_save_disabled": True})
+        _p8 = _R8Drift(); _p8._profile_change_depth = 1
+        _r8 = asyncio.run(_p8.repair_drifted())
+        ok(_r8.get("error") == "busy" and "Nothing needed fixing" not in (_r8.get("message") or ""),
+           f"Fix now during a profile change says it is busy, not that nothing needed fixing ({_r8})")
+        _p8 = _R6(); _p8._profile_change_depth = 1
+        _r8 = asyncio.run(_p8.reapply_all())
+        ok(_r8.get("error") == "busy", f"and so does Force reapply ({_r8.get('message')!r})")
+    finally:
+        _r8_restore()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L10 pass 6 the end of a stream takes power save off under the power save guard")
+try:
+    _r10_restore = _r6_paths()
+    try:
+        m._save_settings({**base_ap, "streaming_mode_enabled": True, "power_save_disabled": True})
+        open(m.STREAM_FLAG_FILE, "w").write("1\n")
+        _p10b = _R6(iw_delay=0.2)
+        _p10b._revert_volatile_fixes = lambda st: _p10b.log.append("REVERT")
+        async def _l10_race(p):
+            a = asyncio.ensure_future(p.set_power_save(True, reapply=True))   # game launch reapply
+            await asyncio.sleep(0.05)
+            async with p._stream_guard():
+                await p._stream_pass_locked(True, None)                       # the stream ended
+            return await a
+        asyncio.run(_l10_race(_p10b))
+        _i10 = _p10b.log.index("REVERT") if "REVERT" in _p10b.log else -1
+        ok(_i10 >= 0 and not [l for l in _p10b.log[_i10 + 1:] if "off" in l or l.endswith(" on")],
+           f"a reapply that passed the gate finishes before the revert, never after it ({_p10b.log})")
+        ok(not os.path.isfile(m.STREAM_FLAG_FILE), "and the flag is down")
+
+        # The user's own on, pressed while the end of the stream takes the
+        # fixes off: it waits, then finds auto mode idle.
+        open(m.STREAM_FLAG_FILE, "w").write("1\n")
+        _p10c = _R6()
+        def _l10_slow_revert(st):
+            time.sleep(0.3); _p10c.log.append("REVERT")
+        _p10c._revert_volatile_fixes = _l10_slow_revert
+        async def _l10_user(p):
+            async def end():
+                async with p._stream_guard():
+                    await p._stream_pass_locked(True, None)
+            e = asyncio.ensure_future(end())
+            await asyncio.sleep(0.05)
+            r = await p.set_power_save(True)
+            await e
+            return r
+        _r10c = asyncio.run(_l10_user(_p10c))
+        ok(_r10c.get("paused") is True and "iw power_save off" not in _p10c.log,
+           f"the panel's on during the revert is recorded paused ({_r10c}, {_p10c.log})")
+    finally:
+        _r10_restore()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+def _p6_proc_dir():
+    """An empty stand-in /proc, and a maker of processes in it."""
+    root = tempfile.mkdtemp()
+    def mk(pid, ppid, argv, comm, fifo=False):
+        # init is played by a PID that is not this one: run as PID 1 (a
+        # container), init would be "this backend", whose children are skipped.
+        if ppid == 1 and os.getpid() == 1:
+            ppid = 69999
+        d = os.path.join(root, str(pid)); os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "status"), "w").write(f"Name:\t{comm}\nPPid:\t{ppid}\n")
+        open(os.path.join(d, "comm"), "w").write(comm + "\n")
+        path = os.path.join(d, "cmdline")
+        if os.path.exists(path):
+            os.remove(path)
+        if fifo:
+            os.mkfifo(path)      # a read that never returns, as one stuck on a wedged mm
+        else:
+            open(path, "wb").write(b"\0".join(a.encode() for a in argv) + b"\0")
+    return root, mk
+
+
+def _p6_release_fifos(root):
+    """Let every read still waiting on a stand-in FIFO end (EOF)."""
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            path = os.path.join(dirpath, f)
+            try:
+                if __import__("stat").S_ISFIFO(os.stat(path).st_mode):
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                        os.close(fd)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
+
+def _p6_within(fn, seconds):
+    """(returned, value): fn's answer if it came within seconds."""
+    out = {}
+    t = _p6_thr.Thread(target=lambda: out.setdefault("v", fn()), daemon=True)
+    t.start(); t.join(seconds)
+    return ("v" in out), out.get("v")
+
+
+section("L4 pass 6 nothing after the process search reads /proc, so one stuck process holds no caller")
+try:
+    _l4_root, _l4_mk = _p6_proc_dir()
+    _l4_saved = (m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE)
+    try:
+        m.PROC_DIR = _l4_root
+        m.STREAM_FLAG_FILE = os.path.join(_l4_root, "noflag"); m.STREAM_HOLD_FILE = os.path.join(_l4_root, "nohold")
+        _l4_mk(100, 1, ["/home/deck/.local/share/Steam/ubuntu12_32/steam", "-gamepadui"], "steam")
+        _l4_mk(200, 100, ["/usr/bin/moonlight", "stream", "host", "Desktop"], "moonlight")
+        _p4 = m.Plugin(); _s4 = m._default_settings()
+        _snap4 = _p4._proc_snapshot(2.0)
+        ok(_snap4 is not None and _p4._find_stream(_p4._stream_patterns(_s4)) is not None,
+           "a good search finds the stream")
+        # The parent's command line now never answers.
+        _l4_mk(100, 1, [], "steam", fifo=True)
+
+        def _l4_recent():
+            # The snapshot's answer stays the one to go by.
+            st = _p4._proc_scan_state()
+            st["last"] = (time.monotonic(), st["last"][1])
+        for _what, _fn, _want in (
+                ("the status read (_stream_running_now)", lambda: _p4._stream_running_now(_s4), True),
+                ("the wake move's check (_game_or_stream_known)", lambda: _p4._game_or_stream_known(_s4), True),
+                ("auto mode's search (_find_stream)",
+                 lambda: (_p4._find_stream(_p4._stream_patterns(_s4)) or {}).get("process"), "moonlight"),
+                ("the update's check (_update_blocker)", lambda: _p4._update_blocker(_s4),
+                 "Close your game or stream first, then update.")):
+            _l4_recent()
+            _done4, _v4 = _p6_within(_fn, 1.0)
+            ok(_done4 and _v4 == _want, f"{_what} answers within 1 s from the snapshot ({_done4}, {_v4!r})")
+    finally:
+        _p6_release_fifos(_l4_root)
+        m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE = _l4_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L11 pass 6 a process search stuck in the kernel is left behind, and an old answer is not gone by")
+try:
+    _l11_root, _l11_mk = _p6_proc_dir()
+    _l11_saved = (m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE)
+    _l11_real_err = m.decky.logger.error
+    try:
+        m.decky.logger.error = staticmethod(lambda msg: None)
+        m.PROC_DIR = _l11_root
+        m.STREAM_FLAG_FILE = os.path.join(_l11_root, "noflag"); m.STREAM_HOLD_FILE = os.path.join(_l11_root, "nohold")
+        _l11_mk(300, 1, [], "bash", fifo=True)          # not a stream, and stuck
+        _p11b = m.Plugin(); _p11b._PROC_SCAN_STUCK_SECONDS = 0.5
+        _pat11 = _p11b._stream_patterns(m._default_settings())
+        _p11b._find_stream(_pat11, wait=0.2)              # the search that gets stuck on 300
+        _l11_mk(400, 1, ["/usr/bin/moonlight", "stream"], "moonlight")   # a stream starts meanwhile
+        time.sleep(0.7)
+        _f11 = _p11b._find_stream(_pat11, wait=1.5)
+        _last11 = (_p11b._proc_scan_state().get("last") or (0, []))[1]
+        ok(_f11 is not None and _f11.get("process") == "moonlight",
+           f"past the stuck time a new search runs and finds the stream ({_f11})")
+        ok(_last11 and all(e[0] != "300" for e in _last11),
+           f"leaving out the process the stuck one was reading ({[e[0] for e in _last11]})")
+
+        # An answer an hour old is not "nothing running".
+        _p11c = m.Plugin()
+        _st11 = _p11c._proc_scan_state()
+        _st11["last"] = (time.monotonic() - 3600, [])
+        _b11 = _p11c._update_blocker(m._default_settings())
+        ok(_b11 == "Couldn't tell whether a game is running. Try again in a moment.",
+           f"the update refuses on an hour-old search that cannot be renewed ({_b11!r})")
+    finally:
+        m.decky.logger.error = _l11_real_err
+        _p6_release_fifos(_l11_root)
+        m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE = _l11_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L12 pass 6 the lock's scan checks ask for no rescan during a game, or on an answer over 5 s old")
+try:
+    _l12_root, _l12_mk = _p6_proc_dir()
+    _l12_saved = (m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE)
+    try:
+        m.PROC_DIR = _l12_root
+        m.STREAM_FLAG_FILE = os.path.join(_l12_root, "noflag"); m.STREAM_HOLD_FILE = os.path.join(_l12_root, "nohold")
+
+        class _P12s(m.Plugin):
+            def __init__(self):
+                super().__init__(); self.rescans = 0
+            def _run_cmd(self, cmd, timeout=5):
+                if "rescan" in cmd: self.rescans += 1
+                return _ok()
+        _l12_mk(500, 1, ["/home/deck/.local/share/Steam/ubuntu12_32/reaper", "SteamLaunch",
+                         "AppId=1245620", "--", "game.exe"], "reaper")
+        _p12s = _P12s(); _p12s._proc_snapshot(2.0)
+        _p12s._lock_scan_is_fresh(m._default_settings(), "wlan0", time.monotonic())
+        ok(_p12s.rescans == 0, "a game running (SteamLaunch AppId) and no stream: no rescan")
+
+        # The game gone, and every search from now on stuck.
+        __import__("shutil").rmtree(os.path.join(_l12_root, "500"))
+        _l12_mk(600, 1, [], "bash", fifo=True)
+        _p12s = _P12s()
+        _p12s._proc_snapshot(0.1)                          # stuck from here on
+        _p12s._proc_scan_state()["last"] = (time.monotonic() - 8, [])
+        _r12 = _p12s._lock_scan_is_fresh(m._default_settings(), "wlan0", time.monotonic())
+        ok(_r12 is None and _p12s.rescans == 0, f"an 8 s old answer: not known yet, no rescan ({_r12})")
+        _p12s._proc_scan_state()["last"] = (time.monotonic(), [])
+        _p12s._lock_scan_at = None
+        _p12s._lock_scan_is_fresh(m._default_settings(), "wlan0", time.monotonic())
+        ok(_p12s.rescans == 1, "a fresh answer with nothing running: the rescan is asked for")
+    finally:
+        _p6_release_fifos(_l12_root)
+        m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE = _l12_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("K-g pass 6 with auto mode off the app ticks are ignored, with it on they are honoured")
+try:
+    _kg = m.Plugin()
+    _kg_moon = {p for _a, _l, pts in m.STREAMING_APPS if _a == "moonlight" for p in pts}
+    _kg_off = {p for _l, p in _kg._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": False,
+                                                     "streaming_apps": {"moonlight": False}})}
+    _kg_on = {p for _l, p in _kg._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
+                                                    "streaming_apps": {"moonlight": False}})}
+    ok(_kg_moon and _kg_moon <= _kg_off, "auto mode off: an app unticked earlier still counts as a stream")
+    ok(not (_kg_moon & _kg_on), "auto mode on: the ticks the panel shows are honoured")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L9 pass 6 a settings change saved from a worker thread and one from the event loop both stay")
+try:
+    class _L9(m.Plugin):
+        def _run_cmd(self, cmd, timeout=5): return _ok("")
+        def _get_wifi_interface(self): return None
+        def _restore_buffer_sysctls(self, settings): return 0
+    _l9_real_write = m._write_settings
+    _p9 = _L9()
+    _l9_done = _p6_thr.Event()
+    _l9_started = []
+
+    def _l9_write(data):
+        # The event loop's save of update notices, slowed: buffer tuning is
+        # turned on from a worker thread while it is under way.
+        if _p6_thr.current_thread() is _p6_thr.main_thread() and not _l9_started:
+            _l9_started.append(_p6_thr.Thread(
+                target=lambda: (_p9._buffer_tuning_work(True, False), _l9_done.set()), daemon=True))
+            _l9_started[0].start()
+            _l9_done.wait(0.5)
+        return _l9_real_write(data)
+    m._save_settings({**base_ap, "buffer_tuning_enabled": False, "update_notify": True})
+    try:
+        m._write_settings = _l9_write
+        asyncio.run(_p9.set_update_notify(False))
+        _l9_done.wait(5)
+    finally:
+        m._write_settings = _l9_real_write
+    _s9 = m._load_settings()
+    ok(_s9.get("buffer_tuning_enabled") is True and _s9.get("update_notify") is False,
+       f"both changes are in the file (buffer tuning {_s9.get('buffer_tuning_enabled')}, "
+       f"update notices {_s9.get('update_notify')})")
+
+    # Many at once, both ways round.
+    _l9_flip = []
+    def _l9_slow(data):
+        time.sleep(0.001)
+        return _l9_real_write(data)
+    m._save_settings({**base_ap, "buffer_tuning_enabled": False, "update_notify": True})
+    async def _l9_many():
+        def worker():
+            for i in range(100):
+                _p9._buffer_tuning_work(i % 2 == 1, False)     # ends on
+        async def loop_side():
+            for i in range(100):
+                await _p9.set_update_notify(i % 2 == 0)          # ends off
+                await asyncio.sleep(0)
+        await asyncio.gather(asyncio.to_thread(worker), loop_side())
+    try:
+        m._write_settings = _l9_slow
+        asyncio.run(_l9_many())
+    finally:
+        m._write_settings = _l9_real_write
+    _s9 = m._load_settings()
+    ok(_s9.get("buffer_tuning_enabled") is True and _s9.get("update_notify") is False,
+       "and after a hundred of each at once, both last values")
+    _src9 = open("main.py").read()
+    ok("Every caller is on the event loop today" not in _src9
+       and "On the event loop: a save\n        from a worker thread races" not in _src9,
+       "and no comment still says every save is made on the event loop")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L20 pass 6 an unknown stream answer has the WPA2-reach check look again at the very next poll")
+try:
+    class _L20(PinnedReach):
+        """Whether a stream runs: not known at the first poll, then no."""
+        def __init__(self):
+            super().__init__("sae", JASONS_ROOM); self.answers = [None]; self.polled_at = []
+        def _stream_running_now(self, settings):
+            return self.answers.pop(0) if self.answers else False
+        def _stream_running(self, settings):
+            return self._stream_running_now(settings)
+        def _run_cmd(self, cmd, timeout=5):
+            if "rescan" in cmd: self.polled_at.append(_l20_clock[0] - 1000.0)
+            return _ok()
+    _l20_clock = [1000.0]
+    _l20_mono = m.time.monotonic
+    try:
+        m.time.monotonic = lambda: _l20_clock[0]
+        _p20 = _L20()
+        for _poll in range(5):                 # a status poll every 3 s
+            _p20._recheck_security_reach(WU, "wlan0", "Home", ON, {}, PIN)
+            _l20_clock[0] += 3
+    finally:
+        m.time.monotonic = _l20_mono
+    ok(_p20.polled_at[:1] == [3.0],
+       f"not known at 0 s: no scan then, and the scan is asked for at the next poll, 3 s ({_p20.polled_at})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L16 pass 6 a settings folder behind a link the plugin will not follow is said as such (C16)")
+try:
+    _l16_top = tempfile.mkdtemp(); _l16_away = tempfile.mkdtemp()
+    os.symlink(_l16_away, os.path.join(_l16_top, "settings"))     # the user's own link
+    _l16_saved = m.SETTINGS_FILE
+    _l16_real_err = m.decky.logger.error
+    try:
+        m.decky.logger.error = staticmethod(lambda msg: None)
+        m.SETTINGS_FILE = os.path.join(_l16_top, "settings", "WiFi Optimizer", "settings.json")
+        m._load_settings()
+        try:
+            m._save_settings({"x": 1})
+        except OSError:
+            pass
+        _st16 = m.Plugin()._with_activity({"live": {}})
+        ok(_st16.get("settings_link_refused") is True and _st16.get("settings_unwritable") is True,
+           f"the status says the settings sit behind a link ({_st16.get('settings_link_refused')})")
+    finally:
+        m.SETTINGS_FILE = _l16_saved
+        m.decky.logger.error = _l16_real_err
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    ok(m.Plugin()._with_activity({"live": {}}).get("settings_link_refused") is False,
+       "and once a save lands again, no longer")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L17 pass 6 the backend switch marker's folder goes with it when it is empty (C15)")
+try:
+    _l17_dir = os.path.join(tempfile.mkdtemp(), "wifi-optimizer")
+    _l17_saved = m.BACKEND_SWITCH_MARKER
+    try:
+        m.BACKEND_SWITCH_MARKER = os.path.join(_l17_dir, "backend-switch")
+        _p17b = m.Plugin()
+        _p17b._set_backend_marker("iwd wpa_supplicant")
+        _had17 = os.path.exists(m.BACKEND_SWITCH_MARKER)
+        _p17b._set_backend_marker(None)
+        ok(_had17 and not os.path.exists(_l17_dir),
+           f"set, then cleared: no folder left ({os.path.exists(_l17_dir)})")
+        _p17b._set_backend_marker("iwd wpa_supplicant")
+        open(os.path.join(_l17_dir, "report-1.json"), "w").write("{}")
+        _p17b._set_backend_marker(None)
+        ok(os.path.isdir(_l17_dir) and not os.path.exists(m.BACKEND_SWITCH_MARKER),
+           "with something else in it, the folder stays")
+    finally:
+        m.BACKEND_SWITCH_MARKER = _l17_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L18 pass 6 a region chosen earlier is named, not called the card's own")
+try:
+    _L18OWN = ("global\ncountry US: DFS-FCC\n\t(2400 - 2472 @ 40), (N/A, 30), (N/A)\n")
+    m._save_settings(dict(base_ap))
+    asyncio.sleep = _no_sleep
+    try:
+        _m18 = asyncio.run(Reg(_L18OWN.replace("country US", "country DE")).set_regdomain("US")).get("message", "")
+    finally:
+        asyncio.sleep = _d_real_sleep
+    ok("its own region" not in _m18 and "stayed on DE instead of US" in _m18,
+       f"the region in force is named as it is ({_m18!r})")
+    ok(_m18 == "The WiFi card stayed on DE instead of US. That is normal on some cards, "
+               "and nothing else needs doing.", "in two short sentences")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("K-f pass 6 the updater installs nothing older than MIN_INSTALL_VERSION")
+try:
+    _kf_src = open("main.py").read()
+    _kf_m = re.search(r'^MIN_INSTALL_VERSION = "([0-9]+\.[0-9]+\.[0-9]+(?:-beta)?)"$', _kf_src, re.M)
+    ok(bool(_kf_m), "the floor is one module-level line, in the shape release.sh reads")
+    _kf_floor = _kf_m.group(1) if _kf_m else "0.24.5-beta"
+    ok(_REAL_MIN_INSTALL_VERSION == _kf_floor, "and that is the value the module holds")
+    m.MIN_INSTALL_VERSION = _kf_floor
+
+    class _KF(m.Plugin):
+        def __init__(self, newest="", current="0.24.6-beta"):
+            super().__init__(); self.fetched = []; self.newest = newest; self.current = current
+        def _fetch_release_file(self, url, cap, deadline):
+            self.fetched.append(url); return {"missing": True, "data": None}
+        async def _github_api(self, url):
+            return _ok(json.dumps([{"tag_name": "v" + self.newest, "prerelease": True,
+                                    "draft": False}]))
+        def _newest_release(self, data): return self.newest
+    _kf = _KF()
+    _rkf = asyncio.run(_kf._signed_release("0.24.4-beta"))
+    ok(_rkf.get("ok") is False and not _kf.fetched,
+       f"a release older than the floor is refused before anything is downloaded ({_rkf})")
+    ok(_kf_floor in _rkf.get("message", ""), "and the refusal names the floor")
+    _kf = _KF()
+    asyncio.run(_kf._signed_release(_kf_floor))
+    ok(_kf.fetched, "the floor itself is fetched and checked as before")
+
+    m._save_settings({**m.DEFAULT_SETTINGS, "update_channel": "beta"})
+    _kf_ver = m.decky.DECKY_PLUGIN_VERSION
+    try:
+        m.decky.DECKY_PLUGIN_VERSION = "0.24.6-beta"
+        _ukf = asyncio.run(_KF(newest="0.24.2-beta").check_for_update())
+        _vkf = asyncio.run(_KF(newest="0.24.5-beta").check_for_update())
+    finally:
+        m.decky.DECKY_PLUGIN_VERSION = _kf_ver
+    ok(_ukf.get("update_available") is False,
+       f"the beta channel's 'go back to' is not offered below the floor ({_ukf})")
+    ok(_vkf.get("update_available") is True and _vkf.get("is_downgrade") is True,
+       f"and is at the floor ({_vkf})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    m.MIN_INSTALL_VERSION = "0.0.0"
+except Exception as _e:
+    import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("this file: no section rebinds a helper the others share")
