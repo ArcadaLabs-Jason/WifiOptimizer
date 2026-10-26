@@ -382,11 +382,14 @@ class Volatile(m.Plugin):
         super().__init__(); self.calls = []
     async def _stamp(self, name):
         self.calls.append(name)
-        m._save_settings_with_timestamp(m._load_settings())
-        return {"success": True}
-    async def set_power_save(self, disabled): return await self._stamp("power_save")
-    async def set_buffer_tuning(self, enabled): return await self._stamp("buffer")
-    async def set_cake(self, enabled): return await self._stamp("cake")
+        _s = m._load_settings()
+        m._save_settings_with_timestamp(_s)
+        # Pass 5 L1: a setter that stamps says so, and only its own stamp is
+        # put back (the real ones leave it alone when re-applying).
+        return {"success": True, "stamp": _s["last_applied"]}
+    async def set_power_save(self, disabled, reapply=False): return await self._stamp("power_save")
+    async def set_buffer_tuning(self, enabled, reapply=False): return await self._stamp("buffer")
+    async def set_cake(self, enabled, reapply=False): return await self._stamp("cake")
 
 m._save_settings({"power_save_disabled": True, "buffer_tuning_enabled": True,
                   "cake_enabled": True, "last_applied": 1700000000})
@@ -3332,9 +3335,9 @@ class Drifted(m.Plugin):
     async def get_status(self): return {"success": True, "drift": dict(self.drift)}
     async def _call(self, name):
         self.calls.append(name); return {"success": True}
-    async def set_power_save(self, v): return await self._call("power_save")
-    async def set_buffer_tuning(self, v): return await self._call("buffer_tuning")
-    async def set_cake(self, v): return await self._call("cake")
+    async def set_power_save(self, v, reapply=False): return await self._call("power_save")
+    async def set_buffer_tuning(self, v, reapply=False): return await self._call("buffer_tuning")
+    async def set_cake(self, v, reapply=False): return await self._call("cake")
     async def set_bssid_lock(self, v): return await self._call("bssid_lock")
     async def set_band_preference(self, v, b="a"): return await self._call("band")
     async def set_ipv6(self, v): return await self._call("ipv6")
@@ -3542,7 +3545,7 @@ class SeenOff(m.Plugin):
         if cmd[:2] == ["/usr/bin/iw", "dev"] and not self.iw_ok:
             return {"success": False, "stdout": "", "stderr": "busy", "returncode": 1}
         return _ok()
-    def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+    def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
         self.seen.append(("drivers", m._load_settings()[self.key]))
     def _apply_pcie_aspm_fix(self, enable, record_all=False):
         self.seen.append(("pcie", m._load_settings()[self.key])); return []
@@ -4446,7 +4449,7 @@ try:
         def _get_wifi_interface(self): return "wlan0"
         def _valve_powersave(self): return self.valve
         def _release_valve_powersave(self, settings): pass
-        def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): pass
         def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
     _rn, _rm, _rs = m.NM_CONF_PATH, m.MODPROBE_CONF_PATH, m.SETTINGS_FILE
     try:
@@ -4668,7 +4671,7 @@ try:
         def _nmcli_modify(self, uuid, key, value, timeout=5):
             time.sleep(min(timeout, 0.6)); return _ok()
         def _get_wifi_interface(self): return None
-        def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): pass
         def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
         def _remove_dispatcher(self): return True
         def _release_generic_backend_conf(self): pass
@@ -4746,7 +4749,7 @@ try:
             m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
             class PS(m.Plugin):
                 def _get_wifi_interface(self): return None
-                def _apply_driver_fixes(self, d, persist=True, record_all=False): pass
+                def _apply_driver_fixes(self, d, persist=True, record_all=False, ps_off=False): pass
                 def _apply_pcie_aspm_fix(self, d, record_all=False): return []
             open(m.WIFI_BACKEND_CONF, "w").write("[connection]\nwifi.powersave=3\n[device]\nwifi.backend=wpa_supplicant\n")
             m._save_settings(dict(m.DEFAULT_SETTINGS))
@@ -5105,7 +5108,7 @@ try:
         def _get_profile_ssid(self, uuid, timeout=5):
             return {"dddddddd-0000-0000-0000-0000000000d1": "Home"}.get(uuid, self.here)
         async def set_bssid_lock(self, enabled): self.locks += 1; return {"success": True}
-        async def set_power_save(self, d): return {"success": True}
+        async def set_power_save(self, d, reapply=False): return {"success": True}
     m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True, "auto_fix_on_wake": False,
                       "bssid_lock_connection_uuid": "dddddddd-0000-0000-0000-0000000000d1"})
     ra = Reapply("Cafe"); asyncio.run(ra.reapply_all())
@@ -5202,8 +5205,8 @@ try:
         def __init__(self):
             super().__init__(); self.locked = False
         async def set_auto_fix(self, e): return {"success": True}
-        async def set_buffer_tuning(self, e): return {"success": True}
-        async def set_power_save(self, d): return {"success": True}
+        async def set_buffer_tuning(self, e, reapply=False): return {"success": True}
+        async def set_power_save(self, d, reapply=False): return {"success": True}
         async def set_bssid_lock(self, e): self.locked = True; return {"success": True}
     io = IwdOptimize(); r = asyncio.run(io.optimize_safe())
     ok(not io.locked and r.get("total") == 3 and r.get("applied") == 3,
@@ -5452,7 +5455,7 @@ try:
             if cmd[:3] == ["/usr/bin/sysctl", "-n", "net.core.rmem_max"]:
                 return _ok("212992")
             return _ok()
-        def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
             self.drivers.append((enable, persist)); self.driver_record = getattr(self, "driver_record", []) + [record_all]
         def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
         def _valve_powersave(self): return getattr(self, "valve", "3")
@@ -6034,7 +6037,7 @@ try:
             if uuid in self.refuse:
                 return {"success": False, "stdout": "", "stderr": "permission denied", "returncode": 1}
             return _ok()
-        def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
             self.ps_at_revert.append(m._load_settings()["power_save_disabled"])
         def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
         def _install_dispatcher(self): self.installed = self.installs; return self.installs
@@ -6767,11 +6770,18 @@ exec /bin/bash "$0" "$@"
         _r1_bin = tempfile.mkdtemp()
         _r1_moon = os.path.join(_r1_bin, "moonlight")
         _r1_sh.copy(_r1_sh.which("sleep"), _r1_moon)
-        _r1_mp = _r1_sp.Popen([_r1_moon, "120"])
+        # Started by a bash that exits at once: not a child of this process,
+        # which apply_update names to the script as the plugin backend, whose
+        # own children are never a stream (pass 5 L6).
+        _r1_mp = int(_r1_sp.run(["/bin/bash", "-c", f"{_r1_moon} 120 >/dev/null 2>&1 </dev/null & echo $!"],
+                                capture_output=True, text=True, timeout=10).stdout.strip())
         try:
             _r1_o = _r1_run(dict(m.DEFAULT_SETTINGS))
         finally:
-            _r1_mp.kill(); _r1_mp.wait()
+            try:
+                os.kill(_r1_mp, 9)
+            except OSError:
+                pass
             _r1_sh.rmtree(_r1_bin, ignore_errors=True)
         ok(_r1_o["rc"] not in (0, None) and not _r1_o["restarted"] and _r1_o["state"] == "failed 9.9.9"
            and _r1_o["main"] == "# new\n" and "waiting for the game or stream" in _r1_o["log"],
@@ -8143,7 +8153,7 @@ class _LReset(m.Plugin):
     def _release_generic_backend_conf(self): self.order.append("backend")
     def _release_regdomain(self, settings=None): self.order.append("region")
     def _revert_queue_tuning(self, settings): self.order.append("queue")
-    def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+    def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
         self.fixes.append(enable)
         if self._real_drivers:
             return m.Plugin._apply_driver_fixes(self, enable, persist, record_all)
@@ -8164,7 +8174,7 @@ class _LTear(m.Plugin):
     def _run_cmd(self, cmd, timeout=5): self.cmds.append(cmd); return _ok()
     def _get_wifi_interface(self): return None
     def _remove_dispatcher(self): return True
-    def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+    def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): pass
     def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
     def _release_generic_backend_conf(self): pass
 
@@ -8192,14 +8202,14 @@ class _LBoot(m.Plugin):
     def _get_backend_method(self): return self.backend_method
     async def _stranded_watch(self): return
     def _find_stream(self, patterns): return None
-    def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+    def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): pass
     def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
     def _revert_queue_tuning(self, settings): pass
-    async def set_power_save(self, disabled):
+    async def set_power_save(self, disabled, reapply=False):
         self.calls.append(("power_save", disabled)); return {"success": True}
-    async def set_buffer_tuning(self, enabled):
+    async def set_buffer_tuning(self, enabled, reapply=False):
         self.calls.append(("buffer_tuning", enabled)); return {"success": True}
-    async def set_cake(self, enabled):
+    async def set_cake(self, enabled, reapply=False):
         self.calls.append(("cake", enabled)); return {"success": True}
 
 
@@ -8419,8 +8429,8 @@ try:
                 return _ok(f"Connected to {self.on} (on wlan0)\n\tfreq: 5180\n")
             return _ok()
         async def set_auto_fix(self, e): return {"success": True}
-        async def set_buffer_tuning(self, e): return {"success": True}
-        async def set_power_save(self, d): return {"success": True}
+        async def set_buffer_tuning(self, e, reapply=False): return {"success": True}
+        async def set_power_save(self, d, reapply=False): return {"success": True}
         async def set_bssid_lock(self, e):
             self.lock_calls += 1; return {"success": True, "reconnected": True}
         def _hard_reconnect(self, uuid=None): self.reconnects += 1; return True
@@ -8567,7 +8577,7 @@ try:
     try:
         class _L11(_LTear):
             def __init__(self): super().__init__(); self.fixes = []; self.reloads = 0
-            def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+            def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
                 self.fixes.append(enable)
             def _reload_nm_conf(self):
                 self.reloads += 1
@@ -8614,7 +8624,7 @@ try:
     class _L13(m.Plugin):
         def __init__(self): super().__init__(); self.done = []
         def _get_wifi_interface(self): return None
-        def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
             raise OSError(_l_errno.EROFS, "Read-only file system")
         def _apply_pcie_aspm_fix(self, enable, record_all=False): self.done.append("pcie"); return []
         def _revert_queue_tuning(self, settings): self.done.append("queue")
@@ -9154,7 +9164,7 @@ try:
             def __init__(self): super().__init__(); self.fixes = []
             def _get_wifi_interface(self): return "wlan0"
             def _reload_nm_conf(self): pass
-            def _apply_driver_fixes(self, enable, persist=True, record_all=False): self.fixes.append(enable)
+            def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): self.fixes.append(enable)
             def _run_cmd(self, cmd, timeout=5):
                 return dict(_NOIW) if cmd[0].endswith("/iw") else _ok()
         m._save_settings(dict(m.DEFAULT_SETTINGS))
@@ -9209,8 +9219,8 @@ try:
     class _L32(m.Plugin):
         def _backend_is_iwd(self): return True
         async def set_auto_fix(self, e): return {"success": True}
-        async def set_buffer_tuning(self, e): return {"success": True}
-        async def set_power_save(self, d): return {"success": True}
+        async def set_buffer_tuning(self, e, reapply=False): return {"success": True}
+        async def set_power_save(self, d, reapply=False): return {"success": True}
     _r32 = asyncio.run(_L32().optimize_safe())
     ok("wpa_supplicant" in ((_r32.get("results") or {}).get("bssid_lock") or {}).get("message", "")
        and _r32.get("total") == 3 and _r32.get("applied") == 3,
@@ -11464,13 +11474,21 @@ try:
                f"with nothing matching running, the script finds no stream, 3 of 3 ({_l1_seen})")
             # sleep, started as "moonlight" (its argv[0]): macOS kills a
             # copied system binary, and pgrep -f reads the argv either way.
-            _l1_moon = _l1_sp.Popen(["/usr/bin/moonlight", "30"],
-                                    executable=_l1_sh.which("sleep") or "/bin/sleep")
+            # Started by a bash that exits at once, so it is not a child of
+            # this process, which apply_update named as the plugin backend
+            # (pass 5 L6: what the backend starts is never a stream).
+            _l1_moon = int(_l1_sp.run(
+                ["/bin/bash", "-c", f"exec -a /usr/bin/moonlight {_l1_sh.which('sleep') or '/bin/sleep'} 30 "
+                 ">/dev/null 2>&1 </dev/null & echo $!"],
+                capture_output=True, text=True, timeout=10).stdout.strip())
             try:
                 time.sleep(0.3)
                 _l1_live = _l1_run()
             finally:
-                _l1_moon.kill(); _l1_moon.wait()
+                try:
+                    os.kill(_l1_moon, 9)
+                except OSError:
+                    pass
             ok(_l1_live == "yes", f"and a real moonlight process running is one ({_l1_live})")
     _l1_sh.rmtree(_l1_dir, ignore_errors=True)
     _l1p._update_dir = None
@@ -11542,7 +11560,7 @@ try:
                 return m.Plugin._run_cmd(self, ["/bin/sleep", "30"], timeout)
             def _backend_without_ours(self): return "wpa_supplicant"
             def _get_wifi_interface(self): return None
-            def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+            def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): pass
             def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
             def _rotate_logs(self, keep=10): pass
         _l2_t = time.monotonic()
@@ -11626,7 +11644,7 @@ try:
         class _L4(m.Plugin):
             def _get_wifi_interface(self): return "wlan0"
             def _managed_interface(self): return "wlan0"
-            def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+            def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): pass
             def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
             def _reload_nm_conf(self): pass
         _l4 = _L4()
@@ -11887,7 +11905,7 @@ try:
             def _run_cmd(self, cmd, timeout=5):
                 self.where.append((cmd[0], _l9_th.current_thread() is _l9_th.main_thread()))
                 return _ok()
-            def _apply_driver_fixes(self, enable, persist=True, record_all=False): pass
+            def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False): pass
             def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
             def _reload_nm_conf(self): pass
         m._save_settings(dict(m.DEFAULT_SETTINGS))
@@ -12164,7 +12182,7 @@ try:
                 super().__init__(); self.reverted_at = None
             def _paused_by_streaming(self): return False
             def _backend_switch_running(self): return False
-            def _apply_driver_fixes(self, enable, persist=True, record_all=False):
+            def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
                 if not enable and self.reverted_at is None:
                     self.reverted_at = time.monotonic()
             def _reload_nm_conf(self): pass
@@ -13316,6 +13334,954 @@ finally:
         m.REPORT_URL = _rep_url_real
     except NameError:
         pass
+
+# ---- QA pass 5, LIFECYCLE (session-artifacts/qa-0.24.4/pass5-triage.md) ----
+import threading as _p5_thr, shutil as _p5_sh, subprocess as _p5_sp, copy
+
+_P5_LEFT = {"bssid_lock_uuids": [], "band_preference_uuids": [], "ipv6_uuids": [],
+            "dns_uuids": [], "wpa2_uuids": [], "wpa2_restore_uuids": []}
+_P5_ON = {**m.DEFAULT_SETTINGS, "driver": "rtw88", "power_save_disabled": True,
+          "buffer_tuning_enabled": True, "cake_enabled": True}
+
+
+class _P5Real(m.Plugin):
+    """The real Plugin with only commands, sysfs writes, the device read
+    (0.5 s) and the profile pins (2 s, the first time) stubbed, as 08's probe."""
+    pins_wait = 2.0
+
+    def __init__(self):
+        super().__init__(); self.cmds = []; self.pin_calls = 0
+    async def get_device_info(self):
+        await asyncio.sleep(0.5)
+        return {"success": True, "model": "lcd", "driver": "rtw88", "device_family": "deck_lcd",
+                "device_label": "Steam Deck LCD", "chip_label": "WiFi 5 (RTL8822CE)",
+                "supports_6ghz": False}
+    def _detect_distro(self): return {"id": "steamos", "name": "SteamOS"}
+    def _run_cmd(self, cmd, timeout=5):
+        self.cmds.append((time.monotonic(), list(cmd))); return _ok()
+    def _get_wifi_interface(self): return "wlan0"
+    def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+    def _clear_profile_pins(self, deadline=None, settings=None):
+        # Reset's call (its 30 s budget) is the slow one; uninstall's, held
+        # to what is left of its own 4 s, is not.
+        self.pin_calls += 1
+        if deadline is None or deadline - time.monotonic() > 10:
+            time.sleep(self.pins_wait)
+        return copy.deepcopy(_P5_LEFT)
+    def _paused_by_streaming(self): return False
+    def _backend_switch_running(self): return False
+
+
+def _p5_run(*coros_after):
+    """Start each (delay, coroutine factory) on one loop; their results."""
+    async def go():
+        tasks = []
+        for delay, make in coros_after:
+            if delay:
+                await asyncio.sleep(delay)
+            tasks.append(asyncio.create_task(make()))
+        return await asyncio.gather(*tasks)
+    return asyncio.run(go())
+
+
+def _p5_state():
+    s = m._load_settings()
+    return (s.get("power_save_disabled"), s.get("buffer_tuning_enabled"), s.get("cake_enabled"),
+            os.path.exists(m.NM_CONF_PATH))
+
+
+section("L1 pass 5 a re-application that read the settings before Reset or a toggle off does not put them back")
+try:
+    _d, _restore = _l_paths()
+    _p5_at = getattr(m, "AT_LOAD_MARKER", None)
+    m.AT_LOAD_MARKER = os.path.join(_d, "run", "at-load-logged")
+    try:
+        # (1) Reset, then the panel's reapply 0.1 s later.
+        m._save_settings(dict(_P5_ON)); open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        _p1 = _P5Real()
+        _r = _p5_run((0, _p1.reset_settings), (0.1, _p1.reapply_volatile))
+        ok(_p5_state() == (False, False, False, False),
+           f"Reset, then a reapply 0.1 s later: everything stays off and no NM conf "
+           f"(power save, buffer, CAKE, NM conf = {_p5_state()}; {_r[0].get('message')})")
+
+        # (2) An on with a slow reload, the user's off queued behind it, then a
+        # reapply that read the settings while they still said on.
+        class _P5Slow(_P5Real):
+            def _reload_nm_conf(self): time.sleep(0.6)
+        m._save_settings(dict(_P5_ON)); os.remove(m.NM_CONF_PATH) if os.path.exists(m.NM_CONF_PATH) else None
+        _p2 = _P5Slow()
+        _p5_run((0, lambda: _p2.set_power_save(True)), (0.1, lambda: _p2.set_power_save(False)),
+                (0.1, _p2.reapply_volatile))
+        ok(_p5_state()[0] is False and not os.path.exists(m.NM_CONF_PATH),
+           f"the user's off queued ahead of a reapply's on stays off, no NM conf ({_p5_state()})")
+
+        # (3) CAKE turned off while a reapply waits in set_power_save.
+        m._save_settings(dict(_P5_ON))
+        _p3 = _P5Slow()
+        _p5_run((0, lambda: _p3.set_power_save(True)), (0.1, _p3.reapply_volatile),
+                (0.1, lambda: _p3.set_cake(False)))
+        ok(m._load_settings().get("cake_enabled") is False,
+           f"CAKE turned off during a reapply's power save step stays off ({_p5_state()})")
+        _p3_tc = [c for _t, c in _p3.cmds if c[:3] == ["/usr/bin/tc", "qdisc", "replace"]]
+        ok(not _p3_tc, f"and CAKE is not put back on the interface ({_p3_tc})")
+
+        # (4) _main's startup apply reached while a Reset holds the guards.
+        class _P5Boot(_P5Real):
+            def _nm_version(self): return (1, 52, 1)
+            def _acknowledge_update(self): pass
+            def _rotate_logs(self, keep=10): pass
+            def _reconcile_backend_switch(self): pass
+            def _install_dispatcher(self): return True
+            def _remove_dispatcher(self): return True
+            def _heal_orphaned_iwd_conf(self): return False
+            async def _unpin_if_iwd(self): pass
+            def _get_backend_method(self): return "none"
+            async def _stranded_watch(self): return
+            def _find_stream(self, patterns, wait=2.0): return None
+        m._save_settings(dict(_P5_ON)); open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        _p4 = _P5Boot()
+        _p4_orig_info = _P5Real.get_device_info
+        _p4_calls = [0]
+
+        async def _p4_info(self):
+            # The first device read (Reset's) is slow; _main's is quick, so
+            # its startup apply is reached while Reset still holds the guards.
+            _p4_calls[0] += 1
+            if _p4_calls[0] == 1:
+                return await _p4_orig_info(self)
+            return {"success": True, "model": "lcd", "driver": "rtw88", "device_family": "deck_lcd",
+                    "device_label": "Steam Deck LCD", "chip_label": "WiFi 5 (RTL8822CE)",
+                    "supports_6ghz": False}
+        _P5Boot.get_device_info = _p4_info
+        _p5_run((0, _p4.reset_settings), (0.05, _p4._main))
+        ok(_p5_state() == (False, False, False, False),
+           f"the startup apply racing a Reset leaves everything off and no NM conf ({_p5_state()})")
+
+        # (5) Force Reapply with the user's off landing during its reconnecting step.
+        _P5U = "dddddddd-0000-0000-0000-0000000000c5"
+
+        class _P5All(_P5Real):
+            def _reapply_context(self, backend=True): return _P5U, "Net", False
+            def _lock_is_for_this_network(self, settings, uuid, ssid, timeout=5): return True
+            async def set_bssid_lock(self, enabled):
+                await asyncio.sleep(0.5)      # its reconnect
+                return {"success": True, "reconnected": True}
+        m._save_settings({**_P5_ON, "bssid_lock_enabled": True, "bssid_lock_connection_uuid": _P5U,
+                          "bssid_lock_value": "02:00:00:00:00:11"})
+        _p5a = _P5All()
+        _r5 = _p5_run((0, _p5a.reapply_all), (0.2, lambda: _p5a.set_power_save(False)))
+        ok(m._load_settings().get("power_save_disabled") is False and not os.path.exists(m.NM_CONF_PATH),
+           f"Force Reapply with power save turned off during its reconnect leaves it off ({_p5_state()})")
+        ok(_r5[0].get("total") == 4 and "power_save" not in _r5[0].get("results", {}),
+           f"and the step it skipped counts in neither total nor applied ({_r5[0]})")
+        # The class: every re-application passes reapply=True to the three setters.
+        _p5_src = open("main.py").read()
+        for _fn, _end in (("async def reapply_all", "def _reapply_context"),
+                          ("async def repair_drifted", "_RESET_PIN_BUDGET = "),
+                          ("async def _reapply_volatile_steps", "async def reapply_volatile")):
+            _body = _p5_src[_p5_src.index(_fn):_p5_src.index(_end, _p5_src.index(_fn))] if _fn in _p5_src else ""
+            _calls = re.findall(r"self\.set_(?:power_save|buffer_tuning|cake)\(True[^)]*\)", _body)
+            ok(_calls and all("reapply=True" in c for c in _calls),
+               f"{_fn.split()[-1]} re-applies with reapply=True only ({_calls})")
+    finally:
+        m.AT_LOAD_MARKER = _p5_at
+        _restore()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L2 pass 5 buffer tuning and CAKE off wait for a dispatcher run holding the apply lock")
+try:
+    import fcntl as _p5_fcntl
+    _p5_rel = [0.0]
+
+    def _p5_hold(seconds):
+        ready = _p5_thr.Event()
+        def hold():
+            fd = os.open(m.APPLY_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+            _p5_fcntl.flock(fd, _p5_fcntl.LOCK_EX)
+            ready.set()
+            time.sleep(seconds)
+            _p5_rel[0] = time.monotonic()
+            os.close(fd)
+        t = _p5_thr.Thread(target=hold); t.start(); ready.wait(5)
+        return t
+
+    class _P5Q(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.cmds = []
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append((time.monotonic(), list(cmd)))
+            if cmd[:3] == ["/usr/bin/tc", "qdisc", "show"]:
+                return _ok("qdisc fq_codel 0: root")
+            return _ok()
+        def _get_wifi_interface(self): return "wlan0"
+    for _name, _key, _match in (
+            ("set_cake", "cake_enabled", lambda c: c[:3] == ["/usr/bin/tc", "qdisc", "del"]),
+            ("set_buffer_tuning", "buffer_tuning_enabled", lambda c: c[:2] == ["/usr/bin/sysctl", "-w"])):
+        m._save_settings({**m.DEFAULT_SETTINGS, _key: True})
+        _q = _P5Q(); _t = _p5_hold(1.0)
+        _qr = asyncio.run(getattr(_q, _name)(False)); _t.join()
+        _first = next((t for t, c in _q.cmds if _match(c)), None)
+        ok(_qr.get("success") and _first is not None and _first >= _p5_rel[0],
+           f"{_name}(False) runs its first command only once the lock is released "
+           f"({'%.2f' % (_first - _p5_rel[0]) if _first else None} s after)")
+        ok(m._load_settings().get(_key) is False, f"and saves it off ({_name})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L3 pass 5 uninstall during a Reset or a dispatcher run leaves nothing of ours behind")
+try:
+    _d, _restore = _l_paths()
+    _p5_pd = m.decky.DECKY_PLUGIN_DIR
+    _p5_at = getattr(m, "AT_LOAD_MARKER", None)
+    m.AT_LOAD_MARKER = os.path.join(_d, "run", "at-load-logged")
+    try:
+        m.decky.DECKY_PLUGIN_DIR = os.getcwd()
+
+        class _P5Un(_P5Real):
+            def _rotate_logs(self, keep=10): pass
+            def _release_generic_backend_conf(self): return True
+            def _stop_update(self): pass
+            def _release_regdomain(self, settings=None): return True
+        m._save_settings(dict(_P5_ON)); open(m.NM_CONF_PATH, "w").write("[connection]\nwifi.powersave = 2\n")
+        open(m.DISPATCHER_PATH, "w").write("#!/bin/sh\n")
+        _u = _P5Un()
+        _p5_run((0, _u.reset_settings), (0.3, _u._uninstall))
+        _left3 = [p for p in (m.DISPATCHER_PATH, m.NM_CONF_PATH, m.SETTINGS_FILE) if os.path.exists(p)]
+        ok(not _left3, f"Reset and uninstall together: no dispatcher, NM conf or settings file left ({_left3})")
+
+        # (2) A dispatcher run holding the apply lock: teardown waits for it
+        # (bounded) before the dispatcher goes and power save is released.
+        class _P5Tear(_P5Un):
+            pins_wait = 0
+            def _remove_dispatcher(self):
+                self.removed_at = time.monotonic(); return m.Plugin._remove_dispatcher(self)
+            def _release_power_save(self, settings=None, reload_conf=False):
+                self.released_at = time.monotonic()
+                return m.Plugin._release_power_save(self, settings, reload_conf)
+        m._save_settings(dict(_P5_ON)); open(m.DISPATCHER_PATH, "w").write("#!/bin/sh\n")
+        _tu = _P5Tear(); _t = _p5_hold(0.6)
+        asyncio.run(_tu._uninstall()); _t.join()
+        ok(getattr(_tu, "removed_at", 0) >= _p5_rel[0] and getattr(_tu, "released_at", 0) >= _p5_rel[0],
+           f"teardown waits for the apply lock before removing the dispatcher and releasing power save "
+           f"({getattr(_tu, 'removed_at', 0) - _p5_rel[0]:.2f} s after the release)")
+        ok(not os.path.exists(m.DISPATCHER_PATH), "and the dispatcher is gone")
+        _src3 = open("main.py").read()
+        _inst = _src3[_src3.index("    def _install_dispatcher(self)"):_src3.index("    def _remove_dispatcher(self)")]
+        ok("_tearing_down" in _inst, "the dispatcher is never installed again while uninstalling")
+    finally:
+        m.decky.DECKY_PLUGIN_DIR = _p5_pd
+        m.AT_LOAD_MARKER = _p5_at
+        _restore()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+def _p5_linux_tools():
+    """What the Linux-only checks need that is missing here."""
+    def out(cmd):
+        try:
+            return _p5_sp.run(cmd, capture_output=True, text=True, timeout=10).stdout
+        except (OSError, _p5_sp.SubprocessError):
+            return ""
+    return [name for name, there in [
+        ("procps pgrep", "procps" in out(["pgrep", "--version"])),
+        ("flock", bool(_p5_sh.which("flock"))),
+        ("perl", bool(_p5_sh.which("perl"))),
+        ("/proc", os.path.isdir("/proc/self")),
+        ("/bin/bash", os.path.exists("/bin/bash"))] if not there]
+
+
+def _p5_skip_or_fail(missing, what):
+    if os.environ.get("REGRESS_REQUIRE_LINUX"):
+        ok(False, f"{what} needs {', '.join(missing)}, and CI must run it")
+    else:
+        print(f"SKIP  {what} needs {', '.join(missing)} (Linux); CI runs it")
+
+
+section("L4 pass 5 the apply lock and the update lock are private to root (0600)")
+try:
+    _p5_lock_saved = m.APPLY_LOCK_FILE
+    try:
+        m.APPLY_LOCK_FILE = os.path.join(tempfile.mkdtemp(), "wo", "apply.lock")
+        _fd = m._take_apply_lock(1); m._drop_apply_lock(_fd)
+        ok(oct(os.stat(m.APPLY_LOCK_FILE).st_mode & 0o777) == "0o600",
+           f"a new apply lock is 0600 ({oct(os.stat(m.APPLY_LOCK_FILE).st_mode & 0o777)})")
+        os.chmod(m.APPLY_LOCK_FILE, 0o644)
+        _fd = m._take_apply_lock(1); m._drop_apply_lock(_fd)
+        ok(oct(os.stat(m.APPLY_LOCK_FILE).st_mode & 0o777) == "0o600",
+           "and one an older version left 0644 is made 0600")
+    finally:
+        m.APPLY_LOCK_FILE = _p5_lock_saved
+    _p5_us = m.UPDATE_SCRIPT
+    _p5_lk = _p5_us[_p5_us.index("if command -v flock"):]
+    _p5_lk = _p5_lk[:_p5_lk.index("\nfi\n") + 4]
+    _p5_missing = [x for x in _p5_linux_tools() if x in ("flock", "/bin/bash")]
+    if _p5_missing:
+        _p5_skip_or_fail(_p5_missing, "the update script's lock lines with real flock")
+    else:
+        _p5_ul = os.path.join(tempfile.mkdtemp(), "update.lock")
+        open(_p5_ul, "w").close(); os.chmod(_p5_ul, 0o644)
+        _p5_o = _p5_sp.run(["/bin/bash", "-c", "umask 022\nOWN_LOCK=0\n"
+                            + _p5_lk.replace("/run/wifi-optimizer-update.lock", _p5_ul)
+                            + 'echo "locked $OWN_LOCK"\n'],
+                           capture_output=True, text=True, timeout=20)
+        ok(oct(os.stat(_p5_ul).st_mode & 0o777) == "0o600",
+           f"the update script's lock file, left 0644 by an older script, is 0600 once it holds it "
+           f"({oct(os.stat(_p5_ul).st_mode & 0o777)}, {_p5_o.stdout.strip()!r} {_p5_o.stderr.strip()[:120]!r})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+def _p5_playing_probe(patterns, setup="", owner=""):
+    """The update script's playing() as shipped, run by real bash with the
+    system's pgrep: yes or no."""
+    us = m.UPDATE_SCRIPT
+    fn = us[us.index("playing() {"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    body = (f"STREAM_PATTERNS={patterns!r}\nOWNER={owner!r}\n"
+            "TMP=$(mktemp -d) || exit 1\ntrap 'rm -rf \"$TMP\"' EXIT\n"
+            + fn.replace("/run/wifi-optimizer/streaming", "/nonexistent/wo-streaming")
+            + setup + "\nif playing; then echo yes; else echo no; fi\n")
+    return _p5_sp.run(["/bin/bash", "-c", body], capture_output=True, text=True,
+                      timeout=30).stdout.strip()
+
+
+section("L5 pass 5 the update script counts a game as running when it cannot tell")
+try:
+    if not (_p5_sh.which("pgrep") and os.path.exists("/bin/bash")):
+        _p5_skip_or_fail(["pgrep"], "playing() with the real pgrep")
+    else:
+        _p5_n = "zzqqnothingmatches"
+        ok(_p5_playing_probe(_p5_n, 'rm -rf "$TMP/pids"; mkdir "$TMP/pids"') == "yes",
+           "pgrep's answer that cannot be written (a directory in the way) counts as playing")
+        ok(_p5_playing_probe("(") == "yes", "a pgrep that fails (exit 2) counts as playing")
+        ok(_p5_playing_probe(_p5_n) == "no", "nothing running is not playing")
+        _p5_moon = _p5_sp.Popen(["/usr/bin/moonlight", "30"], executable=_p5_sh.which("sleep") or "/bin/sleep")
+        try:
+            time.sleep(0.3)
+            _p5_live = _p5_playing_probe("moonlight")
+        finally:
+            _p5_moon.kill(); _p5_moon.wait()
+        ok(_p5_live == "yes", f"a real moonlight is playing ({_p5_live})")
+        _p5_fn = m.UPDATE_SCRIPT[m.UPDATE_SCRIPT.index("playing() {"):]
+        _p5_fn = _p5_fn[:_p5_fn.index("\n}\n")]
+        ok(re.search(r"\$\((?!\()", _p5_fn) is None and "`" not in _p5_fn,
+           "and playing() still runs nothing in a subshell (pass-4 L1)")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L6 pass 5 Decky's plugin backends, PluginLoader and the plugin's own processes are never a stream")
+try:
+    _v = m._stream_pattern_verdicts("caféstream moonlight")
+    ok(("caféstream", "ascii") in _v[1] and "moonlight" in _v[0],
+       f"a name with a letter outside plain ASCII is refused as such ({_v})")
+    _msg6 = m.Plugin._stream_refusal_message(_v[1])
+    ok("plain letters and digits" in _msg6, f"and the refusal says what to use ({_msg6!r})")
+    # apply_update hands the script this backend's PID, in a 0600 file.
+    _p6_dl = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases/download"
+
+    class _P6U(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.launched = []
+        async def check_for_update(self):
+            return {"success": True, "update_available": True, "channel": "beta",
+                    "latest_version": "0.24.6-beta"}
+        async def _signed_release(self, version):
+            return {"ok": True, "url": f"{_p6_dl}/v{version}/wifi-optimizer-v{version}.tar.gz",
+                    "sha256": "0" * 64}
+        def _launch_updater(self, argv): self.launched.append(list(argv))
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _p6 = _P6U(); asyncio.run(_p6.apply_update("0.24.6-beta"))
+    _p6_dir = getattr(_p6, "_update_dir", None) or ""
+    _p6_owner = os.path.join(_p6_dir, "owner")
+    ok(os.path.isfile(_p6_owner) and open(_p6_owner).read() == f"{os.getpid()}\n"
+       and oct(os.stat(_p6_owner).st_mode & 0o777) == "0o600",
+       "the update script is told the backend's PID, in a 0600 file beside it")
+    _p5_sh.rmtree(_p6_dir, ignore_errors=True); _p6._update_dir = None
+
+    _p6_missing = [x for x in _p5_linux_tools() if x != "flock"]
+    if _p6_missing:
+        _p5_skip_or_fail(_p6_missing, "the process search with real Decky-titled processes")
+    else:
+        _p6_pids = []
+
+        def _p6_detached(shell):
+            """Start shell's command in the background of a bash that exits at
+            once, so it is nobody's child here (as Decky's processes are not
+            this backend's). Its PID."""
+            out = _p5_sp.run(["/bin/bash", "-c", shell + " >/dev/null 2>&1 </dev/null & echo $!"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+            _p6_pids.append(int(out)); return int(out)
+
+        def _p6_find(pattern):
+            saved = m.PROC_DIR
+            try:
+                m.PROC_DIR = "/proc"
+                return m.Plugin()._find_stream([(pattern, pattern)])
+            finally:
+                m.PROC_DIR = saved
+        try:
+            # Decky titles each plugin backend this way (setproctitle);
+            # perl's $0 does the same to the command line.
+            _p6_detached("perl -e '$0 = q{MoonDeck (/home/deck/homebrew/plugins/MoonDeck/main.py)}; sleep 60'")
+            _p6_detached("perl -e '$0 = q{WiFi Optimizer (/home/deck/homebrew/plugins/WiFi Optimizer/main.py)}; "
+                         "sleep 60'")
+            _p6_detached("exec -a /home/deck/homebrew/services/PluginLoader perl -e 'sleep 60' optimizer")
+            time.sleep(0.5)
+            for _pat in ("moondeck", "main.py", "optimizer"):
+                _found6 = _p6_find(_pat)
+                ok(_found6 is None, f"the plugin's search: {_pat!r} matches no stream ({_found6})")
+            # The backend's own child, its argv carrying a name: the script is
+            # told the backend's PID in "owner".
+            _p6_owner = _p6_detached("(exec -a 'nmcli optimizer-probe' sleep 60 & wait)")
+            time.sleep(0.5)
+            ok(_p5_playing_probe("optimizer", owner=str(_p6_owner)) == "no",
+               "the update script: 'optimizer' matches no stream (plugin backends, PluginLoader, "
+               "and what the backend started)")
+            ok(_p5_playing_probe("moondeck|main\\.py", owner=str(_p6_owner)) == "no",
+               "nor do 'moondeck' and 'main.py'")
+            _p6_detached("exec -a /usr/bin/moonlight sleep 30")
+            time.sleep(0.3)
+            _found6 = _p6_find("moonlight")
+            ok(bool(_found6), f"a real moonlight is still found by the plugin ({_found6})")
+            ok(_p5_playing_probe("moonlight", owner=str(_p6_owner)) == "yes",
+               "and by the update script")
+        finally:
+            for _pid in _p6_pids:
+                try:
+                    os.kill(_pid, 9)
+                except OSError:
+                    pass
+            _p5_sp.run(["pkill", "-9", "-f", "optimizer-probe"], capture_output=True)
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L7 pass 5 an iw stuck in the driver is not blamed on the access point or the band")
+try:
+    _P7U = "dddddddd-0000-0000-0000-0000000000c7"
+    _STUCK = "an earlier iw is still stuck"
+
+    class _P7(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.failures = []; self.mods = []; self.reconnects = 0
+        async def _await_association(self, iface):
+            return {"iface": iface, "bssid": "", "link": "", "error": _STUCK}
+        def _record_ap_failure(self, bssid): self.failures.append(bssid)
+        def _nmcli_modify(self, uuid, key, value, timeout=5):
+            self.mods.append((key, value)); return _ok()
+        async def _reconnect(self, uuid=None):
+            self.reconnects += 1; return True
+        def _get_wifi_interface(self): return "wlan0"
+        def _get_active_connection_uuid(self): return _P7U
+        def _relock_pin(self, uuid): return None
+    m._save_settings({**m.DEFAULT_SETTINGS, "bssid_lock_enabled": True,
+                      "bssid_lock_value": "02:00:00:00:00:51", "bssid_lock_connection_uuid": _P7U})
+    _p7 = _P7()
+    _r7 = asyncio.run(_p7._verify_lock_move("wlan0", _P7U, "02:00:00:00:00:11", "02:00:00:00:00:51", True))
+    ok(_r7.get("error") == "not_responding" and not _p7.failures and not _p7.mods and not _p7.reconnects,
+       f"a lock move: not_responding, no access point failure, no pin put back, no reconnect "
+       f"({_r7.get('error')}, {_p7.failures}, {_p7.mods}, {_p7.reconnects})")
+    _p7b = _P7()
+    _before7 = m._load_settings()
+    _r7b = asyncio.run(_p7b._confirm_six_ghz(_P7U, _before7, False, "a"))
+    ok((_r7b or {}).get("error") == "not_responding" and not _p7b.mods and not _p7b.reconnects,
+       f"the 6 GHz check: not_responding, the band left as set, no reconnect ({_r7b}, {_p7b.mods})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L8 pass 5 a settings file that cannot be set aside is logged once, not on every read")
+try:
+    _p8_saved = m.SETTINGS_FILE
+    try:
+        m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+        open(m.SETTINGS_FILE, "w").write("{not json")
+        os.mkdir(m.SETTINGS_FILE + ".corrupt"); open(os.path.join(m.SETTINGS_FILE + ".corrupt", "x"), "w").write("x")
+        _p8_errs = []
+        _p8_real = m.decky.logger.error
+        m.decky.logger.error = staticmethod(lambda msg: _p8_errs.append(msg))
+        try:
+            for _ in range(20):
+                m._load_settings()
+        finally:
+            m.decky.logger.error = _p8_real
+        _p8_lines = [e for e in _p8_errs if "could not be read or set aside" in e]
+        ok(len(_p8_lines) == 1, f"20 settings reads log the failed set-aside once ({len(_p8_lines)})")
+        try:
+            m._save_settings(dict(m.DEFAULT_SETTINGS)); _p8_saved_ok = True
+        except OSError:
+            _p8_saved_ok = False
+        ok(not _p8_saved_ok and open(m.SETTINGS_FILE).read() == "{not json",
+           "and saves are still refused, so the unreadable file is kept (pass-4 L13)")
+        _p5_sh.rmtree(m.SETTINGS_FILE + ".corrupt")
+        m._load_settings()
+        ok(os.path.isfile(m.SETTINGS_FILE + ".corrupt") and not os.path.exists(m.SETTINGS_FILE),
+           "once what was in the way is gone, the next read sets the file aside")
+    finally:
+        m.SETTINGS_FILE = _p8_saved
+        if hasattr(m, "_SETTINGS_STATE"):
+            m._SETTINGS_STATE.update({"read_failed": False, "unread": None})
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L9 pass 5 a backend switch cut off by a restart is finished or undone at the next boot")
+try:
+    _p9_saved = (m.BACKEND_SWITCH_MARKER, getattr(m, "BOOT_ID_FILE", None))
+    _p9_dir = os.path.join(tempfile.mkdtemp(), "var-lib-wo")
+    try:
+        m.BACKEND_SWITCH_MARKER = os.path.join(_p9_dir, "backend-switch")
+        m.BOOT_ID_FILE = os.path.join(tempfile.mkdtemp(), "boot_id")
+        open(m.BOOT_ID_FILE, "w").write("11111111-2222-3333-4444-555555555555\n")
+
+        class _P9(m.Plugin):
+            def __init__(self, conf):
+                super().__init__(); self.conf = conf; self.cmds = []
+                self.enabled = {"iwd": True, "wpa_supplicant": False}
+            def _merged_nm_backend(self, config_dir=None): return self.conf
+            def _interface_after_restart(self, backend): return True, False
+            def _run_cmd(self, cmd, timeout=5):
+                self.cmds.append(cmd[1:3])
+                if cmd[:2] == ["/usr/bin/systemctl", "is-enabled"]:
+                    return _ok("enabled" if self.enabled.get(cmd[2]) else "disabled")
+                if cmd[:2] == ["/usr/bin/systemctl", "is-active"]:
+                    return _ok("active" if self.enabled.get(cmd[2]) else "inactive")
+                if cmd[:2] == ["/usr/bin/systemctl", "enable"]:
+                    self.enabled[cmd[2]] = True
+                if cmd[:2] == ["/usr/bin/systemctl", "disable"]:
+                    self.enabled[cmd[2]] = False
+                return _ok()
+        _p9w = _P9("wpa_supplicant")
+        _p9w._set_backend_marker("iwd wpa_supplicant")
+        _p9_text = open(m.BACKEND_SWITCH_MARKER).read() if os.path.exists(m.BACKEND_SWITCH_MARKER) else ""
+        ok(_p9_text == "iwd wpa_supplicant 11111111-2222-3333-4444-555555555555\n"
+           and oct(os.stat(_p9_dir).st_mode & 0o777) == "0o700",
+           f"the marker carries the boot it was written in, in a directory only root can enter ({_p9_text!r})")
+        ok(re.search(r'(?m)^BACKEND_SWITCH_MARKER = "/var/lib/wifi-optimizer/backend-switch"$',
+                     open("main.py").read()) is not None,
+           "and it lives under /var/lib/wifi-optimizer, which a reboot keeps")
+        open(m.BOOT_ID_FILE, "w").write("99999999-2222-3333-4444-555555555555\n")
+        _p9w._reconcile_backend_switch()
+        ok(_p9w.enabled == {"iwd": False, "wpa_supplicant": True} and not os.path.exists(m.BACKEND_SWITCH_MARKER),
+           f"another boot, the configuration naming wpa_supplicant, wpa_supplicant left disabled: it is "
+           f"enabled, iwd disabled, the marker gone ({_p9w.enabled}, {_p9w.cmds})")
+        _p9u = _P9("iwd"); _p9u.enabled = {"iwd": True, "wpa_supplicant": True}
+        open(m.BOOT_ID_FILE, "w").write("11111111-2222-3333-4444-555555555555\n")
+        _p9u._set_backend_marker("iwd wpa_supplicant")
+        open(m.BOOT_ID_FILE, "w").write("99999999-2222-3333-4444-555555555555\n")
+        _p9_restored = []
+        _p9u._restore_generic_backend = lambda backend: (_p9_restored.append(backend), (True, False))[1]
+        _p9u._reconcile_backend_switch()
+        ok(_p9_restored == ["iwd"] and not os.path.exists(m.BACKEND_SWITCH_MARKER),
+           f"and with the configuration still naming iwd, iwd is put back ({_p9_restored})")
+    finally:
+        m.BACKEND_SWITCH_MARKER = _p9_saved[0]
+        if _p9_saved[1] is not None:
+            m.BOOT_ID_FILE = _p9_saved[1]
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L10 pass 5 a dispatcher install that fails leaves no hidden script behind")
+try:
+    _p10_saved = (m.DISPATCHER_PATH, m.decky.DECKY_PLUGIN_DIR)
+    try:
+        m.DISPATCHER_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer")
+        m.decky.DECKY_PLUGIN_DIR = os.getcwd()
+        _p10_tmp = os.path.join(os.path.dirname(m.DISPATCHER_PATH), ".99-wifi-optimizer.new")
+        _p10_real = os.replace
+
+        def _p10_fail(src, dst, *a, **k):
+            if dst == m.DISPATCHER_PATH:
+                raise OSError(28, "No space left on device")
+            return _p10_real(src, dst, *a, **k)
+        os.replace = _p10_fail
+        try:
+            _p10_r = m.Plugin()._install_dispatcher()
+        finally:
+            os.replace = _p10_real
+        ok(_p10_r is False and not os.path.exists(_p10_tmp),
+           f"os.replace failing: no .99-wifi-optimizer.new left ({os.listdir(os.path.dirname(m.DISPATCHER_PATH))})")
+        open(_p10_tmp, "w").write("#!/bin/sh\n"); os.chmod(_p10_tmp, 0o755)
+        m.Plugin()._remove_dispatcher()
+        ok(not os.path.exists(_p10_tmp), "and a temp file an earlier install left is removed with the dispatcher")
+    finally:
+        m.DISPATCHER_PATH, m.decky.DECKY_PLUGIN_DIR = _p10_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L11 pass 5 a process search stuck in the kernel is said, once")
+try:
+    _p11_gate = _p5_thr.Event()
+
+    class _P11(m.Plugin):
+        def _read_processes(self):
+            _p11_gate.wait(10); return []
+    _p11_errs = []
+    _p11_real_err, _p11_real_info = m.decky.logger.error, m.decky.logger.info
+    m.decky.logger.error = staticmethod(lambda msg: _p11_errs.append(msg))
+    m.decky.logger.info = staticmethod(lambda msg: _p11_errs.append(msg))
+    _p11_clock = [time.monotonic()]
+    _p11_mono = m.time.monotonic
+    try:
+        _p11 = _P11()
+        _p11._find_stream([("x", "moonlight")], wait=0.05)
+        m.time.monotonic = lambda: _p11_clock[0]
+        for _k in range(5):
+            _p11_clock[0] += 20
+            _p11._find_stream([("x", "moonlight")], wait=0.05)
+    finally:
+        m.time.monotonic = _p11_mono
+        m.decky.logger.error, m.decky.logger.info = _p11_real_err, _p11_real_info
+        _p11_gate.set()
+    _p11_lines = [e for e in _p11_errs if "process search has not finished" in e]
+    ok(len(_p11_lines) == 1, f"several searches over a stuck one log it exactly once ({_p11_lines})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L12 pass 5 the setters' command chains run off the event loop")
+try:
+    _P12U = "dddddddd-0000-0000-0000-0000000000c2"
+
+    class _P12(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.on_loop = []
+        def _note(self, what):
+            if _p5_thr.current_thread() is _p5_thr.main_thread():
+                self.on_loop.append(what)
+        def _run_cmd(self, cmd, timeout=5):
+            self._note(" ".join(cmd[:3])); return _ok()
+        def _get_wifi_interface(self):
+            self._note("interface lookup"); return "wlan0"
+        def _resolve_uuid(self, msg=None): return _P12U, None
+        def _require_wifi(self): return "wlan0", _P12U, None
+        async def _reconnect(self, uuid=None): return True
+        def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
+            self._note("driver fixes")
+        def _apply_pcie_aspm_fix(self, enable, record_all=False):
+            self._note("PCIe power states"); return []
+        def _reload_nm_conf(self): pass
+        def _paused_by_streaming(self): return False
+    _p12_nm = m.NM_CONF_PATH
+    m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+    try:
+        for _label, _call in (
+                ("buffer tuning on", lambda p: p.set_buffer_tuning(True)),
+                ("buffer tuning off", lambda p: p.set_buffer_tuning(False)),
+                ("CAKE on", lambda p: p.set_cake(True)),
+                ("CAKE off", lambda p: p.set_cake(False)),
+                ("lock off", lambda p: p._release_lock_from_all_profiles()),
+                ("DNS on", lambda p: p.set_dns(True, "cloudflare", "")),
+                ("DNS off", lambda p: p.set_dns(False)),
+                ("power save on", lambda p: p.set_power_save(True))):
+            m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88", "bssid_lock_enabled": True,
+                              "bssid_lock_uuids": [_P12U, "dddddddd-0000-0000-0000-0000000000c3"],
+                              "dns_enabled": True, "dns_uuids": [_P12U]})
+            _p12 = _P12()
+            asyncio.run(_call(_p12))
+            ok(not _p12.on_loop, f"{_label}: nothing on the event loop ({_p12.on_loop})")
+    finally:
+        m.NM_CONF_PATH = _p12_nm
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L13 pass 5 buffer settings that do not take say what to do")
+try:
+    class _P13(m.Plugin):
+        def _get_wifi_interface(self): return None
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[:2] == ["/usr/bin/sysctl", "-w"]:
+                return {"success": False, "stdout": "", "stderr": "nope", "returncode": 1}
+            return _ok("1")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _msg13 = asyncio.run(_P13().set_buffer_tuning(True)).get("message") or ""
+    ok(_msg13 == "Couldn't apply network buffer settings. Try again. If it keeps failing, restart the device.",
+       f"every sysctl refused: the message gives the next step ({_msg13!r})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L14 pass 5 power save is set on every radio in use, and judged on the one the status reads")
+try:
+    _p14_root = tempfile.mkdtemp()
+    _d_netdev(_p14_root, "wlan0", "rtw88_8822ce", operstate="up", bus="pci")
+    _d_netdev(_p14_root, "wlan1", "mt7921u", operstate="up", bus="usb")
+    _p14_saved = (m.SYSFS_NET, m.NM_CONF_PATH)
+    try:
+        m.SYSFS_NET = os.path.join(_p14_root, "net")
+        m.NM_CONF_PATH = os.path.join(tempfile.mkdtemp(), "99-wifi-optimizer.conf")
+
+        class _P14(m.Plugin):
+            def __init__(self, fail=("wlan0",)):
+                super().__init__(); self.iw = []; self.fixes = []; self.fail = fail
+            def _run_cmd(self, cmd, timeout=5):
+                if cmd[:2] == ["/usr/bin/nmcli", "-t"] and cmd[-2:] == ["dev", "status"]:
+                    return _ok("wlan1:wifi\nwlan0:wifi")
+                if cmd[:2] == ["/usr/bin/iw", "dev"] and "power_save" in cmd:
+                    self.iw.append((cmd[2], cmd[-1]))
+                    if cmd[2] in self.fail:
+                        return {"success": False, "stdout": "", "stderr": "Operation not supported",
+                                "returncode": 1}
+                return _ok()
+            def _apply_driver_fixes(self, enable, persist=True, record_all=False, ps_off=False):
+                self.fixes.append((enable, ps_off))
+            def _apply_pcie_aspm_fix(self, enable, record_all=False): return []
+            def _reload_nm_conf(self): pass
+            def _paused_by_streaming(self): return False
+            def _valve_powersave(self): return None
+        m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88"})
+        _p14 = _P14()
+        _r14 = asyncio.run(_p14.set_power_save(True))
+        ok(sorted(_p14.iw) == [("wlan0", "off"), ("wlan1", "off")] and _r14.get("success") is True,
+           f"on: iw on the connected dongle and the internal card, and a failure on the card the "
+           f"status does not read is not the toggle's ({_p14.iw}, {_r14})")
+        ok(_p14.fixes == [(True, False)],
+           f"the driver fixes are told power save is not confirmed off on the managed card ({_p14.fixes})")
+        _p14b = _P14(fail=())
+        asyncio.run(_p14b.set_power_save(True))
+        ok(_p14b.fixes == [(True, True)], f"and are told it is when it went off there ({_p14b.fixes})")
+        _p14c = _P14(fail=())
+        _p14c._release_power_save({**m._load_settings(), "power_save_disabled": True})
+        ok(sorted(_p14c.iw) == [("wlan0", "on"), ("wlan1", "on")],
+           f"Reset and uninstall turn it back on on both ({_p14c.iw})")
+        _p14d = _P14(fail=())
+        _p14d._revert_volatile_fixes({**m._load_settings(), "power_save_disabled": True})
+        ok(sorted(_p14d.iw) == [("wlan0", "on"), ("wlan1", "on")],
+           f"and so does the end of a stream ({_p14d.iw})")
+    finally:
+        m.SYSFS_NET, m.NM_CONF_PATH = _p14_saved
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L15 pass 5 the apply lock's timeout line does not blame the dispatcher")
+try:
+    import fcntl as _p15_fcntl
+    _p15_saved = m.APPLY_LOCK_FILE
+    m.APPLY_LOCK_FILE = os.path.join(tempfile.mkdtemp(), "apply.lock")
+    _p15_fd = os.open(m.APPLY_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    _p15_logged = []
+    _p15_real = m.decky.logger.info
+    m.decky.logger.info = staticmethod(lambda msg: _p15_logged.append(msg))
+    try:
+        # Held by another open file description, as another process would.
+        _p15_other = os.open(m.APPLY_LOCK_FILE, os.O_RDWR)
+        _p15_fcntl.flock(_p15_other, _p15_fcntl.LOCK_EX)
+        m._take_apply_lock(0.2)
+    finally:
+        m.decky.logger.info = _p15_real
+        os.close(_p15_other); os.close(_p15_fd)
+        m.APPLY_LOCK_FILE = _p15_saved
+    ok(any(l.startswith("The apply lock was still held after") for l in _p15_logged)
+       and not any("dispatcher" in l for l in _p15_logged),
+       f"the line names the lock, not the dispatcher ({_p15_logged})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L16 pass 5 6 GHz refused on NetworkManager 1.58.0 says how to get a WPA3 profile")
+try:
+    class _P16(m.Plugin):
+        def _nm_version(self): return (1, 58, 0)
+        def _profile_key_mgmt(self, uuid): return "wpa-psk"
+    m._save_settings({**m.DEFAULT_SETTINGS, "supports_6ghz": True, "distro_id": "steamos"})
+    _r16 = _P16()._six_ghz_refusal("dddddddd-0000-0000-0000-0000000000c6") or {}
+    _msg16 = _r16.get("message", "")
+    ok("forget the network and join it again" in _msg16 and "WPA3 only" in _msg16
+       and "1.58.1 or newer" in _msg16 and "SteamOS" not in _msg16,
+       f"the refusal gives the way on: forget and join again with the router on WPA3 only ({_msg16!r})")
+    ok(all(ord(c) < 128 for c in _msg16) and " - " not in _msg16, "in plain ASCII, no dashes")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("L17 pass 5 after a wake the lock moves to a clearly stronger access point, once")
+try:
+    _P17U = "eeeeeeee-0000-0000-0000-0000000000a7"
+    _p17_logged = []
+
+    class _P17(Mesh):
+        """The mesh model, connected, the lock holding on a weak link."""
+        def __init__(self, signal_dbm=-84):
+            super().__init__(MESH, "02:00:00:00:00:11", signal_dbm=signal_dbm)
+            self.pinned = "02:00:00:00:00:11"; self._ASSOCIATION_WAIT_SECONDS = 1.0
+        def _get_active_connection_uuid(self): return _P17U
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[-1:] == ["general"]:
+                return _ok("connected:enabled")
+            if "802-11-wireless.bssid" in cmd and "show" in cmd:
+                return _ok("802-11-wireless.bssid:" + self.pinned.replace(":", "\\:"))
+            return Mesh._run_cmd(self, cmd, timeout)
+
+    def _p17_lock():
+        m._save_settings({**base_ap, "bssid_lock_enabled": True, "bssid_lock_value": "02:00:00:00:00:11",
+                          "bssid_lock_connection_uuid": _P17U, "bssid_lock_uuids": [_P17U]})
+
+    _p17_offset = [0.0]
+    _p17_had = hasattr(m.time, "CLOCK_BOOTTIME")
+    _p17_real_cg = getattr(m.time, "clock_gettime", None)
+    _p17_real_info = m.decky.logger.info
+
+    def _p17_passes(p, jumps):
+        """Run the background watch's wake check once per entry, the suspend
+        offset growing by that many seconds before it."""
+        async def go():
+            for j in jumps:
+                _p17_offset[0] += j
+                await p._wake_lock_check()
+        asyncio.run(go())
+
+    try:
+        if not _p17_had:
+            m.time.CLOCK_BOOTTIME = 7
+        _p17_boot = m.time.CLOCK_BOOTTIME
+        m.time.clock_gettime = lambda clk: (time.monotonic() + _p17_offset[0] if clk == _p17_boot
+                                            else _p17_real_cg(clk))
+        m.decky.logger.info = staticmethod(lambda msg: _p17_logged.append(msg))
+        _p17_lock(); _p17_logged.clear()
+        _g17 = _P17(); _p17_passes(_g17, [0, 600])
+        ok(_g17.pinned.upper() == "02:00:00:00:00:51"
+           and m._load_settings().get("bssid_lock_value") == "02:00:00:00:00:51",
+           f"a wake, the lock holding at -84 dBm with a stronger access point in range: it moves ({_g17.pinned})")
+        ok(any(l.startswith("After waking, moving the BSSID lock from 02:00:00:00:00:11 (signal")
+               for l in _p17_logged), f"and says so ({[l for l in _p17_logged if 'After waking' in l]})")
+        _n17 = len(_g17.mods)
+        _p17_passes(_g17, [0, 0])
+        ok(len(_g17.mods) == _n17, "and does not try again for the same wake")
+
+        _p17_lock(); _g17 = _P17(); _p17_passes(_g17, [0, 2, 2])
+        ok(_g17.pinned.upper() == "02:00:00:00:00:11" and not _g17.mods, "no clock jump: no move")
+        _p17_lock(); _g17 = _P17(signal_dbm=-45); _p17_passes(_g17, [0, 600])
+        ok(_g17.pinned.upper() == "02:00:00:00:00:11" and not _g17.mods, "a strong link: no move")
+        m._save_settings({**base_ap}); _g17 = _P17(); _p17_passes(_g17, [0, 600])
+        ok(not _g17.mods, "the lock off: no move")
+        _p17_lock(); _g17 = _P17()
+        _p17_flag = m.STREAM_FLAG_FILE
+        open(_p17_flag, "w").write("1\n")
+        try:
+            _p17_logged.clear(); _p17_passes(_g17, [0, 600])
+        finally:
+            os.remove(_p17_flag)
+        ok(not _g17.mods and any("game or stream" in l for l in _p17_logged),
+           f"a stream running: no move, and one line says why ({[l for l in _p17_logged if 'After waking' in l]})")
+        # L18: whether a game runs is known before anything moves. A process
+        # search that has not answered is not "nothing running": the wake
+        # stays pending and is tried at the next pass.
+        _p17_gate = _p5_thr.Event()
+
+        class _P17Slow(_P17):
+            def _read_processes(self):
+                _p17_gate.wait(10); return []
+        _p17_lock(); _g17 = _P17Slow()
+        _p17_passes(_g17, [0, 600])
+        _p17_pending = getattr(_g17, "_wake_lock_pending", None) is not None
+        _p17_gate.set(); time.sleep(0.2)
+        ok(not _g17.mods and _p17_pending,
+           f"a process search that has not answered: no move yet, the wake still pending ({_g17.mods})")
+        _p17_passes(_g17, [0])
+        ok(_g17.pinned.upper() == "02:00:00:00:00:51", "and the move is made once it has")
+    finally:
+        m.decky.logger.info = _p17_real_info
+        if _p17_real_cg is not None:
+            m.time.clock_gettime = _p17_real_cg
+        if not _p17_had and hasattr(m.time, "CLOCK_BOOTTIME"):
+            del m.time.CLOCK_BOOTTIME
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L18 pass 5 with auto mode off, the lock-weaker and WPA2-reach notices still ask for scans and report")
+try:
+    _P18U = "eeeeeeee-0000-0000-0000-0000000000a8"
+    _p18_proc = os.path.join(tempfile.mkdtemp(), "proc")
+    for _pid, _argv in (("4100", [b"/usr/lib/systemd/systemd"]), ("4200", [b"/usr/bin/bash", b"-l"])):
+        os.makedirs(os.path.join(_p18_proc, _pid))
+        open(os.path.join(_p18_proc, _pid, "cmdline"), "wb").write(b"\0".join(_argv) + b"\0")
+        open(os.path.join(_p18_proc, _pid, "status"), "w").write("Name:\tx\nPPid:\t1\n")
+
+    class _P18(Mesh):
+        """The mesh model; the process search real, over a fixture /proc."""
+        def __init__(self, scan=MESH, key_mgmt="wpa-psk"):
+            super().__init__(scan, "02:00:00:00:00:11", signal_dbm=-84, key_mgmt=key_mgmt)
+            self.pinned = "02:00:00:00:00:11"; self.rescans = []
+        def _run_cmd(self, cmd, timeout=5):
+            if "rescan" in cmd:
+                self.rescans.append(_p18_clock[0])
+                return _ok()
+            return Mesh._run_cmd(self, cmd, timeout)
+
+    _p18_clock = [1000.0]
+    _p18_saved = (m.PROC_DIR, m.time.monotonic)
+    _p18_live = {"bssid_lock": "02:00:00:00:00:11", "connected_bssid": "02:00:00:00:00:11"}
+    _p18_link = "Connected to 02:00:00:00:00:11 (on wlan0)\n\tsignal: -84 dBm\n"
+    _p18_set = {**base_ap, "bssid_lock_enabled": True, "bssid_lock_value": "02:00:00:00:00:11",
+                "bssid_lock_connection_uuid": _P18U, "streaming_mode_enabled": False}
+    try:
+        m.PROC_DIR = _p18_proc
+        m.time.monotonic = lambda: _p18_clock[0]
+        m._save_settings(dict(_p18_set))
+        _g18 = _P18()
+        _p18_found = None
+        for _poll in range(80):          # a status poll every 3 s, 240 s
+            _g18._report_lock_weaker(_p18_set, {"live": dict(_p18_live)}, _P18U, "wlan0", "Net", _p18_link) \
+                if hasattr(_g18, "_report_lock_weaker") else None
+            if getattr(_g18, "_lock_weaker", None) and _p18_found is None:
+                _p18_found = _p18_clock[0] - 1000.0
+            time.sleep(0.01)               # the search started this poll finishes
+            _p18_clock[0] += 3
+        ok(_g18.rescans and _g18.rescans[0] - 1000.0 <= 60,
+           f"the lock-weaker check asks for a rescan within the first minute "
+           f"({[r - 1000.0 for r in _g18.rescans][:4]})")
+        ok(_p18_found is not None,
+           f"and reports the stronger access point after its fresh reads (at {_p18_found} s; "
+           f"{getattr(_g18, '_lock_weaker', None)})")
+
+        # The WPA2-reach check: a WPA3-only profile, a stronger WPA2-only
+        # access point of the same network, the profile pinned.
+        _p18_scan = "\n".join([
+            "Net:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3",
+            "Net:02\\:00\\:00\\:00\\:00\\:61:100:5180 MHz:WPA2",
+        ])
+        _p18_clock[0] = 5000.0
+        _g18b = _P18(_p18_scan, key_mgmt="sae")
+        _g18b._nm_version_seen = (1, 58, 1)
+        _p18_reach = None
+        for _poll in range(80):
+            _g18b._recheck_security_reach(_P18U, "wlan0", "Net", "02:00:00:00:00:11",
+                                          _p18_set, "02:00:00:00:00:11")
+            if getattr(_g18b, "_wpa2_blocked", None) and _p18_reach is None:
+                _p18_reach = _p18_clock[0] - 5000.0
+            time.sleep(0.01)
+            _p18_clock[0] += 3
+        ok(_g18b.rescans and _g18b.rescans[0] - 5000.0 <= 60 and _p18_reach is not None,
+           f"the WPA2-reach check asks for a rescan within the first minute and reports "
+           f"({[r - 5000.0 for r in _g18b.rescans][:4]}, at {_p18_reach} s)")
+    finally:
+        m.PROC_DIR, m.time.monotonic = _p18_saved
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("this file: no section rebinds a helper the others share")
 try:
