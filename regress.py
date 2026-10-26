@@ -6802,6 +6802,97 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("R5 pass 5 with REGRESS_REQUIRE_LINUX the pass-4 L1 check fails where it used to skip")
+# CI sets REGRESS_REQUIRE_LINUX so that no Linux-only check can SKIP there
+# (the R1 section above checks that it does). The pass-4 L1 check had two
+# SKIPs of its own that ignored it: no pgrep, and a process already matching
+# the stream patterns. Here that section's own text runs in a child python,
+# with the variable set: once with pgrep missing from PATH, once with a real
+# process named moonlight running beside it.
+try:
+    import subprocess as _r5_sp, shutil as _r5_sh
+    _r5_src = open(__file__).read()
+    _r5_head = _r5_src[:_r5_src.index('\nsection("security: driver profile validation")')]
+    _r5_a = _r5_src.index('\nsection("L1 the update script never takes itself for a stream, with the real pgrep")')
+    _r5_b = _r5_src.index('\nsection(', _r5_a + 1)
+    _r5_dir = tempfile.mkdtemp()
+    _r5_file = os.path.join(_r5_dir, "l1_alone.py")
+    open(_r5_file, "w").write(_r5_head + _r5_src[_r5_a:_r5_b] + '\nprint("R5 CHILD DONE")\n')
+    _r5_empty = tempfile.mkdtemp()
+
+    def _r5_child(path):
+        _r = _r5_sp.run([sys.executable, _r5_file], cwd=os.getcwd(), capture_output=True, text=True,
+                        timeout=120, env={**os.environ, "REGRESS_REQUIRE_LINUX": "1", "PATH": path})
+        return _r.stdout + _r.stderr
+
+    _r5_out = _r5_child(_r5_empty)
+    ok("R5 CHILD DONE" in _r5_out and "FAIL  no pgrep here" in _r5_out
+       and "SKIP  no pgrep here" not in _r5_out,
+       "with no pgrep, the L1 check fails instead of skipping "
+       f"({[l for l in _r5_out.splitlines() if 'pgrep here' in l]})")
+    _r5_pgrep = _r5_sh.which("pgrep")
+    if not _r5_pgrep and os.environ.get("REGRESS_REQUIRE_LINUX"):
+        ok(False, "no pgrep here, and CI must run the second half of this check")
+    elif not _r5_pgrep:
+        print("SKIP  no pgrep here for the busy half of this check (Linux and macOS have one)")
+    else:
+        # sleep, started as "moonlight" (its argv[0]), as the L1 check does.
+        _r5_moon = _r5_sp.Popen(["/usr/bin/moonlight", "120"],
+                                executable=_r5_sh.which("sleep") or "/bin/sleep")
+        try:
+            time.sleep(0.3)
+            _r5_out = _r5_child(os.environ.get("PATH", ""))
+        finally:
+            _r5_moon.kill(); _r5_moon.wait()
+        ok("R5 CHILD DONE" in _r5_out and "FAIL  a process here already matches" in _r5_out
+           and "SKIP  a process here already matches" not in _r5_out,
+           "with a matching process running, the L1 check fails instead of skipping "
+           f"({[l for l in _r5_out.splitlines() if 'already matches' in l]})")
+    _r5_sh.rmtree(_r5_dir, ignore_errors=True)
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("R8 pass 5 CI fails when the build leaves a file in dist/ that was never committed")
+# A bundle chunk the build makes but nobody committed would be missing from
+# every release, and git diff does not see untracked files. The step's own
+# command runs here in a scratch repo laid out like this one (the bundle is
+# listed in .gitignore and committed anyway).
+try:
+    import subprocess as _r8_sp
+    _r8_wf = open(".github/workflows/ci.yml").read()
+    _r8_step = re.search(r"- name: Committed dist matches the source\n        run: (.*)\n", _r8_wf)
+    _r8_cmd = _r8_step.group(1) if _r8_step else ""
+    ok(bool(_r8_cmd), "CI has the step that compares dist/ with the commit")
+    _r8_repo = tempfile.mkdtemp()
+    _r8_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def _r8_git(*a):
+        _r8_sp.run(["git", "-c", "user.name=regress", "-c", "user.email=regress@example.invalid",
+                    "-c", "commit.gpgsign=false", *a], cwd=_r8_repo, env=_r8_env,
+                   capture_output=True, check=True)
+
+    _r8_git("init", "-q")
+    os.mkdir(os.path.join(_r8_repo, "dist"))
+    open(os.path.join(_r8_repo, ".gitignore"), "w").write(open(".gitignore").read())
+    open(os.path.join(_r8_repo, "dist", "index.js"), "w").write("// built\n")
+    _r8_git("add", ".gitignore"); _r8_git("add", "-f", "dist/index.js"); _r8_git("commit", "-q", "-m", "x")
+
+    def _r8_rc():
+        return _r8_sp.run(["bash", "-c", _r8_cmd], cwd=_r8_repo, env=_r8_env,
+                          capture_output=True).returncode
+
+    ok(_r8_cmd and _r8_rc() == 0, "a dist/ that is exactly the commit passes")
+    open(os.path.join(_r8_repo, "dist", "chunk-1.js"), "w").write("// new chunk\n")
+    ok(_r8_cmd and _r8_rc() != 0, "a new file in dist/ that was never committed fails the step")
+    os.remove(os.path.join(_r8_repo, "dist", "chunk-1.js"))
+    open(os.path.join(_r8_repo, "dist", "index.js"), "w").write("// built differently\n")
+    ok(_r8_cmd and _r8_rc() != 0, "and so does a committed bundle that differs from the build")
+    import shutil as _r8_sh; _r8_sh.rmtree(_r8_repo, ignore_errors=True)
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("release signatures: checked strictly, and required for every update")
 try:
     import base64, hashlib
@@ -11762,7 +11853,10 @@ try:
        and oct(os.stat(_l1_sf).st_mode & 0o777) == "0o600",
        "they are in a 0600 file beside the script instead")
 
-    if not _l1_pgrep:
+    # CI sets REGRESS_REQUIRE_LINUX: there neither half below may SKIP.
+    if not _l1_pgrep and os.environ.get("REGRESS_REQUIRE_LINUX"):
+        ok(False, "no pgrep here, and CI must run the real-pgrep half of this check")
+    elif not _l1_pgrep:
         print("SKIP  no pgrep here: the real-pgrep half runs on Linux and macOS")
     else:
         # The script the plugin wrote, cut down to its start (arguments,
@@ -11792,7 +11886,10 @@ try:
             if not _l1_busy:
                 break
             time.sleep(0.5)
-        if _l1_busy:
+        if _l1_busy and os.environ.get("REGRESS_REQUIRE_LINUX"):
+            ok(False, f"a process here already matches the patterns ({_l1_busy[:3]}), "
+                      f"and CI must run this check")
+        elif _l1_busy:
             print(f"SKIP  a process here already matches the patterns ({_l1_busy[:3]})")
         else:
             _l1_seen = [_l1_run() for _ in range(3)]

@@ -47,8 +47,11 @@ jobs:
       - name: Build
         run: pnpm run build
 
+      # git status, not git diff: a file the build makes that was never
+      # committed (a new bundle chunk) would be missing from every release,
+      # and git diff does not see untracked files.
       - name: Committed dist matches the source
-        run: git diff --exit-code dist/
+        run: git status --porcelain --untracked-files=all dist/ && test -z "$(git status --porcelain --untracked-files=all dist/)"
 
       - name: Type check
         run: npx tsc --noEmit -p .
