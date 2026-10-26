@@ -76,12 +76,15 @@ const BACKEND_RESULT_MS = 60 * 1000;
 // until that control was used again, so a failure from an hour ago still
 // read as the current state.
 const MESSAGE_TTL_MS = 2 * 60 * 1000;
-// Shown on the lock and band toggles while the iwd backend is in use.
-const IWD_PIN_NOTICE =
-  "Paused while the WiFi backend is iwd, where NetworkManager can't reconnect a network pinned this way. Switch to wpa_supplicant to use it.";
+// Shown on the lock and band toggles while the iwd backend is in use:
+// NetworkManager can't reconnect a network pinned this way under iwd.
+const IWD_PIN_NOTICE = "Paused under iwd. Switch to wpa_supplicant in Advanced to use it.";
 const BACKEND_POLL_MAX_FAILURES = 5;
-// An iw stuck in the driver, or a card the system can no longer use.
-const NOT_RESPONDING_TEXT = "The WiFi card isn't responding. Restart the device.";
+// An iw stuck in the driver, or a card the system can no longer use. Copy
+// diagnostics first: after the restart they show the healthy boot's link and
+// NetworkManager state, not the failed one's.
+const NOT_RESPONDING_TEXT =
+  "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device.";
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
 // Prevent lag spikes is saved as off, so it does not come back by itself.
@@ -90,9 +93,10 @@ const NOT_RESPONDING_TEXT = "The WiFi card isn't responding. Restart the device.
 // The update channel and notices are kept (main.py _reset_locked), and
 // streaming auto mode starts again from its defaults. Allow WPA2 is only
 // recorded from 0.24.5-beta on (wpa2_uuids), so one allowed on 0.23.0 to
-// 0.24.4-beta stays allowed, and the text says so.
+// 0.24.4-beta stays allowed, and the text says so. The detail (the buffer
+// and region values, the command for the rest) is in the README.
 const RESET_CONFIRM_TEXT =
-  "This turns off what the plugin applied and puts its WiFi settings back to their defaults, except that Prevent lag spikes stays off until you turn it on again. Buffer tuning and CAKE go back to the values your system had, and a WiFi region chosen here goes back to the one from before. The access point lock, the band preference, the IPv6 setting, custom DNS and Allow WPA2 are removed from the networks they were set on, from the next time WiFi connects. Allow WPA2 is only put back where it was allowed with this version or later, since older versions kept no record of it (the README has the command for the rest). Streaming auto mode is turned off and its app choices and process names are cleared. Update settings are kept.";
+  "Turns off everything the plugin applied. Prevent lag spikes stays off until you turn it on. The lock, band, DNS, IPv6 and Allow WPA2 come off your networks at the next connect (Allow WPA2 only if allowed on 0.24.5-beta or later). Streaming auto mode is cleared. Update settings are kept.";
 // Reset does not reconnect, so it does not say WiFi will.
 const RESET_WORKING_TEXT = "Working...";
 const RESET_DONE_TEXT = "Done. Settings are reset.";
@@ -159,7 +163,7 @@ let findingsDismissed = { wpa2: false, lockWeaker: false };
 // the device loads files that are already in place. Restarting Steam is not
 // known to restart Decky's backend, so it is not offered.
 const UPDATE_FAILED_TEXT =
-  "The update didn't finish. Try the update again. If it still doesn't finish, restart the device.";
+  "The update didn't finish. Try again. If it fails again, restart the device.";
 const UPDATE_SLOW_TEXT =
   "The update is taking too long. Restart the device, then check the version at the bottom of this panel. If it didn't change, try the update again.";
 // Long enough for the reloaded backend to have answered the update script,
@@ -961,9 +965,15 @@ function Content() {
       return next;
     });
   // Dismiss hides the notice and any failed attempt's message with it. A
-  // finding comes back only once it has cleared and is reported again.
+  // finding comes back only once it has cleared and is reported again. With
+  // the finding already cleared (the banner up only for a failed Move or
+  // Allow WPA2), only the message goes: a flag set then would never be
+  // cleared, since the effect above sees no change, and would hide the next
+  // finding.
   const dismissFinding = (key: "wpa2" | "lockWeaker", errorKey: string) => {
     dismissError(errorKey);
+    const reported = key === "lockWeaker" ? hasLockWeaker : hasWpa2Finding;
+    if (!reported) return;
     findingsDismissed = { ...findingsDismissed, [key]: true };
     setDismissed(findingsDismissed);
   };
@@ -1257,6 +1267,13 @@ function Content() {
   // A change the backend is still making, which may have outlasted the
   // panel's own wait for it. Every control waits for it too.
   const changeRunning = !!status?.profile_change_in_flight;
+  // The change running is the lock moving by itself after a wake (C13).
+  const wakeMoveRunning = status?.activity === "lock_move_after_wake";
+  // What that move came to, for two minutes after it reconnected. The
+  // backend stops sending it then; the age is checked here as well.
+  const wakeMove = status?.live?.lock_move_after_wake;
+  const wakeMoveOutcome =
+    wakeMove && Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000 ? wakeMove.outcome : null;
   const isBusy = busyState || changeRunning;
   const connected = status?.connected ?? false;
   const supportTier = status?.support_tier ?? 1;
@@ -1281,7 +1298,11 @@ function Content() {
     setNotices(drop);
   };
   const isDeckLcd = s?.device_family === "deck_lcd";
-  const isDeck = isDeckLcd || s?.device_family === "deck_oled";
+  // Under iwd the lock and the band preference are paused, so turning one on
+  // can only be refused. Each stays enabled while on, to be turned off.
+  const onIwd = status?.live?.wifi_backend === "iwd" || !!status?.live?.pins_inactive_iwd;
+  // Force 6 GHz with the network in use refused before it is tried (C14).
+  const sixGhzRefusal = on6GHz ? "" : status?.live?.six_ghz_refusal ?? "";
   // The badge and line for a setting that is on for another network.
   const otherNetworkBadge = { badge: "unknown" as const, text: "other network" };
   const bandOther = !!status?.live?.band_other_network && !!s?.band_preference_enabled;
@@ -1365,6 +1386,7 @@ function Content() {
         streaming={status?.live}
         fixesOn={!!(s?.power_save_disabled || s?.buffer_tuning_enabled || s?.cake_enabled)}
         deviceLabel={deviceParts.length ? deviceParts.join(", ") : undefined}
+        connected={connected}
       />
 
       {/* A status read failed after the panel had loaded. What is shown is
@@ -1377,19 +1399,31 @@ function Content() {
       )}
 
       {/* The settings file could not be saved. Changes then hold until the
-          plugin restarts, and the toggles still read as if they had stuck. */}
-      {status?.settings_unwritable && (
+          plugin restarts, and the toggles still read as if they had stuck.
+          A settings folder behind a link is refused on purpose (C16), and
+          freeing storage would not help there. */}
+      {(status?.settings_unwritable || status?.settings_link_refused) && (
         <Banner variant="warning">
-          The plugin couldn't save its settings, so changes may not last past
-          a restart. Check that the device has free storage space, then try
-          the change again.
+          {status?.settings_link_refused
+            ? "The plugin's settings folder is behind a link, which it doesn't follow. Move it back to ~/homebrew/settings."
+            : "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."}
         </Banner>
       )}
 
       {changeRunning && !busyState && (
         <Banner variant="info">
-          A WiFi change is still finishing. The controls come back when it is
-          done.
+          {wakeMoveRunning
+            ? "Checking the access point lock after sleep. The controls come back when it is done."
+            : "A WiFi change is still finishing. The controls come back when it is done."}
+        </Banner>
+      )}
+      {/* The lock moved by itself after a wake (C13), which reconnected WiFi. */}
+      {wakeMoveOutcome === "moved" && (
+        <Banner variant="info">After sleep, the lock moved to a stronger access point.</Banner>
+      )}
+      {wakeMoveOutcome === "back" && (
+        <Banner variant="info">
+          After sleep, a stronger access point refused the connection. The lock stayed.
         </Banner>
       )}
 
@@ -1458,7 +1492,7 @@ function Content() {
         <Banner variant="info">
           {alreadyOn.length > 0 &&
             `${joinNames(alreadyOn)} ${alreadyOn.length > 1 ? "are" : "is"} already on. `}
-          Tap <strong>Optimize Safe</strong> to turn on the rest of the recommended settings.
+          Select <strong>Optimize Safe</strong> to turn on the rest of the recommended settings.
         </Banner>
       )}
 
@@ -1470,12 +1504,10 @@ function Content() {
           Priority is only claimed when the backend says it was written. */}
       {hasDuplicates && !dupDismissed && (
         <Banner variant="warning">
-          This network is saved more than once with different security
-          settings. Which copy is used decides which access points can be
-          reached, so the connection can look inconsistent.{" "}
+          This network is saved more than once with different security.{" "}
           {status?.duplicates_prioritized
-            ? "The copy in use has been given priority, so the choice stays the same from now on. To use the other one instead, connect with it once and it takes priority."
-            : "Usually the copy used last is picked next time. If the connection keeps acting up, remove the extra copy in Desktop Mode's network settings."}
+            ? "The copy in use now has priority. To use the other, connect with it once."
+            : "If the connection acts up, remove the extra copy in Desktop Mode."}
         </Banner>
       )}
       {hasDuplicates && !dupDismissed && (
@@ -1510,20 +1542,21 @@ function Content() {
           offers only WPA3 on its own. The backend only reports this where no
           such access point is in view (or NetworkManager is new enough), and
           Reset puts WPA3 only back. */}
+      {/* The address's last two octets (C20, as the log masking keeps them)
+          let the user match it to their own access point's label: anyone
+          nearby can broadcast the network's name. The rest of the detail
+          is in the README's Allow WPA2 row. */}
       {(wpa2Shown || errors.allow_wpa2) && (
         <Banner variant="info">
           {status?.wpa2_only_stronger && wpa2Shown && (
             <>
-              A stronger access point on this network (signal{" "}
-              {status.wpa2_only_stronger.signal} of 100, against{" "}
-              {status.wpa2_only_stronger.current_signal} for the one in use) only
-              offers WPA2, and this network is saved as WPA3-only, so this device
-              can't use it. Only allow this if that access point is yours:
-              anyone nearby can broadcast your network's name. The network then
-              accepts WPA2 from any access point with its name, which makes its
-              password easier to attack. An access point that offers only WPA3
-              may then not be joined automatically. Allowing it reconnects
-              WiFi. Reset settings puts it back to WPA3 only.
+              {`A stronger access point here (signal ${status.wpa2_only_stronger.signal} vs ${
+                status.wpa2_only_stronger.current_signal
+              }${
+                status.wpa2_only_stronger.bssid_tail
+                  ? `, address ends ${status.wpa2_only_stronger.bssid_tail}`
+                  : ""
+              }) offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi. Reset settings undoes it.`}
             </>
           )}
           {errors.allow_wpa2 && (
@@ -1555,7 +1588,8 @@ function Content() {
 
       {/* The lock is holding the Deck on an access point it has been carried
           away from, while a much stronger one of the same network is in
-          range. Moving reconnects, so it is offered rather than done. The
+          range. Moving reconnects, so it is offered rather than done, or
+          done once after a wake from a weak link. The
           banner also stays up for a failed move's message, because a failed
           move clears the finding and would otherwise take the reason away
           with it. That message can be dismissed, and expires like the
@@ -1564,10 +1598,7 @@ function Content() {
         <Banner variant="warning">
           {status?.lock_weaker && lockWeakerShown && (
             <>
-              The access point lock is holding you on a weaker access point
-              (signal {status.lock_weaker.current_signal} of 100). A stronger one is in
-              range (signal {status.lock_weaker.signal} of 100). Moving the lock
-              reconnects WiFi for a few seconds.
+              {`The lock holds you on a weak access point (signal ${status.lock_weaker.current_signal} of 100). A stronger one is in range (${status.lock_weaker.signal} of 100). Moving reconnects WiFi for up to half a minute.`}
             </>
           )}
           {errors.move_bssid_lock && (
@@ -1609,13 +1640,13 @@ function Content() {
       {/* A setting we wrote was the likely reason the device could not
           connect, so it was released. Worth stating plainly: nothing the user
           did caused it, and the preference is not lost. */}
+      {/* The lock is set again on whichever access point works; a band
+          preference comes back at the plugin's next check, after about 10
+          minutes, with an access point on that band in range. */}
       {status?.external?.pin_released && (
         <Banner variant="warning">
-          WiFi could not connect for a while, so the setting holding it was
-          released to let it reconnect. It stays on: the access point lock is
-          set again on whichever access point works, and a band preference
-          comes back once the plugin next checks, after about 10 minutes, with
-          an access point on that band in range.
+          WiFi couldn't connect, so the plugin released its access point or
+          band pin. The setting stays on and comes back once WiFi works.
         </Banner>
       )}
 
@@ -1759,17 +1790,23 @@ function Content() {
         <InfoRow
           label="Stop background scanning"
           subtitle="The access point lock: pins one access point. Turn off to roam."
-          explanation="While connected, your device scans now and then for a better access point. Each scan takes the radio off your channel for a moment, which can drop packets and make a game stream stutter. Pinning the connection to one access point turns off these roaming scans. It picks the strongest access point of your network, unless the one you are on is already good. It only applies to the network you turn it on for. You stay on that access point until you turn this off or move the lock. After a wake, if it is weak, the lock moves to a clearly stronger one of this network, unless a game or stream is running. Turning it on or off reconnects WiFi for a few seconds."
+          // No move after a wake on rtw88 (K-d) until the LCD's wake data
+          // clears it, so the (i) does not promise one there.
+          explanation={`Stops the scans for a better access point, which make a stream stutter, by pinning the strongest access point of this network. Only for the network you turn it on for. ${
+            s?.driver === "rtw88"
+              ? "It stays there until you move or turn off the lock."
+              : "It stays there until you move or turn off the lock, or after a wake moves to a clearly stronger one when no game or stream is running."
+          } Turning it on or off reconnects WiFi for up to half a minute.`}
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
             ? otherNetworkBadge
             : getBadge("bssid_lock", status, errors.bssid_lock ?? null))}
           checked={s?.bssid_lock_enabled ?? false}
-          disabled={isBusy || updating || (!connected && !s?.bssid_lock_enabled)}
+          disabled={isBusy || updating || (!s?.bssid_lock_enabled && (!connected || onIwd))}
           working={working === "bssid_lock"}
           error={errors.bssid_lock}
           notice={
             notices.bssid_lock ??
-            (status?.live?.pins_inactive_iwd && s?.bssid_lock_enabled
+            (onIwd
               ? IWD_PIN_NOTICE
               : status?.live?.bssid_lock_other_network && s?.bssid_lock_enabled
               ? OTHER_NETWORK_TEXT
@@ -1796,8 +1833,8 @@ function Content() {
         />
         <InfoRow
           label="Network buffer tuning"
-          subtitle="Optimize UDP buffers and TX queue for streaming"
-          explanation="Increases the kernel's network buffer sizes and transmit queue length to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
+          subtitle="Larger UDP buffers for streaming"
+          explanation="Increases the kernel's network buffer sizes to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
           {...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled)}
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
@@ -1819,7 +1856,7 @@ function Content() {
           <PanelSectionRow>
             <DropdownItem
               label="WiFi region"
-              description="Which channels this device may use. Set it to where you actually are. The wrong region can hide 5 GHz and 6 GHz channels entirely."
+              description="Which channels this device may use. The wrong region can hide 5 GHz and 6 GHz channels."
               rgOptions={[
                 // Not set by the plugin: labelled with the region in use.
                 // Once the plugin has set one, choosing this puts back the
@@ -1875,20 +1912,18 @@ function Content() {
         {regdomain?.readable && !regdomain.changeable && (
           <PanelSectionRow>
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
-              WiFi region: the card uses{" "}
-              {regdomain.governing ? governingName(regdomain.governing, regdomain.setting) : "an unknown region"}. This device's
-              WiFi card sets its own region, so it cannot be changed here. That
-              is normal for many cards{isDeck ? ", the Steam Deck's included," : ""} and
-              does not mean a band is missing.
+              WiFi region:{" "}
+              {regdomain.governing ? governingName(regdomain.governing, regdomain.setting) : "unknown"}, set
+              by the WiFi card. That's normal and hides no band.
             </div>
           </PanelSectionRow>
         )}
         <InfoRow
           label="Force 5 GHz band"
           subtitle="Avoid 2.4 GHz Bluetooth interference"
-          explanation={`This is the band preference. Bluetooth operates on the 2.4 GHz band${
-            isDeckLcd ? ", and on the Steam Deck LCD the antennas are shared" : ""
-          }. Using 5 GHz for WiFi avoids this interference entirely, giving you a cleaner, faster connection. Only turn this on if your router has 5 GHz. If no 5 GHz access point for this network is in range when you turn it on, it is refused instead of disconnecting you. If you later take the device out of range of this network's 5 GHz access points, it is released after about a minute so WiFi can reconnect. Turning it on or off reconnects WiFi for a few seconds.${
+          explanation={`This is the band preference. Keeps WiFi on 5 GHz, away from Bluetooth on 2.4 GHz${
+            isDeckLcd ? ", which shares the antennas on the Steam Deck LCD" : ""
+          }. Refused if no 5 GHz access point is in range; released after about a minute out of range. Reconnects WiFi for up to half a minute.${
             supports6GHz
               ? status?.live?.six_ghz_offered || on6GHz
                 ? " This keeps the device on 5 GHz specifically, so leave it off if you connect over 6 GHz. To stay on 6 GHz, use Force 6 GHz band below instead."
@@ -1899,7 +1934,9 @@ function Content() {
             ? otherNetworkBadge
             : getBadge(on6GHz ? undefined : "band_preference", status, band5Error ?? null))}
           checked={(s?.band_preference_enabled ?? false) && !on6GHz}
-          disabled={isBusy || updating || (!connected && !(s?.band_preference_enabled && !on6GHz))}
+          disabled={
+            isBusy || updating || (!(s?.band_preference_enabled && !on6GHz) && (!connected || onIwd))
+          }
           working={working === "band_5ghz"}
           error={band5Error}
           notice={
@@ -1907,7 +1944,7 @@ function Content() {
             (on6GHz
               ? undefined
               : notices.band_preference ??
-                (status?.live?.pins_inactive_iwd && s?.band_preference_enabled
+                (onIwd
                   ? IWD_PIN_NOTICE
                   : bandOther
                   ? OTHER_NETWORK_TEXT
@@ -1933,20 +1970,22 @@ function Content() {
         {(status?.live?.six_ghz_offered || on6GHz) && (
           <InfoRow
             label="Force 6 GHz band"
-            subtitle="Stay on 6 GHz where your router has it"
+            // Refused for the network in use (C14): the reason and what to do
+            // stand where the subtitle is, and the toggle can't be turned on.
+            subtitle={sixGhzRefusal || "Stay on 6 GHz where your router has it"}
             explanation="This is the band preference. 6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Turning it on or off reconnects WiFi. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
             {...(bandOther && on6GHz && !band6Error
               ? otherNetworkBadge
               : getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null))}
             checked={on6GHz}
-            disabled={isBusy || updating || (!connected && !on6GHz)}
+            disabled={isBusy || updating || (!on6GHz && (!connected || !!sixGhzRefusal))}
             working={working === "band_6ghz"}
             error={band6Error}
             notice={
               notices.band_6ghz ??
               (on6GHz
                 ? notices.band_preference ??
-                  (status?.live?.pins_inactive_iwd
+                  (onIwd
                     ? IWD_PIN_NOTICE
                     : bandOther
                       ? OTHER_NETWORK_TEXT
@@ -1962,7 +2001,7 @@ function Content() {
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
-          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the WiFi network you set it on, and replaces that network's own DNS servers, including any it offers over IPv6. The servers used are IPv4 addresses, so on the rare network with no IPv4 at all, websites would stop loading; leave this off there. Each change reconnects WiFi for a few seconds."
+          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the WiFi network you set it on, and replaces that network's own DNS servers, including any it offers over IPv6. The servers used are IPv4 addresses, so on the rare network with no IPv4 at all, websites would stop loading; leave this off there. Each change reconnects WiFi for up to half a minute."
           {...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
             ? otherNetworkBadge
             : getBadge("dns", status, errors.dns ?? null))}
@@ -2047,14 +2086,14 @@ function Content() {
         <InfoRow
           label="Disable IPv6"
           subtitle="Use IPv4 only on this network"
-          explanation="This is the IPv6 setting. Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only turn this on if you have one of those problems. Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for a few seconds."
+          explanation="This is the IPv6 setting. Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only turn this on if you have one of those problems. Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for up to half a minute."
           {...(status?.live?.ipv6_other_network && s?.ipv6_disabled && !errors.ipv6
             ? otherNetworkBadge
             : getBadge("ipv6", status, errors.ipv6 ?? null))}
           notice={
             notices.ipv6 ??
             (status?.external?.ipv6
-              ? "IPv6 is already off on this network, set outside this plugin. Nothing to do unless something here needs IPv6. To turn IPv6 back on, turn this on, then off."
+              ? "IPv6 is off on this network, set outside this plugin. To turn it back on, turn this on, then off."
               : status?.live?.ipv6_other_network
                 ? OTHER_NETWORK_TEXT
                 : undefined)
@@ -2067,10 +2106,13 @@ function Content() {
             handleToggle("ipv6", () => backend.setIpv6(val))
           }
         />
+        {/* mac80211 WiFi drivers queue below the qdisc (fq_codel per access
+            category), so on the cards built into these devices CAKE rarely
+            holds a packet: measured on a Deck OLED, backlog 0 at full upload. */}
         <InfoRow
           label="Traffic shaping (CAKE)"
           subtitle="Fair queuing for traffic this device sends"
-          explanation="Replaces the default queue for traffic this device sends with CAKE, which keeps flows fair and filters redundant TCP acknowledgments. It only affects outgoing traffic from this device. It cannot control other devices, your router, or your internet connection, so it does not fix lag that starts there. It does not limit your bandwidth. It is lost on reboot, and put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
+          explanation="Fair queuing on the network interface. Most built-in WiFi cards already do this in the driver, so the effect there is small. It is lost on reboot, and put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
           {...gatedBadge("cake", s?.cake_enabled)}
           checked={s?.cake_enabled ?? false}
           disabled={isBusy || updating || (!connected && !s?.cake_enabled)}

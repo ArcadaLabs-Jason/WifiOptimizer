@@ -24,6 +24,9 @@ export interface ReportState {
   // A waiting report was dropped unsent (refused, too large, invalid or
   // two weeks old), until dismissed. Older backends leave it out.
   dropped?: boolean;
+  // The journal read behind wake_failure failed or timed out and waits for
+  // its retry (C17), so the answer can still change.
+  wake_unknown?: boolean;
 }
 
 interface ReportPreview {
@@ -53,7 +56,7 @@ const PREVIEW_FAIL_TEXT = "Couldn't put the report together. Try again in a mome
 // still go through.
 const SEND_SLOW_TEXT = "The report may still be sending. Check back here in a minute.";
 const CANCEL_FAIL_TEXT = "Couldn't delete the saved report. Try again in a moment.";
-const READY_TEXT = "Report ready. Open it here to review.";
+const READY_TEXT = "Report ready to review.";
 // The preview collects the same diagnostics as Copy diagnostics, and a send
 // can take as long again, so both get the limit Copy diagnostics has
 // (CALL_TIMEOUT_MS). The state read and the notices answer from a few small
@@ -73,15 +76,19 @@ type Ready = { id: string; text: string; from: Outcome["from"] };
 // even if the panel is closed and opened again.
 // inFlight counts the preview, send and cancel calls under way, so the
 // buttons stay disabled until the last of them has ended, not the first.
+// collecting is set while a preview is being put together, which takes as
+// long as Copy diagnostics and says so the same way.
 let shared: {
   state: ReportState | null;
   inFlight: number;
+  collecting: boolean;
   outcome: Outcome | null;
   ready: Ready | null;
   cancelFailed: boolean;
 } = {
   state: null,
   inFlight: 0,
+  collecting: false,
   outcome: null,
   ready: null,
   cancelFailed: false,
@@ -117,10 +124,11 @@ function end(patch: Partial<typeof shared> = {}) {
   update({ ...patch, inFlight: Math.max(0, shared.inFlight - 1) });
 }
 
-// One timer at a time, only while something here is on screen.
+// One timer at a time, only while something here is on screen. A wake read
+// that waits for its retry is polled too, so the notice follows its answer.
 function schedulePoll() {
   if (pollTimer || !listeners.size) return;
-  if (shared.state && !shared.state.pending) return;
+  if (shared.state && !shared.state.pending && !shared.state.wake_unknown) return;
   pollTimer = setTimeout(() => {
     pollTimer = null;
     // While hidden, the visibility handler reads it when the panel is back.
@@ -207,7 +215,7 @@ function ReportPreviewModal({
   return (
     <ConfirmModal
       strTitle="Send this report to the developer?"
-      strDescription="This is everything that will be sent. Network names and addresses are already taken out. Scroll through it, then choose Send."
+      strDescription="This is everything that is sent. Network names and addresses are removed."
       strOKButtonText="Send"
       strCancelButtonText="Cancel"
       onOK={onSend}
@@ -282,14 +290,14 @@ function openPreview(ready: Ready) {
 
 async function startReport(from: Outcome["from"]) {
   if (shared.inFlight) return;
-  begin({ outcome: null, ready: null });
+  begin({ outcome: null, ready: null, collecting: true });
   let preview: ReportPreview | null = null;
   try {
     preview = await withTimeout(previewReport(), CALL_TIMEOUT_MS);
   } catch (e) {
     console.error("preview report error", e);
   }
-  end();
+  end({ collecting: false });
   if (!preview?.success || typeof preview.id !== "string" || !preview.payload) {
     update({
       outcome: {
@@ -365,7 +373,7 @@ function ReadyRows({ ready, working }: { ready: Ready; working: boolean }) {
 
 // Beside Copy diagnostics, inside the footer's section.
 export function SendReportRow() {
-  const { state, inFlight, outcome, ready, cancelFailed } = useReportState();
+  const { state, inFlight, collecting, outcome, ready, cancelFailed } = useReportState();
   const working = inFlight > 0;
   if (!state?.enabled) return null;
   const sentRef = state.sent_ref && state.sent_ref !== hidden.sentRef ? state.sent_ref : "";
@@ -373,7 +381,7 @@ export function SendReportRow() {
     <>
       <PanelSectionRow>
         <ButtonItem layout="below" disabled={working} onClick={() => void startReport("footer")}>
-          {working ? "Working..." : "Send report to the developer"}
+          {collecting ? "Collecting..." : working ? "Working..." : "Send report to the developer"}
         </ButtonItem>
       </PanelSectionRow>
       {/* A preview started from the wake notice is offered here once the
@@ -469,7 +477,7 @@ function wakeNoticeText(at: number): string {
           minute: "2-digit",
         })})`
       : "";
-  return `Before this device last started up, WiFi didn't come back after it woke from sleep${when}. Sending a report helps find out why.`;
+  return `WiFi didn't come back after sleep${when}. A report helps find out why.`;
 }
 
 // Whether the wake notice is on screen with its own buttons, where a preview
@@ -482,7 +490,7 @@ function wakeNoticeOffersReady(state: ReportState | null, outcome: Outcome | nul
 // Near the top of the panel, for a wake in the previous boot that left WiFi
 // down, until dismissed or answered with a report.
 export function WakeFailureNotice() {
-  const { state, inFlight, outcome, ready } = useReportState();
+  const { state, inFlight, collecting, outcome, ready } = useReportState();
   const working = inFlight > 0;
   const fromHere = outcome?.from === "wake" ? outcome : null;
   if (!state?.enabled || (!state.wake_failure && !fromHere)) return null;
@@ -531,7 +539,7 @@ export function WakeFailureNotice() {
         ) : (
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={working} onClick={() => void startReport("wake")}>
-              {working ? "Working..." : "Send report to the developer"}
+              {collecting ? "Collecting..." : working ? "Working..." : "Send report to the developer"}
             </ButtonItem>
           </PanelSectionRow>
         )}

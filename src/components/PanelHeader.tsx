@@ -2,6 +2,7 @@ import { PanelSection, PanelSectionRow } from "@decky/ui";
 import { theme } from "../theme";
 import { timeAgo } from "../utils";
 import type { LiveStatus } from "../types";
+import { bandLabel } from "./StatsGrid";
 
 interface PanelHeaderProps {
   driver: string;
@@ -12,6 +13,17 @@ interface PanelHeaderProps {
   // Whether any fix auto mode governs (Prevent lag spikes, buffer tuning,
   // CAKE) is turned on. With none on there is nothing to pause or hold.
   fixesOn: boolean;
+  connected?: boolean;
+}
+
+// "Connected, 5 GHz, -55 dBm": the link at a glance, on the first screen.
+// Whatever the link read leaves out is left out here too.
+export function connectionLine(live: LiveStatus | undefined): string {
+  const parts = ["Connected"];
+  if (live?.frequency && !isNaN(parseInt(live.frequency))) parts.push(bandLabel(live.frequency));
+  const dbm = parseInt(live?.signal_dbm ?? "");
+  if (!isNaN(dbm)) parts.push(`${dbm} dBm`);
+  return parts.join(", ");
 }
 
 export function PanelHeader({
@@ -21,6 +33,7 @@ export function PanelHeader({
   deviceLabel,
   streaming,
   fixesOn,
+  connected = false,
 }: PanelHeaderProps) {
   const modelLabel = deviceLabel && deviceLabel !== "unknown"
     ? deviceLabel
@@ -46,6 +59,13 @@ export function PanelHeader({
           Device: {modelLabel}
         </span>
       </PanelSectionRow>
+      {connected && (
+        <PanelSectionRow>
+          <div style={{ fontSize: theme.fontSize.body, color: theme.text.primary }}>
+            {connectionLine(streaming)}
+          </div>
+        </PanelSectionRow>
+      )}
       {streaming?.streaming_mode && (
         // Always in view, so nobody has to find the section to know whether
         // the fixes are on right now.

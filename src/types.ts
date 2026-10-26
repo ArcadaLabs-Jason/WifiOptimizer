@@ -52,6 +52,13 @@ export interface LiveStatus {
   band?: string;
   /** The card and NetworkManager can hold a network to 6 GHz. */
   six_ghz_offered?: boolean;
+  /** Why Force 6 GHz would be refused for the network in use, while the band
+   * is not 6 GHz already (C14). The panel shows the row disabled with it. */
+  six_ghz_refusal?: string;
+  /** For 120 s after the lock moved by itself after a wake and reconnected
+   * (C13): "moved" onto the stronger access point, or "back" on the previous
+   * one after the stronger refused. */
+  lock_move_after_wake?: { outcome: "moved" | "back"; at: number };
   buffer_tuning_applied?: boolean;
   cake_applied?: boolean;
   dispatcher_installed?: boolean;
@@ -108,11 +115,13 @@ export interface PluginStatus {
   external?: Record<string, boolean>;
   // A stronger access point of this network that only offers WPA2, while the
   // profile is saved as WPA3-only and so cannot use it. Signals are 0-100.
-  wpa2_only_stronger?: { signal: number; current_signal: number };
+  // bssid_tail is its address's last two octets, "XX:XX" (C20).
+  wpa2_only_stronger?: { signal: number; current_signal: number; bssid_tail?: string };
   // The access point lock is holding the device on an access point that a
   // much stronger one of the same network, which the lock could use, has
   // overtaken on two reads in a row. Signals are 0-100. Reported only: the
-  // move is the user's to make, through move_bssid_lock.
+  // move is the user's to make, through move_bssid_lock, or once after a
+  // wake from a weak link.
   lock_weaker?: { signal: number; current_signal: number };
   // NetworkManager saw another device on the network holding our address.
   address_conflict?: { ip: string; other: string };
@@ -124,6 +133,11 @@ export interface PluginStatus {
   duplicates_prioritized?: boolean;
   // The last attempt to save the settings file failed.
   settings_unwritable?: boolean;
+  // The settings folder is behind a link, which the plugin refuses (C16).
+  settings_link_refused?: boolean;
+  // What the change in flight is, where the panel words it differently:
+  // the lock moving by itself after a wake (C13).
+  activity?: string;
   // A lock, band, WPA2, DNS, IPv6, Reset or backend change is still running.
   profile_change_in_flight?: boolean;
   last_applied?: number;

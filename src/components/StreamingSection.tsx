@@ -26,14 +26,25 @@ interface StreamingSectionProps {
 }
 
 // Auto mode never keeps the driver options file (main.py set_power_save,
-// persist=not auto, and _drop_persistent_power_save), so on every driver
-// whose profile has options read only when the driver loads, those options
-// are not in effect in auto mode. These are the DRIVER_PROFILES keys with
-// modprobe_options (regress.py ties the two): rtw88 and rtw89 (Realtek),
-// mt7921e (MediaTek), iwlwifi (Intel).
+// persist=not auto, and _drop_persistent_power_save). These are the
+// DRIVER_PROFILES keys with modprobe_options (regress.py ties the two):
+// rtw88 and rtw89 (Realtek), mt7921e (MediaTek), iwlwifi (Intel). On rtw88
+// the parameters are read at runtime and come off between streams (except
+// the CLKREQ part of disable_aspm, set only when the driver loads), and on
+// the Steam Deck LCD they are the ones that help WiFi come back after
+// sleep. On the others they only take effect when the driver loads (C19).
 export const LOAD_TIME_DRIVERS = ["rtw88", "rtw89", "mt7921e", "iwlwifi"];
+const SLEEP_HELP_DRIVER = "rtw88";
+const SLEEP_HELP_AUTO_TEXT =
+  " In auto mode, the driver settings that help WiFi come back after sleep are off between streams.";
 const LOAD_TIME_AUTO_TEXT =
-  " On Realtek, MediaTek and Intel cards (the Steam Deck LCD, ROG Ally and Legion Go among them), driver settings that only apply at startup are not in effect in auto mode.";
+  " In auto mode, driver settings that only apply when the driver loads are not in effect.";
+
+// What auto mode costs on this card's driver, if anything.
+function autoModeDriverText(driver: string): string {
+  if (driver === SLEEP_HELP_DRIVER) return SLEEP_HELP_AUTO_TEXT;
+  return LOAD_TIME_DRIVERS.includes(driver) ? LOAD_TIME_AUTO_TEXT : "";
+}
 
 // Streaming auto mode: when the fixes apply, rather than another fix. Placed
 // after Advanced for that reason. Most of what is here is about making it
@@ -102,9 +113,7 @@ export function StreamingSection({
       ? `${governed.slice(0, -1).join(", ")} and ${governed[governed.length - 1]}`
       : governed[0] ?? "";
   // With none of them on, a stream has nothing to turn on either.
-  const fixesText = governed.length
-    ? " Fixes are on."
-    : " Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) are all off, so there is nothing to turn on.";
+  const fixesText = governed.length ? " Fixes are on." : " No fixes are turned on.";
   let stateText: string;
   if (active && app) {
     stateText = `Streaming: ${app} (${process}).${fixesText}`;
@@ -119,8 +128,7 @@ export function StreamingSection({
       governed.length > 1 ? "are" : "is"
     } paused until one starts.`;
   } else {
-    stateText =
-      "No streaming app running. Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) are all off, so there is nothing to pause.";
+    stateText = "No streaming app running. No fixes are turned on.";
   }
 
   return (
@@ -132,9 +140,9 @@ export function StreamingSection({
             ? "Fixes apply while a streaming app runs"
             : "Off: enabled fixes apply all the time"
         }
-        explanation={`Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.${
-          LOAD_TIME_DRIVERS.includes(settings?.driver ?? "") ? LOAD_TIME_AUTO_TEXT : ""
-        } If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.`}
+        explanation={`Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.${autoModeDriverText(
+          settings?.driver ?? "",
+        )} If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.`}
         checked={enabled}
         disabled={disabled}
         error={errors.streaming}
