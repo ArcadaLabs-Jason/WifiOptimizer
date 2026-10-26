@@ -30,9 +30,17 @@ if [ ! -d "$PLUGIN_BASE" ]; then
     exit 1
 fi
 
-# Fetch latest release tag from GitHub
+# The latest release's tag, from where GitHub redirects /releases/latest
+# (not the API, which allows 60 lookups an hour per address and is easily
+# used up behind a shared address). Without a release tag nothing is
+# installed: the main branch can carry unpublished work.
 echo "Checking for latest release..."
-LATEST_TAG=$(curl -sL --proto '=https' --connect-timeout 15 --max-time 60 "https://api.github.com/repos/ArcadaLabs-Jason/WifiOptimizer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+RELEASES="https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases"
+LATEST_URL=$(curl -s -o /dev/null -w '%{redirect_url}' --proto '=https' --connect-timeout 15 --max-time 60 "$RELEASES/latest" || true)
+case "$LATEST_URL" in
+    "$RELEASES/tag/"*) LATEST_TAG="${LATEST_URL#"$RELEASES/tag/"}" ;;
+    *) LATEST_TAG="" ;;
+esac
 # Only a plain version tag goes into the download URL and the folder name.
 case "$LATEST_TAG" in
     v[0-9]*) case "$LATEST_TAG" in *[!A-Za-z0-9.-]*) LATEST_TAG="" ;; esac ;;
@@ -40,14 +48,12 @@ case "$LATEST_TAG" in
 esac
 
 if [ -z "$LATEST_TAG" ]; then
-    echo "Warning: Couldn't fetch latest release, falling back to main branch"
-    REPO_URL="https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/heads/main.tar.gz"
-    DIR_NAME="WifiOptimizer-main"
-else
-    echo "Latest release: $LATEST_TAG"
-    REPO_URL="https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/tags/${LATEST_TAG}.tar.gz"
-    DIR_NAME="WifiOptimizer-${LATEST_TAG#v}"
+    echo "Error: Couldn't find the latest release. Try again in a few minutes."
+    exit 1
 fi
+echo "Latest release: $LATEST_TAG"
+REPO_URL="https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/tags/${LATEST_TAG}.tar.gz"
+DIR_NAME="WifiOptimizer-${LATEST_TAG#v}"
 
 TMP_DIR=$(mktemp -d)
 # Staging and the previous copy live beside the plugins folder, not in it:
