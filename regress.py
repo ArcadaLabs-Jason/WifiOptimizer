@@ -31,6 +31,9 @@ m.STREAM_HOLD_FILE = os.path.join(_run_dir, "streaming-hold")
 m.PCIE_BASELINE_FILE = os.path.join(_run_dir, "pcie-baseline")
 m.BACKEND_SWITCH_MARKER = os.path.join(_run_dir, "backend-switch")
 m.UPDATE_LOCK_FILE = os.path.join(_run_dir, "update.lock")
+# The boot's "driver parameters at load" claim (contract C12), made by every
+# re-application before it writes last_enforced.
+m.AT_LOAD_MARKER = os.path.join(_run_dir, "at-load-logged")
 # And the lock the plugin and the dispatcher share while the fixes change.
 m.APPLY_LOCK_FILE = os.path.join(_run_dir, "apply.lock")
 m.PROC_DIR = os.path.join(tempfile.mkdtemp(), "no-proc")
@@ -15585,6 +15588,65 @@ try:
     finally:
         m.PROC_DIR, m.time.monotonic = _p18_saved
     m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 5, merge: what one owner's change needs from another's ----
+import threading as _mp5_thr
+
+section("merge p5: a re-application claims the 'driver parameters at load' line, off the event loop")
+# Contract C12: DEVICES' _claim_at_load, called by LIFECYCLE's
+# _record_reapplied before it writes last_enforced. On LIFECYCLE's branch the
+# call found no method and did nothing; merged, it reads sysfs and runs
+# logger, so it is made from a worker thread before the loop's part.
+try:
+    _mp5_r = tempfile.mkdtemp(); _mp5_run = os.path.join(_mp5_r, "run"); os.makedirs(_mp5_run)
+    _mp5_sv = (m.AT_LOAD_MARKER, m.ENFORCED_FILE)
+    _mp5_log = []
+
+    class _Mp5Re(m.Plugin):
+        """Only the setters' run and the commands stubbed: the claim, the
+        settings and last_enforced are the real ones."""
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0] == "/usr/bin/logger":
+                _mp5_log.append((cmd[-1], _mp5_thr.current_thread() is _mp5_thr.main_thread(),
+                                 os.path.exists(m.ENFORCED_FILE)))
+            return _ok()
+        async def _reapply_volatile_steps(self, settings, power_save_first=True, results=None):
+            return 1, 1, set(), False
+
+    _mp5_restore = _dv5_sysmod(_mp5_r)
+    try:
+        m.AT_LOAD_MARKER = os.path.join(_mp5_run, "at-load-logged")
+        m.ENFORCED_FILE = os.path.join(_mp5_run, "last_enforced")
+        _dv5_params(_mp5_r, "Y", "Y")
+        m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88", "buffer_tuning_enabled": True})
+        _mp5_res = asyncio.run(_Mp5Re().reapply_volatile())
+        ok(_mp5_res.get("total") == 1 and os.path.exists(m.AT_LOAD_MARKER)
+           and os.path.exists(m.ENFORCED_FILE)
+           and [l for l, _main, _enf in _mp5_log]
+           == ["driver parameters at load: disable_lps_deep=Y disable_aspm=Y"],
+           f"reapply_volatile as the boot's first writer logs the values the driver loaded with ({_mp5_log})")
+        ok(_mp5_log and not _mp5_log[0][2],
+           "and logs them before it writes last_enforced, as the contract says")
+        ok(_mp5_log and not _mp5_log[0][1], "and runs logger in a worker thread, not on the event loop")
+        _mp5_log.clear()
+        asyncio.run(_Mp5Re().reapply_volatile())
+        ok(not _mp5_log, f"a second re-application in the same boot logs nothing ({_mp5_log})")
+    finally:
+        _mp5_restore()
+        (m.AT_LOAD_MARKER, m.ENFORCED_FILE) = _mp5_sv
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _mp5_src = open("main.py").read()
+    _mp5_calls = [i for i in range(len(_mp5_src)) if _mp5_src.startswith("self._record_reapplied(", i)]
+    ok(len(_mp5_calls) == 2 and all("await asyncio.to_thread(self._claim_at_load)"
+                                    in _mp5_src[max(0, i - 200):i] for i in _mp5_calls),
+       f"both callers of _record_reapplied (startup and reapply_volatile) claim from a worker thread first "
+       f"({len(_mp5_calls)} callers)")
+    _mp5_rr = _between(_mp5_src, "def _record_reapplied(", "_replace_no_follow(ENFORCED_FILE")
+    ok("self._claim_at_load()" in _mp5_rr and 'getattr(self, "_claim_at_load"' not in _mp5_rr,
+       "and _record_reapplied itself calls the claim, not a method that may be missing")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

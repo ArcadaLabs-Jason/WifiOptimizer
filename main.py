@@ -4388,6 +4388,7 @@ class Plugin:
                     _applied, total, stamps, skipped = await self._reapply_volatile_steps(
                         fresh, power_save_first=False)
                     if total:
+                        await asyncio.to_thread(self._claim_at_load)
                         self._record_reapplied(fresh.get("last_applied", 0), stamps, skipped)
                 except Exception as e:
                     decky.logger.error(f"Startup apply failed: {e}")
@@ -11293,10 +11294,10 @@ class Plugin:
         writes. Use that.
         """
         # Contract C12: whoever is first to write last_enforced in a boot
-        # claims the "driver parameters at load" line before it.
-        claim = getattr(self, "_claim_at_load", None)
-        if claim is not None:
-            claim()
+        # claims the "driver parameters at load" line before it. The callers
+        # claim it first in a worker thread (it reads sysfs and runs logger),
+        # so here it only finds the marker already made.
+        self._claim_at_load()
         settings = _load_settings()
         current = settings.get("last_applied", 0)
         if not skipped and current != last_changed and current in stamps:
@@ -11364,6 +11365,7 @@ class Plugin:
 
             if total > 0:
                 decky.logger.info(f"reapply_volatile: {applied}/{total} applied")
+                await asyncio.to_thread(self._claim_at_load)
                 self._record_reapplied(settings.get("last_applied", 0), stamps, skipped)
 
             return {"success": True, "applied": applied, "total": total}
