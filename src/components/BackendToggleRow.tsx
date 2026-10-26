@@ -18,18 +18,11 @@ const PHASE_TEXT: Record<BackendSwitchPhase, string> = {
 };
 
 const EXPLANATION =
-  "Linux handhelds use one of two WiFi backends, and which one your " +
-  "system is on varies by device and OS version. Some devices see " +
-  "disconnects after sleep, 5 GHz dropouts, or 'invalid password' errors " +
-  "with iwd. Switching to wpa_supplicant trades a slightly slower reconnect " +
-  "(about 5 seconds instead of 1 or 2) for broader compatibility and better " +
-  "stability on some routers. The setting survives reboots and OS updates. " +
-  "Switching takes WiFi down for up to a minute. On some devices the WiFi " +
-  "card has to be restarted along the way, which the plugin does by itself, " +
-  "and if that doesn't work a restart of the device finishes the switch. " +
-  "Some networks (WPA3-only, some work or school networks) behave " +
-  "differently between the two. If WiFi stops connecting after a switch, " +
-  "switch back.";
+  "wpa_supplicant can fix disconnects after sleep, 5 GHz dropouts and " +
+  "'invalid password' errors that some devices see with iwd, and reconnects " +
+  "a little slower. Switching takes WiFi down for up to a minute. If WiFi " +
+  "stops connecting afterwards, switch back. The choice survives reboots and " +
+  "OS updates.";
 
 // What a finished switch says, in the banner at the top of the panel and
 // under the toggle. A failure is checked first: a switch that failed and
@@ -97,7 +90,7 @@ export function BackendToggleRow({
     (next && next !== currentBackend
       ? `Changes to ${next} from the next boot.`
       : isWpa
-        ? "In use. Turn off to go back to iwd."
+        ? "In use. Turn off to use iwd."
         : currentBackend === "iwd"
           ? "Instead of iwd. Can fix sleep and stability problems."
           : "Can fix sleep and stability problems.");

@@ -12,7 +12,7 @@ function signalColor(dbm: string | undefined): string {
   return theme.error.text;
 }
 
-function bandLabel(freqStr: string | undefined): string {
+export function bandLabel(freqStr: string | undefined): string {
   if (!freqStr) return "--";
   const mhz = parseInt(freqStr);
   if (isNaN(mhz)) return freqStr;

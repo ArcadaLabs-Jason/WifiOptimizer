@@ -62,7 +62,7 @@ export function UpdatesSection({
       <PanelSectionRow>
         <ToggleField
           label="Tell me about updates"
-          description="Shows one notification when a new version is out, never during a game or a stream. Nothing installs until you choose to."
+          description="One notification per new version, never during a game or stream."
           checked={notify}
           disabled={updating}
           onChange={onNotifyChange}
@@ -98,7 +98,7 @@ export function UpdatesSection({
               }}
             >
               {updateInfo.is_downgrade
-                ? `v${updateInfo.latest_version} is what the beta channel currently offers, which is older than your v${updateInfo.current_version}`
+                ? `Beta now offers v${updateInfo.latest_version}, older than your v${updateInfo.current_version}.`
                 : `v${updateInfo.latest_version} available (you have v${updateInfo.current_version})`}
             </div>
           </PanelSectionRow>
