@@ -15757,6 +15757,69 @@ finally:
     except NameError:
         pass
 
+section("merge p5: what the panel and README say the lock does after a wake is what it does")
+# FRONT F16's text is only true with LIFECYCLE L17 merged: the lock moves on
+# its own after a wake, from a weak access point to a clearly stronger one
+# of the same network, never during a game or stream. L17's own check runs
+# the stream case with the stream flag; here a game is found the way it is
+# on a device, by the process search.
+try:
+    _mp5l_ix = _between(_F_IX, 'label="Stop background scanning"', "checked=")
+    _mp5l_rd = _between(_F_RD, "| Stop background scanning |", "\n")
+    ok("After a wake, if it is weak, the lock moves to a clearly stronger one of this network, "
+       "unless a game or stream is running." in _mp5l_ix
+       and "only moves on its own after a wake, and only from a weak access point to a clearly "
+       "stronger one, never during a game or stream." in _mp5l_rd,
+       "the panel and the README say it moves after a wake, from weak to clearly stronger, not during a game")
+    _mp5l_src = open("main.py").read()
+    _mp5l_mv = _between(_mp5l_src, "async def _move_lock_after_wake(", "def _game_or_stream_known(")
+    _mp5l_ln = _between(_mp5l_src, "def _wake_lock_link(", "async def _stranded_watch_once(")
+    ok("self._lock_onto_best(iface, uuid, moving=True" in _mp5l_mv
+       and "if self._link_is_strong(out):" in _mp5l_ln,
+       "the move is Move the lock's own (same network, same margin), and only from a link that is not strong")
+    _mp5l_proc = m.PROC_DIR
+    _mp5l_info = m.decky.logger.info
+    _mp5l_cg = getattr(m.time, "clock_gettime", None)
+    _mp5l_had = hasattr(m.time, "CLOCK_BOOTTIME")
+    _mp5l_log = []
+    try:
+        m.PROC_DIR = tempfile.mkdtemp()
+        _mp5l_gpid = os.path.join(m.PROC_DIR, "4242"); os.mkdir(_mp5l_gpid)
+        open(os.path.join(_mp5l_gpid, "cmdline"), "wb").write(
+            b"/home/deck/.local/share/Steam/ubuntu12_32/reaper\0SteamLaunch\0AppId=1245620\0--\0game.exe\0")
+        open(os.path.join(_mp5l_gpid, "status"), "w").write("Name:\treaper\nPPid:\t69999\n")
+        open(os.path.join(_mp5l_gpid, "comm"), "w").write("reaper\n")
+        if not _mp5l_had:
+            m.time.CLOCK_BOOTTIME = 7
+        _mp5l_boot = m.time.CLOCK_BOOTTIME
+        _p17_offset[0] = 0.0
+        m.time.clock_gettime = lambda clk: (time.monotonic() + _p17_offset[0] if clk == _mp5l_boot
+                                            else _mp5l_cg(clk))
+        m.decky.logger.info = staticmethod(lambda msg: _mp5l_log.append(msg))
+        _p17_lock()
+        _mp5l_g = _P17(); _p17_passes(_mp5l_g, [0, 600])
+        ok(not _mp5l_g.mods and _mp5l_g.pinned.upper() == "02:00:00:00:00:11"
+           and any(l == "After waking, the BSSID lock was left as it is: a game or stream is running"
+                   for l in _mp5l_log),
+           f"a game running, found by the process search: no move, and the log says why "
+           f"({[l for l in _mp5l_log if 'After waking' in l]})")
+        _p5_sh.rmtree(_mp5l_gpid)
+        _mp5l_log.clear()
+        _mp5l_g2 = _P17(); _p17_passes(_mp5l_g2, [0, 600])
+        ok(_mp5l_g2.pinned.upper() == "02:00:00:00:00:51",
+           f"the game over, the next wake moves it ({_mp5l_g2.pinned})")
+    finally:
+        m.PROC_DIR = _mp5l_proc
+        m.decky.logger.info = _mp5l_info
+        if _mp5l_cg is not None:
+            m.time.clock_gettime = _mp5l_cg
+        if not _mp5l_had and hasattr(m.time, "CLOCK_BOOTTIME"):
+            del m.time.CLOCK_BOOTTIME
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
