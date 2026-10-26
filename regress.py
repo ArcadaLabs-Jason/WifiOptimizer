@@ -16096,6 +16096,17 @@ try:
     ok(_p2.pin.upper() == _W6WEAK and len(_p2.cycles) == 2,
        f"refused and not associated: the rollback reconnects ({_p2.cycles})")
 
+    # The band preference wanting another band than the one in use: the
+    # lock's own band settling would cycle the radio before any game check.
+    class _W2Band(_W6):
+        def _band_is_reachable(self, iface, uuid, band): return True
+    _w6_locked(band_preference_enabled=True, band_preference="bg", band_preference_ssid="Net",
+               band_preference_uuids=[_W6U])
+    _p2 = _W2Band()
+    asyncio.run(_p2._move_lock_after_wake())
+    ok(not _p2.cycles and not any(k == "802-11-wireless.bssid" for k, _ in _p2.mods),
+       f"a band to settle first: no radio cycle after a wake, the lock left as it is ({_p2.cycles})")
+
     # Steam starting a game (poke_detection) counts before its process shows.
     _p2 = m.Plugin()
     async def _l2_poke(p):

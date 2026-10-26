@@ -10058,7 +10058,8 @@ class Plugin:
 
     def _settle_band_before_locking(self, current: dict, iface: str, uuid: str,
                                     bssid: str, link_out: str,
-                                    active_ssid: str | None) -> tuple:
+                                    active_ssid: str | None,
+                                    may_reconnect: bool = True) -> tuple:
         """Get onto the preferred band before pinning, or refuse to pin.
 
         Returns (error, iface, bssid, link_out): an error dict if locking must
@@ -10102,6 +10103,10 @@ class Plugin:
                         f"band preference off to lock anyway."
                     ),
                 }, iface, bssid, link_out
+            if not may_reconnect:
+                # The move a wake makes on its own: no radio cycle nobody
+                # asked for that has not just checked for a game first.
+                return {"success": False, "error": "band_conflict"}, iface, bssid, link_out
             decky.logger.info(
                 "Band conflict before locking; reconnecting to let NM "
                 "pick an access point on the preferred band"
@@ -10277,7 +10282,7 @@ class Plugin:
         active_ssid = await asyncio.to_thread(self._get_profile_ssid, uuid)
         err, iface, bssid, link_out = await asyncio.to_thread(
             self._settle_band_before_locking,
-            current, iface, uuid, bssid, link_out, active_ssid,
+            current, iface, uuid, bssid, link_out, active_ssid, not after_wake,
         )
         if err:
             return err
