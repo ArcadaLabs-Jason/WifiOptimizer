@@ -5309,7 +5309,8 @@ try:
     r = asyncio.run(ti.start_backend_switch("wpa_supplicant"))
     ok(r.get("accepted") and not ti.cleared, "switching away from iwd leaves them to come back")
     ok("IWD_PIN_NOTICE" in open("src/index.tsx").read()
-       and "Paused while the WiFi backend is iwd" in open("dist/index.js").read(),
+       # Pass 6 F20, merge p6: the rebuilt bundle carries the shorter notice.
+       and "Paused under iwd. Switch to wpa_supplicant in Advanced to use it." in open("dist/index.js").read(),
        "the panel says why the lock and band are not applied under iwd")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -8240,7 +8241,7 @@ try:
        "the wording is plain ASCII")
     _dist = open("dist/index.js").read()
     ok('"move_bssid_lock"' in _dist and "Move the lock" in _dist
-       and "The access point lock is holding you on a weaker access point" in _dist,
+       and "The lock holds you on a weak access point" in _dist,  # Pass 6 F7, merge p6: the rebuilt bundle
        "and the built bundle carries the notice and the button")
 except Exception as _e:
     import traceback; traceback.print_exc()
