@@ -6908,24 +6908,38 @@ class Plugin:
         at = getattr(self, "_app_event_at", None)
         return at is not None and time.monotonic() - at < self._APP_EVENT_SECONDS
 
-    def _game_or_stream_known(self, settings: dict) -> bool | None:
+    def _game_or_stream_known(self, settings: dict, wait: float = PROC_SCAN_WAIT_SECONDS,
+                              fresh: float = PROC_SCAN_FRESH_SECONDS) -> bool | None:
         """Whether a game or stream is running, from a process search no
-        older than PROC_SCAN_FRESH_SECONDS, or None when there is none to go
-        by. In a worker thread: it waits up to PROC_SCAN_WAIT_SECONDS for a
-        search started now. Never "not running" for want of an answer: the
-        plain search answers from whatever it last had, and a move made on
-        that could reconnect in the middle of a game."""
+        older than fresh seconds, or None when there is none to go by. With
+        a wait (in a worker thread), it waits that long for a search started
+        now. Never "not running" for want of an answer: the plain search
+        answers from whatever it last had, and a move made on that could
+        reconnect in the middle of a game. The one test for every check
+        before a reconnect or a scan nobody asked for: the flag, the hold, a
+        game just started or stopped (poke_detection), a SteamLaunch game
+        and the stream apps."""
         if (os.path.isfile(STREAM_FLAG_FILE) or os.path.isfile(STREAM_HOLD_FILE)
                 or self._app_event_recent()):
             return True
-        self._proc_snapshot(PROC_SCAN_WAIT_SECONDS)
+        return self._known_running([self._GAME_PATTERN] + self._stream_patterns(settings),
+                                   wait, fresh)
+
+    def _known_running(self, patterns: list, wait: float = PROC_SCAN_WAIT_SECONDS,
+                       fresh: float = PROC_SCAN_FRESH_SECONDS) -> bool | None:
+        """Whether a process matching patterns runs, from a search no older
+        than fresh seconds (waiting up to wait for one started now), or None
+        when there is none that recent."""
+        if wait > 0:
+            self._proc_snapshot(wait)
         _PROC_SCAN_LOCAL.no_wait = True
         _PROC_SCAN_LOCAL.unknown = False
+        _PROC_SCAN_LOCAL.fresh = fresh
         try:
-            found = (self._find_stream([("game", "steamlaunch appid=")])
-                     or self._find_stream(self._stream_patterns(settings)))
+            found = self._find_stream(patterns)
         finally:
             _PROC_SCAN_LOCAL.no_wait = False
+            _PROC_SCAN_LOCAL.fresh = PROC_SCAN_FRESH_SECONDS
         if found is not None:
             return True
         return None if _PROC_SCAN_LOCAL.unknown else False
@@ -8802,35 +8816,38 @@ class Plugin:
         setattr(self, used, asked)
         return True
 
-    def _stream_running(self, settings: dict) -> bool:
+    def _stream_running(self, settings: dict) -> bool | None:
         """Whether a game stream looks to be running, auto mode on or not.
 
         Auto mode's flag says so when it is on, and the hold means the user
         has said so. With auto mode off nothing keeps that flag, so the same
-        process search it uses is run here; scanning in the middle of a
-        stream is the one thing this must not do.
+        process search it uses is run here, waiting for one under way. None
+        when the last search is too old to go by (PROC_SCAN_FRESH_SECONDS):
+        whatever waits for a stream to end waits then too, rather than going
+        on an hours-old "nothing running". In a worker thread.
         """
         if os.path.isfile(STREAM_FLAG_FILE) or os.path.isfile(STREAM_HOLD_FILE):
             return True
-        return self._find_stream(self._stream_patterns(settings)) is not None
+        return self._apps_running(self._stream_patterns(settings))
+
+    def _apps_running(self, patterns: list) -> bool | None:
+        """Whether a process matching patterns runs, from a search no older
+        than PROC_SCAN_FRESH_SECONDS (waiting for one under way), or None."""
+        return self._known_running(patterns)
+
+    # How old a process search may be for the lock-weaker and WPA2-reach
+    # checks to ask for a scan on it: a forced rescan in the first seconds
+    # of a stream or a game is the stutter the checks exist to avoid.
+    _SCAN_GATE_FRESH_SECONDS = 5.0
 
     def _stream_running_now(self, settings: dict) -> bool | None:
-        """_stream_running for the status read, which never waits on the
-        process search (one stuck in the kernel held every status read
-        after it): it goes by the last search's answer while that is recent
-        (PROC_SCAN_FRESH_SECONDS), starting a new search for the next poll,
-        and answers None while there is none to go by."""
-        if os.path.isfile(STREAM_FLAG_FILE) or os.path.isfile(STREAM_HOLD_FILE):
-            return True
-        _PROC_SCAN_LOCAL.no_wait = True
-        _PROC_SCAN_LOCAL.unknown = False
-        try:
-            found = self._find_stream(self._stream_patterns(settings))
-        finally:
-            _PROC_SCAN_LOCAL.no_wait = False
-        if found is not None:
-            return True
-        return None if _PROC_SCAN_LOCAL.unknown else False
+        """Whether a game or stream is running, for the status read, which
+        never waits on the process search (one stuck in the kernel held every
+        status read after it): it goes by the last search's answer while that
+        is under _SCAN_GATE_FRESH_SECONDS old, starting a new search for the
+        next poll, and answers None while there is none to go by. A game
+        counts as much as a stream: a forced scan stutters either."""
+        return self._game_or_stream_known(settings, wait=0, fresh=self._SCAN_GATE_FRESH_SECONDS)
 
     async def allow_wpa2(self) -> dict:
         """Let a WPA3-only profile use the WPA2-only access points of its network.
@@ -12143,42 +12160,48 @@ class Plugin:
         return {"success": True, "paused": True, "message": self._PAUSED_MESSAGE}
 
     def _stream_patterns(self, settings: dict) -> list[tuple[str, str]]:
-        """(label, pattern) for every app watched, the user's own last."""
-        watched = settings.get("streaming_apps", {})
+        """(label, pattern) for every app watched, the user's own last.
+
+        The app ticks count only while auto mode is on: with it off the panel
+        hides them, and choices nobody can see must not decide what blocks an
+        update or a lock move. Then every app counts (K-g)."""
+        watched = (settings.get("streaming_apps", {})
+                   if settings.get("streaming_mode_enabled") else {})
         out = [(label, pattern) for app_id, label, patterns in STREAMING_APPS
                if watched.get(app_id, True) for pattern in patterns]
         kept, _refused = _parse_stream_patterns(settings.get("streaming_custom_patterns", ""))
         out.extend((pattern, pattern) for pattern in kept)
         return out
 
-    def _game_or_stream_running(self, settings: dict) -> bool:
-        """Whether Steam is running a game, or a game stream looks to be on.
-
-        Steam starts every game through its SteamLaunch wrapper, whose
-        command line carries the game's AppId; Steam itself never does.
-        """
-        return (self._find_stream([("game", "steamlaunch appid=")]) is not None
-                or self._stream_running(settings))
+    _GAME_PATTERN = ("game", "steamlaunch appid=")
 
     def _update_blocker(self, settings: dict) -> str | None:
         """Why an update must wait, for the panel, or None.
 
         Keep fixes on counts as a stream, since the user says one is on. It
         is named when it is the only reason, because "close your game or
-        stream" said nothing to someone running neither.
+        stream" said nothing to someone running neither. A process search
+        too old to go by (PROC_SCAN_FRESH_SECONDS) is not "nothing running":
+        an update restarts Steam if Decky's reload does not answer. In a
+        worker thread.
         """
-        if not self._game_or_stream_running(settings):
-            return None
-        held = os.path.isfile(STREAM_HOLD_FILE)
-        playing = (self._find_stream([("game", "steamlaunch appid=")]) is not None
-                   or self._find_stream(self._stream_patterns(settings)) is not None)
-        if held and not playing:
-            return "Turn off Keep fixes on first, then update."
-        if held:
+        if os.path.isfile(STREAM_HOLD_FILE):
             # Both, named together: one at a time, the next press after
             # closing the game was refused again for the other.
-            return "Close your game or stream and turn off Keep fixes on first, then update."
-        return "Close your game or stream first, then update."
+            if self._apps_running([self._GAME_PATTERN] + self._stream_patterns(settings)):
+                return "Close your game or stream and turn off Keep fixes on first, then update."
+            return "Turn off Keep fixes on first, then update."
+        stream = self._stream_running(settings)
+        game = True if stream else self._apps_running([self._GAME_PATTERN])
+        if stream or game:
+            return "Close your game or stream first, then update."
+        if stream is None or game is None:
+            return "Couldn't tell whether a game is running. Try again in a moment."
+        return None
+
+    @staticmethod
+    def _snapshot_fresh(snapshot, fresh: float = PROC_SCAN_FRESH_SECONDS) -> bool:
+        return snapshot is not None and time.monotonic() - snapshot[0] <= fresh
 
     def _find_stream(self, patterns: list[tuple[str, str]],
                      wait: float = PROC_SCAN_WAIT_SECONDS) -> dict | None:
@@ -12196,24 +12219,32 @@ class Plugin:
         # answer too old to go by is said to be unknown.
         no_wait = getattr(_PROC_SCAN_LOCAL, "no_wait", False)
         snapshot = self._proc_snapshot(0 if no_wait else wait)
-        if no_wait and (snapshot is None
-                        or time.monotonic() - snapshot[0] > PROC_SCAN_FRESH_SECONDS):
+        if no_wait and not self._snapshot_fresh(
+                snapshot, getattr(_PROC_SCAN_LOCAL, "fresh", PROC_SCAN_FRESH_SECONDS)):
             _PROC_SCAN_LOCAL.unknown = True
             return None
         if snapshot is None:
             return None
-        for pid, raw in snapshot[1]:
+        return self._match_snapshot(snapshot, patterns)
+
+    def _match_snapshot(self, snapshot, patterns: list[tuple[str, str]]) -> dict | None:
+        """_find_stream's match over one search's answer. Reads nothing from
+        /proc: everything it needs (command lines, parents, names) was read
+        by the search, in its own thread, so a process whose memory is stuck
+        holds that thread and never a caller."""
+        entries = snapshot[1]
+        by_pid = {e[0]: e for e in entries}
+        for entry in entries:
+            pid, raw = entry[0], entry[1]
+            if not raw:
+                continue
             cmdline = raw.replace(b"\0", b" ").decode("utf-8", "replace").lower()
             if not any(pattern in cmdline for _label, pattern in patterns):
                 continue
-            if self._our_own_process(pid, raw):
+            if self._our_own_process(pid, raw, by_pid):
                 continue
             label = next(label for label, pattern in patterns if pattern in cmdline)
-            try:
-                with open(os.path.join(PROC_DIR, pid, "comm"), "rb") as f:
-                    name = f.read(64).decode("utf-8", "replace").strip()
-            except OSError:
-                name = ""
+            name = entry[3] if len(entry) > 3 else ""
             return {"app": label, "process": name or pid}
         return None
 
@@ -12221,84 +12252,159 @@ class Plugin:
         state = getattr(self, "_proc_scan", None)
         if state is None:
             state = self._proc_scan = {"lock": threading.Lock(), "pending": None, "last": None,
-                                       "started": 0.0, "stuck_said": None}
+                                       "started": 0.0, "stuck_said": None, "progress": None,
+                                       "stuck_pids": set(), "abandoned": [], "full_said": False,
+                                       "last_started": 0.0}
         return state
 
+    # How recent a finished search must be to be answered from again rather
+    # than repeated: a caller that waits for a fresh one right after another
+    # finished would otherwise walk every process twice in a row.
+    _PROC_SCAN_REUSE_SECONDS = 1.0
+    # Searches left behind stuck in the kernel before no more are started.
+    _PROC_SCAN_MAX_STUCK = 4
+
     def _proc_snapshot(self, wait: float = PROC_SCAN_WAIT_SECONDS):
-        """(monotonic time, [(pid, raw cmdline)]) from a search started now
-        or already under way, or the last one finished when it has not
-        answered within wait seconds. None when no search has finished yet.
+        """(monotonic time, [(pid, raw cmdline, parent pid, name)]) from a
+        search started now or already under way, or the last one finished
+        when it has not answered within wait seconds. None when no search
+        has finished yet.
 
         The search runs in a thread of its own, one at a time, so ten
         callers at once make one search, and one stuck in the kernel keeps
-        one thread rather than every caller's.
+        one thread rather than every caller's. One stuck for longer than
+        _PROC_SCAN_STUCK_SECONDS is left behind: the next search skips the
+        process it was reading, and every one found stuck before, so one
+        stuck process does not end process detection until a restart.
         """
         state = self._proc_scan_state()
+        now = time.monotonic()
         with state["lock"]:
             pending = state["pending"]
-            if pending is None:
+            if (pending is not None and not pending.is_set()
+                    and now - state["started"] > self._PROC_SCAN_STUCK_SECONDS):
+                state["abandoned"] = [e for e in state["abandoned"] if not e.is_set()]
+                if len(state["abandoned"]) < self._PROC_SCAN_MAX_STUCK:
+                    stuck = (state["progress"] or {}).get("pid")
+                    if stuck:
+                        state["stuck_pids"].add(stuck)
+                    state["abandoned"].append(pending)
+                    self._note_proc_scan_stuck(state, pending, now)
+                    pending = state["pending"] = None
+                elif not state["full_said"]:
+                    state["full_said"] = True
+                    decky.logger.error(
+                        f"{self._PROC_SCAN_MAX_STUCK} process searches are stuck; no more are "
+                        "started until the plugin restarts")
+            last = state["last"]
+            if pending is None and last is not None and now - last[0] < self._PROC_SCAN_REUSE_SECONDS:
+                return last
+            if pending is None and len([e for e in state["abandoned"] if not e.is_set()]) \
+                    <= self._PROC_SCAN_MAX_STUCK:
                 pending = state["pending"] = threading.Event()
-                state["started"] = time.monotonic()
-                threading.Thread(target=self._run_proc_scan, args=(pending,),
+                state["started"] = now
+                state["progress"] = progress = {"pid": None}
+                threading.Thread(target=self._run_proc_scan,
+                                 args=(pending, progress, frozenset(state["stuck_pids"]), now),
                                  name="wifi-optimizer-process-search", daemon=True).start()
-        if wait > 0:
+        if pending is not None and wait > 0:
             pending.wait(wait)
         # A search stuck in the kernel (a process's cmdline read blocked in
         # D state) never finishes, and every answer after it is the last one
-        # it had. Said once per stuck search, rather than nothing at all.
-        if not pending.is_set():
+        # it had. Said once, until a search finishes again.
+        if pending is not None and not pending.is_set():
             age = time.monotonic() - state["started"]
-            if age > self._PROC_SCAN_STUCK_SECONDS and state["stuck_said"] is not pending:
-                state["stuck_said"] = pending
-                decky.logger.error(
-                    f"process search has not finished for {age:.0f} s; auto mode is "
-                    "going by the last answer")
+            if age > self._PROC_SCAN_STUCK_SECONDS:
+                with state["lock"]:
+                    self._note_proc_scan_stuck(state, pending, time.monotonic())
         return state["last"]
+
+    @staticmethod
+    def _note_proc_scan_stuck(state: dict, pending, now: float):
+        if state["stuck_said"] is not None:
+            return
+        state["stuck_said"] = pending
+        decky.logger.error(
+            f"process search has not finished for {now - state['started']:.0f} s; auto mode is "
+            "going by the last answer")
 
     # How long a process search may run before it is said to be stuck.
     _PROC_SCAN_STUCK_SECONDS = 30
 
-    def _run_proc_scan(self, done: threading.Event):
+    def _run_proc_scan(self, done: threading.Event, progress: dict | None = None,
+                       skip: frozenset = frozenset(), started: float = 0.0):
         state = self._proc_scan_state()
         entries = None
         try:
-            entries = self._read_processes()
+            reader = self._read_processes
+            # A stand-in for the search may take no arguments.
+            code = getattr(reader, "__code__", None)
+            if code is not None and code.co_argcount >= 3:
+                entries = reader(progress, skip)
+            else:
+                entries = reader()
         except Exception as e:
             self._log_throttled("process_search", f"process search error: {e}")
         finally:
             with state["lock"]:
-                if entries is not None:
+                # A search left behind that finishes late has older news than
+                # the one that replaced it, and is not kept over it.
+                if entries is not None and started >= state["last_started"]:
                     state["last"] = (time.monotonic(), entries)
+                    state["last_started"] = started
+                    state["stuck_said"] = None
                 if state["pending"] is done:
                     state["pending"] = None
             done.set()
 
-    def _read_processes(self) -> list[tuple[str, bytes]]:
-        """Every process's command line but this backend's own (a kernel
-        thread has none and is left out)."""
+    def _read_processes(self, progress: dict | None = None,
+                        skip: frozenset = frozenset()) -> list[tuple]:
+        """(pid, raw command line, parent pid, name) for every process but
+        this backend's own. A kernel thread's command line is empty. Parent
+        and name come from status and comm, which never wait on a process's
+        memory; the command line can, and progress["pid"] says whose is being
+        read, so a search stuck on one can be left behind (skip)."""
         own = str(os.getpid())
         try:
-            pids = [d for d in os.listdir(PROC_DIR) if d.isdigit() and d != own]
+            pids = [d for d in os.listdir(PROC_DIR) if d.isdigit() and d != own and d not in skip]
         except OSError:
             return []
         out = []
         for pid in pids:
+            base = os.path.join(PROC_DIR, pid)
             try:
-                with open(os.path.join(PROC_DIR, pid, "cmdline"), "rb") as f:
+                with open(os.path.join(base, "status"), "rb") as f:
+                    status = f.read(4096).decode("utf-8", "replace")
+                found = re.search(r"^PPid:\s*(\d+)", status, re.M)
+                ppid = found.group(1) if found else ""
+            except OSError:
+                ppid = ""
+            try:
+                with open(os.path.join(base, "comm"), "rb") as f:
+                    name = f.read(64).decode("utf-8", "replace").strip()
+            except OSError:
+                name = ""
+            if progress is not None:
+                progress["pid"] = pid
+            try:
+                with open(os.path.join(base, "cmdline"), "rb") as f:
                     raw = f.read(4096)
             except OSError:
                 continue
-            if raw:
-                out.append((pid, raw))
+            out.append((pid, raw, ppid, name))
+        if progress is not None:
+            progress["pid"] = None
         return out
 
-    def _our_own_process(self, pid: str, raw: bytes) -> bool:
+    def _our_own_process(self, pid: str, raw: bytes, by_pid: dict | None = None) -> bool:
         """Whether pid is the update script, the dispatcher, or started by
         either or by this backend (followed up a few parents at most); or is
         never a stream: a Decky plugin's backend or Decky's PluginLoader
-        (_never_a_stream), as the update script's playing() has it."""
+        (_never_a_stream), as the update script's playing() has it. From the
+        search's own record (by_pid); nothing here reads /proc."""
         if self._never_a_stream(raw):
             return True
+        by_pid = by_pid or {}
         own = str(os.getpid())
         for _ in range(8):
             argv = raw.split(b"\0")[:2]
@@ -12306,24 +12412,18 @@ class Plugin:
                 text = arg.decode("utf-8", "replace")
                 if text == DISPATCHER_PATH or _UPDATE_SCRIPT_ARG_RE.match(text):
                     return True
-            try:
-                with open(os.path.join(PROC_DIR, pid, "status"), "rb") as f:
-                    status = f.read(4096).decode("utf-8", "replace")
-            except OSError:
+            entry = by_pid.get(pid)
+            if entry is None or len(entry) < 3 or not entry[2]:
                 return False
-            found = re.search(r"^PPid:\s*(\d+)", status, re.M)
-            if not found:
-                return False
-            pid = found.group(1)
+            pid = entry[2]
             if pid == own:
                 return True
             if pid in ("0", "1"):
                 return False
-            try:
-                with open(os.path.join(PROC_DIR, pid, "cmdline"), "rb") as f:
-                    raw = f.read(4096)
-            except OSError:
+            parent = by_pid.get(pid)
+            if parent is None:
                 return False
+            raw = parent[1]
         return False
 
     # Decky titles every plugin backend "<Name> (<plugin dir>/main.py)".
@@ -12802,7 +12902,8 @@ class Plugin:
                 info.get("update_available") and not info.get("is_downgrade")
                 and latest and latest != settings.get("update_notified_version", "")
             )
-            busy = notify and await asyncio.to_thread(self._stream_running, settings)
+            # A search too old to go by counts as busy: the toast waits.
+            busy = notify and await asyncio.to_thread(self._stream_running, settings) is not False
             return {"notify": notify, "version": latest, "busy": bool(busy)}
         except Exception as e:
             decky.logger.error(f"update_notice error: {e}")

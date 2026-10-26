@@ -5418,7 +5418,8 @@ try:
         found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS}))
         ok(found == {"app": "Moonlight", "process": "moonlight"},
            f"a streaming app is found by its command line ({found})")
-        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS,
+        # K-g pass 6: the ticks count while auto mode is on, where they show.
+        found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
                                                      "streaming_apps": {"moonlight": False}}))
         ok(found is None, "an app the user unticked is not")
         found = pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS,
@@ -5426,6 +5427,7 @@ try:
         ok(found and found["process"] == "sunshine-client", "a pattern of the user's own is")
         shutil_rm = __import__("shutil").rmtree
         shutil_rm(os.path.join(_proc, "100"))
+        time.sleep(1.1)   # L11 pass 6: a search under a second old is answered from again
         ok(pl._find_stream(pl._stream_patterns({**m.DEFAULT_SETTINGS})) is None,
            "and the plugin's own process does not count, nor do kernel threads")
     finally:
@@ -9182,8 +9184,9 @@ try:
         p._update_dir = None
         return r, argv
     _moon = [pt for app, _l, pts in m.STREAMING_APPS if app == "moonlight" for pt in pts]
+    # K-g pass 6: the ticks count while auto mode is on, where they show.
     m._save_settings({**m.DEFAULT_SETTINGS, "streaming_apps": {"moonlight": False},
-                      "streaming_custom_patterns": "mystreamer"})
+                      "streaming_mode_enabled": True, "streaming_custom_patterns": "mystreamer"})
     _r26, _argv26 = _l26_apply("0.24.6-beta")
     ok(_r26.get("success") and _argv26 and "mystreamer" in _argv26[-1]
        and not any(pt.replace(".", "\\.") in _argv26[-1] for pt in _moon),
@@ -16623,6 +16626,177 @@ try:
     finally:
         _r10_restore()
     m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+def _p6_proc_dir():
+    """An empty stand-in /proc, and a maker of processes in it."""
+    root = tempfile.mkdtemp()
+    def mk(pid, ppid, argv, comm, fifo=False):
+        d = os.path.join(root, str(pid)); os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "status"), "w").write(f"Name:\t{comm}\nPPid:\t{ppid}\n")
+        open(os.path.join(d, "comm"), "w").write(comm + "\n")
+        path = os.path.join(d, "cmdline")
+        if os.path.exists(path):
+            os.remove(path)
+        if fifo:
+            os.mkfifo(path)      # a read that never returns, as one stuck on a wedged mm
+        else:
+            open(path, "wb").write(b"\0".join(a.encode() for a in argv) + b"\0")
+    return root, mk
+
+
+def _p6_release_fifos(root):
+    """Let every read still waiting on a stand-in FIFO end (EOF)."""
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            path = os.path.join(dirpath, f)
+            try:
+                if __import__("stat").S_ISFIFO(os.stat(path).st_mode):
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                        os.close(fd)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
+
+def _p6_within(fn, seconds):
+    """(returned, value): fn's answer if it came within seconds."""
+    out = {}
+    t = _p6_thr.Thread(target=lambda: out.setdefault("v", fn()), daemon=True)
+    t.start(); t.join(seconds)
+    return ("v" in out), out.get("v")
+
+
+section("L4 pass 6 nothing after the process search reads /proc, so one stuck process holds no caller")
+try:
+    _l4_root, _l4_mk = _p6_proc_dir()
+    _l4_saved = (m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE)
+    try:
+        m.PROC_DIR = _l4_root
+        m.STREAM_FLAG_FILE = os.path.join(_l4_root, "noflag"); m.STREAM_HOLD_FILE = os.path.join(_l4_root, "nohold")
+        _l4_mk(100, 1, ["/home/deck/.local/share/Steam/ubuntu12_32/steam", "-gamepadui"], "steam")
+        _l4_mk(200, 100, ["/usr/bin/moonlight", "stream", "host", "Desktop"], "moonlight")
+        _p4 = m.Plugin(); _s4 = m._default_settings()
+        _snap4 = _p4._proc_snapshot(2.0)
+        ok(_snap4 is not None and _p4._find_stream(_p4._stream_patterns(_s4)) is not None,
+           "a good search finds the stream")
+        # The parent's command line now never answers.
+        _l4_mk(100, 1, [], "steam", fifo=True)
+
+        def _l4_recent():
+            # The snapshot's answer stays the one to go by.
+            st = _p4._proc_scan_state()
+            st["last"] = (time.monotonic(), st["last"][1])
+        for _what, _fn, _want in (
+                ("the status read (_stream_running_now)", lambda: _p4._stream_running_now(_s4), True),
+                ("the wake move's check (_game_or_stream_known)", lambda: _p4._game_or_stream_known(_s4), True),
+                ("auto mode's search (_find_stream)",
+                 lambda: (_p4._find_stream(_p4._stream_patterns(_s4)) or {}).get("process"), "moonlight"),
+                ("the update's check (_update_blocker)", lambda: _p4._update_blocker(_s4),
+                 "Close your game or stream first, then update.")):
+            _l4_recent()
+            _done4, _v4 = _p6_within(_fn, 1.0)
+            ok(_done4 and _v4 == _want, f"{_what} answers within 1 s from the snapshot ({_done4}, {_v4!r})")
+    finally:
+        _p6_release_fifos(_l4_root)
+        m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE = _l4_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L11 pass 6 a process search stuck in the kernel is left behind, and an old answer is not gone by")
+try:
+    _l11_root, _l11_mk = _p6_proc_dir()
+    _l11_saved = (m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE)
+    _l11_real_err = m.decky.logger.error
+    try:
+        m.decky.logger.error = staticmethod(lambda msg: None)
+        m.PROC_DIR = _l11_root
+        m.STREAM_FLAG_FILE = os.path.join(_l11_root, "noflag"); m.STREAM_HOLD_FILE = os.path.join(_l11_root, "nohold")
+        _l11_mk(300, 1, [], "bash", fifo=True)          # not a stream, and stuck
+        _p11b = m.Plugin(); _p11b._PROC_SCAN_STUCK_SECONDS = 0.5
+        _pat11 = _p11b._stream_patterns(m._default_settings())
+        _p11b._find_stream(_pat11, wait=0.2)              # the search that gets stuck on 300
+        _l11_mk(400, 1, ["/usr/bin/moonlight", "stream"], "moonlight")   # a stream starts meanwhile
+        time.sleep(0.7)
+        _f11 = _p11b._find_stream(_pat11, wait=1.5)
+        _last11 = (_p11b._proc_scan_state().get("last") or (0, []))[1]
+        ok(_f11 is not None and _f11.get("process") == "moonlight",
+           f"past the stuck time a new search runs and finds the stream ({_f11})")
+        ok(_last11 and all(e[0] != "300" for e in _last11),
+           f"leaving out the process the stuck one was reading ({[e[0] for e in _last11]})")
+
+        # An answer an hour old is not "nothing running".
+        _p11c = m.Plugin()
+        _st11 = _p11c._proc_scan_state()
+        _st11["last"] = (time.monotonic() - 3600, [])
+        _b11 = _p11c._update_blocker(m._default_settings())
+        ok(_b11 == "Couldn't tell whether a game is running. Try again in a moment.",
+           f"the update refuses on an hour-old search that cannot be renewed ({_b11!r})")
+    finally:
+        m.decky.logger.error = _l11_real_err
+        _p6_release_fifos(_l11_root)
+        m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE = _l11_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L12 pass 6 the lock's scan checks ask for no rescan during a game, or on an answer over 5 s old")
+try:
+    _l12_root, _l12_mk = _p6_proc_dir()
+    _l12_saved = (m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE)
+    try:
+        m.PROC_DIR = _l12_root
+        m.STREAM_FLAG_FILE = os.path.join(_l12_root, "noflag"); m.STREAM_HOLD_FILE = os.path.join(_l12_root, "nohold")
+
+        class _P12s(m.Plugin):
+            def __init__(self):
+                super().__init__(); self.rescans = 0
+            def _run_cmd(self, cmd, timeout=5):
+                if "rescan" in cmd: self.rescans += 1
+                return _ok()
+        _l12_mk(500, 1, ["/home/deck/.local/share/Steam/ubuntu12_32/reaper", "SteamLaunch",
+                         "AppId=1245620", "--", "game.exe"], "reaper")
+        _p12s = _P12s(); _p12s._proc_snapshot(2.0)
+        _p12s._lock_scan_is_fresh(m._default_settings(), "wlan0", time.monotonic())
+        ok(_p12s.rescans == 0, "a game running (SteamLaunch AppId) and no stream: no rescan")
+
+        # The game gone, and every search from now on stuck.
+        __import__("shutil").rmtree(os.path.join(_l12_root, "500"))
+        _l12_mk(600, 1, [], "bash", fifo=True)
+        _p12s = _P12s()
+        _p12s._proc_snapshot(0.1)                          # stuck from here on
+        _p12s._proc_scan_state()["last"] = (time.monotonic() - 8, [])
+        _r12 = _p12s._lock_scan_is_fresh(m._default_settings(), "wlan0", time.monotonic())
+        ok(_r12 is None and _p12s.rescans == 0, f"an 8 s old answer: not known yet, no rescan ({_r12})")
+        _p12s._proc_scan_state()["last"] = (time.monotonic(), [])
+        _p12s._lock_scan_at = None
+        _p12s._lock_scan_is_fresh(m._default_settings(), "wlan0", time.monotonic())
+        ok(_p12s.rescans == 1, "a fresh answer with nothing running: the rescan is asked for")
+    finally:
+        _p6_release_fifos(_l12_root)
+        m.PROC_DIR, m.STREAM_FLAG_FILE, m.STREAM_HOLD_FILE = _l12_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("K-g pass 6 with auto mode off the app ticks are ignored, with it on they are honoured")
+try:
+    _kg = m.Plugin()
+    _kg_moon = {p for _a, _l, pts in m.STREAMING_APPS if _a == "moonlight" for p in pts}
+    _kg_off = {p for _l, p in _kg._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": False,
+                                                     "streaming_apps": {"moonlight": False}})}
+    _kg_on = {p for _l, p in _kg._stream_patterns({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
+                                                    "streaming_apps": {"moonlight": False}})}
+    ok(_kg_moon and _kg_moon <= _kg_off, "auto mode off: an app unticked earlier still counts as a stream")
+    ok(not (_kg_moon & _kg_on), "auto mode on: the ticks the panel shows are honoured")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
