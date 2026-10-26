@@ -17923,6 +17923,93 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("merge p6: what the panel reads for the pass 6 contracts is what the backend sends (C13 C14 C16 C17 C20)")
+# Each owner checked its own half: LIFECYCLE and DEVICES the fields, FRONT
+# the panel source. Here the backend's real values are matched against the
+# literals the panel tests for, so a renamed key or value on one side fails.
+try:
+    # C13: the real after-wake move, looked at while it runs and after.
+    async def _mp6c_during(p):
+        async def look():
+            await asyncio.sleep(0.2)
+            return p._with_activity({"live": {}})
+        return await asyncio.gather(p._move_lock_after_wake(), look())
+    _mp6c_info = m.decky.logger.info
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: None)
+        _w6_locked(); _mp6c_p = _W6(game_delay=0.6)
+        _mp6c_mv, _mp6c_mid = asyncio.run(_mp6c_during(_mp6c_p))
+        _mp6c_after = _mp6c_p._with_activity({"live": {}})
+        _w6_locked(); _mp6c_b = _W6(reachable=False)
+        asyncio.run(_mp6c_b._move_lock_after_wake())
+        _mp6c_back = _mp6c_b._with_activity({"live": {}})
+    finally:
+        m.decky.logger.info = _mp6c_info
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+    _mp6c_act = re.search(r'status\?\.activity === "([^"]+)"', _F_IX)
+    ok(_mp6c_act is not None and _mp6c_mid.get("activity") == _mp6c_act.group(1)
+       and _mp6c_mid.get("profile_change_in_flight") is True
+       and "Checking the access point lock after sleep." in _between(_F_IX, "{changeRunning && !busyState && (", "</Banner>"),
+       f"C13: while the move runs the backend's activity is the value the panel's banner tests "
+       f"({_mp6c_mid.get('activity')!r}, panel {_mp6c_act.group(1) if _mp6c_act else None!r})")
+    _mp6c_outs = set(re.findall(r'wakeMoveOutcome === "([^"]+)"', _F_IX))
+    _mp6c_got = [(_mp6c_after["live"].get("lock_move_after_wake") or {}),
+                 (_mp6c_back["live"].get("lock_move_after_wake") or {})]
+    ok([g.get("outcome") for g in _mp6c_got] == ["moved", "back"] and _mp6c_outs == {"moved", "back"},
+       f"C13: the two outcomes the backend sends are the two the panel shows ({_mp6c_got}, panel {sorted(_mp6c_outs)})")
+    ok(all(isinstance(g.get("at"), int) and abs(g["at"] - time.time()) < 30 for g in _mp6c_got)
+       and "Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000" in _F_IX
+       and re.search(r"const MESSAGE_TTL_MS = 2 \* 60 \* 1000;", _F_IX)
+       and m.Plugin._WAKE_MOVE_SHOWN_SECONDS == 120,
+       "C13: 'at' is in Unix seconds, as the panel ages it, and both sides keep it two minutes")
+    ok("activity" not in _mp6c_after, "C13: no activity once the move is over")
+
+    # C14: the cached refusal as the status pass reports it.
+    class _Mp6c6(m.Plugin):
+        def _six_ghz_offered(self, settings, status): return True
+        def _six_ghz_refusal(self, uuid, quiet=False):
+            return {"success": False, "error": "six_ghz_wpa_psk", "message": "6 GHz needs WPA3 here."}
+    _mp6c_s6 = {"live": {}}
+    _Mp6c6()._report_six_ghz({}, _mp6c_s6, "u6", "5GHz")
+    _mp6c_s6b = {"live": {}}
+    _Mp6c6()._report_six_ghz({}, _mp6c_s6b, "u6", "6GHz")
+    _mp6c_row = _between(_F_IX, 'label="Force 6 GHz band"', "/>")
+    ok(_mp6c_s6["live"].get("six_ghz_refusal") == "6 GHz needs WPA3 here."
+       and "six_ghz_refusal" not in _mp6c_s6b["live"]
+       and 'status?.live?.six_ghz_refusal' in _F_IX
+       and "subtitle={sixGhzRefusal ||" in _mp6c_row and "!!sixGhzRefusal" in _mp6c_row,
+       f"C14: live.six_ghz_refusal carries the message the Force 6 GHz row shows and disables on ({_mp6c_s6['live']})")
+
+    # C16: a refused link on the way to the settings folder.
+    _mp6c_lr = m._SETTINGS_STATE.get("link_refused")
+    try:
+        m._SETTINGS_STATE["link_refused"] = True
+        _mp6c_s16 = m.Plugin()._with_activity({"live": {}})
+    finally:
+        m._SETTINGS_STATE["link_refused"] = _mp6c_lr
+    ok(_mp6c_s16.get("settings_link_refused") is True
+       and "status?.settings_link_refused" in _F_IX and "settings_link_refused?: boolean" in _F_TY,
+       "C16: settings_link_refused is the top-level key the panel's banner reads")
+
+    # C20: the WPA2-only finding as the status pass copies it.
+    class _Mp6c20(m.Plugin):
+        def _visible_access_points(self, iface, ssid, cached_only=False, rescan=False):
+            return [("D8:07:B6:90:C7:D1", 100, 5180, "WPA2"), ("62:E9:31:0D:1F:E7", 52, 5745, "WPA2 WPA3")]
+    _mp6c_k = _Mp6c20(); _mp6c_k._nm_version_seen = (1, 58, 1)
+    _mp6c_f = _mp6c_k._wpa2_finding("wlan0", "Home", "62:e9:31:0d:1f:e7", {}) or {}
+    ok(_mp6c_f.get("bssid_tail") == "C7:D1"
+       and 'status["wpa2_only_stronger"] = dict(self._wpa2_blocked)' in _F_MAIN
+       and "status.wpa2_only_stronger.bssid_tail" in _F_IX and "bssid_tail?: string" in _F_TY,
+       f"C20: the finding's bssid_tail reaches the panel under wpa2_only_stronger ({_mp6c_f})")
+
+    # C17 (dormant): the key the backend adds is the one SendReport polls on.
+    ok('state["wake_unknown"] = True' in _F_MAIN and "wake_unknown?: boolean" in _P6F_SR
+       and "!shared.state.wake_unknown" in _P6F_SR,
+       "C17: wake_unknown is the key SendReport keeps polling on")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
