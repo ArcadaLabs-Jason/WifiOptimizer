@@ -15651,6 +15651,62 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("merge p5: Prevent lag spikes writes rtw88's disable_aspm only when iw turned power save off on the card")
+# Contract C10: DEVICES' _apply_driver_fixes writes the parameter only with
+# ps_off, and LIFECYCLE's set_power_save passes ps_off when iw turned power
+# save off on the card the driver profile manages. Each branch alone had one
+# half: LIFECYCLE's wrote the parameter whatever iw did, DEVICES' was never
+# passed ps_off, so the plugin never wrote it.
+try:
+    _mp5c = tempfile.mkdtemp(); _mp5c_run = os.path.join(_mp5c, "run"); os.makedirs(_mp5c_run)
+    _mp5c_sv = (m.SYSFS_NET, m.SYSFS_ROOT, m.PCIE_BASELINE_FILE, m.AT_LOAD_MARKER)
+    _mp5c_d, _mp5c_rp = _l_paths()
+    _mp5c_rs = _dv5_sysmod(_mp5c)
+    _mp5c_iw = []
+
+    class _Mp5Ps(m.Plugin):
+        """A USB adapter carries the connection (the radio the status reads);
+        the built-in rtw88 card is the one the driver profile manages."""
+        iw_fails_on = ()
+        def _reload_nm_conf(self): pass
+        def _get_wifi_interface(self): return "wlan1"
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0].endswith("/iw") and "power_save" in cmd:
+                _mp5c_iw.append(cmd[2])
+                if cmd[2] in self.iw_fails_on:
+                    return {"success": False, "stdout": "", "returncode": 1,
+                            "stderr": "command failed: Device or resource busy (-16)"}
+            return _ok()
+
+    try:
+        m.SYSFS_ROOT = os.path.realpath(_mp5c) + "/"
+        m.PCIE_BASELINE_FILE = os.path.join(_mp5c_run, "pcie-baseline")
+        m.AT_LOAD_MARKER = os.path.join(_mp5c_run, "at-load-logged")
+        _d_netdev(_mp5c, "wlan0", "rtw88_8822ce")
+        _d_netdev(_mp5c, "wlan1", "rtw88_8821cu", bus="usb")
+        m.SYSFS_NET = os.path.join(_mp5c, "net")
+        _mp5c_seen = {}
+        for _mp5c_fail in (("wlan0",), ()):
+            _dv5_params(_mp5c)
+            m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88", "power_save_disabled": False})
+            _mp5c_iw.clear()
+            _mp5c_p = _Mp5Ps(); _mp5c_p.iw_fails_on = _mp5c_fail
+            _mp5c_res = asyncio.run(_mp5c_p.set_power_save(True))
+            _mp5c_seen[_mp5c_fail] = (_mp5c_res.get("success"), sorted(_mp5c_iw), _dv5_param(_mp5c),
+                                      _dv5_param(_mp5c, "rtw88_core/parameters/disable_lps_deep"))
+        ok(_mp5c_seen[("wlan0",)] == (True, ["wlan0", "wlan1"], "N", "Y"),
+           f"iw fails on the built-in card and works on the adapter: the toggle works, disable_aspm is "
+           f"left alone, the other parameter is written ({_mp5c_seen[('wlan0',)]})")
+        ok(_mp5c_seen[()] == (True, ["wlan0", "wlan1"], "Y", "Y"),
+           f"iw turns power save off on both: disable_aspm is written too ({_mp5c_seen[()]})")
+    finally:
+        _mp5c_rs(); _mp5c_rp()
+        (m.SYSFS_NET, m.SYSFS_ROOT, m.PCIE_BASELINE_FILE, m.AT_LOAD_MARKER) = _mp5c_sv
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
