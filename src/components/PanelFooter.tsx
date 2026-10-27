@@ -112,7 +112,12 @@ export function PanelFooter({ version, showDetails, onShowDetails }: PanelFooter
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
-        <ToggleField label="Show details" checked={showDetails} onChange={onShowDetails} />
+        <ToggleField
+          label="Show details"
+          description="Opens every (i) explanation."
+          checked={showDetails}
+          onChange={onShowDetails}
+        />
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem
