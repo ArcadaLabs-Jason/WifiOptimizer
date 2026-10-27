@@ -1597,8 +1597,10 @@ def _unread_settings_in_place() -> bool:
 # unread: the regular file a failed read left in place (see _note_unread_settings).
 # aside_failed: the identity of the last set-aside that failed (see
 # _set_aside_corrupt_settings), so it is neither retried nor logged again.
-# save_failed_cause: "link" (behind a link), "space" (ENOSPC) or "other",
-# for the settings reads that check again (_recheck_settings_writable).
+# save_failed_cause: "link" (behind a link), "space" (ENOSPC), "unread" (the
+# file there could not be read, so no save may replace it) or "other", for
+# the settings reads that check again (_recheck_settings_writable) and the
+# panel's advice (contract C27).
 _SETTINGS_STATE = {"read_failed": False, "save_failed": False, "unread": None,
                    "aside_failed": None, "link_refused": False, "save_failed_cause": None}
 
@@ -1735,8 +1737,10 @@ def _save_settings(data: dict):
     """
     with _SETTINGS_LOCK:
         if _unread_settings_in_place():
+            # "unread" (C27): a restart reads the same file again and fails
+            # again; Reset is what sets it aside.
             _SETTINGS_STATE["save_failed"] = True
-            _SETTINGS_STATE["save_failed_cause"] = "other"
+            _SETTINGS_STATE["save_failed_cause"] = "unread"
             raise SettingsSaveError("settings not saved: the file there could not be read")
         merged = data
         if isinstance(data, _LoadedSettings) and data._gen != _SETTINGS_GEN[0]:
@@ -1745,7 +1749,7 @@ def _save_settings(data: dict):
             merged = _read_settings_file()
             if _unread_settings_in_place():
                 _SETTINGS_STATE["save_failed"] = True
-                _SETTINGS_STATE["save_failed_cause"] = "other"
+                _SETTINGS_STATE["save_failed_cause"] = "unread"
                 raise SettingsSaveError("settings not saved: the file there could not be read")
             for key in set(data) | set(data._base):
                 mine = data.get(key, _MISSING)
@@ -4633,16 +4637,21 @@ class Plugin:
     def _take_detected_driver(detected, saved, pci_now) -> bool:
         """Whether a load or Reset records the driver detected now over the
         one saved. With the radio missing ("unknown"), only when nothing was
-        saved. Over a driver the plugin has a profile for, only one it has a
-        profile for too, and only while a WiFi card is on PCI: with the
-        built-in card gone after a bad wake, the detected one is a USB
-        adapter's, and taking it would drop the built-in card's fixes (its
-        modprobe options) at the next boot."""
+        saved. Over a driver the plugin has a profile for, only while a WiFi
+        card is on PCI: with the built-in card gone after a bad wake, the
+        detected one is a USB adapter's, and taking it would drop the
+        built-in card's fixes (its modprobe options) at the next boot.
+
+        With a card on PCI the detected driver is that card's
+        (_detect_wifi_driver reads it first), so it is taken whether or not
+        the plugin has a profile for it: a card swapped for one it has none
+        for (an MT7925, a QCA6174) is then named and treated as unknown
+        hardware, not as the old card."""
         if detected == "unknown":
             return saved in (None, "", "unknown")
         if saved not in DRIVER_PROFILES:
             return True
-        return detected in DRIVER_PROFILES and bool(pci_now)
+        return bool(pci_now)
 
     def _pci_wifi_interface(self) -> str | None:
         """The wireless netdev on PCI, for telling which card a device is
@@ -6831,7 +6840,7 @@ class Plugin:
         between polls.
         """
         status["settings_unwritable"] = bool(_SETTINGS_STATE["save_failed"])
-        # Contract C27: why, while it stands ("link", "space" or "other").
+        # Contract C27: why, while it stands ("link", "space", "unread" or "other").
         if status["settings_unwritable"]:
             status["settings_unwritable_cause"] = _SETTINGS_STATE.get("save_failed_cause") or "other"
         else:
@@ -6855,6 +6864,9 @@ class Plugin:
             # (contract C22): the panel is seldom open at a wake.
             if outcome and time.monotonic() - outcome[2] < self._WAKE_MOVE_KEPT_SECONDS:
                 live["lock_move_after_wake"] = {"outcome": outcome[0], "at": outcome[1]}
+                # Contract C30: only for an "off" whose pin was moved.
+                if outcome[0] == "off" and len(outcome) > 3 and outcome[3]:
+                    live["lock_move_after_wake"]["pin_moved"] = True
             else:
                 live.pop("lock_move_after_wake", None)
         return status
@@ -7739,6 +7751,10 @@ class Plugin:
             # The card stopped answering after the move's radio cycle: the pin
             # names the new access point and WiFi is not back (contract C24).
             stuck = result.get("error") == "not_responding" and result.get("pin_moved")
+            # Contract C30: an "off" whose pin names the stronger access
+            # point, so the panel does not say the lock couldn't move there.
+            # Not every radio-off end: after a rollback the pin is the old one.
+            pin_moved = bool((radio_off or stuck) and result.get("pin_moved"))
             outcome = None
             if result.get("success") and result.get("reconnected"):
                 outcome = "moved"
@@ -7749,7 +7765,8 @@ class Plugin:
             elif radio_off or stuck:
                 outcome = "off"
             if outcome:
-                self._wake_move_outcome = (outcome, int(time.time()), time.monotonic())
+                self._wake_move_outcome = (outcome, int(time.time()), time.monotonic(),
+                                           pin_moved)
             if radio_off or stuck or result.get("wifi_not_back"):
                 # logger can take seconds right after a wake: off the loop.
                 await asyncio.to_thread(self._log_wake_move_death)
@@ -11324,7 +11341,10 @@ class Plugin:
                 self._nmcli_modify, uuid, "802-11-wireless.bssid", previous_pin)
             return self._unexpected_response(e)
         if not await self._reconnect(uuid):
-            return dict(self._RADIO_OFF_RESULT)
+            # pin_moved: the pin names the stronger access point, so the
+            # device joins it once the radio is back (contract C30).
+            return {**self._RADIO_OFF_RESULT, "pin_moved": True} if moved_to \
+                else dict(self._RADIO_OFF_RESULT)
 
         if moved_to:
             return await self._verify_lock_move(iface, uuid, bssid, chosen, moving,
@@ -11419,7 +11439,10 @@ class Plugin:
             except SettingsSaveError as e:
                 decky.logger.error(f"BSSID lock: the settings could not record the rollback: {e}")
             if not await self._reconnect(uuid):
-                return dict(self._RADIO_OFF_RESULT)
+                # Still pinned to chosen when the pin could not be cleared
+                # either (contract C30); cleared, the lock is off.
+                return ({**self._RADIO_OFF_RESULT, "pin_moved": True} if not cleared["success"]
+                        else dict(self._RADIO_OFF_RESULT))
             return {"success": False, "error": "move_failed", "reconnected": True,
                     "message": message, **(await self._wifi_not_back(iface, no_link))}
         if self._tearing_down_now():

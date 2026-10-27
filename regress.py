@@ -21539,6 +21539,269 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+# ---- QA pass 9, LIFECYCLE (L1-L15) ----
+# Each section is named after its item in session-artifacts/qa-0.24.4/pass9-triage.md.
+
+
+section("L1 pass 9 a card swapped for one the plugin has no profile for is taken at a load and Reset; every older case holds")
+try:
+    _sys901 = m.SYSFS_NET
+    _d901, _restore901 = _l_paths()
+    try:
+        def _p901_netdevs(*devs):
+            """A sysfs with one wireless netdev per (name, bus, module)."""
+            root = tempfile.mkdtemp()
+            m.SYSFS_NET = os.path.join(root, "net")
+            os.makedirs(m.SYSFS_NET)
+            for i, (name, bus, module) in enumerate(devs):
+                dev = os.path.join(root, "devices", f"dev{i}")
+                os.makedirs(os.path.join(m.SYSFS_NET, name, "phy80211"))
+                open(os.path.join(m.SYSFS_NET, name, "phy80211", "name"), "w").write(f"phy{i}\n")
+                os.makedirs(os.path.join(dev, "driver"))
+                os.makedirs(os.path.join(root, "bus", bus), exist_ok=True)
+                os.makedirs(os.path.join(root, "module", module), exist_ok=True)
+                os.symlink(os.path.join(root, "bus", bus), os.path.join(dev, "subsystem"))
+                os.symlink(os.path.join(root, "module", module), os.path.join(dev, "driver", "module"))
+                os.symlink(dev, os.path.join(m.SYSFS_NET, name, "device"))
+
+        class _L901(_LReset):
+            """A load and a Reset that detect the driver from the sysfs above
+            (the real get_device_info and _detect_wifi_driver); `iw phy` lists
+            a 6 GHz channel, as a 6E or 7 card does."""
+            get_device_info = m.Plugin.get_device_info
+            def _get_wifi_interface(self):
+                names = m.Plugin._wireless_netdevs()
+                return names[0] if names else None
+            def _detect_device_family(self): return ("Jupiter", "deck_lcd", "Steam Deck LCD")
+            def _run_cmd(self, cmd, timeout=5):
+                self.cmds.append(cmd)
+                if cmd[:2] == ["/usr/bin/iw", "phy"]:
+                    return _ok("Wiphy phy0\n\tBand 4:\n\t\tFrequencies:\n\t\t\t* 5955 MHz [1] (disabled)\n")
+                return _ok()
+
+        _base901 = {k: v for k, v in base_ap.items() if k not in ("driver", "chip_label", "supports_6ghz")}
+
+        def _p901(saved, devs, how):
+            _p901_netdevs(*devs)
+            m._save_settings({**_base901, "driver": saved, "chip_label": "WiFi 5 (RTL8822CE)",
+                              "supports_6ghz": False})
+            p = _L901()
+            if how == "load":
+                asyncio.run(p._main())
+            else:
+                asyncio.run(p.reset_settings())
+            s = m._load_settings()
+            return s.get("driver"), s.get("chip_label"), s.get("supports_6ghz"), p._get_support_tier()
+
+        # The item: the LCD's RTL8822CE swapped for an MT7925 (mt7925e) or a QCA6174 (ath10k_pci).
+        for _how in ("load", "Reset"):
+            _got = _p901("rtw88", [("wlan0", "pci", "mt7925e")], _how)
+            ok(_got == ("mt7925e", "unknown", True, 3),
+               f"{_how}: rtw88 saved, an MT7925 on PCI -> its driver, no old chip name, 6 GHz from the card, tier 3 ({_got})")
+            _got = _p901("rtw88", [("wlan0", "pci", "ath10k_pci")], _how)
+            ok(_got[0] == "ath10k_pci" and _got[3] == 3,
+               f"{_how}: rtw88 saved, a QCA6174 on PCI -> ath10k_pci, tier 3 ({_got})")
+        # Every case the driver recording handled before (v0.24.5-beta's "any
+        # detected driver but unknown", and pass 8's USB guard) still holds.
+        _old901 = {
+            # (saved, devices, how): driver kept or taken
+            ("rtw88", (), "load"): "rtw88",                     # radio missing: the saved one kept
+            ("rtw88", (), "Reset"): "rtw88",
+            ("mt7925e", (), "load"): "mt7925e",                 # also when it has no profile
+            ("", (), "load"): "unknown",                        # nothing saved: unknown recorded
+            ("unknown", (), "Reset"): "unknown",
+            ("mt7921e", (("wlan1", "usb", "rtw89_8852bu"),), "load"): "mt7921e",   # pass 8 L10: USB only
+            ("mt7921e", (("wlan1", "usb", "rtw89_8852bu"),), "Reset"): "mt7921e",
+            ("mt7921e", (("wlan1", "usb", "rtw88_8822cu"),), "load"): "mt7921e",   # a USB one with a profile
+            ("mt7921e", (("wlan1", "usb", "mt7921u"),), "Reset"): "mt7921e",       # a USB one without
+            ("", (("wlan1", "usb", "rtw89_8852bu"),), "load"): "rtw89",            # none saved: taken
+            ("mt7921e", (("wlan0", "pci", "rtw89_8852be"),), "load"): "rtw89",     # profiled swap
+            ("mt7925e", (("wlan0", "pci", "rtw88_8822ce"),), "Reset"): "rtw88",    # swapped back
+            ("rtw88", (("wlan0", "pci", "rtw88_8822ce"),), "load"): "rtw88",       # same card
+            ("rtw88", (("wlan1", "usb", "rtw89_8852bu"), ("wlan0", "pci", "mt7925e")), "load"): "mt7925e",  # the item, USB listed first
+        }
+        _bad901 = {}
+        for (_saved, _devs, _how), _want in _old901.items():
+            _got = _p901(_saved, list(_devs), _how)[0]
+            if _got != _want:
+                _bad901[(_saved, _devs, _how)] = _got
+        ok(not _bad901, f"every older case keeps its answer (wrong: {_bad901})")
+    finally:
+        _restore901()
+        m.SYSFS_NET = _sys901
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L2 pass 9 a settings file that could not be read is said as such (cause 'unread', C27), and Reset clears it")
+try:
+    _sf902 = m.SETTINGS_FILE
+    _st902 = dict(m._SETTINGS_STATE)
+    _d902, _restore902 = _l_paths()
+    try:
+        def _p902_cause():
+            w = m.Plugin()._with_activity({"live": {}})
+            return w.get("settings_unwritable"), w.get("settings_unwritable_cause")
+
+        # A file that does not parse and cannot be set aside: a folder the
+        # user left at settings.json.corrupt (05's p_corrupt end state).
+        os.mkdir(m.SETTINGS_FILE + ".corrupt")
+        open(m.SETTINGS_FILE, "w").write("{not json")
+        _s902 = m._load_settings(); _s902["update_notify"] = False
+        try:
+            m._save_settings(_s902); _e902 = None
+        except Exception as _x:
+            _e902 = _x
+        ok(isinstance(_e902, m.SettingsSaveError) and open(m.SETTINGS_FILE).read() == "{not json",
+           f"a file that does not parse and cannot be set aside is kept, and the save is refused ({_e902})")
+        ok(_p902_cause() == (True, "unread"), f"said with cause 'unread', not 'other' ({_p902_cause()})")
+        os.rmdir(m.SETTINGS_FILE + ".corrupt")
+
+        # A read that failed with an I/O error (noted as the read does).
+        m._SETTINGS_STATE.update({"save_failed": False, "save_failed_cause": None})
+        open(m.SETTINGS_FILE, "w").write(json.dumps({**m.DEFAULT_SETTINGS, "update_notify": False}))
+        m._note_unread_settings()
+        try:
+            m._save_settings(dict(m.DEFAULT_SETTINGS)); _e902 = None
+        except Exception as _x:
+            _e902 = _x
+        ok(isinstance(_e902, m.SettingsSaveError) and _p902_cause() == (True, "unread"),
+           f"an I/O error on the read: the save is refused with cause 'unread' ({_e902}, {_p902_cause()})")
+        # The refusal inside the merge too: a copy loaded before another
+        # save, after which the file was replaced by one that does not parse
+        # and cannot be set aside.
+        m._SETTINGS_STATE.update({"save_failed": False, "save_failed_cause": None,
+                                  "unread": None, "read_failed": False})
+        _c902 = m._load_settings()
+        m._save_settings(m._load_settings())           # saved over since _c902 was loaded
+        open(m.SETTINGS_FILE, "w").write("{not json")
+        os.mkdir(m.SETTINGS_FILE + ".corrupt")
+        _c902["update_notify"] = True
+        try:
+            m._save_settings(_c902); _e902 = None
+        except Exception as _x:
+            _e902 = _x
+        os.rmdir(m.SETTINGS_FILE + ".corrupt")
+        ok(isinstance(_e902, m.SettingsSaveError) and open(m.SETTINGS_FILE).read() == "{not json"
+           and _p902_cause() == (True, "unread"),
+           f"and the refusal inside the merge says 'unread' too ({_e902}, {_p902_cause()})")
+
+        # A write that fails for another reason keeps "other".
+        m._SETTINGS_STATE.update({"unread": None, "read_failed": False})
+        _wr902 = m._write_settings
+        try:
+            def _eio(data):
+                raise OSError(5, "Input/output error")
+            m._write_settings = _eio
+            try:
+                m._save_settings(m._load_settings())
+            except m.SettingsSaveError:
+                pass
+        finally:
+            m._write_settings = _wr902
+        ok(_p902_cause() == (True, "other"), f"a write that fails otherwise keeps 'other' ({_p902_cause()})")
+
+        # Reset sets the unread file aside, its save lands, and the cause is gone.
+        m._note_unread_settings()
+        try:
+            m._save_settings(m._load_settings())
+        except m.SettingsSaveError:
+            pass
+        _r902 = asyncio.run(_LReset().reset_settings())
+        ok(_r902.get("success") is True and os.path.isfile(m.SETTINGS_FILE + ".corrupt")
+           and _p902_cause() == (False, None),
+           f"after Reset sets it aside and saves, nothing says the settings can't be saved "
+           f"({_r902.get('error')}, {_p902_cause()})")
+    finally:
+        _restore902()
+        m.SETTINGS_FILE = _sf902
+        m._SETTINGS_STATE.clear(); m._SETTINGS_STATE.update(_st902)
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L3 pass 9 an after-wake 'off' whose pin was moved says so (pin_moved, C30); every other end does not")
+try:
+    def _p903(plugin):
+        """The after-wake move run; what the status sends for it."""
+        _p8_wake_move(plugin)
+        return plugin._with_activity({"live": {}})["live"].get("lock_move_after_wake") or {}
+
+    # The card stops responding after the move's radio cycle (pass 8 L1's end).
+    _w6_locked(); _p903a = _W8Stuck()
+    _s903 = _p903(_p903a)
+    ok(_s903.get("outcome") == "off" and _s903.get("pin_moved") is True
+       and _p903a.pin.upper() == _W6STRONG,
+       f"the card stuck after the move: 'off' with pin_moved, the pin on the stronger one ({_s903})")
+
+    # The radio does not come back on after the pin was written.
+    class _W903Off(_W8Stuck):
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); return False
+    _w6_locked(); _p903b = _W903Off()
+    _s903 = _p903(_p903b)
+    ok(_s903.get("outcome") == "off" and _s903.get("pin_moved") is True
+       and _p903b.pin.upper() == _W6STRONG,
+       f"the radio not back after the move: 'off' with pin_moved ({_s903})")
+
+    # Refused, and the old pin could not be written back: cleared, lock off.
+    class _W903NoBack(_W7):
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            if k == "802-11-wireless.bssid" and v.upper() == _W6WEAK:
+                self.mods.append((k, v))
+                return {"success": False, "stdout": "", "stderr": "nope", "returncode": 1}
+            return _W7._nmcli_modify(self, u, k, v, timeout)
+    _w6_locked(); _p903c = _W903NoBack(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903c)
+    ok(_s903.get("outcome") == "off" and "pin_moved" not in _s903 and _p903c.pin == "",
+       f"a refused move whose old pin could not go back: 'off' without pin_moved ({_s903}, pin {_p903c.pin!r})")
+
+    # Refused, the old pin written back, then the radio does not come back on:
+    # the pin is the old one, so not moved either.
+    class _W903BackOff(_W7):
+        def _hard_reconnect(self, uuid=None):
+            if len(self.cycles) >= 1:
+                self.cycles.append(self.game); return False
+            return _W7._hard_reconnect(self, uuid)
+    _w6_locked(); _p903d = _W903BackOff(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903d)
+    ok(_s903.get("outcome") == "off" and "pin_moved" not in _s903 and _p903d.pin.upper() == _W6WEAK,
+       f"the old pin back, then the radio not back: 'off' without pin_moved ({_s903}, pin {_p903d.pin})")
+
+    # Neither the old pin nor a cleared one could be written, then the radio
+    # did not come back: the pin still names the stronger one.
+    class _W903Stays(_W7):
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            if k == "802-11-wireless.bssid" and v.upper() != _W6STRONG:
+                self.mods.append((k, v))
+                return {"success": False, "stdout": "", "stderr": "nope", "returncode": 1}
+            return _W7._nmcli_modify(self, u, k, v, timeout)
+        def _hard_reconnect(self, uuid=None):
+            if len(self.cycles) >= 1:
+                self.cycles.append(self.game); return False
+            return _W7._hard_reconnect(self, uuid)
+    _w6_locked(); _p903g = _W903Stays(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903g)
+    ok(_s903.get("outcome") == "off" and _s903.get("pin_moved") is True and _p903g.pin.upper() == _W6STRONG,
+       f"the pin left on the stronger one, then the radio not back: 'off' with pin_moved ({_s903})")
+
+    # Moved, and back where it was: no pin_moved on either.
+    _w6_locked(); _p903e = _W7()
+    _s903 = _p903(_p903e)
+    ok(_s903 == {"outcome": "moved", "at": _s903.get("at")}, f"a move that landed: 'moved' only ({_s903})")
+    _w6_locked(); _p903f = _W7(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903f)
+    ok(_s903.get("outcome") == "back" and "pin_moved" not in _s903, f"a move that went back: 'back' only ({_s903})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
