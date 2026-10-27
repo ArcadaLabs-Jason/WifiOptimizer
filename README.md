@@ -2,7 +2,7 @@
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (the access point lock, band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, restart the device. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
-A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause lag, stuttering, and dropped connections during game streaming. It helps any streaming over WiFi: Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki (PS Remote Play), and more.
+A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause lag, stuttering, and dropped connections. It helps any streaming over WiFi: Steam Remote Play, [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/), Parsec, Chiaki (PS Remote Play), and more. Players have also reported that it fixed lag and disconnects in online multiplayer games.
 
 **Supported devices:** Steam Deck (LCD and OLED), Legion Go, ROG Ally, and other PC handhelds. Works on SteamOS, Bazzite, and CachyOS.
 
@@ -10,7 +10,7 @@ A [Decky Loader](https://decky.xyz/) plugin that fixes WiFi problems that cause 
 
 ## The problem
 
-Updates and sleep turn WiFi power saving back on, and every restart resets the network buffers. The result: latency spikes, connection drops, and degraded streaming quality, and the only fix is a trip to Desktop Mode.
+Updates and sleep turn WiFi power saving back on, and every restart resets the network buffers. The result: latency spikes, connection drops, lag in online games, and degraded streaming quality, and the only fix is a trip to Desktop Mode.
 
 WiFi Optimizer fixes this from Game Mode. One tap, and it stays fixed.
 
