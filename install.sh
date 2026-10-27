@@ -52,7 +52,10 @@ if [ -z "$LATEST_TAG" ]; then
     exit 1
 fi
 echo "Latest release: $LATEST_TAG"
-REPO_URL="https://github.com/ArcadaLabs-Jason/WifiOptimizer/archive/refs/tags/${LATEST_TAG}.tar.gz"
+# The release's own tarball, the one its signed SHA256SUMS lists, so what is
+# installed can be checked against the release. GitHub's generated archive
+# of the tag is listed nowhere. Both unpack to WifiOptimizer-<version>/.
+REPO_URL="$RELEASES/download/${LATEST_TAG}/wifi-optimizer-${LATEST_TAG}.tar.gz"
 DIR_NAME="WifiOptimizer-${LATEST_TAG#v}"
 
 TMP_DIR=$(mktemp -d)
