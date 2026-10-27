@@ -7453,8 +7453,8 @@ try:
         # What installs is what the user approved. GitHub is asked again
         # when they press the button, and a different answer, an older
         # signed release above all, must not be installed in its place.
-        _changed = "The available update changed. Check again and retry."
-        _again = "Check for updates again, then retry."
+        _changed = "The update on offer changed. Tap Update again."
+        _again = "Couldn't start the update. Tap Update again."
         for _what, _approved, _msg in [
             ("an approval for an older version", "0.20.0-beta", _changed),
             ("an approval for a newer version", "0.22.0", _changed),
@@ -7481,20 +7481,20 @@ try:
         _wrong_comment = _minisign(_REL_SUMS, "wifi-optimizer v0.20.0-beta")
         _no_tar = f"{_TAR_SHA}  wifi-optimizer-v0.20.0-beta.tar.gz\n".encode()
         _cases = [
-            ("no signature file", _files(sig=None), "This release isn't signed, so it wasn't installed."),
-            ("no checksum list", _files(sums=None), "This release isn't signed, so it wasn't installed."),
+            ("no signature file", _files(sig=None), "This release isn't signed, so it wasn't installed. Report it on GitHub."),
+            ("no checksum list", _files(sums=None), "This release isn't signed, so it wasn't installed. Report it on GitHub."),
             ("a signature that does not verify", _files(sig=_edit_b64(_REL_SIG, 1, 30)),
-             "This release's signature didn't check out, so it wasn't installed."),
+             "This release's signature didn't check out, so it wasn't installed. Report it on GitHub."),
             ("a checksum list changed after signing", _files(sums=_REL_SUMS.replace(b"  ", b"  x")),
-             "This release's signature didn't check out, so it wasn't installed."),
+             "This release's signature didn't check out, so it wasn't installed. Report it on GitHub."),
             ("a signature for another version", _files(sig=_wrong_comment),
-             "This release's signature didn't check out, so it wasn't installed."),
+             "This release's signature didn't check out, so it wasn't installed. Report it on GitHub."),
             ("a signature by a key that is not pinned", _files(sig=_MS_SIG),
-             "This release's signature didn't check out, so it wasn't installed."),
+             "This release's signature didn't check out, so it wasn't installed. Report it on GitHub."),
             ("a signature file that is not text", _files(sig=b"\xff\xfe" + _REL_SIG.encode()),
-             "This release's signature didn't check out, so it wasn't installed."),
+             "This release's signature didn't check out, so it wasn't installed. Report it on GitHub."),
             ("a signed list without the tarball", _files(sums=_no_tar, sig=_minisign(_no_tar, f"wifi-optimizer v{_VER}")),
-             "This release isn't signed properly, so it wasn't installed."),
+             "This release isn't signed properly, so it wasn't installed. Report it on GitHub."),
             ("the signature not downloadable", _files(sig="down"),
              "Couldn't download the release's signature. Try again later."),
             ("an oversized checksum list", _files(sums=b"x" * (m.RELEASE_SUMS_MAX + 1)),
@@ -13668,9 +13668,9 @@ try:
     ok(not hasattr(m.Plugin, "_relock_after_band_change"),
        "the band change's relock helper that nothing called is gone")
     _src22 = open("main.py").read()
-    ok("6 GHz requires them. Change it in Desktop Mode's network settings to use 6 GHz." in
+    ok("6 GHz needs them. The README's Force 6 GHz row has the command to turn them on." in
        re.sub(r'"\s*\n\s*"', "", _src22),
-       "the 6 GHz refusal for management frames says where to change it")
+       "the 6 GHz refusal for management frames says where the fix is (L12 pass 8)")
     ok("Couldn't remove the auto-fix script. Restart the device, then try again." in _src22
        and "Couldn't change the auto-fix script. Restart the device, then try again." in _src22,
        "and the auto-fix script failures say to restart and try again")
@@ -15935,7 +15935,7 @@ try:
         _p5_skip_or_fail(["pgrep"], "playing() with the real pgrep")
     else:
         _p5_n = "zzqqnothingmatches"
-        ok(_p5_playing_probe(_p5_n, 'rm -rf "$TMP/pids"; mkdir "$TMP/pids"') == "yes",
+        ok(_p5_playing_probe(_p5_n, 'rm -rf "$TMP/pids" "$TMP/pids-1"; mkdir "$TMP/pids" "$TMP/pids-1"') == "yes",
            "pgrep's answer that cannot be written (a directory in the way) counts as playing")
         ok(_p5_playing_probe("(") == "yes", "a pgrep that fails (exit 2) counts as playing")
         ok(_p5_playing_probe(_p5_n) == "no", "nothing running is not playing")
@@ -19804,14 +19804,14 @@ except Exception as _e:
 section("L19 L20 L21 L22 pass 7 texts")
 try:
     _src719 = open("main.py").read()
-    ok("Some PCIe power saving couldn't be turned off. The rest is on." in _src719
+    ok("Some PCIe power saving couldn't be turned off. The rest of this fix applied." in _src719
        and "Nothing to do." not in _src719, "L19: the PCIe note in two plain sentences")
     m._save_settings({**base_ap, "device_family": "deck_oled"})
     _m720 = asyncio.run(Reg(SELF_MANAGED).set_regdomain("DE")).get("message", "")
     ok(_m720.endswith("and ignores this setting. That is normal and hides no band.")
        and "Steam Deck" not in _m720 and _m720.startswith("This device's WiFi uses "),
        f"L20: the self-managed region notice ({_m720!r})")
-    ok("This release isn't signed properly, so it wasn't installed." in _src719
+    ok("This release isn't signed properly, so it wasn't installed. Report it on GitHub." in _src719
        and "signed checksums don't cover" not in _src719, "L21: the unsigned-tarball refusal")
     _w6_locked()
     _l722_logged = []
@@ -19953,6 +19953,527 @@ try:
         m._save_settings(dict(m.DEFAULT_SETTINGS))
     ok(_mp7o_had == "off" and _mp7o_now is None,
        f"turning the lock back on after an 'off' clears it ({_mp7o_had} -> {_mp7o_now})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+# ---- QA pass 8, LIFECYCLE ----
+import threading as _p8_thr, subprocess as _p8_sp
+
+
+class _W8Stuck(_W7):
+    """The after-wake move on the OLED's card, where the move's radio cycle
+    wedges the card: every iw after it answers that an earlier one is still
+    stuck. Every command is recorded, with whether it ran on the main thread."""
+    def __init__(self, wedged=False, **kw):
+        super().__init__(**kw); self.cmds = []; self.wedged = wedged; self.logger_on_main = []
+    def _hard_reconnect(self, uuid=None):
+        self.cycles.append(self.game); self.wedged = True
+        return True
+    def _run_cmd(self, cmd, timeout=5):
+        self.cmds.append(list(cmd))
+        if cmd[:1] == ["/usr/bin/logger"]:
+            self.logger_on_main.append(_p8_thr.current_thread() is _p8_thr.main_thread())
+            return _ok()
+        if self.wedged and cmd[:2] == ["/usr/bin/iw", "dev"] and cmd[-1] == "link":
+            return {"success": False, "stdout": "", "stderr": "previous iw is still stuck", "returncode": -1}
+        return _W7._run_cmd(self, cmd, timeout)
+
+
+def _p8_wake_move(plugin):
+    """Run the after-wake move; (info log lines, outcome the status sends)."""
+    lines = []
+    info = m.decky.logger.info
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: lines.append(msg))
+        asyncio.run(plugin._move_lock_after_wake())
+    finally:
+        m.decky.logger.info = info
+    sent = plugin._with_activity({"live": {}})["live"].get("lock_move_after_wake") or {}
+    return lines, sent.get("outcome")
+
+
+section("L1 pass 8 an after-wake move after which the card stops responding is journaled, sent as 'off' and said as moved")
+try:
+    _w6_locked(); _p81 = _W8Stuck()
+    _l81, _o81 = _p8_wake_move(_p81)
+    _j81 = [c for c in _p81.cmds if c[:1] == ["/usr/bin/logger"]]
+    ok(_p81.pin.upper() == _W6STRONG and _p81.cycles,
+       f"(the move's radio cycle ran and the pin names the stronger access point: {_p81.pin})")
+    ok(_j81 == [["/usr/bin/logger", "-t", m.JOURNAL_TAG, "--", m.WAKE_MOVE_DOWN_LINE]],
+       f"exactly one journal line, the one the wake rule reads (C24) ({_j81})")
+    ok(_o81 == "off", f"the status sends 'off' for it (C22) ({_o81})")
+    ok(not any("left as it is" in l for l in _l81)
+       and "After waking, the BSSID lock was moved, then the WiFi card stopped responding" in _l81,
+       f"the log says the lock was moved, not left as it is ({[l for l in _l81 if 'After waking' in l]})")
+    _J81 = globals().get("_J71"); _mv81 = globals().get("_moved71"); _w81 = globals().get("_W71")
+    if _J81 and _mv81 is not None and _j81:
+        _g81 = _J81(_mv81 + [(4060.0, "wifi-optimizer[4242]", _j81[0][-1], 0)])._read_wake_failure()
+        ok(_g81 == _w81, f"and that line, read back by the wake rule (D1 pass 7), flags the wake ({_g81})")
+    else:
+        ok(False, "the wake rule's journal model (D1 pass 7) or the journal line is missing")
+    # A card already stuck before anything was moved: nothing changed, so
+    # "left as it is" is true there, and the move took nothing down.
+    _w6_locked(); _p81b = _W8Stuck(wedged=True)
+    _l81b, _o81b = _p8_wake_move(_p81b)
+    ok(_p81b.pin.upper() == _W6WEAK and not _p81b.cycles
+       and not [c for c in _p81b.cmds if c[:1] == ["/usr/bin/logger"]] and _o81b is None
+       and any(l.startswith("After waking, the BSSID lock was left as it is") for l in _l81b),
+       f"a card stuck before the move: left as it is, no journal line, no outcome ({_o81b})")
+    # The radio not coming back on after the pin was changed: not "left as it is" either.
+    class _W81Off(_W8Stuck):
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); return False
+    _w6_locked(); _p81c = _W81Off()
+    _l81c, _o81c = _p8_wake_move(_p81c)
+    ok(_o81c == "off" and not any("left as it is" in l for l in _l81c)
+       and "After waking, the WiFi radio didn't come back on after the BSSID lock's move" in _l81c,
+       f"the radio not back after the move: 'off', and not said as left as it is "
+       f"({[l for l in _l81c if 'After waking' in l]})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L6 pass 8 the after-wake move's journal line is written off the event loop")
+try:
+    class _W86Off(_W8Stuck):
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); return False
+    _w6_locked(); _p86 = _W86Off()
+    _p8_wake_move(_p86)
+    ok(_p86.logger_on_main == [False],
+       f"the radio not back: logger runs once, in a worker thread ({_p86.logger_on_main})")
+    _w6_locked(); _p86b = _W8Stuck()
+    _p8_wake_move(_p86b)
+    ok(_p86b.logger_on_main == [False],
+       f"the card stuck after the move: the same ({_p86b.logger_on_main})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+class _P8Clock:
+    """time.monotonic moved forward by hand, for checks that span minutes."""
+    def __init__(self):
+        self.real = time.monotonic; self.offset = 0.0
+    def __enter__(self):
+        time.monotonic = lambda: self.real() + self.offset
+        return self
+    def __exit__(self, *a):
+        time.monotonic = self.real
+
+
+section("L2 pass 8 a security change made in Desktop Mode shows on the Force 6 GHz row and the WPA2 notice within a minute")
+try:
+    _U82 = "u-82"
+    class _P82(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.km = "wpa-psk"; self.km_reads = 0; self._nm_version_seen = (1, 58, 0)
+        def _nm_version(self): return (1, 58, 0)
+        def _profile_key_mgmt(self, uuid):
+            self.km_reads += 1; return self.km
+        def _read_profile_field(self, uuid, field, timeout=5): return ""
+        def _visible_access_points(self, iface, ssid, rescan=False, cached_only=False):
+            return [("02:00:00:00:00:61", 80, 5955, "WPA3")]
+        def _recheck_address_conflict(self, ip): pass
+        def _wpa2_finding(self, iface, ssid, current_bssid, settings):
+            return {"bssid_tail": "00:71", "signal": 90}
+    m._save_settings({**m.DEFAULT_SETTINGS, "supports_6ghz": True, "distro_id": "steamos"})
+
+    def _p82_row(p):
+        st = {"live": {"wifi_backend": "wpa_supplicant"}}
+        p._report_six_ghz(m._load_settings(), st, _U82, "", "wlan0", "Net")
+        return st["live"].get("six_ghz_refusal")
+    _logged82 = []
+    _info82 = m.decky.logger.info
+    with _P8Clock() as _c82:
+        try:
+            m.decky.logger.info = staticmethod(lambda msg: _logged82.append(msg))
+            _p82 = _P82()
+            _a82 = _p82_row(_p82)
+            _p82.km = "sae"            # set to WPA3 Personal in Desktop Mode, as the row says
+            _c82.offset += 30
+            _b82 = _p82_row(_p82)
+            _c82.offset += 31
+            _d82 = _p82_row(_p82)
+            ok(bool(_a82) and _d82 is None,
+               f"refused, then 61 s after the profile became WPA3 the status no longer refuses ({_a82!r} -> {_d82!r})")
+            # The reassertion (quiet=False) keeps its 600 s, so its log line stays rare.
+            _p82r = _P82()
+            for _step in (0, 61, 239, 298):          # at 0, 61, 300 and 598 s
+                _c82.offset += _step
+                _p82r._six_ghz_refusal_cached(_U82, quiet=False)
+            _n82 = sum(1 for l in _logged82 if l.startswith("Refusing band '6GHz'"))
+            _c82.offset += 3                         # 601 s
+            _p82r._six_ghz_refusal_cached(_U82, quiet=False)
+            _n82b = sum(1 for l in _logged82 if l.startswith("Refusing band '6GHz'"))
+            ok(_n82 == 1 and _n82b == 2,
+               f"the reassertion logs its refusal once in 600 s, and again after ({_n82}, {_n82b})")
+
+            # The WPA2-reach notice: up while the profile is WPA3 only.
+            _p82w = _P82(); _p82w.km = "sae"
+            def _p82_reach(p):
+                st = {"live": {"connected_bssid": "02:00:00:00:00:11", "bssid_lock": ""}}
+                p._report_network_problems(st, _U82, "wlan0", "Net", {})
+                return st.get("wpa2_only_stronger")
+            _e82 = _p82_reach(_p82w)
+            _r0 = _p82w.km_reads
+            _c82.offset += 30
+            _f82 = _p82_reach(_p82w)
+            _r30 = _p82w.km_reads - _r0
+            _p82w.km = "wpa-psk"       # WPA2 allowed in Desktop Mode
+            _c82.offset += 31
+            _g82 = _p82_reach(_p82w)
+            ok(bool(_e82) and bool(_f82) and _g82 is None,
+               f"the WPA2 notice goes 61 s after WPA2 was allowed outside the plugin ({_e82} -> {_g82})")
+            ok(_r30 == 0, f"and its security is not read more than once a minute ({_r30} reads in 30 s)")
+        finally:
+            m.decky.logger.info = _info82
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+def _p8_playing_fn():
+    us = m.UPDATE_SCRIPT
+    fn = us[us.index("playing() {"):]
+    return fn[:fn.index("\n}\n") + 3].replace("/run/wifi-optimizer/streaming", "/nonexistent/wo-streaming")
+
+
+section("L3 pass 8 a pgrep the update script left behind cannot write over a later answer")
+try:
+    if not os.path.exists("/bin/bash"):
+        print("SKIP  no /bin/bash here")
+    else:
+        _d83 = tempfile.mkdtemp()
+        os.mkdir(os.path.join(_d83, "bin"))
+        # Call 1: stuck 3.5 s (past playing()'s 3 s), then lists only the
+        # plugin's backend. Call 2: lists the game at once, exits 1 s later.
+        open(os.path.join(_d83, "bin", "pgrep"), "w").write(
+            '#!/bin/bash\n'
+            'n=$(cat "$RACE_DIR/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$RACE_DIR/n"\n'
+            'if [ "$n" = 1 ]; then sleep 3.5; echo "$RACE_OWNER"; exit 0; fi\n'
+            'echo "$RACE_GAME"; sleep 1; exit 0\n')
+        os.chmod(os.path.join(_d83, "bin", "pgrep"), 0o755)
+        _game83 = _p8_sp.Popen(["sleep", "30"])
+        try:
+            _g83 = str(_game83.pid)
+            # A backend pid of the same length as the game's, so the old list
+            # lands exactly over the new one.
+            _own83 = str(_game83.pid - 1) if len(str(_game83.pid - 1)) == len(_g83) else str(_game83.pid + 1)
+            _body83 = (f"STREAM_PATTERNS='moonlight'\nOWNER={_own83}\nTMP=$(mktemp -d) || exit 1\n"
+                       "trap 'rm -rf \"$TMP\"' EXIT\n" + _p8_playing_fn()
+                       + 'if playing; then echo "1 yes"; else echo "1 no"; fi\n'
+                       + 'if playing; then echo "2 yes"; else echo "2 no"; fi\n')
+            _o83 = _p8_sp.run(["/bin/bash", "-c", _body83], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "PATH": os.path.join(_d83, "bin") + ":" + os.environ.get("PATH", ""),
+                                   "RACE_DIR": _d83, "RACE_OWNER": _own83, "RACE_GAME": _g83}).stdout.split("\n")
+            time.sleep(0.6)    # the stale pgrep has ended by now
+        finally:
+            _game83.kill(); _game83.wait()
+        ok("2 yes" in _o83,
+           f"the second call, with the game listed and the first pgrep ending during it, is playing ({_o83})")
+        ok(m.UPDATE_SCRIPT.count('"$TMP/pids-$PLAYING_CALLS"') == 3 and '"$TMP/pids"' not in m.UPDATE_SCRIPT,
+           "each call writes, marks and reads its own answer file")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L4 pass 8 an update refused at the tap names the button to tap again")
+try:
+    _t84 = ast.parse(open(m.__file__).read())
+    _f84 = next(n for n in ast.walk(_t84) if isinstance(n, ast.AsyncFunctionDef) and n.name == "apply_update")
+    _s84 = [n.value for n in ast.walk(_f84) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    ok("The update on offer changed. Tap Update again." in _s84
+       and "Couldn't start the update. Tap Update again." in _s84,
+       "the changed offer and a malformed approval both say to tap Update again")
+    ok(not any("Check again" in t or "Check for updates again" in t for t in _s84),
+       "and none sends the user to Check for updates, hidden while an offer is shown")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L5 pass 8 the update script does not take a kernel thread for a game")
+try:
+    if not os.path.exists("/bin/bash"):
+        print("SKIP  no /bin/bash here")
+    else:
+        def _p85(pid, status, cmdline=b""):
+            """playing() over a /proc fixture holding one process, the one pgrep lists."""
+            proc = tempfile.mkdtemp(); binn = tempfile.mkdtemp()
+            if status is not None:
+                os.mkdir(os.path.join(proc, pid))
+                open(os.path.join(proc, pid, "cmdline"), "wb").write(cmdline)
+                open(os.path.join(proc, pid, "status"), "w").write(status)
+            open(os.path.join(binn, "pgrep"), "w").write(f"#!/bin/sh\necho {pid}\nexit 0\n")
+            os.chmod(os.path.join(binn, "pgrep"), 0o755)
+            body = ("STREAM_PATTERNS='thread'\nOWNER=''\nTMP=$(mktemp -d) || exit 1\n"
+                    "trap 'rm -rf \"$TMP\"' EXIT\n" + _p8_playing_fn().replace("/proc/", proc + "/")
+                    + "if playing; then echo yes; else echo no; fi\n")
+            return _p8_sp.run(["/bin/bash", "-c", body], capture_output=True, text=True, timeout=30,
+                              env={**os.environ, "PATH": binn + ":" + os.environ.get("PATH", "")}).stdout.strip()
+        _k85 = _p85("4", "Name:\tkworker/0:0-thread\nState:\tI (idle)\nPPid:\t2\n")
+        ok(_k85 == "no", f"a kernel thread (empty command line, PPid 2) is no game ({_k85})")
+        _k85 = _p85("2", "Name:\tkthreadd\nState:\tS (sleeping)\nPPid:\t0\n")
+        ok(_k85 == "no", f"nor kthreadd itself ({_k85})")
+        _k85 = _p85("4", "Name:\tthreadtool\nState:\tZ (zombie)\nPPid:\t4321\n")
+        ok(_k85 == "yes", f"an empty command line under another parent still counts as playing ({_k85})")
+        _k85 = _p85("4", None)
+        ok(_k85 == "yes", f"and so does a process gone before it could be read ({_k85})")
+        _k85 = _p85("4", "Name:\tthreadgame\nPPid:\t2\n", b"/usr/bin/threadgame\0")
+        ok(_k85 == "yes", f"a process with a command line is never skipped as a kernel thread ({_k85})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L7 pass 8 an uninstall in the first seconds after a load is not undone by startup")
+try:
+    _d87, _restore87 = _l_paths()
+    try:
+        class _L87(_LReset):
+            async def get_device_info(self):
+                await asyncio.sleep(1.0)     # startup still asking the card when uninstall comes
+                return await _LReset.get_device_info(self)
+        m._save_settings({**base_ap, "regdomain": "DE"})
+        _p87 = _L87()
+
+        async def _l87_race():
+            t = asyncio.ensure_future(_p87._main())
+            await asyncio.sleep(0.2)
+            await _p87._unload()
+            await _p87._uninstall()
+            await asyncio.sleep(2.5)
+            if not t.done():
+                t.cancel()
+        asyncio.run(_l87_race())
+        _reg87 = [c for c in _p87.cmds if list(c[:3]) == ["/usr/bin/iw", "reg", "set"]]
+        ok(not os.path.exists(m.SETTINGS_FILE) and not os.path.isdir(os.path.dirname(m.SETTINGS_FILE)),
+           f"2.5 s after uninstall no settings file and no settings folder "
+           f"({os.path.exists(m.SETTINGS_FILE)}, {os.path.isdir(os.path.dirname(m.SETTINGS_FILE))})")
+        ok(not _reg87, f"and startup set no region after the teardown released it ({_reg87})")
+        ok(getattr(_p87, "_stranded_task", None) is None, "nor started the background watch")
+    finally:
+        _restore87()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L8 pass 8 a process search slower than the wait still lets the after-wake move go at the next pass")
+try:
+    class _P88(m.Plugin):
+        def _read_processes(self, progress=None, skip=frozenset()):
+            time.sleep(2.5)            # longer than PROC_SCAN_WAIT_SECONDS
+            return [("100", b"bash\0", "1", "bash")]
+    _s88 = dict(m.DEFAULT_SETTINGS)
+    with _P8Clock() as _c88:
+        _p88 = _P88()
+        _ask88 = getattr(_p88, "_wake_game_or_stream_known", _p88._game_or_stream_known)
+        _a88 = _ask88(_s88)
+        time.sleep(0.8)                # that pass's search ends
+        _c88.offset += 20              # the watch's next pass
+        _b88 = _ask88(_s88)
+        ok(_a88 is None and _b88 is False,
+           f"a 2.5 s search, passes 20 s apart: the second pass knows nothing is running ({_a88}, {_b88})")
+        _p88e = _P88()
+        _ask88 = getattr(_p88e, "_wake_game_or_stream_known", _p88e._game_or_stream_known)
+        _a88 = _ask88(_s88)
+        _p88e._app_event_at = time.monotonic()   # Steam started a game after that search started
+        time.sleep(0.8)
+        _c88.offset += 20
+        _b88 = _ask88(_s88)
+        ok(_a88 is None and _b88 is None,
+           f"with a game started or stopped after that search started, still not known ({_a88}, {_b88})")
+    _t88 = ast.parse(open(m.__file__).read())
+    _f88 = next(n for n in ast.walk(_t88) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_move_lock_after_wake")
+    ok(any(isinstance(n, ast.Attribute) and n.attr == "_wake_game_or_stream_known" for n in ast.walk(_f88)),
+       "the after-wake move asks that way")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L9 pass 8 Optimize Safe is refused up front during a profile change")
+try:
+    class _P89(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.ran = []
+        async def set_auto_fix(self, *a, **k): self.ran.append("auto_fix"); return {"success": True}
+        async def set_buffer_tuning(self, *a, **k): self.ran.append("buffer"); return {"success": True}
+        async def set_bssid_lock(self, *a, **k): self.ran.append("lock"); return {"success": True}
+        async def set_power_save(self, *a, **k): self.ran.append("power_save"); return {"success": True}
+        def _install_dispatcher(self, *a, **k): self.ran.append("dispatcher"); return True
+        def _backend_is_iwd(self): return False
+        def _lock_holding(self): return False
+        def _lock_held_elsewhere(self): return False
+    m._save_settings({**base_ap, "last_applied": 1234})
+    _p89 = _P89(); _p89._profile_change_depth = 1
+    _r89 = asyncio.run(_p89.optimize_safe())
+    ok(_r89 == _p89._busy_result() and _r89.get("success") is False,
+       f"with a profile change under way it returns the busy result ({_r89})")
+    ok(_p89.ran == [] and m._load_settings().get("last_applied") == 1234,
+       f"runs no applier and leaves Last changed ({_p89.ran})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L10 pass 8 a USB adapter's driver does not replace the built-in card's at a load or Reset")
+try:
+    _sys810 = m.SYSFS_NET
+    _d810, _restore810 = _l_paths()
+    try:
+        def _p810_netdev(bus, module):
+            root = tempfile.mkdtemp()
+            m.SYSFS_NET = os.path.join(root, "net")
+            dev = os.path.join(root, "devices", "dev0")
+            os.makedirs(os.path.join(m.SYSFS_NET, "wlan1", "phy80211"))
+            os.makedirs(dev); os.makedirs(os.path.join(root, "bus", bus))
+            os.makedirs(os.path.join(root, "module", module))
+            os.makedirs(os.path.join(dev, "driver"))
+            os.symlink(os.path.join(root, "bus", bus), os.path.join(dev, "subsystem"))
+            os.symlink(os.path.join(root, "module", module), os.path.join(dev, "driver", "module"))
+            os.symlink(dev, os.path.join(m.SYSFS_NET, "wlan1", "device"))
+
+        class _L810(_LReset):
+            get_device_info = m.Plugin.get_device_info
+            def _get_wifi_interface(self): return "wlan1"
+            def _detect_device_family(self): return ("Jupiter", "deck_lcd", "Steam Deck LCD")
+        _got810 = {}
+        _p810_netdev("usb", "rtw89_8852bu")
+        _base810 = {k: v for k, v in base_ap.items() if k not in ("driver", "chip_label")}
+        m._save_settings({**_base810, "driver": "mt7921e"})
+        asyncio.run(_L810()._main())
+        _got810["load, USB only"] = m._load_settings().get("driver")
+        asyncio.run(_L810().reset_settings())
+        _got810["Reset, USB only"] = m._load_settings().get("driver")
+        m._save_settings({**_base810, "driver": ""})
+        asyncio.run(_L810()._main())
+        _got810["load, none saved"] = m._load_settings().get("driver")
+        _p810_netdev("pci", "rtw89_8852be")
+        m._save_settings({**_base810, "driver": "mt7921e"})
+        asyncio.run(_L810()._main())
+        _got810["load, card on PCI"] = m._load_settings().get("driver")
+        ok(_got810 == {"load, USB only": "mt7921e", "Reset, USB only": "mt7921e",
+                       "load, none saved": "rtw89", "load, card on PCI": "rtw89"},
+           f"the built-in card's driver is kept while only a USB adapter is there; taken with none "
+           f"saved or a card on PCI ({_got810})")
+    finally:
+        _restore810()
+        m.SYSFS_NET = _sys810
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L11 pass 8 a failed settings save gives one piece of advice, with its cause, and a folder at the name is set aside (C27)")
+try:
+    _sf811 = m.SETTINGS_FILE
+    _st811 = dict(m._SETTINGS_STATE)
+    try:
+        m.SETTINGS_FILE = os.path.join(tempfile.mkdtemp(), "settings.json")
+        os.mkdir(m.SETTINGS_FILE)
+        _s811 = m._load_settings(); _s811["update_notify"] = False
+        try:
+            m._save_settings(_s811); _e811 = None
+        except Exception as _x:
+            _e811 = _x
+        ok(_e811 is None and os.path.isfile(m.SETTINGS_FILE)
+           and m._load_settings().get("update_notify") is False
+           and os.path.isdir(m.SETTINGS_FILE + ".corrupt"),
+           f"a folder at settings.json is set aside and the save goes on ({_e811})")
+        ok(not m.Plugin()._with_activity({"live": {}}).get("settings_unwritable"),
+           "and nothing says the settings could not be saved")
+        # Something real at the .corrupt name stays, and the save fails as "other".
+        os.remove(m.SETTINGS_FILE); os.rmdir(m.SETTINGS_FILE + ".corrupt")
+        open(m.SETTINGS_FILE + ".corrupt", "w").write("the user's old settings")
+        os.mkdir(m.SETTINGS_FILE)
+        try:
+            m._save_settings(m._load_settings()); _e811 = None
+        except Exception as _x:
+            _e811 = _x
+        _w811 = m.Plugin()._with_activity({"live": {}})
+        ok(isinstance(_e811, m.SettingsSaveError)
+           and open(m.SETTINGS_FILE + ".corrupt").read() == "the user's old settings",
+           f"with a file already set aside it is kept, and the save fails ({_e811})")
+        ok(_w811.get("settings_unwritable") is True and _w811.get("settings_unwritable_cause") == "other",
+           f"said with cause 'other' ({_w811.get('settings_unwritable_cause')})")
+        os.rmdir(m.SETTINGS_FILE)
+        # A full disk.
+        _wr811 = m._write_settings
+        try:
+            def _full(data):
+                raise OSError(28, "No space left on device")
+            m._write_settings = _full
+            try:
+                m._save_settings(m._load_settings())
+            except m.SettingsSaveError:
+                pass
+            _w811 = m.Plugin()._with_activity({"live": {}})
+        finally:
+            m._write_settings = _wr811
+        ok(_w811.get("settings_unwritable") is True and _w811.get("settings_unwritable_cause") == "space",
+           f"a full disk: cause 'space' ({_w811.get('settings_unwritable_cause')})")
+        m._save_settings(m._load_settings())
+        _w811 = m.Plugin()._with_activity({"live": {}})
+        ok("settings_unwritable_cause" not in _w811, "and no cause once a save lands")
+        _m811 = m.Plugin()._unexpected_response(m.SettingsSaveError("x")).get("message")
+        ok(_m811 == "Couldn't save the plugin's settings. See the notice at the top.",
+           f"the control's message points at the notice and gives no advice of its own ({_m811!r})")
+    finally:
+        m.SETTINGS_FILE = _sf811
+        m._SETTINGS_STATE.clear(); m._SETTINGS_STATE.update(_st811)
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L12 pass 8 the PMF refusal points at the README's command")
+try:
+    class _P812(m.Plugin):
+        def _nm_version(self): return (1, 58, 1)
+        def _profile_key_mgmt(self, uuid): return "wpa-psk"
+        def _read_profile_field(self, uuid, field, timeout=5):
+            return "1 (disable)" if field == "802-11-wireless-security.pmf" else ""
+    m._save_settings({**m.DEFAULT_SETTINGS, "supports_6ghz": True, "distro_id": "steamos"})
+    _r812 = (_P812()._six_ghz_refusal("u-812", quiet=True) or {}).get("message", "")
+    ok(_r812 == "This network is saved with protected management frames off, and 6 GHz needs them. "
+               "The README's Force 6 GHz row has the command to turn them on.",
+       f"the refusal ({_r812!r})")
+    ok("Change it in Desktop" not in open(m.__file__).read(), "and nothing says 'Change it in Desktop Mode'")
+    ok("802-11-wireless-security.pmf default" in open("README.md").read(),
+       "the README's row has that command")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L13 L14 L15 pass 8 texts")
+try:
+    _src813 = open(m.__file__).read()
+    ok(_src813.count('"Received an unexpected version from GitHub. Report it on GitHub."') == 2
+       and "This release isn't signed, so it wasn't installed. Report it on GitHub." in _src813
+       and "This release's signature didn't check out, so it wasn't installed. Report it on GitHub." in _src813
+       and "This release isn't signed properly, so it wasn't installed. Report it on GitHub." in _src813,
+       "L13: the update refusals a user can do nothing about say to report it")
+    ok("Some PCIe power saving couldn't be turned off. The rest of this fix applied." in _src813,
+       "L14: the PCIe note says the rest of this fix applied")
+    ok("Couldn't install the auto-fix script. Restart the device, then try again." in _src813
+       and "The filesystem may be read-only." not in _src813,
+       "L15: the auto-fix install failure says what to do, as the panel's own text")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
