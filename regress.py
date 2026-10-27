@@ -6846,12 +6846,22 @@ exec /bin/bash "$0" "$@"
         # checks above would pass with a pgrep that finds nothing at all.
         _r1_bin = tempfile.mkdtemp()
         _r1_moon = os.path.join(_r1_bin, "moonlight")
-        _r1_sh.copy(_r1_sh.which("sleep"), _r1_moon)
+        # perl titles itself: a copy of sleep named moonlight is no stand-in
+        # where sleep is a multi-call binary (Ubuntu 26.04's coreutils), which
+        # refuses a name it does not know and exits at once.
+        _r1_perl = _r1_sh.which("perl")
+        ok(bool(_r1_perl), "perl is here to stand in for a stream")
         # Started by a bash that exits at once: not a child of this process,
         # which apply_update names to the script as the plugin backend, whose
         # own children are never a stream (pass 5 L6).
-        _r1_mp = int(_r1_sp.run(["/bin/bash", "-c", f"{_r1_moon} 120 >/dev/null 2>&1 </dev/null & echo $!"],
+        _r1_mp = int(_r1_sp.run(["/bin/bash", "-c",
+                                 f"{_r1_perl} -e '$0 = \"{_r1_moon} 120\"; sleep 120' "
+                                 f">/dev/null 2>&1 </dev/null & echo $!"],
                                 capture_output=True, text=True, timeout=10).stdout.strip())
+        time.sleep(0.5)
+        ok(os.path.exists(f"/proc/{_r1_mp}")
+           and "moonlight" in open(f"/proc/{_r1_mp}/cmdline").read(),
+           "the stand-in stream is running, titled moonlight")
         try:
             _r1_o = _r1_run(dict(m.DEFAULT_SETTINGS))
         finally:
