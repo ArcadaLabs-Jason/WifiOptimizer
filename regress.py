@@ -12412,6 +12412,24 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("F8 pass 8 with WiFi down, the status banners come first, above the wake notice and the update offer")
+try:
+    _p8f_ret = _F_IX[_F_IX.find("<PanelHeader"):]
+    _p8f_at = {k: _p8f_ret.find(v) for k, v in {
+        "read failed": "{status?.success === false && (",
+        "disconnected": "<Banner variant=\"error\">{disconnectedText}</Banner>",
+        "stuck iw": "<Banner variant=\"warning\">{NOT_RESPONDING_TEXT}</Banner>",
+        "wake notice": "<WakeFailureNotice />",
+        "update offer": "{updateInfo?.update_available && !updating && (",
+        "settings banner": "{(status?.settings_unwritable || status?.settings_link_refused) && (",
+    }.items()}
+    ok(all(v > 0 for v in _p8f_at.values()), f"every block is rendered ({_p8f_at})")
+    ok(all(_p8f_at[a] < _p8f_at[b] for a in ("read failed", "disconnected", "stuck iw")
+           for b in ("wake notice", "update offer", "settings banner")),
+       f"the status read, disconnected and stuck-iw banners come before the rest ({_p8f_at})")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 # ---- QA pass 3 merge: where two owners' work meets ----
 section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
 # The dispatcher records the system's PCIe values only while last_enforced is

@@ -1506,6 +1506,28 @@ function Content() {
         connected={connected}
       />
 
+      {/* The WiFi state comes first, right under the header: with WiFi
+          dead, an update offer or a wake notice above it led to an action
+          that cannot work offline. */}
+      {/* Status read failed - say so rather than claiming disconnection */}
+      {status?.success === false && (
+        <Banner variant="error">
+          {status?.message ?? "Couldn't read WiFi status."} The panel keeps
+          trying. If this stays, restart the device.
+        </Banner>
+      )}
+
+      {/* Disconnected banner. A dead or missing card is not something
+          connecting fixes, so it says what to do for each case. */}
+      {status?.success !== false && !connected && (
+        <Banner variant="error">{disconnectedText}</Banner>
+      )}
+      {/* NetworkManager can still say connected while an iw is stuck in the
+          driver (C1 (c)), and nothing then works until a restart. */}
+      {status?.success !== false && connected && status?.live?.wifi_state === "not_responding" && (
+        <Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>
+      )}
+
       {/* A status read failed after the panel had loaded. What is shown is
           the last status that came through. */}
       {statusFailed && (
@@ -1801,25 +1823,6 @@ function Content() {
             </PanelSectionRow>
           )}
         </PanelSection>
-      )}
-
-      {/* Status read failed - say so rather than claiming disconnection */}
-      {status?.success === false && (
-        <Banner variant="error">
-          {status?.message ?? "Couldn't read WiFi status."} The panel keeps
-          trying. If this stays, restart the device.
-        </Banner>
-      )}
-
-      {/* Disconnected banner. A dead or missing card is not something
-          connecting fixes, so it says what to do for each case. */}
-      {status?.success !== false && !connected && (
-        <Banner variant="error">{disconnectedText}</Banner>
-      )}
-      {/* NetworkManager can still say connected while an iw is stuck in the
-          driver (C1 (c)), and nothing then works until a restart. */}
-      {status?.success !== false && connected && status?.live?.wifi_state === "not_responding" && (
-        <Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>
       )}
 
       {/* Backend switch result banner */}
