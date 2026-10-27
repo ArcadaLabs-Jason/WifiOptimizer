@@ -5,7 +5,7 @@
   "api_version": 1,
   "publish": {
     "tags": ["wifi", "network", "optimization", "streaming", "moonlight", "handheld"],
-    "description": "WiFi optimizations for game streaming. Survives sleep and updates.",
+    "description": "WiFi optimizations for game streaming and online play. Survives sleep and updates.",
     "image": ""
   }
 }

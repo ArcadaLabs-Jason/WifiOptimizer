@@ -1,7 +1,7 @@
 {
   "name": "wifi-optimizer",
   "version": "0.24.6-beta",
-  "description": "WiFi optimizer for game streaming on Steam Deck and PC handhelds",
+  "description": "WiFi optimizer for game streaming and online play on Steam Deck and PC handhelds",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
