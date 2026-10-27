@@ -39,7 +39,7 @@ export function PanelHeader({
     ? deviceLabel
     : driver && driver !== "unknown"
       ? driver
-      : "Unrecognized hardware";
+      : "Unknown WiFi card";
   const rowStyle: React.CSSProperties = {
     fontSize: theme.fontSize.tiny,
     color: theme.text.muted,

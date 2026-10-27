@@ -6,8 +6,7 @@ interface ActionsSectionProps {
   isBusy: boolean;
   onForceReapply: () => void;
   onReset: () => void;
-  // Reset's outcome when it failed. Force Reapply reports through the
-  // result banner at the top of the panel, like Optimize Safe.
+  // Reset's outcome when it failed.
   resetError?: string | null;
   // Reset's outcome when it worked.
   resetNotice?: string | null;
@@ -16,6 +15,10 @@ interface ActionsSectionProps {
   resetNoticeInfo?: boolean;
   // Said here while Force Reapply or Reset runs, where the button was pressed.
   workingText?: string | null;
+  // Force reapply's outcome, refusals included: the result banner at the top
+  // of the panel says it too, but is off screen from here. Same text, tone
+  // and expiry as that banner.
+  reapplyResult?: { variant: "success" | "warning" | "error" | "info"; text: string } | null;
 }
 
 export function ActionsSection({
@@ -27,6 +30,7 @@ export function ActionsSection({
   resetNotice,
   resetNoticeInfo,
   workingText,
+  reapplyResult,
 }: ActionsSectionProps) {
   return (
     <PanelSection title="Actions">
@@ -48,6 +52,13 @@ export function ActionsSection({
         <PanelSectionRow>
           <div style={{ fontSize: theme.fontSize.small, color: theme.info.text }}>
             {workingText}
+          </div>
+        </PanelSectionRow>
+      )}
+      {!workingText && reapplyResult && (
+        <PanelSectionRow>
+          <div style={{ fontSize: theme.fontSize.small, color: theme[reapplyResult.variant].text }}>
+            {reapplyResult.text}
           </div>
         </PanelSectionRow>
       )}

@@ -53,12 +53,16 @@ export interface LiveStatus {
   /** The card and NetworkManager can hold a network to 6 GHz. */
   six_ghz_offered?: boolean;
   /** Why Force 6 GHz would be refused for the network in use, while the band
-   * is not 6 GHz already (C14). The panel shows the row disabled with it. */
+   * is not 6 GHz already and a 6 GHz access point of this network is in
+   * NetworkManager's cached list (C21). The panel shows the row disabled with
+   * it; absent, the row stays enabled. */
   six_ghz_refusal?: string;
-  /** For 120 s after the lock moved by itself after a wake and reconnected
-   * (C13): "moved" onto the stronger access point, or "back" on the previous
-   * one after the stronger refused. */
-  lock_move_after_wake?: { outcome: "moved" | "back"; at: number };
+  /** What the lock's move by itself after a wake came to (C13, C22): "moved"
+   * onto the stronger access point, "back" on the previous one after the
+   * stronger refused, or "off" when the previous one could not be put back
+   * and the lock was turned off. Kept until the user next acts on the lock,
+   * at most 12 h; "at" is in Unix seconds. */
+  lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };
   buffer_tuning_applied?: boolean;
   cake_applied?: boolean;
   dispatcher_installed?: boolean;
@@ -265,7 +269,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
     "The settings file can't be read or replaced. Remove ~/homebrew/settings/WiFi Optimizer/settings.json, then try Reset again.",
   // Shown while the backend reports settings_recovered.
   parse_error:
-    "The settings file could not be read, so settings went back to their defaults. Turn your settings back on, or tap Optimize Safe. The old file was kept as settings.json.corrupt.",
+    "Your settings file couldn't be read, so settings are back to their defaults. Turn them back on, or select Optimize Safe.",
   unexpected: "Something went wrong. Try again. If it keeps happening, use Copy diagnostics at the bottom of this panel and report it.",
 };
 

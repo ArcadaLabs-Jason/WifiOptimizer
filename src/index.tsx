@@ -50,7 +50,7 @@ import {
   startUpdateNotices,
 } from "./updateWatch";
 import { theme } from "./theme";
-import { NoAnswer, withTimeout } from "./utils";
+import { NoAnswer, timeAgo, withTimeout } from "./utils";
 
 const REFRESH_INTERVAL = 3000;
 const RECONNECT_DELAY = 4000;
@@ -77,9 +77,26 @@ const BACKEND_RESULT_MS = 60 * 1000;
 // read as the current state.
 const MESSAGE_TTL_MS = 2 * 60 * 1000;
 // Shown on the lock and band toggles while the iwd backend is in use:
-// NetworkManager can't reconnect a network pinned this way under iwd.
+// NetworkManager can't reconnect a network pinned this way under iwd. "Paused"
+// only for a setting that is on; one that is off says what it needs.
 const IWD_PIN_NOTICE = "Paused under iwd. Switch to wpa_supplicant in Advanced to use it.";
+const IWD_OFF_NOTICE = "Needs wpa_supplicant. Switch to it in Advanced.";
 const BACKEND_POLL_MAX_FAILURES = 5;
+// The lock moves by itself after a wake only on drivers whose names start
+// with this, the Steam Deck OLED's ath11k, the one card it was measured on
+// (C25, the same test as the backend's).
+const WAKE_MOVE_DRIVER = "ath11k";
+// How long the backend keeps an after-wake move's outcome at most (C22).
+const WAKE_MOVE_KEPT_S = 12 * 60 * 60;
+// The lock row's line for an after-wake move's outcome, once its banner is
+// gone (C22).
+function wakeMoveRowText(outcome: "moved" | "back" | "off", at: number): string | undefined {
+  const ago = timeAgo(at);
+  if (outcome === "moved") return `Moved to a stronger access point after sleep, ${ago}.`;
+  if (outcome === "back") return `Stayed after sleep: the stronger access point refused, ${ago}.`;
+  if (outcome === "off") return `Turned off after sleep: it couldn't move or go back, ${ago}.`;
+  return undefined;
+}
 // An iw stuck in the driver, or a card the system can no longer use. Copy
 // diagnostics first: after the restart they show the healthy boot's link and
 // NetworkManager state, not the failed one's.
@@ -87,16 +104,18 @@ const NOT_RESPONDING_TEXT =
   "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device.";
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
-// Prevent lag spikes is saved as off, so it does not come back by itself.
-// The network settings are written to the saved networks without a
-// reconnect, so the connection in use keeps them until WiFi next connects.
-// The update channel and notices are kept (main.py _reset_locked), and
-// streaming auto mode starts again from its defaults. Allow WPA2 is only
-// recorded from 0.24.5-beta on (wpa2_uuids), so one allowed on 0.23.0 to
-// 0.24.4-beta stays allowed, and the text says so. The detail (the buffer
-// and region values, the command for the rest) is in the README.
+// Auto-fix on wake stays on, as on a fresh install (main.py _reset_locked),
+// with nothing left for it to apply. The network settings are written to
+// the saved networks without a reconnect, so the connection in use keeps
+// them until WiFi next connects. The update channel and notices are kept,
+// and streaming auto mode starts again from its defaults. Allow WPA2 is only
+// recorded from 0.24.5-beta on (wpa2_uuids); that, the buffer and region
+// values and the command for the rest are in the README, not here.
 const RESET_CONFIRM_TEXT =
-  "Turns off everything the plugin applied. Prevent lag spikes stays off until you turn it on. The lock, band, DNS, IPv6 and Allow WPA2 come off your networks at the next connect (Allow WPA2 only if allowed on 0.24.5-beta or later). Streaming auto mode is cleared. Update settings are kept.";
+  "Turns off every fix except Auto-fix on wake, which then applies nothing. The lock, band, DNS, IPv6 and Allow WPA2 come off your networks at the next connect. Streaming auto mode is cleared. Update settings are kept.";
+// Move the lock often finds nothing clearly stronger and stays put, with no
+// reconnect, so its button does not promise one.
+const MOVE_WORKING_TEXT = "Working, WiFi may reconnect...";
 // Reset does not reconnect, so it does not say WiFi will.
 const RESET_WORKING_TEXT = "Working...";
 const RESET_DONE_TEXT = "Done. Settings are reset.";
@@ -166,6 +185,34 @@ const UPDATE_FAILED_TEXT =
   "The update didn't finish. Try again. If it fails again, restart the device.";
 const UPDATE_SLOW_TEXT =
   "The update is taking too long. Restart the device, then check the version at the bottom of this panel. If it didn't change, try the update again.";
+// The update call itself failed (Decky restarting, say) and the script
+// reports nothing: no update is running, so the panel says so at once
+// instead of "Starting the update..." for UPDATE_TIMEOUT_MS.
+const UPDATE_NOT_STARTED_TEXT = "Couldn't start the update. Try again in a moment.";
+// The phases of a script that is still running (UPDATE_ACTIVE_PHASES in
+// main.py).
+const UPDATE_RUNNING_PHASES = ["downloading", "installing", "swapped", "loaded", "restarting"];
+// The script writes its first phase within moments of starting, so this
+// long after a failed call an update that did start has said so.
+const UPDATE_START_LOOK_MS = 3000;
+const UPDATE_LOOK_TIMEOUT_MS = 20 * 1000;
+
+// After a failed apply_update call: whether the update script started for
+// this version anyway. One bounded look at what it reports. Anything that
+// cannot be read counts as started, so the watch follows it as before.
+async function updateStarted(version: string): Promise<boolean> {
+  await new Promise((r) => setTimeout(r, UPDATE_START_LOOK_MS));
+  try {
+    const progress = await withTimeout(backend.getUpdateProgress(), UPDATE_LOOK_TIMEOUT_MS);
+    if (!progress?.success) return true;
+    if (UPDATE_RUNNING_PHASES.includes(progress.phase)) return true;
+    // "done" or "failed" for this version is this update's own outcome;
+    // the watch shows it. Nothing at all, or another version's, is none.
+    return !!progress.phase && progress.version === version;
+  } catch {
+    return true;
+  }
+}
 // Long enough for the reloaded backend to have answered the update script,
 // so a finished update is announced rather than mistaken for a running one.
 const ANNOUNCE_DELAY_MS = 4000;
@@ -188,6 +235,47 @@ function updatingText(progress: UpdateProgress | null): string {
     default:
       return "Starting the update...";
   }
+}
+
+type ResultView = { variant: "success" | "warning" | "error" | "info"; text: string };
+
+// What Optimize Safe, Fix now or Force reapply came to, in one line. where:
+// on which side of the settings it is shown, for the failed ones it points
+// at. Only Optimize Safe saves anything, so only it says "Saved." for fixes
+// streaming auto mode holds back.
+function batchResultView(
+  result: OptimizeSafeResult,
+  from: "optimize" | "fix" | "reapply" | null,
+  where: "below" | "above",
+): ResultView {
+  // A failure has no counts at all, and undefined === undefined made it
+  // read as "All applied".
+  if (result.success === false) {
+    return { variant: "error", text: result.message ?? GENERIC_FAIL_TEXT };
+  }
+  if (!result.total) {
+    return { variant: "info", text: result.message ?? "Nothing to apply." };
+  }
+  const all = result.applied === result.total;
+  // In streaming auto mode with no stream running, these were saved but
+  // not applied, so "All applied" was not true.
+  const paused = Object.entries(result.results ?? {})
+    .filter(([, v]) => isResult(v) && v.success && v.paused)
+    .map(([k]) => DRIFT_LABELS[k] ?? k);
+  const pausedText = paused.length
+    ? `${joinNames(paused)} ${paused.length > 1 ? "apply" : "applies"} only while a streaming app is running.`
+    : "";
+  if (all && paused.length) {
+    return { variant: "info", text: from === "optimize" ? `Saved. ${pausedText}` : pausedText };
+  }
+  return all
+    ? { variant: "success", text: "All applied" }
+    : {
+        variant: "warning",
+        text: `${result.applied} of ${result.total} applied. The settings marked failed ${where} say why.${
+          pausedText ? " " + pausedText : ""
+        }`,
+      };
 }
 
 function getBadge(
@@ -355,6 +443,10 @@ function Content() {
   const [dupDismissed, setDupDismissed] = useState(duplicatesDismissed);
   const [dismissed, setDismissed] = useState(findingsDismissed);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeSafeResult | null>(null);
+  // Which button the result above is for. Force reapply's is also said under
+  // its own button, where focus is; "Saved." only for Optimize Safe, the one
+  // that saves anything.
+  const [resultFrom, setResultFrom] = useState<"optimize" | "fix" | "reapply" | null>(null);
   const [regdomain, setRegdomainInfo] = useState<RegdomainInfo | null>(null);
 
   // The wireless region is a device-level fact that does not change on its
@@ -909,6 +1001,7 @@ function Content() {
       const result: OptimizeSafeResult = isResult(answer)
         ? answer
         : { success: false, total: 0, applied: 0, results: {}, message: GENERIC_FAIL_TEXT };
+      setResultFrom(from);
       setOptimizeResult(result);
       if (result.results) {
         // Successes can carry a message too, as they do for a single toggle:
@@ -934,6 +1027,7 @@ function Content() {
       }
     } catch (e) {
       console.error("optimize error", e);
+      setResultFrom(from);
       setOptimizeResult({
         success: false, total: 0, applied: 0, results: {},
         message: e instanceof NoAnswer ? NO_ANSWER_TEXT : UNREACHABLE_TEXT,
@@ -1164,8 +1258,14 @@ function Content() {
     } catch {
       // The script may well be running anyway. Follow it, so the plugin is
       // still reloaded when the files are in place rather than Steam
-      // restarted; if nothing started, the watch and the safety timeout end.
-      if (updateInfo?.latest_version) watchUpdate(updateInfo.latest_version, true);
+      // restarted. If it reports nothing, nothing started: say so now.
+      const version = updateInfo?.latest_version ?? "";
+      if (!(await updateStarted(version))) {
+        setUpdating(false);
+        setUpdateError(UPDATE_NOT_STARTED_TEXT);
+        return;
+      }
+      if (version) watchUpdate(version, true);
     }
   };
 
@@ -1269,11 +1369,16 @@ function Content() {
   const changeRunning = !!status?.profile_change_in_flight;
   // The change running is the lock moving by itself after a wake (C13).
   const wakeMoveRunning = status?.activity === "lock_move_after_wake";
-  // What that move came to, for two minutes after it reconnected. The
-  // backend stops sending it then; the age is checked here as well.
+  // What that move came to (C22). The backend keeps it until the user next
+  // acts on the lock, at most 12 h. A banner for the first two minutes, as
+  // other notices last; after that a line on the lock row, with the time.
   const wakeMove = status?.live?.lock_move_after_wake;
   const wakeMoveOutcome =
     wakeMove && Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000 ? wakeMove.outcome : null;
+  const wakeMoveLine =
+    wakeMove && !wakeMoveOutcome && Date.now() / 1000 - wakeMove.at < WAKE_MOVE_KEPT_S
+      ? wakeMoveRowText(wakeMove.outcome, wakeMove.at)
+      : undefined;
   const isBusy = busyState || changeRunning;
   const connected = status?.connected ?? false;
   const supportTier = status?.support_tier ?? 1;
@@ -1301,7 +1406,9 @@ function Content() {
   // Under iwd the lock and the band preference are paused, so turning one on
   // can only be refused. Each stays enabled while on, to be turned off.
   const onIwd = status?.live?.wifi_backend === "iwd" || !!status?.live?.pins_inactive_iwd;
-  // Force 6 GHz with the network in use refused before it is tried (C14).
+  // Force 6 GHz with the network in use refused before it is tried (C21:
+  // only with a 6 GHz access point of this network in range; otherwise the
+  // key is absent, the row stays enabled and a press says why).
   const sixGhzRefusal = on6GHz ? "" : status?.live?.six_ghz_refusal ?? "";
   // The badge and line for a setting that is on for another network.
   const otherNetworkBadge = { badge: "unknown" as const, text: "other network" };
@@ -1324,6 +1431,12 @@ function Content() {
     streamingIdle && on && !errors[key]
       ? { badge: "paused" as const, text: "paused" }
       : getBadge(key, status, errors[key] ?? null);
+
+  // The batch result, at the top of the panel and, for Force reapply, under
+  // its own button too: the top is off screen from there (F2).
+  const resultView = optimizeResult ? batchResultView(optimizeResult, resultFrom, "below") : null;
+  const reapplyResult =
+    optimizeResult && resultFrom === "reapply" ? batchResultView(optimizeResult, resultFrom, "above") : null;
 
   // The findings with a Dismiss, unless dismissed.
   const wpa2Shown = !!status?.wpa2_only_stronger && !dismissed.wpa2;
@@ -1401,11 +1514,13 @@ function Content() {
       {/* The settings file could not be saved. Changes then hold until the
           plugin restarts, and the toggles still read as if they had stuck.
           A settings folder behind a link is refused on purpose (C16), and
-          freeing storage would not help there. */}
+          freeing storage would not help there. Any folder on the path can
+          be the link, ~/homebrew itself included. Both are the state now,
+          read again at every status (C23). */}
       {(status?.settings_unwritable || status?.settings_link_refused) && (
         <Banner variant="warning">
           {status?.settings_link_refused
-            ? "The plugin's settings folder is behind a link, which it doesn't follow. Move it back to ~/homebrew/settings."
+            ? "A folder on the way to the plugin's settings (~/homebrew/settings) is a link, which the plugin doesn't follow. Make it a real folder."
             : "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."}
         </Banner>
       )}
@@ -1417,7 +1532,7 @@ function Content() {
             : "A WiFi change is still finishing. The controls come back when it is done."}
         </Banner>
       )}
-      {/* The lock moved by itself after a wake (C13), which reconnected WiFi. */}
+      {/* The lock moved by itself after a wake (C13, C22), which reconnected WiFi. */}
       {wakeMoveOutcome === "moved" && (
         <Banner variant="info">After sleep, the lock moved to a stronger access point.</Banner>
       )}
@@ -1426,13 +1541,20 @@ function Content() {
           After sleep, a stronger access point refused the connection. The lock stayed.
         </Banner>
       )}
+      {/* The stronger one refused and the old pin could not be put back,
+          so the lock was turned off rather than leave WiFi pinned to
+          nothing (C22). */}
+      {wakeMoveOutcome === "off" && (
+        <Banner variant="warning">
+          After sleep, the lock couldn't move or go back, so it was turned off.
+        </Banner>
+      )}
 
       {/* Unknown hardware info */}
       {supportTier === 3 && (
         <Banner variant="info">
-          Unknown WiFi hardware detected. Some optimizations may not apply.
-          Use Copy diagnostics at the bottom of this panel and report it on
-          GitHub.
+          Unknown WiFi card: driver-specific fixes are off. Copy diagnostics
+          (bottom of this panel) and report it on GitHub.
         </Banner>
       )}
 
@@ -1500,13 +1622,14 @@ function Content() {
           The old wording here told people to forget the network and rejoin.
           That throws away their settings and gambles on which security the
           new copy gets, when the actual problem is only that the copies rank
-          equally. Say what was done instead, and how to choose the other.
+          equally. Say what was done instead. Choosing the other copy is not
+          offered: Steam's WiFi list may show one entry per network name.
           Priority is only claimed when the backend says it was written. */}
       {hasDuplicates && !dupDismissed && (
         <Banner variant="warning">
           This network is saved more than once with different security.{" "}
           {status?.duplicates_prioritized
-            ? "The copy in use now has priority. To use the other, connect with it once."
+            ? "The copy in use now is kept first."
             : "If the connection acts up, remove the extra copy in Desktop Mode."}
         </Banner>
       )}
@@ -1525,9 +1648,9 @@ function Content() {
           is the obvious suspect. */}
       {status?.address_conflict && (
         <Banner variant="warning">
-          Another device on your network is using the same address as this
-          one ({status.address_conflict.ip}), so the connection may not work. That's
-          the router, not a WiFi setting. Restarting the router usually fixes it.
+          Another device on your network has this device's address
+          ({status.address_conflict.ip}), so the connection may not work. Restart
+          your router.
         </Banner>
       )}
 
@@ -1544,19 +1667,19 @@ function Content() {
           Reset puts WPA3 only back. */}
       {/* The address's last two octets (C20, as the log masking keeps them)
           let the user match it to their own access point's label: anyone
-          nearby can broadcast the network's name. The rest of the detail
-          is in the README's Allow WPA2 row. */}
+          nearby can broadcast the network's name. The rest of the detail,
+          Reset undoing it included, is in the README's Allow WPA2 row. */}
       {(wpa2Shown || errors.allow_wpa2) && (
         <Banner variant="info">
           {status?.wpa2_only_stronger && wpa2Shown && (
             <>
-              {`A stronger access point here (signal ${status.wpa2_only_stronger.signal} vs ${
+              {`A stronger access point (signal ${status.wpa2_only_stronger.signal} vs ${
                 status.wpa2_only_stronger.current_signal
-              }${
+              } of 100${
                 status.wpa2_only_stronger.bssid_tail
                   ? `, address ends ${status.wpa2_only_stronger.bssid_tail}`
                   : ""
-              }) offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi. Reset settings undoes it.`}
+              }) offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi.`}
             </>
           )}
           {errors.allow_wpa2 && (
@@ -1598,7 +1721,7 @@ function Content() {
         <Banner variant="warning">
           {status?.lock_weaker && lockWeakerShown && (
             <>
-              {`The lock holds you on a weak access point (signal ${status.lock_weaker.current_signal} of 100). A stronger one is in range (${status.lock_weaker.signal} of 100). Moving reconnects WiFi for up to half a minute.`}
+              {`Locked to a weak access point (signal ${status.lock_weaker.current_signal} of 100). A stronger one is in range (${status.lock_weaker.signal} of 100). Moving reconnects WiFi.`}
             </>
           )}
           {errors.move_bssid_lock && (
@@ -1611,7 +1734,7 @@ function Content() {
         <PanelSection>
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleMoveLock}>
-              {working === "move_bssid_lock" ? WORKING_TEXT : "Move the lock"}
+              {working === "move_bssid_lock" ? MOVE_WORKING_TEXT : "Move the lock"}
             </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
@@ -1645,8 +1768,8 @@ function Content() {
           minutes, with an access point on that band in range. */}
       {status?.external?.pin_released && (
         <Banner variant="warning">
-          WiFi couldn't connect, so the plugin released its access point or
-          band pin. The setting stays on and comes back once WiFi works.
+          WiFi couldn't connect, so the plugin let go of its pin. The setting
+          stays on and comes back once WiFi works.
         </Banner>
       )}
 
@@ -1708,43 +1831,7 @@ function Content() {
       })()}
 
       {/* Optimize result banner */}
-      {optimizeResult && (() => {
-        // A failure has no counts at all, and undefined === undefined made
-        // it read as "All applied".
-        if (optimizeResult.success === false) {
-          return (
-            <Banner variant="error">
-              {optimizeResult.message ?? GENERIC_FAIL_TEXT}
-            </Banner>
-          );
-        }
-        if (!optimizeResult.total) {
-          return (
-            <Banner variant="info">
-              {optimizeResult.message ?? "Nothing to apply."}
-            </Banner>
-          );
-        }
-        const all = optimizeResult.applied === optimizeResult.total;
-        // In streaming auto mode with no stream running, these were saved
-        // but not applied, so "All applied" was not true.
-        const paused = Object.entries(optimizeResult.results ?? {})
-          .filter(([, v]) => isResult(v) && v.success && v.paused)
-          .map(([k]) => DRIFT_LABELS[k] ?? k);
-        const pausedText = paused.length
-          ? `${joinNames(paused)} ${paused.length > 1 ? "apply" : "applies"} only while a streaming app is running.`
-          : "";
-        if (all && paused.length) {
-          return <Banner variant="info">{`Saved. ${pausedText}`}</Banner>;
-        }
-        return (
-          <Banner variant={all ? "success" : "warning"}>
-            {all
-              ? "All applied"
-              : `${optimizeResult.applied} of ${optimizeResult.total} applied. The settings marked failed below say why.${pausedText ? " " + pausedText : ""}`}
-          </Banner>
-        );
-      })()}
+      {resultView && <Banner variant={resultView.variant}>{resultView.text}</Banner>}
 
       {/* Optimize button */}
       <PanelSection>
@@ -1790,12 +1877,12 @@ function Content() {
         <InfoRow
           label="Stop background scanning"
           subtitle="The access point lock: pins one access point. Turn off to roam."
-          // No move after a wake on rtw88 (K-d) until the LCD's wake data
-          // clears it, so the (i) does not promise one there.
+          // The move after a wake runs only on the card it was measured on
+          // (C25), so the (i) promises it nowhere else.
           explanation={`Stops the scans for a better access point, which make a stream stutter, by pinning the strongest access point of this network. Only for the network you turn it on for. ${
-            s?.driver === "rtw88"
-              ? "It stays there until you move or turn off the lock."
-              : "It stays there until you move or turn off the lock, or after a wake moves to a clearly stronger one when no game or stream is running."
+            s?.driver?.startsWith(WAKE_MOVE_DRIVER)
+              ? "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one."
+              : "It stays there until you move it or turn the lock off."
           } Turning it on or off reconnects WiFi for up to half a minute.`}
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
             ? otherNetworkBadge
@@ -1807,12 +1894,12 @@ function Content() {
           notice={
             notices.bssid_lock ??
             (onIwd
-              ? IWD_PIN_NOTICE
+              ? s?.bssid_lock_enabled ? IWD_PIN_NOTICE : IWD_OFF_NOTICE
               : status?.live?.bssid_lock_other_network && s?.bssid_lock_enabled
               ? OTHER_NETWORK_TEXT
               : status?.external?.bssid_lock
               ? "This network is already pinned to one access point by a setting outside this plugin. Turn this on and off to clear it."
-              : undefined)
+              : wakeMoveLine)
           }
           onChange={(val: boolean) =>
             handleToggle("bssid_lock", () => backend.setBssidLock(val))
@@ -1912,9 +1999,15 @@ function Content() {
         {regdomain?.readable && !regdomain.changeable && (
           <PanelSectionRow>
             <div style={{ fontSize: "12px", opacity: 0.8, padding: "4px 0" }}>
-              WiFi region:{" "}
-              {regdomain.governing ? governingName(regdomain.governing, regdomain.setting) : "unknown"}, set
-              by the WiFi card. That's normal and hides no band.
+              {/* 99 is the card's own region, which hides no band; 00, the
+                  world default, can. */}
+              {regdomain.governing === "99"
+                ? "WiFi region: set by the WiFi card. That's normal and hides no band."
+                : regdomain.governing === "00"
+                  ? "WiFi region: the world default, set by the WiFi card."
+                  : `WiFi region: ${
+                      regdomain.governing ? governingName(regdomain.governing, regdomain.setting) : "unknown"
+                    }, set by the WiFi card. That's normal and hides no band.`}
             </div>
           </PanelSectionRow>
         )}
@@ -1945,7 +2038,7 @@ function Content() {
               ? undefined
               : notices.band_preference ??
                 (onIwd
-                  ? IWD_PIN_NOTICE
+                  ? s?.band_preference_enabled ? IWD_PIN_NOTICE : IWD_OFF_NOTICE
                   : bandOther
                   ? OTHER_NETWORK_TEXT
                   : onBg
@@ -1970,10 +2063,10 @@ function Content() {
         {(status?.live?.six_ghz_offered || on6GHz) && (
           <InfoRow
             label="Force 6 GHz band"
-            // Refused for the network in use (C14): the reason and what to do
+            // Refused for the network in use (C21): the reason and what to do
             // stand where the subtitle is, and the toggle can't be turned on.
             subtitle={sixGhzRefusal || "Stay on 6 GHz where your router has it"}
-            explanation="This is the band preference. 6 GHz is the least crowded band, with the most room for wide channels, but it reaches less far than 5 GHz and only routers with WiFi 6E or newer offer it. This keeps the device on 6 GHz for this network. It needs WPA3. If this network can't use it, turning it on says why. If the device can't connect on 6 GHz when you turn this on, the band is put back the way it was. Turning it on or off reconnects WiFi. Like the 5 GHz setting, if you later take the device out of range it is released after about a minute so WiFi can reconnect."
+            explanation="This is the band preference. Keeps the device on 6 GHz for this network: the least crowded band, but shorter range than 5 GHz, and only on WiFi 6E or newer routers. Needs WPA3. If this network can't use it, the row says why. If the device can't connect on 6 GHz, the band is put back. Turning it on or off reconnects WiFi. Out of range, it is released after about a minute."
             {...(bandOther && on6GHz && !band6Error
               ? otherNetworkBadge
               : getBadge(on6GHz ? "band_preference" : undefined, status, band6Error ?? null))}
@@ -2001,7 +2094,7 @@ function Content() {
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
-          explanation="Your internet provider's DNS servers translate domain names into IP addresses. They can be slow or unreliable. Switching to a public DNS like Cloudflare (1.1.1.1) or Google (8.8.8.8) can speed up initial connections and improve reliability. This only affects the WiFi network you set it on, and replaces that network's own DNS servers, including any it offers over IPv6. The servers used are IPv4 addresses, so on the rare network with no IPv4 at all, websites would stop loading; leave this off there. Each change reconnects WiFi for up to half a minute."
+          explanation="Replaces this network's DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider's. Only for the network you set it on. Leave it off on a network with no IPv4. Each change reconnects WiFi for up to half a minute."
           {...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
             ? otherNetworkBadge
             : getBadge("dns", status, errors.dns ?? null))}
@@ -2086,7 +2179,7 @@ function Content() {
         <InfoRow
           label="Disable IPv6"
           subtitle="Use IPv4 only on this network"
-          explanation="This is the IPv6 setting. Some networks have poor or misconfigured IPv6 support, which can cause slow DNS resolution, connection timeouts, or routing issues. Disabling IPv6 forces all traffic through IPv4. Only turn this on if you have one of those problems. Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for up to half a minute."
+          explanation="This is the IPv6 setting. Forces all traffic through IPv4. Only turn this on if this network's IPv6 is broken (slow lookups, timeouts). Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for up to half a minute."
           {...(status?.live?.ipv6_other_network && s?.ipv6_disabled && !errors.ipv6
             ? otherNetworkBadge
             : getBadge("ipv6", status, errors.ipv6 ?? null))}
@@ -2164,6 +2257,7 @@ function Content() {
         resetError={errors.reset}
         resetNotice={notices.reset}
         resetNoticeInfo={!!notices.reset && notices.reset !== RESET_DONE_TEXT}
+        reapplyResult={reapplyResult}
         workingText={
           working === "reset" ? RESET_WORKING_TEXT
             : applyingAll && batchFrom === "reapply" ? BATCH_WORKING_TEXT
@@ -2222,8 +2316,10 @@ export default definePlugin(() => {
       (notification: { bRunning: boolean }) => {
         if (disposed) return;
         // Streaming auto mode looks now and again once the app has had time
-        // to start or exit, instead of waiting for its next pass. A no-op
-        // with auto mode off.
+        // to start or exit, instead of waiting for its next pass. With auto
+        // mode off it still records the app event, which keeps the
+        // after-wake move and the lock scans from reconnecting as a game
+        // starts.
         backend.pokeDetection().catch(() => {});
         later(3000, () => backend.pokeDetection().catch(() => {}));
         if (notification.bRunning) {

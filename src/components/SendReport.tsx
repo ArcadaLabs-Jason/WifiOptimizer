@@ -67,7 +67,15 @@ const STATE_LIMIT_MS = 60000;
 // send made in the background without the panel being reopened.
 const STATE_POLL_MS = 20000;
 
-type Outcome = { text: string; tone: "success" | "info" | "error"; from: "wake" | "footer" };
+// queued: a send saved to go later. seq: the actionSeq once that send had
+// ended, so only a state read started after it can retire the outcome.
+type Outcome = {
+  text: string;
+  tone: "success" | "info" | "error";
+  from: "wake" | "footer";
+  queued?: boolean;
+  seq?: number;
+};
 // A preview that came back while the panel was closed, kept to open here.
 type Ready = { id: string; text: string; from: Outcome["from"] };
 
@@ -163,13 +171,19 @@ function refreshReportState(): Promise<void> {
     return again;
   }
   loadingSeq = actionSeq;
+  const seq = loadingSeq;
   loading = withTimeout(getReportState(), STATE_LIMIT_MS)
     .then((state) => {
       if (!state || typeof state !== "object") return;
       // A dropped report the backend no longer reports was dismissed for
       // good, so the next one is shown again.
       if (!state.dropped) hidden.dropped = false;
-      update({ state });
+      // "Saved, sent later" is over once nothing is waiting: the report was
+      // sent (its reference shows), dropped or withdrawn. It stayed beside
+      // "Your saved report was sent."
+      const outcome = shared.outcome;
+      const done = !!outcome?.queued && !state.pending && seq >= (outcome.seq ?? 0);
+      update(done ? { state, outcome: null } : { state });
     })
     .catch((e) => console.error("report state error", e))
     .finally(() => {
@@ -215,7 +229,7 @@ function ReportPreviewModal({
   return (
     <ConfirmModal
       strTitle="Send this report to the developer?"
-      strDescription="This is everything that is sent. Network names and addresses are removed."
+      strDescription="This is everything that is sent. Network names and addresses are masked."
       strOKButtonText="Send"
       strCancelButtonText="Cancel"
       onOK={onSend}
@@ -277,6 +291,9 @@ async function send(id: string, from: Outcome["from"]) {
           text: typeof result?.message === "string" ? result.message : SEND_FAIL_TEXT,
           tone: status === "sent" ? "success" : status === "queued" ? "info" : "error",
           from,
+          queued: status === "queued",
+          // end() counts this send as ended before it stores the outcome.
+          seq: actionSeq + 1,
         },
   });
   await refreshReportState();
