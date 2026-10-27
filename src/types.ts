@@ -138,6 +138,9 @@ export interface PluginStatus {
   duplicates_prioritized?: boolean;
   // The last attempt to save the settings file failed.
   settings_unwritable?: boolean;
+  // Why, while settings_unwritable is true (C27): behind a link, no space
+  // left, or anything else. Absent otherwise, and from older backends.
+  settings_unwritable_cause?: "link" | "space" | "other";
   // The settings folder is behind a link, which the plugin refuses (C16).
   settings_link_refused?: boolean;
   // What the change in flight is, where the panel words it differently:

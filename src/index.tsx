@@ -1555,12 +1555,16 @@ function Content() {
           A settings folder behind a link is refused on purpose (C16), and
           freeing storage would not help there. Any folder on the path can
           be the link, ~/homebrew itself included. Both are the state now,
-          read again at every status (C23). */}
+          read again at every status (C23). Storage space is only advised
+          when the disk was full; any other cause (or a backend that does
+          not say) gets the restart (C27). */}
       {(status?.settings_unwritable || status?.settings_link_refused) && (
         <Banner variant="warning">
-          {status?.settings_link_refused
+          {status?.settings_link_refused || status?.settings_unwritable_cause === "link"
             ? "A folder on the way to the plugin's settings (~/homebrew/settings) is a link, which the plugin doesn't follow. Make it a real folder."
-            : "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."}
+            : status?.settings_unwritable_cause === "space"
+              ? "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."
+              : "The plugin couldn't save its settings, so changes may not last past a restart. Restart the device, then try again."}
         </Banner>
       )}
 

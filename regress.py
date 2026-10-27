@@ -12547,6 +12547,20 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("F14 pass 8 the settings banner gives storage advice only for a full disk, else a restart (C27)")
+try:
+    _p8f_sb = _p7f_flat(_between(_F_IX, "{(status?.settings_unwritable || status?.settings_link_refused) && (", "</Banner>"))
+    ok('status?.settings_link_refused || status?.settings_unwritable_cause === "link" ? '
+       '"A folder on the way to the plugin\'s settings (~/homebrew/settings) is a link, which the plugin doesn\'t follow. Make it a real folder."'
+       in _p8f_sb, "link: the link text")
+    ok(': status?.settings_unwritable_cause === "space" ? "The plugin couldn\'t save its settings, so changes may not last past a restart. '
+       'Check that the device has free storage space, then try the change again."' in _p8f_sb, "space: the storage text")
+    ok(': "The plugin couldn\'t save its settings, so changes may not last past a restart. Restart the device, then try again."'
+       in _p8f_sb, "other or absent: the restart, with no storage advice")
+    ok('settings_unwritable_cause?: "link" | "space" | "other";' in _F_TY, "the panel reads the cause the backend sends")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 # ---- QA pass 3 merge: where two owners' work meets ----
 section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
 # The dispatcher records the system's PCIe values only while last_enforced is
