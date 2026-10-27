@@ -10624,8 +10624,8 @@ except Exception as _e:
 
 section("F10 a dead or missing card is not told to connect first")
 try:
-    # Pass 6 F12: Copy diagnostics comes before the restart.
-    ok("live?.wifi_state" in _F_IX and "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device." in _F_IX
+    # Pass 8 F1 (N-a): the restart comes before Copy diagnostics.
+    ok("live?.wifi_state" in _F_IX and "The WiFi card isn't responding. Restart the device, then use Copy diagnostics to report it." in _F_IX
        and "WiFi is off. Turn it on in Steam's settings." in _F_IX,
        "the disconnected banner follows wifi_state")
     ok('?? "disconnected"' in _F_IX and "wifi_state?:" in _F_TY, "a backend without it reads as disconnected")
@@ -11276,7 +11276,7 @@ try:
        "no_device has its own text")
     ok('connected && status?.live?.wifi_state === "not_responding" && (' in _F_IX
        and '<Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>' in _F_IX
-       and '"The WiFi card isn\'t responding. Copy diagnostics (bottom of this panel), then restart the device."' in _F_IX,  # Pass 6 F12
+       and '"The WiFi card isn\'t responding. Restart the device, then use Copy diagnostics to report it."' in _F_IX,  # Pass 8 F1
        "C1 (c): not_responding on the connected path shows the restart text")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11649,9 +11649,9 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
-section("F12 pass 6 a card that isn't responding: copy diagnostics before the restart")
+section("F12 pass 6 a card that isn't responding: the banner text (pass 8 F1: restart first)")
 try:
-    _p6f_nr = "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device."
+    _p6f_nr = "The WiFi card isn't responding. Restart the device, then use Copy diagnostics to report it."
     ok(f'const NOT_RESPONDING_TEXT =\n  "{_p6f_nr}";' in _F_IX,
        "the banner says it (the per-control error keeps the backend's own words)")
 except Exception as _e:
@@ -12316,6 +12316,20 @@ try:
     ok(not any(re.search(r"\w -{1,2} \w", _p7f_l)
                for _p7f_l in (_F_SEC + _between(_F_RD, "## The problem", "## Building from source")).split("\n")),
        "no spaced hyphen used as a dash in SECURITY.md or the README's user sections")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 8: FRONT ----
+_P8F_PH = _src("src/components/PanelHeader.tsx"); _P8F_SR = _src("src/components/SendReport.tsx")
+_P8F_INST = _src("install.sh")
+
+section("F1 pass 8 a card that isn't responding: restart first, then Copy diagnostics (N-a)")
+try:
+    _p8f_nr = _between(_F_IX, "const NOT_RESPONDING_TEXT =", ";\n")
+    ok("Restart the device, then use Copy diagnostics" in _p8f_nr and "then restart" not in _p8f_nr,
+       f"the restart comes first, and the copy after it ({_p8f_nr.strip()[-100:]!r})")
+    ok("then restart" not in _p7f_flat(_between(_F_IX, "const disconnectedText =", ";\n")),
+       "no other dead-card text asks for a copy before the restart")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 

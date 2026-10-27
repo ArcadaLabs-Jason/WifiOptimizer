@@ -97,11 +97,13 @@ function wakeMoveRowText(outcome: "moved" | "back" | "off", at: number): string 
   if (outcome === "off") return `Couldn't move to a stronger access point after sleep, ${ago}.`;
   return undefined;
 }
-// An iw stuck in the driver, or a card the system can no longer use. Copy
-// diagnostics first: after the restart they show the healthy boot's link and
-// NetworkManager state, not the failed one's.
+// An iw stuck in the driver, or a card the system can no longer use. The
+// restart comes first: with WiFi dead a copy has nowhere to go, and the
+// restart clears the clipboard. After it, Copy diagnostics still shows the
+// failure: the card's state is written to the journal 90 seconds after a
+// failed wake, and the previous boot's logs are taken around that wake.
 const NOT_RESPONDING_TEXT =
-  "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device.";
+  "The WiFi card isn't responding. Restart the device, then use Copy diagnostics to report it.";
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
 // Auto-fix on wake stays on, as on a fresh install (main.py _reset_locked),
