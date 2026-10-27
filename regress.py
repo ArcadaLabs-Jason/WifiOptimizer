@@ -6567,8 +6567,9 @@ except Exception as _e:
 
 section("J5 CI runs on a release tag, never on a push to beta or main")
 # A push to beta is a release for plugins up to 0.20.0-beta on the beta
-# channel (they install the branch as it stands), and install.sh installs main
-# when GitHub's API does not answer. CI used to run only on those pushes, so
+# channel (they install the branch as it stands), and install.sh, read from
+# main, installed main whenever GitHub's API did not answer (until 0.24.6).
+# CI used to run only on those pushes, so
 # every release was out before it was checked or signed. CI now runs on a
 # pushed v* tag, on pull requests and by hand; the branches move to the tag
 # only after release.sh has published it.
