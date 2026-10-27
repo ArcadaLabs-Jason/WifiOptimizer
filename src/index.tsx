@@ -198,6 +198,8 @@ const UPDATE_SLOW_TEXT =
 // reports nothing: no update is running, so the panel says so at once
 // instead of "Starting the update..." for UPDATE_TIMEOUT_MS.
 const UPDATE_NOT_STARTED_TEXT = "Couldn't start the update. Try again in a moment.";
+// A check for updates the user asked for that got no answer.
+const UPDATE_CHECK_FAILED_TEXT = "Couldn't check for updates. Try again in a moment.";
 // The phases of a script that is still running (UPDATE_ACTIVE_PHASES in
 // main.py).
 const UPDATE_RUNNING_PHASES = ["downloading", "installing", "swapped", "loaded", "restarting"];
@@ -1288,7 +1290,11 @@ function Content() {
       const result = await withTimeout(backend.checkForUpdate());
       if (seq === updateCheckSeqRef.current) setUpdateInfo(result);
     } catch {
-      // refreshStatus has its own catch; no need to log here
+      // No answer, or the call failed. The answer from an earlier check
+      // stayed up, and read as "Up to date" after a check that failed.
+      if (seq === updateCheckSeqRef.current) {
+        setUpdateInfo({ success: false, update_available: false, message: UPDATE_CHECK_FAILED_TEXT });
+      }
     }
     setCheckingUpdate(false);
   };
@@ -1612,16 +1618,20 @@ function Content() {
       <WakeFailureNotice />
 
       {/* Update available. A refusal is said here too: the Updates section
-          is far down the panel, and pressing this showed nothing. */}
-      {updateInfo?.update_available && !updating && (
+          is far down the panel, and pressing this showed nothing. The
+          refusal stays here after the check that follows it finds no
+          update, without the button: that check took the offer away. */}
+      {(updateInfo?.update_available || updateError) && !updating && (
         <PanelSection>
-          <PanelSectionRow>
-            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleApplyUpdate}>
-              {updateInfo.is_downgrade
-                ? `Go back to v${updateInfo.latest_version}`
-                : `Update to v${updateInfo.latest_version}`}
-            </ButtonItem>
-          </PanelSectionRow>
+          {updateInfo?.update_available && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleApplyUpdate}>
+                {updateInfo.is_downgrade
+                  ? `Go back to v${updateInfo.latest_version}`
+                  : `Update to v${updateInfo.latest_version}`}
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
           {updateError && (
             <PanelSectionRow>
               <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>

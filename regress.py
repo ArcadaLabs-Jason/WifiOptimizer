@@ -12420,7 +12420,7 @@ try:
         "disconnected": "<Banner variant=\"error\">{disconnectedText}</Banner>",
         "stuck iw": "<Banner variant=\"warning\">{NOT_RESPONDING_TEXT}</Banner>",
         "wake notice": "<WakeFailureNotice />",
-        "update offer": "{updateInfo?.update_available && !updating && (",
+        "update offer": "`Update to v${updateInfo.latest_version}`",
         "settings banner": "{(status?.settings_unwritable || status?.settings_link_refused) && (",
     }.items()}
     ok(all(v > 0 for v in _p8f_at.values()), f"every block is rendered ({_p8f_at})")
@@ -12487,6 +12487,64 @@ try:
        and _F_IX.find("<DetailsContext.Provider") < _F_IX.find("<ActionsSection") < _F_IX.find("</DetailsContext.Provider>"),
        "and the section reads the panel's Show details")
 except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F12 pass 8 an update refusal stays at the top after the re-check finds no update")
+try:
+    _p8f_top = _between(_F_IX, "{/* Update available.", "{/* Updating */}")
+    _p8f_cond = re.search(r"\n      \{(\(?[^\n]*?)&& \(\n        <PanelSection>", _p8f_top)
+    _p8f_c = _p8f_cond.group(1) if _p8f_cond else ""
+    ok("updateError" in _p8f_c and "!updating" in _p8f_c
+       and not re.match(r"updateInfo\?\.update_available &&", _p8f_c.strip()),
+       f"the top section shows while a refusal is set, offer or not ({_p8f_c!r})")
+    _p8f_btn = _between(_p8f_top, "<PanelSection>", "onClick={handleApplyUpdate}")
+    ok("{updateInfo?.update_available && (" in _p8f_btn,
+       "the update button only with an offer")
+    ok("{updateError && (" in _p8f_top and "{updateError}" in _p8f_top, "and the refusal's row with or without it")
+    # The refusal is kept by the re-check that follows it (keepError).
+    ok("runUpdateCheck(true, true);" in _between(_F_IX, "const handleApplyUpdate = async", "\n  };")
+       and "if (info?.success && !keepError) setUpdateError(null);" in _F_IX,
+       "which keeps the refusal while it asks GitHub again")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F13 pass 8 a check for updates that fails no longer leaves 'Up to date' up")
+try:
+    _p8f_hc = _between(_F_IX, "const handleCheckForUpdate = async () => {", "\n  };")
+    _p8f_cf = _between(_F_IX, "const UPDATE_CHECK_FAILED_TEXT", ";\n")
+    ok(bool(_p8f_hc), "the handler is there")
+    _p8f_case = ("let info: any = null; const setUpdateInfo = (v: any) => { info = v; };\n"
+                 "const setCheckingUpdate = (_v: boolean) => {}; const setUpdateError = (_v: any) => {};\n"
+                 "const lastUpdateCheckAtRef = {current: 0}; const updateCheckSeqRef = {current: 0};\n"
+                 "const withTimeout = (p: any) => p;\n"
+                 "const backend: any = {checkForUpdate: () => Promise.resolve({success: true, update_available: false})};\n"
+                 + (_p8f_cf + ";\n" if _p8f_cf else "") + _p8f_hc + "\n  };\n"
+                 "(async () => {\n"
+                 " await handleCheckForUpdate(); const upToDate = info;\n"
+                 " backend.checkForUpdate = () => Promise.reject(new Error('offline'));\n"
+                 " await handleCheckForUpdate(); const failed = info;\n"
+                 # A check overtaken by a channel change leaves the new answer alone.
+                 " info = {success: true, update_available: false}; let rej: any = null;\n"
+                 " backend.checkForUpdate = () => new Promise((_r, j) => { rej = j; });\n"
+                 " const p = handleCheckForUpdate(); updateCheckSeqRef.current += 1; rej(new Error('late')); await p;\n"
+                 " console.log(JSON.stringify({upToDate, failed, overtaken: info})); })();\n")
+    _p8f_r = _p7f_run(_p8f_case) if _p8f_hc else None
+    if _p8f_hc and _p8f_r is None:
+        print("SKIP  no node or typescript here to run the update check; CI runs it")
+    else:
+        _p8f_o = (_p7f_json(_p8f_r) if _p8f_r else None) or {}
+        ok((_p8f_o.get("upToDate") or {}).get("success") is True
+           and _p8f_o.get("failed") == {"success": False, "update_available": False,
+                                        "message": "Couldn't check for updates. Try again in a moment."},
+           f"'Up to date', then a check that throws: the section is told it failed ({_p8f_o} {(_p8f_r or ('', '', ''))[2][-200:]})")
+        ok(_p8f_o.get("overtaken") == {"success": True, "update_available": False},
+           "a failed check overtaken by a channel change does not overwrite the newer answer")
+    _p8f_us = _between(_F_US, ") : (", "Check for updates")
+    ok("updateInfo && updateInfo.success === false && updateInfo.message" in _p8f_us
+       and 'updateInfo?.success && !updateInfo?.update_available\n                  ? "Up to date"' in _p8f_us,
+       "which the Updates section shows, with the button back to Check for updates")
+except Exception as _e:
+    import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 # ---- QA pass 3 merge: where two owners' work meets ----
