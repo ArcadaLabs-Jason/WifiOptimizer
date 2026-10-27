@@ -12561,6 +12561,79 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+def _p8f_install(installed=None, tag="v0.24.3", files=None, download=True):
+    """Run the real install.sh against a stub GitHub serving tag's release
+    tarball (prefix WifiOptimizer-<version>/, its package.json carrying the
+    version), over a fake Decky with installed (a version) or nothing in
+    place. (rc, stdout + stderr)."""
+    import tarfile as _t, io as _io
+    _d = tempfile.mkdtemp()
+    _bin = os.path.join(_d, "bin"); os.mkdir(_bin)
+    _home = os.path.join(_d, "home"); _plugins = os.path.join(_home, "homebrew", "plugins")
+    os.makedirs(_plugins)
+    if installed:
+        _pd = os.path.join(_plugins, "WiFi Optimizer"); os.makedirs(_pd)
+        open(os.path.join(_pd, "package.json"), "w").write(
+            '{\n  "name": "wifi-optimizer",\n  "version": "' + installed + '",\n  "license": "BSD-3-Clause"\n}\n')
+        open(os.path.join(_pd, "main.py"), "w").write("old\n")
+    _ver = tag[1:]
+    _tgz = os.path.join(_d, "asset.tar.gz")
+    with _t.open(_tgz, "w:gz") as _tf:
+        for _f in (files or ("plugin.json", "package.json", "main.py", "decky.pyi", "dist/index.js",
+                             "defaults/dispatcher.sh.tmpl")):
+            _b = (('{\n  "name": "wifi-optimizer",\n  "version": "' + _ver + '",\n  "license": "BSD-3-Clause"\n}\n')
+                  if _f == "package.json" else "payload " + _f + "\n").encode()
+            _i = _t.TarInfo("WifiOptimizer-" + _ver + "/" + _f); _i.size = len(_b)
+            _tf.addfile(_i, _io.BytesIO(_b))
+    _rel = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases"
+    _stubs = {
+        "id": '#!/bin/bash\n[ "$1" = "-u" ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n',
+        "getent": f'#!/bin/bash\necho "tester:x:1000:1000::{_home}:/bin/bash"\n',
+        "systemctl": "#!/bin/bash\nexit 0\n",
+        "curl": ('#!/bin/bash\nout=""; url=""; prev=""\n'
+                 'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; case "$a" in https://*) url="$a" ;; esac; prev="$a"; done\n'
+                 'case "$url" in\n'
+                 '  */releases/latest) printf "%s" "' + _rel + '/tag/' + tag + '"; exit 0 ;;\n'
+                 + ('  ' + _rel + '/download/' + tag + '/wifi-optimizer-' + tag + '.tar.gz) cp "' + _tgz + '" "$out"; exit 0 ;;\n'
+                    if download else "") +
+                 'esac\nexit 22\n'),
+    }
+    for _n, _body in _stubs.items():
+        open(os.path.join(_bin, _n), "w").write(_body); os.chmod(os.path.join(_bin, _n), 0o755)
+    _r = _p5f_sp.run([_p5f_sh.which("bash"), os.path.abspath("install.sh")], capture_output=True, text=True, timeout=60,
+                     env={**os.environ, "PATH": _bin + os.pathsep + os.environ.get("PATH", ""), "SUDO_USER": "tester"},
+                     cwd=_d)
+    return _r.returncode, _r.stdout + _r.stderr
+
+section("F15 pass 8 install.sh says which version it installed and which was there, never 'updated'")
+try:
+    _p8f_rc, _p8f_out = _p8f_install(installed="0.24.6-beta", tag="v0.24.3")
+    ok(_p8f_rc == 0 and "Installed v0.24.3 (was v0.24.6-beta)." in _p8f_out,
+       f"the 0.24.3 asset over a 0.24.6-beta install says so (rc {_p8f_rc}, {_p8f_out.strip()[-160:]!r})")
+    ok("updated!" not in _p8f_out and "preserved" not in _p8f_out and "Upgrading" not in _p8f_out,
+       "and claims neither an update nor kept settings")
+    _p8f_rc, _p8f_out = _p8f_install(installed="0.24.3", tag="v0.24.3")
+    ok(_p8f_rc == 0 and "Reinstalled v0.24.3." in _p8f_out, f"the same version says reinstalled ({_p8f_out.strip()[-80:]!r})")
+    _p8f_rc, _p8f_out = _p8f_install(installed=None, tag="v0.24.3")
+    ok(_p8f_rc == 0 and "WiFi Optimizer installed! Open the Quick Access Menu to configure." in _p8f_out,
+       "a fresh install keeps its line")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F25 pass 8 install.sh says plainly when the download fails, can't be unpacked or is incomplete")
+try:
+    _p8f_rc, _p8f_out = _p8f_install(tag="v0.24.3", download=False)
+    ok(_p8f_rc == 1 and "Error: Couldn't download v0.24.3. Try again in a few minutes." in _p8f_out,
+       f"a failed download ({_p8f_out.strip()[-100:]!r})")
+    _p8f_rc, _p8f_out = _p8f_install(tag="v0.24.3", files=("plugin.json", "package.json", "main.py"))
+    ok(_p8f_rc == 1 and "Error: The download is incomplete. Try again." in _p8f_out and "repo structure" not in _p8f_out,
+       f"a tarball missing files ({_p8f_out.strip()[-100:]!r})")
+    ok('{ echo "Error: Couldn\'t unpack $LATEST_TAG. Try again."; exit 1; }' in _P8F_INST, "one that won't unpack")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 # ---- QA pass 3 merge: where two owners' work meets ----
 section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
 # The dispatcher records the system's PCIe values only while last_enforced is

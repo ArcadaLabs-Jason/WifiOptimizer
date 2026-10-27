@@ -82,16 +82,37 @@ echo "Installing $PLUGIN_NAME..."
 
 # Download and extract
 echo "Downloading..."
-curl -sSL --fail --proto '=https' --connect-timeout 15 --max-time 300 "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz"
-tar xzf "$TMP_DIR/plugin.tar.gz" -C "$TMP_DIR"
+curl -sSL --fail --proto '=https' --connect-timeout 15 --max-time 300 "$REPO_URL" -o "$TMP_DIR/plugin.tar.gz" ||
+    { echo "Error: Couldn't download $LATEST_TAG. Try again in a few minutes."; exit 1; }
+tar xzf "$TMP_DIR/plugin.tar.gz" -C "$TMP_DIR" ||
+    { echo "Error: Couldn't unpack $LATEST_TAG. Try again."; exit 1; }
 
 SRC="$TMP_DIR/$DIR_NAME"
 for f in plugin.json package.json main.py decky.pyi dist/index.js defaults/dispatcher.sh.tmpl; do
     if [ ! -f "$SRC/$f" ]; then
-        echo "Error: Download failed or repo structure changed (missing $f)."
+        echo "Error: The download is incomplete. Try again."
         exit 1
     fi
 done
+
+# The "version" of a package.json, or nothing. Only a plain version is
+# printed.
+version_of() {
+    local v
+    v=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1)
+    case "$v" in
+        [0-9]*) case "$v" in *[!A-Za-z0-9.-]*) v="" ;; esac ;;
+        *) v="" ;;
+    esac
+    echo "$v"
+}
+# What is installed now and what replaces it. The latest stable release can
+# be older than what is installed (a beta, say), so the end says which
+# version went in and which was there, never that it was updated.
+NEW_VERSION=$(version_of "$SRC/package.json")
+[ -n "$NEW_VERSION" ] || NEW_VERSION="${LATEST_TAG#v}"
+OLD_VERSION=""
+[ -f "$PLUGIN_DIR/package.json" ] && OLD_VERSION=$(version_of "$PLUGIN_DIR/package.json")
 
 # Build the new copy completely before touching the installed one, so a
 # failure part way (a full disk, a closed terminal) leaves it working.
@@ -105,7 +126,7 @@ touch "$STAGE_DIR/py_modules/.keep"
 
 # Install
 if [ -d "$PLUGIN_DIR" ]; then
-    echo "Upgrading existing installation..."
+    echo "Replacing the installed copy..."
     UPGRADING=true
     rm -rf "$OLD_DIR"
     MOVED_ASIDE=true
@@ -135,7 +156,13 @@ fi
 
 echo ""
 if [ "$UPGRADING" = true ]; then
-    echo "WiFi Optimizer updated! Your settings have been preserved."
+    if [ -z "$OLD_VERSION" ]; then
+        echo "Installed v$NEW_VERSION."
+    elif [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+        echo "Reinstalled v$NEW_VERSION."
+    else
+        echo "Installed v$NEW_VERSION (was v$OLD_VERSION)."
+    fi
 else
     echo "WiFi Optimizer installed! Open the Quick Access Menu to configure."
 fi
