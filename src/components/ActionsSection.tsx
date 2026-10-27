@@ -1,5 +1,11 @@
+import { useContext } from "react";
 import { PanelSection, PanelSectionRow, ButtonItem } from "@decky/ui";
 import { theme } from "../theme";
+import { DetailsContext } from "./InfoRow";
+
+// What Force reapply all does, under its button. Only with Show details on:
+// explanation never stands in front of an action.
+const FORCE_REAPPLY_DETAIL = "Applies every setting that is on again. Can reconnect WiFi.";
 
 interface ActionsSectionProps {
   connected: boolean;
@@ -32,6 +38,7 @@ export function ActionsSection({
   workingText,
   reapplyResult,
 }: ActionsSectionProps) {
+  const showDetails = useContext(DetailsContext);
   return (
     <PanelSection title="Actions">
       <PanelSectionRow>
@@ -39,6 +46,7 @@ export function ActionsSection({
           layout="below"
           disabled={!connected || isBusy}
           onClick={onForceReapply}
+          description={showDetails ? FORCE_REAPPLY_DETAIL : undefined}
         >
           Force reapply all
         </ButtonItem>

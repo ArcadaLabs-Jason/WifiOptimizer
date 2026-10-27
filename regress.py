@@ -12473,6 +12473,22 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("F11 pass 8 Force reapply all is explained in the README and, with Show details, under its button")
+try:
+    ok("**Force reapply all** applies every setting that is on again, the lock and network settings included, which can reconnect WiFi."
+       in _F_RD, "the README says what it does")
+    _p8f_as = _src("src/components/ActionsSection.tsx")
+    _p8f_fr = _between(_p8f_as, "<ButtonItem", "Force reapply all")
+    ok("useContext(DetailsContext)" in _p8f_as
+       and "description={showDetails ? FORCE_REAPPLY_DETAIL : undefined}" in _p8f_fr
+       and 'const FORCE_REAPPLY_DETAIL = "Applies every setting that is on again. Can reconnect WiFi.";' in _p8f_as,
+       "the button's description shows only with Show details")
+    ok("<DetailsContext.Provider value={showDetails}>" in _F_IX
+       and _F_IX.find("<DetailsContext.Provider") < _F_IX.find("<ActionsSection") < _F_IX.find("</DetailsContext.Provider>"),
+       "and the section reads the panel's Show details")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 # ---- QA pass 3 merge: where two owners' work meets ----
 section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
 # The dispatcher records the system's PCIe values only while last_enforced is

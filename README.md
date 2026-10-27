@@ -55,6 +55,8 @@ Releases are signed. From v0.21.0-beta on, before installing an update, the plug
 
 Want to go further? The remaining optimizations are available as individual toggles. Each one has an **(i)** icon you can tap for a full explanation of what it does and any tradeoffs, and **Show details** at the bottom of the panel opens them all at once, for reading with a controller. Advanced options include forcing 5 GHz (or 6 GHz, where your setup supports it), custom DNS, disabling IPv6, CAKE traffic shaping, and switching between the `iwd` and `wpa_supplicant` WiFi backends.
 
+**Force reapply all** applies every setting that is on again, the lock and network settings included, which can reconnect WiFi.
+
 ## All optimizations
 
 **Safe tier (applied by Optimize Safe)**
