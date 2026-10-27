@@ -6062,7 +6062,8 @@ try:
     _rct = _rct[:_rct.index(";")]
     # Pass 6 F2: the confirmation names what comes off; the buffer, CAKE and
     # region detail is in the README's Reset paragraph.
-    ok(all(w in _rct for w in ("Turns off everything the plugin applied", "lock", "band", "IPv6", "DNS"))
+    # Pass 7 F9: every fix except Auto-fix on wake, which Reset leaves on.
+    ok(all(w in _rct for w in ("Turns off every fix except Auto-fix on wake", "lock", "band", "IPv6", "DNS"))
        and "undoes buffer tuning and CAKE" in open("README.md").read(),
        "the confirmation says what a reset undoes")
     ok("Reset WiFi Optimizer?" in open("dist/index.js").read(), "and the built bundle carries it")
@@ -7683,7 +7684,9 @@ try:
     _catch = _ix[_ix.index("const handleApplyUpdate"):]
     _catch = _catch[_catch.index("} catch {"):]
     _catch = _catch[:_catch.index("\n  };")]
-    ok("watchUpdate(updateInfo.latest_version, true)" in _catch,
+    # Pass 7 F15: after one look at the script's progress, which says when
+    # nothing started at all.
+    ok("watchUpdate(version, true)" in _catch and "updateInfo?.latest_version" in _catch,
        "a lost reply still follows the update, so the plugin is reloaded rather than Steam restarted")
     ok("current = null;" in _uw[_uw.index('if (progress.phase === "failed" || progress.phase === "done") {'):],
        "a finished update's result is told once, not replayed to every panel opened later")
@@ -8225,7 +8228,7 @@ try:
     # F8 renamed the condition: the finding is shown unless dismissed.
     _ban = _tsx[_tsx.index("{(lockWeakerShown || errors.move_bssid_lock) && ("):]
     _ban = _ban[:_ban.index("Move the lock") + 40]
-    ok("The lock holds you on a weak access point" in _ban  # Pass 6 F7
+    ok("Locked to a weak access point" in _ban  # Pass 7 F22
        and "A stronger one is in" in _ban and "status.lock_weaker.current_signal" in _ban
        and "status.lock_weaker.signal" in _ban,
        "the panel shows a warning with both signals while lock_weaker is reported")
@@ -10690,7 +10693,8 @@ except Exception as _e:
 
 section("F18 a paused result is not All applied")
 try:
-    _ob = _between(_F_IX, "{optimizeResult && (() => {", "})()}")
+    # Pass 7 F2: one function words it, for the banner and Force reapply's line.
+    _ob = _between(_F_IX, "function batchResultView(", "\n}\n")
     ok("v.paused" in _ob and "`Saved. ${pausedText}`" in _ob and "paused?: boolean;" in _F_TY,
        "fixes saved for the next stream say so")
 except Exception as _e:
@@ -10746,7 +10750,8 @@ try:
     # Pass 5 F1: the game refusal first shipped in v0.24.2-beta.
     # Pass 6 F21: the paragraph drops the version history and says what
     # holds now.
-    ok("reloads itself" in _upd and "Updates wait while a game, a stream or Keep fixes on is running." in _upd,
+    # Pass 7 F5: the button refuses; nothing waits.
+    ok("reloads itself" in _upd and "The update button won't start while a game, a stream or Keep fixes on is running." in _upd,
        "the reload and the wait for a game, a stream or Keep fixes on are said")
     ok("from late 2024 or newer" in _F_RD, "the zip-over-install claim names the Decky it holds for")
 except Exception as _e:
@@ -10804,16 +10809,17 @@ try:
                                          "\"Update Now\"", "DNS Provider")),
        "F32 buttons in sentence case")
     ok("The other WiFi backend" not in _F_BT, "F32 the backend subtitle reads right with wpa_supplicant in use")
-    ok("Turn your settings back on, or tap Optimize Safe." in _F_TY, "F33 the recovered notice says what to do")
+    ok("Turn them back on, or select Optimize Safe." in _F_TY, "F33 the recovered notice says what to do")  # Pass 7 F23
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("J1 J2 FRONT: Allow WPA2 and custom DNS say what they do")
 try:
     ok("Access points that offer WPA3 keep using it." not in _F_IX
-       and "Reset settings undoes it." in _F_IX  # Pass 6 F3
-       and "| Allow WPA2 here |" in _F_RD, "the WPA2 banner and README are true before and after NetworkManager 1.58.1")
-    ok("no IPv4 at all" in _between(_F_IX, 'label="Custom DNS"', "checked="), "the DNS explanation warns about an IPv6-only network")
+       and "Reset puts the network back to WPA3 only" in _between(_F_RD, "| Allow WPA2 here |", "\n"),  # Pass 7 F21
+       "the WPA2 banner and README are true before and after NetworkManager 1.58.1")
+    ok("Leave it off on a network with no IPv4." in _between(_F_IX, 'label="Custom DNS"', "checked="),  # Pass 7 F29
+       "the DNS explanation warns about an IPv6-only network")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -10982,7 +10988,7 @@ try:
     _p4_pr = _between(_F_IX, "{status?.external?.pin_released && (", "</Banner>")
     _p4_pr = re.sub(r"\s+", " ", _p4_pr)
     # Pass 6 F16: "its access point or band pin", which comes back once WiFi works.
-    ok("Both stay on" not in _p4_pr and "released its access point or band pin" in _p4_pr
+    ok("Both stay on" not in _p4_pr and "let go of its pin" in _p4_pr  # Pass 7 F28
        and "The setting stays on and comes back once WiFi works." in _p4_pr,
        "one setting, and it comes back")
 except Exception as _e:
@@ -10992,7 +10998,7 @@ section("F13 pass 4: the 5 GHz explanation says it is released out of range, as 
 try:
     _p4_5 = _between(_F_IX, 'label="Force 5 GHz band"', "checked=")
     ok("released after about a minute out of range" in _p4_5  # Pass 6 F19
-       and "Like the 5 GHz setting" in _between(_F_IX, 'label="Force 6 GHz band"', "checked="),
+       and "Out of range, it is released after about a minute." in _between(_F_IX, 'label="Force 6 GHz band"', "checked="),  # Pass 7 F1
        "both band explanations say it")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11015,7 +11021,9 @@ section("Reset confirm: Allow WPA2 is only put back where this version recorded 
 try:
     _rw = _between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n")
     # Pass 6 F2: the record exists from 0.24.5-beta, so the confirmation names it.
-    ok("(Allow WPA2 only if allowed on 0.24.5-beta or later)" in _rw and "this version or later" not in _rw,
+    # Pass 7 F9 (M-e): it no longer does; the README keeps the version, and
+    # the confirmation promises nothing for any version.
+    ok("0.24.5-beta" not in _rw and "this version or later" not in _rw and "Allow WPA2 come off" in _rw,
        "the confirmation does not promise to undo Allow WPA2 set by a version that kept no record")
     # Pass 5 F1: the README names 0.24.5-beta, the first release with the record.
     ok("version 0.24.5-beta or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n"),
@@ -11114,7 +11122,7 @@ try:
     _p4_un = _between(_F_RD, "## Uninstall", "## Building from source")
     ok("If the plugin is disabled in Decky, enable it again, tap **Reset settings**, then uninstall" in _p4_un
        and "install it again (its settings are still there)" in _p4_un
-       and "as long as the plugin is enabled in Decky" in _p4_un,
+       and "while the plugin is enabled in Decky" in _p4_un,  # Pass 7 F8
        "enable, Reset, then uninstall, and what to do if it is too late")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11127,8 +11135,7 @@ try:
     ok("LOAD_TIME_DRIVERS.includes(driver) ? LOAD_TIME_AUTO_TEXT" in _F_SS
        and "only apply when the driver loads are not in effect" in _between(_F_SS, "const LOAD_TIME_AUTO_TEXT", ";\n"),
        "the panel says so on the rtw88 card, and on every card with load-time options")
-    ok("auto mode takes the driver settings off between streams, and some only take effect when the driver loads"
-       in _between(_F_RD, "**Streaming auto mode**", "## Hardware"),
+    ok("driver settings that only take effect when the driver loads" in _between(_F_RD, "**Streaming auto mode**", "## Hardware"),  # Pass 7 F6
        "and the README's streaming section")
     ok("persist=not auto" in _F_MAIN, "which is what auto mode does (set_power_save never keeps the options file)")
 except Exception as _e:
@@ -11162,8 +11169,10 @@ try:
     # The released wording (e86517b) already covers this: it promises Allow WPA2
     # back only where this version or a later one recorded it.
     # Pass 6 F2: the confirmation names 0.24.5-beta itself.
-    ok("(Allow WPA2 only if allowed on 0.24.5-beta or later)" in _p5f_rc,
-       "the Reset confirmation says which Allow WPA2 it can take off (not one allowed on 0.23.0 to 0.24.4-beta)")
+    # Pass 7 F9 (M-e): the version caveat is gone from the confirmation; the
+    # README's three notes below carry it.
+    ok("0.24.5-beta" not in _p5f_rc and "0.24.4" not in _p5f_rc,
+       "the Reset confirmation names no version; the README says which Allow WPA2 it can take off")
     ok("0.24.5-beta or later" in _between(_F_RD, "| Allow WPA2 here |", "\n")
        and "0.24.5-beta or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n")
        and "with a version before 0.24.5-beta wasn't recorded" in _F_RD,
@@ -11196,7 +11205,7 @@ try:
     ok("not in effect." in _p5f_t and "autoModeDriverText(" in _p5f_ex,
        "and says what is not in effect")
     _p5f_st = _between(_F_RD, "**Streaming auto mode**", "## Hardware")
-    ok(all(w in _p5f_st for w in ("Realtek, MediaTek and Intel", "only take effect when the driver loads"))
+    ok(all(w in _p5f_st for w in ("Intel, MediaTek, and Realtek", "only take effect when the driver loads"))  # Pass 7 F6
        and "Realtek (rtw88)" not in _F_RD, "the README's streaming section says the same")
     ok("On some cards part of it needs a restart to take effect."
        in _between(_F_IX, 'label="Prevent lag spikes"', "checked=")
@@ -11270,7 +11279,7 @@ except Exception as _e:
 
 section("F7 pass 5: unknown hardware says what to do")
 try:
-    ok("Unknown WiFi hardware detected. Some optimizations may not apply. Use Copy diagnostics at the bottom of this panel and report it on GitHub."
+    ok("Unknown WiFi card: driver-specific fixes are off. Copy diagnostics (bottom of this panel) and report it on GitHub."  # Pass 7 F25
        in _p5f_flat(_between(_F_IX, "{supportTier === 3 && (", "</Banner>")),
        "the tier-3 banner points at Copy diagnostics and GitHub")
 except Exception as _e:
@@ -11278,8 +11287,9 @@ except Exception as _e:
 
 section("F8 pass 5: SECURITY.md says the beta channel can offer an older signed release")
 try:
-    # Pass 6 F21 and K-f: shorter, and Go back to has a floor.
-    ok("On the beta channel the updater offers the newest release GitHub lists. If newer releases are taken down, the beta channel offers the newest remaining one as Go back to, but never one older than the last release with a security fix. Nothing installs without your tap, and the stable channel never goes back."
+    # Pass 6 F21 and K-f: shorter, and Go back to has a floor. Pass 7 F4:
+    # from v0.24.6-beta on.
+    ok("On the beta channel the updater offers the newest release GitHub lists. If newer releases are taken down, the beta channel offers the newest remaining one as Go back to, but, from v0.24.6-beta on, never one older than the last release with a security fix. Nothing installs without your tap, and the stable channel never goes back."
        in _between(_F_SEC, "## Signed releases", "Release key"),
        "the rollback a signature does not prevent is said")
     ok("update_available = latest != current" in _F_MAIN and "latest_tuple > current_tuple" in _F_MAIN,
@@ -11292,8 +11302,10 @@ try:
     _p5f_w = _p5f_flat(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"))
     # Pass 6 F3: the banner keeps the cost and the undo; the whole-network
     # detail is in the README row.
-    ok("it makes your WiFi password easier to attack." in _p5f_w and "Reset settings undoes it." in _p5f_w,
-       "in the banner")
+    # Pass 7 F21: the undo is the README row's, which says it.
+    ok("it makes your WiFi password easier to attack." in _p5f_w
+       and "Reset puts the network back to WPA3 only" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
+       "in the banner, and the undo in the README")
     ok("The network then accepts WPA2 from any access point with its name, which makes its password easier to attack."
        in _between(_F_RD, "| Allow WPA2 here |", "\n"), "and in the README")
 except Exception as _e:
@@ -11303,8 +11315,8 @@ section("F10 pass 5: the README says disabling leaves Prevent lag spikes' files 
 try:
     _p5f_un = _between(_F_RD, "## Uninstall", "## Building from source")
     ok("stops it from applying its changes again" not in _F_RD
-       and "the files behind Prevent lag spikes stay in force" in _p5f_un
-       and "tap **Reset settings** first, then disable it, then restart the device." in _p5f_un,
+       and "What it set stays: WiFi power save off at every connect, the driver's power settings at every restart" in _p5f_un
+       and "tap **Reset settings**, then disable the plugin, then restart the device." in _p5f_un,  # Pass 7 F3
        "what stays in force, and the order Reset, disable, restart")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11415,17 +11427,19 @@ except Exception as _e:
 section("F15 pass 5: the README says how to use 6 GHz on NetworkManager 1.58.0 with a network saved for WPA2")
 try:
     _p5f_6 = _between(_F_RD, "| Force 6 GHz band |", "\n")
-    ok("a network saved for WPA2 works from NetworkManager 1.58.1" in _p5f_6
+    # Pass 7 F1 (M-a, C21): only 1.58.0 is named, and the way out is this
+    # network's own security, never the router or forgetting the network.
+    ok("On NetworkManager 1.58.0 (SteamOS 3.9.5) a network saved for WPA2 must be saved as WPA3 first" in _p5f_6
        and "(SteamOS 3.9 or newer)" in _p5f_6, "the version notes are kept")  # Pass 6 F8
-    ok("On 1.58.0, set your router to WPA3 only, then forget the network and join it again so it is saved for WPA3."
-       in _p5f_6, "and forgetting and joining again with the router on WPA3 only is the way out on 1.58.0")
+    ok("set its security to WPA3 Personal" in _p5f_6 and "802-11-wireless-security.key-mgmt sae" in _p5f_6
+       and "forget" not in _p5f_6, "and saving this network as WPA3 is the way out on 1.58.0")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 section("F16 pass 5: the access point lock says it moves to a clearly stronger access point after a wake")
 try:
-    # Pass 6 F7 and F6: the shorter texts.
-    ok("or after a wake moves to a clearly stronger one when no game or stream is running."
+    # Pass 6 F7 and F6: the shorter texts. Pass 7 F20: on the card it runs on (C25).
+    ok("After a wake, with no game or stream running, it moves to a clearly stronger one."
        in _between(_F_IX, 'label="Stop background scanning"', "checked="), "in the lock's explanation")
     _p5f_l16r = _between(_F_RD, "| Stop background scanning |", "\n")
     ok("It moves on its own only after a wake, from a weak access point to a clearly stronger one (never during a game or stream"
@@ -11445,8 +11459,10 @@ try:
        and "showDetails" not in _between(_p5f_main, "<PanelHeader", "/>"),
        "the panel hands Show details to the footer, after Optimize Safe and every setting")
     _p5f_tg = re.search(r"<ToggleField([^>]*)/>", _F_PF)
-    ok(_p5f_tg and 'label="Show details"' in _p5f_tg.group(1) and "description=" not in _p5f_tg.group(1),
-       "where it is a plain toggle with no subtitle")
+    # Pass 7 F26: with one line saying what it does.
+    ok(_p5f_tg and 'label="Show details"' in _p5f_tg.group(1)
+       and 'description="Opens every (i) explanation."' in _p5f_tg.group(1),
+       "where it is a plain toggle, its subtitle saying what it opens")
     ok(0 <= _F_PF.find('label="Show details"') < _F_PF.find("{label}"),
        "next to Copy diagnostics")
     ok("**Show details** at the bottom of the panel" in _F_RD, "and the README says where it is")
@@ -11509,12 +11525,13 @@ section("F2 pass 6 the Reset confirmation names 0.24.5-beta and is short")
 try:
     _p6f_rc = _between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n")
     _p6f_rct = _between(_p6f_rc, '"', '";')
-    ok("0.24.5-beta or later" in _p6f_rct and "this version or later" not in _p6f_rct,
-       "Allow WPA2 is said to come off where it was allowed on 0.24.5-beta or later")
+    # Pass 7 F9 (M-e): the version caveat goes; the README keeps it.
+    ok("0.24.5-beta" not in _p6f_rct and "this version or later" not in _p6f_rct,
+       "Allow WPA2 is said to come off, with no version history at the prompt")
     ok(_p6f_rct and _p6f_words(_p6f_rct) < 70, f"under 70 words ({_p6f_words(_p6f_rct)})")
-    ok(all(w in _p6f_rct for w in ("Prevent lag spikes stays off", "next connect", "Streaming auto mode is cleared.",
+    ok(all(w in _p6f_rct for w in ("every fix except Auto-fix on wake", "next connect", "Streaming auto mode is cleared.",
                                    "Update settings are kept.")),
-       "and keeps what stays off, when the network settings go, auto mode and the update settings")
+       "and keeps what stays on, when the network settings go, auto mode and the update settings")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -11527,8 +11544,8 @@ try:
     ok(_p6f_wt and _p6f_words(_p6f_wt) < 45, f"under 45 words ({_p6f_words(_p6f_wt)})")
     ok("wpa2_only_stronger.bssid_tail" in _p6f_wt and ", address ends ${status.wpa2_only_stronger.bssid_tail}" in _p6f_wt
        and "bssid_tail?: string" in _F_TY, "the last two octets of its address are shown when the backend sends them (C20)")
-    ok(0 <= _p6f_wt.find("offers only WPA2") < _p6f_wt.find("Reconnects WiFi. Reset settings undoes it."),
-       "what it does and how to undo it are said after the finding")
+    ok(0 <= _p6f_wt.find("offers only WPA2") < _p6f_wt.find("Reconnects WiFi."),  # Pass 7 F21: the undo is in the README
+       "what it does is said after the finding")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -11552,8 +11569,8 @@ try:
        and "After sleep, a stronger access point refused the connection. The lock stayed." in _p6f_flat(_F_IX),
        "afterwards, what it came to")
     ok("MESSAGE_TTL_MS / 1000" in _between(_F_IX, "const wakeMoveOutcome =", ";\n")
-       and 'lock_move_after_wake?: { outcome: "moved" | "back"; at: number };' in _F_TY,
-       "for the two minutes other notices last")
+       and 'lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };' in _F_TY,  # Pass 7 F17
+       "the banner for the two minutes other notices last")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -11575,10 +11592,10 @@ section("F7 pass 6 reconnect times say up to half a minute, and the lock's (i) d
 try:
     _p6f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
     ok("You stay on that access point until you turn this off or move the lock" not in _p6f_li
-       and "It stays there until you move or turn off the lock, or after a wake moves to a clearly stronger one when no game or stream is running." in _p6f_li
+       and "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one." in _p6f_li  # Pass 7 F20
        and "Turning it on or off reconnects WiFi for up to half a minute." in _p6f_li,
        "the lock's explanation")
-    ok("Moving reconnects WiFi for up to half a minute." in _between(_F_IX, "{status?.lock_weaker && lockWeakerShown && (", "</>"),
+    ok("Moving reconnects WiFi." in _between(_F_IX, "{status?.lock_weaker && lockWeakerShown && (", "</>"),  # Pass 7 F22
        "the weaker-lock banner")
     ok(not re.search(r"reconnects? WiFi for a few seconds", _F_ALL),
        "no control says a reconnect takes a few seconds (a radio cycle measured 13 to 24 s)")
@@ -11622,7 +11639,8 @@ try:
        and "LOAD_TIME_DRIVERS.includes(driver) ? LOAD_TIME_AUTO_TEXT" in _F_SS
        and "autoModeDriverText(" in _between(_F_SS, 'label="Only fix while streaming"', "checked="),
        "on the other load-time drivers it says what loads with the driver")
-    ok("On Realtek, MediaTek and Intel cards, auto mode takes the driver settings off between streams, and some only take effect when the driver loads. On the Steam Deck LCD these include the ones that help WiFi come back after sleep."
+    # Pass 7 F6: README:86 says it per driver, as the panel does.
+    ok("In auto mode, driver settings that only take effect when the driver loads (Intel, MediaTek, and Realtek cards other than the Steam Deck LCD's) are not in effect at all. On the Steam Deck LCD, the ones that help WiFi come back after sleep are off between streams."
        in _between(_F_RD, "**Streaming auto mode**", "## Hardware"), "and the README says the same")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11643,8 +11661,9 @@ try:
        "the lock is disabled while off under iwd")
     ok("(!(s?.band_preference_enabled && !on6GHz) && (!connected || onIwd))" in _between(_F_IX, 'label="Force 5 GHz band"', "onChange="),
        "and so is Force 5 GHz")
-    ok(_between(_F_IX, 'label="Stop background scanning"', "onChange=").count("(onIwd\n              ? IWD_PIN_NOTICE") == 1
-       and "(onIwd\n                  ? IWD_PIN_NOTICE" in _between(_F_IX, 'label="Force 5 GHz band"', "onChange="),
+    # Pass 7 F14: "Paused" while on, what it needs while off.
+    ok(_between(_F_IX, 'label="Stop background scanning"', "onChange=").count("(onIwd\n              ? s?.bssid_lock_enabled ? IWD_PIN_NOTICE : IWD_OFF_NOTICE") == 1
+       and "(onIwd\n                  ? s?.band_preference_enabled ? IWD_PIN_NOTICE : IWD_OFF_NOTICE" in _between(_F_IX, 'label="Force 5 GHz band"', "onChange="),
        "both say why, on or off")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11653,7 +11672,7 @@ section("F14 pass 6 a settings folder behind a link is said, not blamed on stora
 try:
     _p6f_sb = _between(_F_IX, "{(status?.settings_unwritable || status?.settings_link_refused) && (", "</Banner>")
     ok("status?.settings_link_refused" in _p6f_sb
-       and "The plugin's settings folder is behind a link, which it doesn't follow. Move it back to ~/homebrew/settings." in _p6f_sb
+       and "is a link, which the plugin doesn't follow. Make it a real folder." in _p6f_sb  # Pass 7 F10
        and "settings_link_refused?: boolean;" in _F_TY, "keyed on settings_link_refused (C16)")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11669,10 +11688,10 @@ section("F16 to F23 pass 6 shorter notices, update and report texts")
 try:
     _p6f_fx = _p6f_flat(_F_IX)
     ok("This network is saved more than once with different security." in _p6f_fx
-       and "The copy in use now has priority. To use the other, connect with it once." in _p6f_fx
+       and "The copy in use now is kept first." in _p6f_fx  # Pass 7 F12
        and "If the connection acts up, remove the extra copy in Desktop Mode." in _p6f_fx, "F16 duplicates")
-    ok("WiFi couldn't connect, so the plugin released its access point or band pin. The setting stays on and comes back once WiFi works."
-       in _p6f_fx, "F16 pin released")
+    ok("WiFi couldn't connect, so the plugin let go of its pin. The setting stays on and comes back once WiFi works."
+       in _p6f_fx, "F16 pin released")  # Pass 7 F28
     ok("set by the WiFi card. That's normal and hides no band." in _p6f_fx, "F16 fixed region")
     ok('"IPv6 is off on this network, set outside this plugin. To turn it back on, turn this on, then off."' in _F_IX,
        "F16 IPv6 set elsewhere")
@@ -11694,11 +11713,11 @@ try:
     ok('"Paused under iwd. Switch to wpa_supplicant in Advanced to use it."' in _F_IX
        and '"In use. Turn off to use iwd."' in _F_BT, "F20")
     _p6f_up = _between(_F_RD, "**Updating:**", "\n\n")
-    ok("From v0.19.0-beta on" not in _p6f_up and "Updates wait while a game, a stream or Keep fixes on is running." in _p6f_up
+    ok("From v0.19.0-beta on" not in _p6f_up and "The update button won't start while a game, a stream or Keep fixes on is running." in _p6f_up  # Pass 7 F5
        and "some Decky builds from earlier in 2024" not in _F_RD
        and "the beta channel offers the newest remaining one as Go back to" in _F_SEC, "F21")
     ok("WiFi didn't come back after sleep${when}. A report helps find out why." in _P6F_SR
-       and '"This is everything that is sent. Network names and addresses are removed."' in _P6F_SR
+       and '"This is everything that is sent. Network names and addresses are masked."' in _P6F_SR  # Pass 7 F18
        and '"Report ready to review."' in _P6F_SR
        and _P6F_SR.count('collecting ? "Collecting..." : working ? "Working..."') == 2, "F22")
     ok("or once after a\n  // wake from a weak link." in _F_TY and "or\n          done once after a wake from a weak link." in _F_IX,
@@ -11721,11 +11740,18 @@ except Exception as _e:
 
 section("K-c pass 6 Force 6 GHz refused for this network shows disabled with the reason")
 try:
+    # Pass 7 F1 (C21 replaces C14): the backend sets six_ghz_refusal only with
+    # a cached 6 GHz access point of this network; the row is disabled by
+    # that key alone, so without it the row stays enabled with its plain
+    # subtitle and a press gets the presence refusal.
     _p6f_6 = _between(_F_IX, 'label="Force 6 GHz band"', "onChange=")
     ok('subtitle={sixGhzRefusal || "Stay on 6 GHz where your router has it"}' in _p6f_6
        and "(!on6GHz && (!connected || !!sixGhzRefusal))" in _p6f_6, "the reason as its subtitle, and off can still be turned off")
     ok('on6GHz ? "" : status?.live?.six_ghz_refusal ?? ""' in _F_IX and "six_ghz_refusal?: string;" in _F_TY,
-       "from live.six_ghz_refusal (C14)")
+       "from live.six_ghz_refusal (C21)")
+    _p6f_6d = _between(_p6f_6, "disabled={", "}\n")
+    ok(_p6f_6d.count("sixGhzRefusal") == 1 and "six_ghz" not in _p6f_6d.replace("sixGhzRefusal", ""),
+       f"nothing else disables it, so with the key absent it stays enabled ({_p6f_6d!r})")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -11779,7 +11805,8 @@ try:
            f"{_p6f_what}: it stops and downloads nothing, the main branch included (rc {_p6f_rc}, {_p6f_out.strip()[-120:]!r})")
     _p6f_rc, _p6f_out, _p6f_calls = _p6f_install(_p6f_rel + "/tag/v0.24.6-beta")
     ok("/releases/latest" in _p6f_calls and "api.github.com" not in _p6f_calls
-       and "archive/refs/tags/v0.24.6-beta.tar.gz" in _p6f_calls and "Latest release: v0.24.6-beta" in _p6f_out,
+       and "releases/download/v0.24.6-beta/wifi-optimizer-v0.24.6-beta.tar.gz" in _p6f_calls  # Pass 7 F16
+       and "Latest release: v0.24.6-beta" in _p6f_out,
        f"a release tag: read from the redirect, no API, and that tag is downloaded ({_p6f_calls.strip()[-200:]!r})")
     ok("downloads the `main` branch instead" not in _F_SEC and "the current main branch" not in _F_RD,
        "SECURITY.md and the README no longer describe a main-branch fallback")
@@ -11789,7 +11816,8 @@ except Exception as _e:
 
 section("K-f pass 6 SECURITY.md says Go back to has a floor")
 try:
-    ok("but never one older than the last release with a security fix" in _between(_F_SEC, "## Signed releases", "Release key"),
+    # Pass 7 F4: the floor holds from v0.24.6-beta on.
+    ok("never one older than the last release with a security fix" in _between(_F_SEC, "## Signed releases", "Release key"),
        "the beta channel's Go back to stops at the last security fix (MIN_INSTALL_VERSION)")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11800,6 +11828,488 @@ try:
     ok(all(ord(ch) < 128 for ch in _p6f_all), "plain ASCII")
     ok(not any(re.search(r"\w -{1,2} \w", _p6f_l)
                for _p6f_l in (_F_SEC + _between(_F_RD, "## The problem", "## Building from source")).split("\n")),
+       "no spaced hyphen used as a dash in SECURITY.md or the README's user sections")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 7: FRONT ----
+_P7F_SR = _src("src/components/SendReport.tsx"); _P7F_PH = _src("src/components/PanelHeader.tsx")
+_P7F_UT = _src("src/utils.ts"); _P7F_INST = _src("install.sh")
+_P7F_NODE = _p5f_sh.which("node")
+def _p7f_flat(text):
+    return re.sub(r"\s+", " ", text)
+def _p7f_words(text):
+    return len(re.sub(r"\$\{[^}]*\}", "X", text).split())
+def _p7f_fn(text, name):
+    """A top-level function of a source file, from its first line to the
+    closing brace at the start of a line, or "" when it is not there."""
+    _m = re.search(r"(?m)^(?:export )?(?:async )?function " + re.escape(name) + r"\(", text)
+    if not _m:
+        return ""
+    _j = text.find("\n}\n", _m.start())
+    return text[_m.start():_j + 2] if _j >= 0 else ""
+def _p7f_run(ts_code):
+    """Run TypeScript under node, compiled with the project's own typescript.
+    None when either is not here (CI has both); else (rc, stdout, stderr)."""
+    _tsjs = os.path.abspath(os.path.join("node_modules", "typescript", "lib", "typescript.js"))
+    if not _P7F_NODE or not os.path.isfile(_tsjs):
+        return None
+    _d = tempfile.mkdtemp()
+    _case = os.path.join(_d, "case.ts"); open(_case, "w").write(ts_code)
+    _out = os.path.join(_d, "case.cjs"); _runner = os.path.join(_d, "run.cjs")
+    open(_runner, "w").write(
+        "const ts = require(" + json.dumps(_tsjs) + "); const fs = require('fs');\n"
+        "fs.writeFileSync(" + json.dumps(_out) + ", ts.transpileModule(fs.readFileSync(" + json.dumps(_case)
+        + ", 'utf8'), {compilerOptions: {target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS}}).outputText);\n"
+        "require(" + json.dumps(_out) + ");\n")
+    _r = _p5f_sp.run([_P7F_NODE, _runner], capture_output=True, text=True, timeout=60)
+    return _r.returncode, _r.stdout, _r.stderr
+def _p7f_json(run):
+    try:
+        return json.loads((run[1] or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+section("F1 pass 7 the Force 6 GHz README row and (i) say how to save the network as WPA3, never router-wide or forget (C21)")
+try:
+    _p7f_6r = _between(_F_RD, "| Force 6 GHz band |", "\n")
+    ok("forget" not in _p7f_6r.lower() and "router to WPA3 only" not in _p7f_6r
+       and "set your router to WPA3" not in _p7f_6r.lower(),
+       "the row tells nobody to set the router to WPA3 only or to forget the network")
+    ok("set its security to WPA3 Personal" in _p7f_6r and "in Desktop Mode's network settings" in _p7f_6r
+       and '`sudo nmcli connection modify "NAME" 802-11-wireless-security.key-mgmt sae`' in _p7f_6r
+       and '`sudo nmcli connection modify "NAME" 802-11-wireless-security.pmf default`' in _p7f_6r,
+       "it says to save just this network as WPA3 Personal, with the command, and the PMF command")
+    ok("On NetworkManager 1.58.0 (SteamOS 3.9.5) a network saved for WPA2 must be saved as WPA3 first" in _p7f_6r
+       and "can't use an access point of that network that offers only WPA2" in _p7f_6r
+       and "Refused when no 6 GHz access point for your network is in range" in _p7f_6r,
+       "on 1.58.0 only, with its cost, and the presence refusal kept")
+    _p7f_6i = _between(_F_IX, 'label="Force 6 GHz band"', "checked=")
+    ok("If this network can't use it, the row says why." in _p7f_6i and "turning it on says why" not in _p7f_6i
+       and "This is the band preference." in _p7f_6i,
+       "the (i) says the row gives the reason, which it now does (C21)")
+    _p7f_all_txt = _F_ALL + _F_RD
+    ok("router to WPA3 only" not in _p7f_all_txt and "WPA3 only, then forget" not in _p7f_all_txt,
+       "no panel text or README line gives the router-wide route")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F2 pass 7 Force reapply's outcome is said under its own button, and only Optimize Safe says Saved")
+try:
+    ok("reapplyResult?: {" in _F_AS and "{reapplyResult.text}" in _F_AS
+       and "theme[reapplyResult.variant].text" in _F_AS
+       and "{!workingText && reapplyResult && (" in _F_AS,
+       "ActionsSection shows the result line under its buttons, in the banner's tone, once the work is done")
+    _p7f_rv = _between(_F_IX, "const reapplyResult =", ";\n")
+    ok('resultFrom === "reapply"' in _p7f_rv and "batchResultView(optimizeResult, resultFrom" in _p7f_rv
+       and "reapplyResult={reapplyResult}" in _between(_F_IX, "<ActionsSection", "/>")
+       and "batchResultView(optimizeResult, resultFrom, \"below\")" in _F_IX
+       and "{resultView && <Banner variant={resultView.variant}>{resultView.text}</Banner>}" in _F_IX,
+       "for Force reapply only, from the same result as the banner (same text and the same expiry)")
+    ok("setResultFrom(from);" in _between(_F_IX, "const runBatch = async", "\n  };"),
+       "the batch records which button its result is for")
+    _p7f_bv = _p7f_fn(_F_IX, "batchResultView")
+    ok(bool(_p7f_bv), "one function words the result for both places")
+    if _p7f_bv:
+        _p7f_case = ("type MethodResult = any; type OptimizeSafeResult = any;\n"
+                     "const GENERIC_FAIL_TEXT = 'generic';\n"
+                     "const DRIFT_LABELS: Record<string, string> = {power_save: 'Prevent lag spikes', buffer_tuning: 'Network buffer tuning'};\n"
+                     + _p7f_fn(_F_IX, "isResult") + _p7f_fn(_F_IX, "joinNames") + _p7f_bv +
+                     "const paused = {success: true, total: 2, applied: 2, results: {power_save: {success: true, paused: true}, buffer_tuning: {success: true, paused: true}}};\n"
+                     "const part = {success: true, total: 3, applied: 2, results: {bssid_lock: {success: false}}};\n"
+                     "const refused = {success: false, total: 0, applied: 0, results: {}, message: 'Another WiFi change is still in progress.'};\n"
+                     "console.log(JSON.stringify({optimize: batchResultView(paused, 'optimize', 'below'),"
+                     " reapply: batchResultView(paused, 'reapply', 'above'), fix: batchResultView(paused, 'fix', 'below'),"
+                     " part: batchResultView(part, 'reapply', 'above'), refused: batchResultView(refused, 'reapply', 'above')}));\n")
+        _p7f_r = _p7f_run(_p7f_case)
+        if _p7f_r is None:
+            print("SKIP  no node or typescript here to run the result wording; CI runs it")
+        else:
+            _p7f_o = _p7f_json(_p7f_r) or {}
+            _p7f_pt = "Prevent lag spikes and Network buffer tuning apply only while a streaming app is running."
+            ok((_p7f_o.get("optimize") or {}).get("text") == "Saved. " + _p7f_pt
+               and (_p7f_o.get("reapply") or {}).get("text") == _p7f_pt
+               and (_p7f_o.get("fix") or {}).get("text") == _p7f_pt,
+               f"Saved. only for Optimize Safe; Force reapply and Fix now saved nothing ({_p7f_o} {_p7f_r[2][-200:]})")
+            ok("marked failed above say why" in (_p7f_o.get("part") or {}).get("text", "")
+               and _p7f_o.get("refused") == {"variant": "error", "text": "Another WiFi change is still in progress."},
+               f"under the buttons the failed settings are above, and a refusal is said in full ({_p7f_o.get('part')}, {_p7f_o.get('refused')})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F3 pass 7 disabling the plugin says the network pins stay with nothing to release them")
+try:
+    _p7f_dis = _between(_F_RD, "Disabling the plugin in Decky", "\n")
+    ok("lock, band, DNS and IPv6" in _p7f_dis and "nothing to release" in _p7f_dis
+       and "tap **Reset settings**, then disable the plugin, then restart the device" in _p7f_dis,
+       f"the paragraph names the network settings, that nothing releases a pin, and what to do ({_p7f_dis[:80]!r})")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F4 pass 7 SECURITY.md says the Go back to floor starts with v0.24.6-beta (C26)")
+try:
+    _p7f_sr = _between(_F_SEC, "## Signed releases", "Release key")
+    ok("but, from v0.24.6-beta on, never one older than the last release with a security fix." in _p7f_sr,
+       "the floor is said to apply from v0.24.6-beta on")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F5 pass 7 the README says the update button won't start during a game, not that updates wait")
+try:
+    _p7f_up = _between(_F_RD, "**Updating:**", "\n\n")
+    ok("The update button won't start while a game, a stream or Keep fixes on is running." in _p7f_up
+       and "Updates wait while" not in _F_RD, "what the button does, which is refuse (apply_update)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F6 pass 7 the README's auto mode caveat: load-time settings off entirely, the LCD's sleep help between streams (C19)")
+try:
+    _p7f_am = _p7f_flat(_between(_F_RD, "**Streaming auto mode**", "## Hardware"))
+    ok("driver settings that only take effect when the driver loads (Intel, MediaTek, and Realtek cards other than the Steam Deck LCD's) are not in effect at all." in _p7f_am
+       and "On the Steam Deck LCD, the ones that help WiFi come back after sleep are off between streams." in _p7f_am
+       and "auto mode takes the driver settings off between streams" not in _p7f_am,
+       "no line implies MediaTek or Intel settings come on for a stream")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F7 pass 7 the README's problem statement: buffers reset at a restart, not at a wake")
+try:
+    _p7f_pr = _between(_F_RD, "## The problem", "## Install")
+    ok("sleep/wake cycle" not in _p7f_pr and "every restart resets the network buffers" in _p7f_pr
+       and "Updates and sleep turn WiFi power saving back on" in _p7f_pr,
+       "the sysctls survive suspend, so only power saving is blamed on sleep")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F8 pass 7 the README says Decky can stop the uninstall before it finishes")
+try:
+    _p7f_bu = _between(_F_RD, "**Before uninstalling:**", "\n\n")
+    ok("Decky can stop it before it finishes, so tap Reset first." in _p7f_bu
+       and "Uninstalling from Decky does the same as Reset" not in _p7f_bu,
+       "no promise Decky does not keep (Decky issue 975)")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F9 M-e pass 7 the Reset confirmation names Auto-fix on wake and drops the version caveat")
+try:
+    _p7f_rc = _between(_between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n"), '"', '";')
+    ok("Turns off every fix except Auto-fix on wake, which then applies nothing." in _p7f_rc
+       and "everything the plugin applied" not in _p7f_rc,
+       "Auto-fix on wake stays on, and the text no longer says everything")
+    ok("0.24.5-beta" not in _p7f_rc and "next connect." in _p7f_rc,
+       "no version history in front of the action (M-e); the README keeps it")
+    ok(_p7f_rc and _p7f_words(_p7f_rc) < 50, f"under 50 words ({_p7f_words(_p7f_rc)})")
+    ok("0.24.5-beta or later" in _between(_F_RD, "| Allow WPA2 here |", "\n")
+       and "0.24.5-beta or later" in _between(_F_RD, "**Before uninstalling:**", "\n\n"),
+       "the README keeps the Allow WPA2 version detail")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F10 pass 7 a link anywhere on the way to the settings folder is named as such (C23)")
+try:
+    _p7f_sb = _between(_F_IX, "{(status?.settings_unwritable || status?.settings_link_refused) && (", "</Banner>")
+    ok("A folder on the way to the plugin's settings (~/homebrew/settings) is a link, which the plugin doesn't follow. Make it a real folder." in _p7f_sb
+       and "Move it back to ~/homebrew/settings" not in _p7f_sb,
+       "the banner does not point at one folder when ~/homebrew itself can be the link")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F11 pass 7 the Move button does not promise a reconnect; Allow WPA2's does")
+try:
+    ok('const MOVE_WORKING_TEXT = "Working, WiFi may reconnect...";' in _F_IX
+       and 'working === "move_bssid_lock" ? MOVE_WORKING_TEXT : "Move the lock"' in _F_IX,
+       "Move the lock: WiFi may reconnect")
+    ok('working === "allow_wpa2" ? WORKING_TEXT : "Allow WPA2 here"' in _F_IX
+       and 'WORKING_TEXT = "Working, WiFi will reconnect...";' in _src("src/components/InfoRow.tsx"),
+       "Allow WPA2, which always reconnects, keeps 'will reconnect'")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F12 pass 7 the duplicate notice asks for nothing Game Mode cannot do")
+try:
+    _p7f_dp = _p7f_flat(_between(_F_IX, "{hasDuplicates && !dupDismissed && (", "</Banner>"))
+    ok("connect with it once" not in _p7f_dp and '"The copy in use now is kept first."' in _p7f_dp
+       and '"If the connection acts up, remove the extra copy in Desktop Mode."' in _p7f_dp,
+       "prioritized: says what was done; not prioritized: unchanged")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F13 pass 7 a card's own region: 99 hides no band, 00 is not said to")
+try:
+    _p7f_fr = _p7f_flat(_between(_F_IX, "{regdomain?.readable && !regdomain.changeable && (", "</PanelSectionRow>"))
+    ok('regdomain.governing === "99" ? "WiFi region: set by the WiFi card. That\'s normal and hides no band."' in _p7f_fr,
+       "99: set by the card, hides no band")
+    ok('regdomain.governing === "00" ? "WiFi region: the world default, set by the WiFi card."' in _p7f_fr,
+       "00: the world default, with no claim that it hides no band")
+    ok("governingName(regdomain.governing, regdomain.setting)" in _p7f_fr
+       and "}, set by the WiFi card. That's normal and hides no band.`" in _p7f_fr,
+       "every other region unchanged")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F14 pass 7 under iwd a setting that is off says what it needs, not Paused")
+try:
+    ok('const IWD_OFF_NOTICE = "Needs wpa_supplicant. Switch to it in Advanced.";' in _F_IX
+       and 'const IWD_PIN_NOTICE = "Paused under iwd. Switch to wpa_supplicant in Advanced to use it.";' in _F_IX,
+       "both texts")
+    ok("? s?.bssid_lock_enabled ? IWD_PIN_NOTICE : IWD_OFF_NOTICE" in _between(_F_IX, 'label="Stop background scanning"', "onChange="),
+       "the lock: Paused only while it is on")
+    ok("? s?.band_preference_enabled ? IWD_PIN_NOTICE : IWD_OFF_NOTICE" in _between(_F_IX, 'label="Force 5 GHz band"', "onChange="),
+       "Force 5 GHz: the same")
+    _p7f_6n = _between(_between(_F_IX, 'label="Force 6 GHz band"', "onChange="), "notice={", "}\n")
+    ok("IWD_OFF_NOTICE" not in _p7f_6n and "(on6GHz" in _p7f_6n,
+       "Force 6 GHz shows the iwd notice only while on, so Paused stays right there")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F15 pass 7 an update call that fails with nothing started says so at once")
+try:
+    _p7f_cat = _between(_between(_F_IX, "const handleApplyUpdate = async", "\n  };"), "} catch {", "\n    }\n")
+    ok("await updateStarted(version)" in _p7f_cat and "setUpdating(false);" in _p7f_cat
+       and "setUpdateError(UPDATE_NOT_STARTED_TEXT);" in _p7f_cat
+       and 0 <= _p7f_cat.find("updateStarted(") < _p7f_cat.find("watchUpdate(version, true)"),
+       "the catch looks once before it watches, and says it did not start when nothing did")
+    ok('const UPDATE_NOT_STARTED_TEXT = "Couldn\'t start the update. Try again in a moment.";' in _F_IX,
+       "with the text that says what to do")
+    _p7f_ph = re.search(r"const UPDATE_RUNNING_PHASES = \[([^\]]*)\];", _F_IX)
+    ok(_p7f_ph and tuple(re.findall(r'"(\w+)"', _p7f_ph.group(1))) == tuple(m.UPDATE_ACTIVE_PHASES),
+       f"the phases it counts as running are main.py's UPDATE_ACTIVE_PHASES ({_p7f_ph.group(1) if _p7f_ph else None})")
+    _p7f_us = _p7f_fn(_F_IX, "updateStarted")
+    ok("withTimeout(backend.getUpdateProgress()" in _p7f_us, "one look, bounded")
+    if _p7f_us:
+        _p7f_case = ("let answer: any = null;\n"
+                     "const backend = { getUpdateProgress: async () => { if (answer === 'throw') throw new Error('gone'); return answer; } };\n"
+                     "function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> { return p; }\n"
+                     + (_p7f_ph.group(0) if _p7f_ph else "") + "\nconst UPDATE_START_LOOK_MS = 0; const UPDATE_LOOK_TIMEOUT_MS = 1000;\n"
+                     + _p7f_us +
+                     "(async () => { const out: any = {};\n"
+                     " const cases: any = {none: {success: true, phase: '', version: ''},"
+                     " other_done: {success: true, phase: 'done', version: '0.24.6-beta'},"
+                     " downloading: {success: true, phase: 'downloading', version: '0.24.7'},"
+                     " failed_here: {success: true, phase: 'failed', version: '0.24.7'},"
+                     " unread: {success: false, phase: '', version: ''}, gone: 'throw'};\n"
+                     " for (const k of Object.keys(cases)) { answer = cases[k]; out[k] = await updateStarted('0.24.7'); }\n"
+                     " console.log(JSON.stringify(out)); })();\n")
+        _p7f_r = _p7f_run(_p7f_case)
+        if _p7f_r is None:
+            print("SKIP  no node or typescript here to run the update look; CI runs it")
+        else:
+            _p7f_o = _p7f_json(_p7f_r)
+            ok(_p7f_o == {"none": False, "other_done": False, "downloading": True, "failed_here": True,
+                          "unread": True, "gone": True},
+               f"no phase or another version's outcome: not started; running, this version's outcome or no answer: watched ({_p7f_o} {_p7f_r[2][-200:]})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F16 pass 7 install.sh installs the release's own tarball, the one SHA256SUMS lists")
+try:
+    ok('REPO_URL="$RELEASES/download/${LATEST_TAG}/wifi-optimizer-${LATEST_TAG}.tar.gz"' in _P7F_INST
+       and "/archive/" not in _P7F_INST, "the download is the release asset, not GitHub's generated archive")
+    ok("It downloads the latest release's tarball, the one SHA256SUMS lists, from GitHub over HTTPS, and installs nothing if it can't find that release."
+       in _F_SEC and "source archive of the latest release" not in _F_SEC, "and SECURITY.md says so")
+    _p7f_bash = _p5f_sh.which("bash")
+    _p7f_dir = tempfile.mkdtemp()
+    _p7f_bin = os.path.join(_p7f_dir, "bin"); os.mkdir(_p7f_bin)
+    _p7f_home = os.path.join(_p7f_dir, "home"); os.makedirs(os.path.join(_p7f_home, "homebrew", "plugins"))
+    _p7f_log = os.path.join(_p7f_dir, "curl.log")
+    # The release tarball as release.sh builds it: git archive with the
+    # prefix WifiOptimizer-<version>/ (no leading v), named after the tag.
+    import tarfile as _p7f_tar, io as _p7f_io
+    _p7f_tgz = os.path.join(_p7f_dir, "wifi-optimizer-v0.24.6-beta.tar.gz")
+    with _p7f_tar.open(_p7f_tgz, "w:gz") as _p7f_t:
+        for _p7f_f in ("plugin.json", "package.json", "main.py", "decky.pyi", "dist/index.js",
+                       "defaults/dispatcher.sh.tmpl"):
+            _p7f_b = ("payload " + _p7f_f + "\n").encode()
+            _p7f_i = _p7f_tar.TarInfo("WifiOptimizer-0.24.6-beta/" + _p7f_f); _p7f_i.size = len(_p7f_b)
+            _p7f_t.addfile(_p7f_i, _p7f_io.BytesIO(_p7f_b))
+    _p7f_rel = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases"
+    _p7f_stubs = {
+        "id": '#!/bin/bash\n[ "$1" = "-u" ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n',
+        "getent": f'#!/bin/bash\necho "tester:x:1000:1000::{_p7f_home}:/bin/bash"\n',
+        "systemctl": "#!/bin/bash\nexit 0\n",
+        # Only the release asset is there to download; GitHub's archive of the
+        # tag, the API and anything else fail.
+        "curl": ('#!/bin/bash\nprintf "%s\\n" "$*" >> "' + _p7f_log + '"\n'
+                 'out=""; url=""; prev=""\n'
+                 'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; case "$a" in https://*) url="$a" ;; esac; prev="$a"; done\n'
+                 'case "$url" in\n'
+                 '  */releases/latest) printf "%s" "' + _p7f_rel + '/tag/v0.24.6-beta"; exit 0 ;;\n'
+                 '  ' + _p7f_rel + '/download/v0.24.6-beta/wifi-optimizer-v0.24.6-beta.tar.gz) cp "' + _p7f_tgz + '" "$out"; exit 0 ;;\n'
+                 'esac\nexit 22\n'),
+    }
+    for _p7f_n, _p7f_body in _p7f_stubs.items():
+        open(os.path.join(_p7f_bin, _p7f_n), "w").write(_p7f_body)
+        os.chmod(os.path.join(_p7f_bin, _p7f_n), 0o755)
+    open(_p7f_log, "w").close()
+    _p7f_r = _p5f_sp.run([_p7f_bash, os.path.abspath("install.sh")], capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PATH": _p7f_bin + os.pathsep + os.environ.get("PATH", ""),
+                              "SUDO_USER": "tester"}, cwd=_p7f_dir)
+    _p7f_pd = os.path.join(_p7f_home, "homebrew", "plugins", "WiFi Optimizer")
+    _p7f_calls = open(_p7f_log).read()
+    ok(_p7f_r.returncode == 0 and os.path.isfile(os.path.join(_p7f_pd, "main.py"))
+       and open(os.path.join(_p7f_pd, "main.py")).read() == "payload main.py\n"
+       and os.path.isfile(os.path.join(_p7f_pd, "defaults", "dispatcher.sh.tmpl")),
+       f"the release tarball unpacks where install.sh looks, and is installed (rc {_p7f_r.returncode}, "
+       f"{(_p7f_r.stdout + _p7f_r.stderr).strip()[-160:]!r})")
+    ok("/releases/download/v0.24.6-beta/wifi-optimizer-v0.24.6-beta.tar.gz" in _p7f_calls
+       and "/archive/" not in _p7f_calls and "api.github.com" not in _p7f_calls,
+       f"and that asset is the only download ({_p7f_calls.strip()[-200:]!r})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F17 M-c pass 7 the after-wake move's outcome: a banner for two minutes, then a line on the lock row (C22)")
+try:
+    ok('lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };' in _F_TY,
+       "the panel reads the three outcomes the backend sends")
+    ok('wakeMoveOutcome === "off"' in _F_IX
+       and "After sleep, the lock couldn't move or go back, so it was turned off." in _p7f_flat(_F_IX),
+       "off has its banner, like moved and back")
+    ok("Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000" in _between(_F_IX, "const wakeMoveOutcome =", ";\n"),
+       "the banners last the first 120 s")
+    _p7f_wl = _between(_F_IX, "const wakeMoveLine =", ";\n")
+    ok("!wakeMoveOutcome" in _p7f_wl and "< WAKE_MOVE_KEPT_S" in _p7f_wl
+       and "const WAKE_MOVE_KEPT_S = 12 * 60 * 60;" in _F_IX,
+       "after them the row line, while the backend keeps the outcome (at most 12 h)")
+    _p7f_ln = _between(_F_IX, 'label="Stop background scanning"', "onChange=")
+    ok(": wakeMoveLine)" in _p7f_ln and _p7f_ln.find("notices.bssid_lock ??") < _p7f_ln.find("wakeMoveLine"),
+       "the line is the lock row's notice, only where no other notice holds the slot (an error shows over it)")
+    _p7f_wr = _p7f_fn(_F_IX, "wakeMoveRowText")
+    ok(bool(_p7f_wr), "one function words the row line")
+    if _p7f_wr:
+        _p7f_case = (_p7f_fn(_P7F_UT, "timeAgo").replace("export function", "function") + _p7f_wr +
+                     "const t = Math.floor(Date.now() / 1000) - 300;\n"
+                     "console.log(JSON.stringify(['moved', 'back', 'off'].map((o: any) => wakeMoveRowText(o, t))));\n")
+        _p7f_r = _p7f_run(_p7f_case)
+        if _p7f_r is None:
+            print("SKIP  no node or typescript here to run the row line; CI runs it")
+        else:
+            _p7f_o = _p7f_json(_p7f_r)
+            ok(_p7f_o == ["Moved to a stronger access point after sleep, 5 min ago.",
+                          "Stayed after sleep: the stronger access point refused, 5 min ago.",
+                          "Turned off after sleep: it couldn't move or go back, 5 min ago."],
+               f"each outcome with the time ago ({_p7f_o} {_p7f_r[2][-200:]})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F18 pass 7 the report preview says names and addresses are masked, not removed")
+try:
+    ok('strDescription="This is everything that is sent. Network names and addresses are masked."' in _P7F_SR
+       and "are removed." not in _P7F_SR, "the address tails the masking keeps are not claimed gone")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F19 pass 7 a send saved for later stops being said once nothing is waiting")
+try:
+    ok('queued: status === "queued",' in _between(_P7F_SR, "async function send(", "\n}"),
+       "the outcome of a send saved for later is marked as such")
+    _p7f_rr = _p7f_fn(_P7F_SR, "refreshReportState")
+    ok("!state.pending" in _p7f_rr and "outcome: null" in _p7f_rr, "the state read retires it")
+    if _p7f_rr:
+        _p7f_case = ("type ReportState = any;\n"
+                     "let shared: any = {state: null, outcome: null};\n"
+                     "function update(patch: any) { shared = {...shared, ...patch}; }\n"
+                     "let loading: any = null; let again: any = null; let actionSeq = 0; let loadingSeq = 0;\n"
+                     "const hidden: any = {dropped: false}; function schedulePoll() {}\n"
+                     "const STATE_LIMIT_MS = 1000; function withTimeout(p: any, ms: number) { return p; }\n"
+                     "let next: any = null; let held: any = null;\n"
+                     "let getReportState = (): Promise<any> => held ? new Promise((r) => { const h = held; held = null; h(r); }) : Promise.resolve(next);\n"
+                     + _p7f_rr +
+                     "(async () => {\n"
+                     " const queued = (seq: number) => ({text: 'Saved. It is sent once WiFi is back.', tone: 'info', from: 'footer', queued: true, seq});\n"
+                     " actionSeq = 1; shared.outcome = queued(1);\n"
+                     " next = {pending: true}; await refreshReportState(); const waiting = !!shared.outcome;\n"
+                     " next = {pending: false, sent_ref: 'R1'}; await refreshReportState(); const sent = shared.outcome === null;\n"
+                     # A read already under way when a send ends answers from before it.
+                     " let release: any = null; held = (r: any) => { release = r; };\n"
+                     " const p = refreshReportState(); actionSeq = 2; shared.outcome = queued(2);\n"
+                     " release({pending: false}); await p; const stale = !!shared.outcome;\n"
+                     " shared.outcome = {text: 'The report may still be sending.', tone: 'info', from: 'footer'};\n"
+                     " next = {pending: false}; await refreshReportState(); const slow = !!shared.outcome;\n"
+                     " console.log(JSON.stringify({waiting, sent, stale, slow})); })();\n")
+        _p7f_r = _p7f_run(_p7f_case)
+        if _p7f_r is None:
+            print("SKIP  no node or typescript here to run the report state read; CI runs it")
+        else:
+            _p7f_o = _p7f_json(_p7f_r)
+            ok(_p7f_o == {"waiting": True, "sent": True, "stale": True, "slow": True},
+               f"kept while it waits, gone once sent, kept by a read from before the send, other notes kept ({_p7f_o} {_p7f_r[2][-200:]})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F20 M-b pass 7 the lock's (i) and the README promise the after-wake move only on the Steam Deck OLED (C25)")
+try:
+    _p7f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
+    ok('const WAKE_MOVE_DRIVER = "ath11k";' in _F_IX and "s?.driver?.startsWith(WAKE_MOVE_DRIVER)" in _p7f_li,
+       "the (i) is keyed on drivers starting ath11k, as the backend's allow list is")
+    ok('? "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one."\n'
+       '              : "It stays there until you move it or turn the lock off."' in _p7f_li,
+       "the move is promised there, and nowhere else")
+    ok(m.Plugin._module_profile("ath11k_pci").startswith("ath11k")
+       and not any(m.Plugin._module_profile(d).startswith("ath11k") for d in ("rtw88_pci", "rtw89_8852be", "mt7921e", "iwlwifi", "ath12k")),
+       "the OLED's card is recorded under a name starting ath11k, and no other card the plugin knows is")
+    _p7f_row = _between(_F_RD, "| Stop background scanning |", "\n")
+    _p7f_list = _p7f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
+    ok("(never during a game or stream, and for now only on the Steam Deck OLED)" in _p7f_row
+       and "(never during a game or stream, and for now only on the Steam Deck OLED)" in _p7f_list
+       and "not yet on the Steam Deck LCD" not in _F_RD,
+       "both README places say for now only on the Steam Deck OLED")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F21 to F31 pass 7 shorter notices, explanations and comments")
+try:
+    _p7f_fx = _p7f_flat(_F_IX)
+    _p7f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
+    ok(_p7f_w.startswith("{`A stronger access point (signal ${status.wpa2_only_stronger.signal} vs ${")
+       and "} of 100${" in _p7f_w and "offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi.`" in _p7f_w + "`"
+       and "Reset settings undoes it" not in _p7f_w and "access point here" not in _p7f_w, "F21 WPA2 banner")
+    ok("Reset puts the network back to WPA3 only" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
+       "F21 the README row keeps the undo")
+    ok("{`Locked to a weak access point (signal ${status.lock_weaker.current_signal} of 100). A stronger one is in range (${status.lock_weaker.signal} of 100). Moving reconnects WiFi.`}" in _F_IX,
+       "F22 weaker-lock banner")
+    ok('"Your settings file couldn\'t be read, so settings are back to their defaults. Turn them back on, or select Optimize Safe."' in _F_TY,
+       "F23 settings recovered")
+    ok("Another device on your network has this device's address ({status.address_conflict.ip}), so the connection may not work. Restart your router." in _p7f_fx,
+       "F24 address conflict")
+    ok("Unknown WiFi card: driver-specific fixes are off. Copy diagnostics (bottom of this panel) and report it on GitHub." in _p7f_fx
+       and ': "Unknown WiFi card";' in _P7F_PH and "Unrecognized hardware" not in _P7F_PH, "F25 unknown card, banner and header")
+    _p7f_tg = re.search(r"<ToggleField([^>]*)/>", _F_PF)
+    ok(_p7f_tg and 'label="Show details"' in _p7f_tg.group(1) and 'description="Opens every (i) explanation."' in _p7f_tg.group(1),
+       "F26 Show details says what it does")
+    _p7f_ta = _p7f_fn(_P7F_UT, "timeAgo")
+    ok('days === 1 ? "1 day ago" : `${days} days ago`' in _p7f_ta and "d ago`" not in _p7f_ta
+       and '"1 day ago", "3 days ago"' in _P7F_UT, "F27 days in words, and the comment")
+    _p7f_r = _p7f_run(_p7f_ta.replace("export function", "function") +
+                      "const n = Math.floor(Date.now() / 1000);\n"
+                      "console.log(JSON.stringify([timeAgo(n - 86400), timeAgo(n - 3 * 86400), timeAgo(n - 7200)]));\n") if _p7f_ta else None
+    if _p7f_ta and _p7f_r is None:
+        print("SKIP  no node or typescript here to run timeAgo; CI runs it")
+    elif _p7f_ta:
+        ok(_p7f_json(_p7f_r) == ["1 day ago", "3 days ago", "2 hr ago"], f"F27 timeAgo ({_p7f_r[1].strip()} {_p7f_r[2][-200:]})")
+    ok("WiFi couldn't connect, so the plugin let go of its pin. The setting stays on and comes back once WiFi works." in _p7f_fx,
+       "F28 pin released")
+    ok('explanation="Replaces this network\'s DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider\'s. Only for the network you set it on. Leave it off on a network with no IPv4. Each change reconnects WiFi for up to half a minute."' in _F_IX,
+       "F29 Custom DNS (i)")
+    ok('explanation="This is the IPv6 setting. Forces all traffic through IPv4. Only turn this on if this network\'s IPv6 is broken (slow lookups, timeouts). Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for up to half a minute."' in _F_IX,
+       "F29 Disable IPv6 (i), still naming the IPv6 setting")
+    ok("3. Tap **Optimize Safe** to turn on the other two of the four settings that suit most setups. Together the four:" in _F_RD,
+       "F30 Getting started")
+    ok("With auto\n        // mode off it still records the app event, which keeps the\n        // after-wake move and the lock scans from reconnecting as a game\n        // starts." in _F_IX
+       and "A no-op\n        // with auto mode off." not in _F_IX, "F31 the app event comment")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("pass 7 FRONT: the changed text is plain ASCII with no dashes as punctuation")
+try:
+    _p7f_all = _F_RD + _F_SEC + _P7F_INST + _F_ALL
+    ok(all(ord(ch) < 128 for ch in _p7f_all), "plain ASCII")
+    ok(not any(re.search(r"\w -{1,2} \w", _p7f_l)
+               for _p7f_l in (_F_SEC + _between(_F_RD, "## The problem", "## Building from source")).split("\n")),
        "no spaced hyphen used as a dash in SECURITY.md or the README's user sections")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -16221,8 +16731,9 @@ section("merge p5: what the panel and README say the lock does after a wake is w
 try:
     _mp5l_ix = _between(_F_IX, 'label="Stop background scanning"', "checked=")
     _mp5l_rd = _between(_F_RD, "| Stop background scanning |", "\n")
-    # Pass 6 F6 and F7: the shorter texts say the same.
-    ok("or after a wake moves to a clearly stronger one when no game or stream is running." in _mp5l_ix
+    # Pass 6 F6 and F7: the shorter texts say the same. Pass 7 F20: the (i)
+    # says it where the move runs (C25).
+    ok("After a wake, with no game or stream running, it moves to a clearly stronger one." in _mp5l_ix
        and "It moves on its own only after a wake, from a weak access point to a clearly "
        "stronger one (never during a game or stream" in _mp5l_rd,
        "the panel and the README say it moves after a wake, from weak to clearly stronger, not during a game")
@@ -17892,34 +18403,40 @@ section("merge p6: the panel and the README leave out the after-wake move where 
 # any of its names) or the locked interface's own module. The value the panel
 # tests must be the one the backend records and skips on, and every other
 # driver the panel knows must still move, as its (i) says.
+# Pass 7 M-b (C25): the (i) and the README promise the move only where the
+# backend's allow list runs it, drivers starting "ath11k" (the Steam Deck
+# OLED), and nowhere else. This keeps the FRONT half: the driver the panel
+# keys on is the OLED's recorded name and the real move runs there, and
+# rtw88 does not move. LIFECYCLE's K-d section holds the backend's matrix.
 try:
-    _mp6k_m = re.search(r's\?\.driver === "([^"]+)"\s*\?\s*"It stays there until you move or turn off the lock\."',
+    _mp6k_m = re.search(r's\?\.driver\?\.startsWith\(WAKE_MOVE_DRIVER\)\s*\?\s*"It stays there until you move it or turn the lock off\. After a wake',
                         _between(_F_IX, 'label="Stop background scanning"', "checked="))
-    _mp6k_drv = _mp6k_m.group(1) if _mp6k_m else ""
-    ok(bool(_mp6k_drv), "the lock's (i) leaves out the after-wake clause for one driver value")
-    ok(_mp6k_drv and m.Plugin._module_profile("rtw88_8822ce") == _mp6k_drv
-       and m.Plugin._module_profile("rtw88_pci") == _mp6k_drv,
-       f"that value is the name the backend records for the LCD's card ({_mp6k_drv!r})")
+    _mp6k_k = re.search(r'const WAKE_MOVE_DRIVER = "([^"]+)";', _F_IX)
+    _mp6k_drv = _mp6k_k.group(1) if (_mp6k_m and _mp6k_k) else ""
+    ok(bool(_mp6k_drv), "the lock's (i) promises the after-wake move for one driver prefix only")
+    ok(_mp6k_drv and m.Plugin._module_profile("ath11k_pci").startswith(_mp6k_drv)
+       and not m.Plugin._module_profile("rtw88_8822ce").startswith(_mp6k_drv),
+       f"that prefix is the name the backend records for the OLED's card, not the LCD's ({_mp6k_drv!r})")
     _mp6k_info = m.decky.logger.info
     _mp6k_got = {}
     try:
         m.decky.logger.info = staticmethod(lambda msg: None)
-        for _mp6k_d in [_mp6k_drv or "rtw88", "rtw89", "mt7921e", "iwlwifi", "ath11k"]:
+        for _mp6k_d in ["rtw88", "ath11k_pci"]:
             _w6_locked(driver=_mp6k_d); _mp6k_p = _W6()
             asyncio.run(_mp6k_p._move_lock_after_wake())
             _mp6k_got[_mp6k_d] = _mp6k_p.pin.upper() == _W6STRONG
     finally:
         m.decky.logger.info = _mp6k_info
         m._save_settings(dict(m.DEFAULT_SETTINGS))
-    ok(_mp6k_got.get(_mp6k_drv or "rtw88") is False,
-       f"the real move leaves the lock where the panel says it does not move ({_mp6k_got})")
-    ok(all(_mp6k_got.get(d) for d in ("rtw89", "mt7921e", "iwlwifi", "ath11k")),
-       f"and moves on every other card, where the (i) says it does ({_mp6k_got})")
+    ok(_mp6k_got.get("rtw88") is False,
+       f"the real move leaves the lock alone on the LCD's card, where the panel promises none ({_mp6k_got})")
+    ok(_mp6k_got.get("ath11k_pci") is True,
+       f"and moves it on the OLED's, where the (i) says it does ({_mp6k_got})")
     _mp6k_row = _between(_F_RD, "| Stop background scanning |", "\n")
     _mp6k_list = _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
-    ok("(never during a game or stream, and not yet on the Steam Deck LCD)" in _mp6k_row
-       and "(never during a game or stream, and not yet on the Steam Deck LCD)" in _mp6k_list,
-       "both README places that name the after-wake move say it does not happen on the LCD")
+    ok("(never during a game or stream, and for now only on the Steam Deck OLED)" in _mp6k_row
+       and "(never during a game or stream, and for now only on the Steam Deck OLED)" in _mp6k_list,
+       "both README places that name the after-wake move say for now only on the Steam Deck OLED")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -17956,8 +18473,9 @@ try:
     _mp6c_outs = set(re.findall(r'wakeMoveOutcome === "([^"]+)"', _F_IX))
     _mp6c_got = [(_mp6c_after["live"].get("lock_move_after_wake") or {}),
                  (_mp6c_back["live"].get("lock_move_after_wake") or {})]
-    ok([g.get("outcome") for g in _mp6c_got] == ["moved", "back"] and _mp6c_outs == {"moved", "back"},
-       f"C13: the two outcomes the backend sends are the two the panel shows ({_mp6c_got}, panel {sorted(_mp6c_outs)})")
+    # Pass 7 F17 (C22): the panel also shows "off", which LIFECYCLE L6 sends.
+    ok([g.get("outcome") for g in _mp6c_got] == ["moved", "back"] and _mp6c_outs == {"moved", "back", "off"},
+       f"C13: the outcomes the backend sends are among those the panel shows ({_mp6c_got}, panel {sorted(_mp6c_outs)})")
     ok(all(isinstance(g.get("at"), int) and abs(g["at"] - time.time()) < 30 for g in _mp6c_got)
        and "Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000" in _F_IX
        and re.search(r"const MESSAGE_TTL_MS = 2 \* 60 \* 1000;", _F_IX)
