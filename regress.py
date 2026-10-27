@@ -12430,6 +12430,21 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("F9 pass 8 Last changed and Auto-applied are in the footer, beside the version, not on the first screen")
+try:
+    _p8f_pf = _src("src/components/PanelFooter.tsx")
+    ok("Last changed" not in _P8F_PH and "Auto-applied" not in _P8F_PH,
+       "the header has neither line")
+    _p8f_vr = _between(_p8f_pf, "v{version} by jasonridesabike", "</PanelSectionRow>")
+    ok("Last changed: {timeAgo(lastApplied)}" in _p8f_vr and "Auto-applied: {timeAgo(lastEnforced)}" in _p8f_vr,
+       "the footer has both, in the version's row")
+    _p8f_fc = _between(_F_IX, "<PanelFooter", "/>")
+    ok("lastApplied={s?.last_applied ?? 0}" in _p8f_fc and "lastEnforced={status?.live?.last_enforced}" in _p8f_fc
+       and "lastApplied=" not in _between(_F_IX, "<PanelHeader", "/>"),
+       "and the panel hands them to the footer")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 # ---- QA pass 3 merge: where two owners' work meets ----
 section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
 # The dispatcher records the system's PCIe values only while last_enforced is

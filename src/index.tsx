@@ -1498,8 +1498,6 @@ function Content() {
     <DetailsContext.Provider value={showDetails}>
       <PanelHeader
         driver={s?.driver ?? ""}
-        lastApplied={s?.last_applied ?? 0}
-        lastEnforced={status?.live?.last_enforced}
         streaming={status?.live}
         fixesOn={!!(s?.power_save_disabled || s?.buffer_tuning_enabled || s?.cake_enabled)}
         deviceLabel={deviceParts.length ? deviceParts.join(", ") : undefined}
@@ -2292,6 +2290,8 @@ function Content() {
 
       <PanelFooter
         version={status?.version ?? "?"}
+        lastApplied={s?.last_applied ?? 0}
+        lastEnforced={status?.live?.last_enforced}
         showDetails={showDetails}
         onShowDetails={handleShowDetails}
       />
