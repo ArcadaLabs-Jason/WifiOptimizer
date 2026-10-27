@@ -62,8 +62,10 @@ export interface LiveStatus {
    * stronger refused, or "off" when the move failed and the previous one
    * could not be put back (the lock then turned off, or left on the refusing
    * one) or the radio did not come back on. Kept until the user next acts on
-   * the lock, at most 12 h; "at" is in Unix seconds. */
-  lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };
+   * the lock, at most 12 h; "at" is in Unix seconds. "pin_moved" is true on
+   * an "off" whose pin was moved before WiFi failed to come back (C30), and
+   * absent for every other outcome. */
+  lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number; pin_moved?: boolean };
   buffer_tuning_applied?: boolean;
   cake_applied?: boolean;
   dispatcher_installed?: boolean;
@@ -139,8 +141,9 @@ export interface PluginStatus {
   // The last attempt to save the settings file failed.
   settings_unwritable?: boolean;
   // Why, while settings_unwritable is true (C27): behind a link, no space
-  // left, or anything else. Absent otherwise, and from older backends.
-  settings_unwritable_cause?: "link" | "space" | "other";
+  // left, a settings file that could not be read, or anything else. Absent
+  // otherwise, and from older backends.
+  settings_unwritable_cause?: "link" | "space" | "unread" | "other";
   // The settings folder is behind a link, which the plugin refuses (C16).
   settings_link_refused?: boolean;
   // What the change in flight is, where the panel words it differently:

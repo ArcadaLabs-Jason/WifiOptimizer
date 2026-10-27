@@ -11589,7 +11589,7 @@ try:
        and "After sleep, a stronger access point refused the connection. The lock stayed." in _p6f_flat(_F_IX),
        "afterwards, what it came to")
     ok("MESSAGE_TTL_MS / 1000" in _between(_F_IX, "const wakeMoveOutcome =", ";\n")
-       and 'lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };' in _F_TY,  # Pass 7 F17
+       and 'lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number;' in _F_TY,  # Pass 7 F17, pass 9 F3
        "the banner for the two minutes other notices last")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -12184,7 +12184,7 @@ except Exception as _e:
 
 section("F17 M-c pass 7 the after-wake move's outcome: a banner for two minutes, then a line on the lock row (C22)")
 try:
-    ok('lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };' in _F_TY,
+    ok('lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number;' in _F_TY,  # Pass 9 F3: and pin_moved
        "the panel reads the three outcomes the backend sends")
     ok('wakeMoveOutcome === "off"' in _F_IX
        # Merge p7: one text true for every end the backend sends as "off".
@@ -12290,7 +12290,7 @@ try:
     _p7f_fx = _p7f_flat(_F_IX)
     _p7f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
     # Pass 8 F22: the signals worded as the weaker-lock banner words them.
-    ok(_p7f_w.startswith("{`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${")
+    ok(_p7f_w.startswith("{`A stronger access point (signal ${status.wpa2_only_stronger.signal} of 100, the one in use ${")
        and "current_signal\n              }${" in _p7f_w and "offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi.`" in _p7f_w + "`"
        and "Reset settings undoes it" not in _p7f_w and "access point here" not in _p7f_w, "F21 WPA2 banner")
     ok("Reset puts the network back to WPA3 only" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
@@ -12466,7 +12466,8 @@ try:
     _p8f_to = _between(_F_IX, "const wakeMoveTurnedOff =", ";\n")
     ok('wakeMove?.outcome === "off"' in _p8f_to and "!status?.settings?.bssid_lock_enabled" in _p8f_to,
        "which is an 'off' outcome with the lock off")
-    ok("wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff)" in _between(_F_IX, "const wakeMoveLine =", ";\n"),
+    # Pass 9 F3: and whether the pin was moved (C30).
+    ok("wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff, wakeMovePinMoved)" in _between(_F_IX, "const wakeMoveLine =", ";\n"),
        "the row line is told the same")
     _p8f_wr = _p7f_fn(_F_IX, "wakeMoveRowText")
     _p8f_r = _p7f_run(_p7f_fn(_P7F_UT, "timeAgo").replace("export function", "function") + _p8f_wr +
@@ -12569,7 +12570,10 @@ try:
        'Check that the device has free storage space, then try the change again."' in _p8f_sb, "space: the storage text")
     ok(': "The plugin couldn\'t save its settings, so changes may not last past a restart. Restart the device, then try again."'
        in _p8f_sb, "other or absent: the restart, with no storage advice")
-    ok('settings_unwritable_cause?: "link" | "space" | "other";' in _F_TY, "the panel reads the cause the backend sends")
+    # Pass 9 F2 (C27 amended): a fourth branch, for a settings file that could not be read.
+    ok(': status?.settings_unwritable_cause === "unread" ? "The plugin can\'t read its settings file, so changes aren\'t saved. '
+       'Tap Reset settings under Actions."' in _p8f_sb, "unread: Reset, not a restart")
+    ok('settings_unwritable_cause?: "link" | "space" | "unread" | "other";' in _F_TY, "the panel reads the cause the backend sends")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -12718,7 +12722,7 @@ try:
        and "reboot usually fixes it" not in _src("src/components/PanelFooter.tsx") + _F_RD,
        "F21 the footer (and the README's heads-up) say restart the device")
     _p8f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
-    ok(_p8f_w.startswith("{`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${")
+    ok(_p8f_w.startswith("{`A stronger access point (signal ${status.wpa2_only_stronger.signal} of 100, the one in use ${")
        and "vs ${" not in _p8f_w and ", address ends ${status.wpa2_only_stronger.bssid_tail}" in _p8f_w,
        "F22 the WPA2 banner words the signals as the weaker-lock banner does")
     ok("On the others they take effect when the driver loads (rtw89: and\n// at each resume) (C19)." in _F_SS,
@@ -12738,6 +12742,135 @@ try:
                + [_l for _l in _P8F_INST.split("\n") if "echo " in _l]),
        "no spaced hyphen used as a dash in SECURITY.md, the README's user sections or what install.sh prints")
 except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 9: FRONT ----
+_P9F_SR = _src("src/components/SendReport.tsx")
+
+def _p9f_banner_expr(start):
+    """The JS expression a banner block renders: the {...} inside its
+    <Banner>, or its plain text as a string literal. "" when not there."""
+    _b = _between(_F_IX, start, "</Banner>")
+    if not _b:
+        return ""
+    _in = _b[_b.find(">", _b.find("<Banner")) + 1:].strip()
+    if _in.startswith("{") and _in.endswith("}"):
+        return _in[1:-1]
+    return json.dumps(_p7f_flat(_in).strip())
+
+def _p9f_render(consts, expr, cases):
+    """Run expr under node for each status in cases (a list of JSON-able
+    dicts), with consts (source lines of the panel) defined first. None when
+    node or typescript is not here; else (list or None, stderr tail)."""
+    _code = ("function render(status: any): any {\n  const s = status?.settings;\n"
+             "  const wakeMove = status?.live?.lock_move_after_wake;\n"
+             + "".join("  " + c.strip() + "\n" for c in consts if c) +
+             "  return (" + expr + ");\n}\n"
+             "console.log(JSON.stringify(" + json.dumps(cases) + ".map(render)));\n")
+    _r = _p7f_run(_code)
+    if _r is None:
+        return None
+    return _p7f_json(_r), (_r[2] or "")[-300:]
+
+section("F1 pass 9 the WPA2 notice says 'the one in use' for the connection, and 'yours' only for ownership")
+try:
+    _p9f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
+    ok(_p9f_w.startswith("{`A stronger access point (signal ${status.wpa2_only_stronger.signal} of 100, the one in use ${"),
+       f"the signals are named: this one's, and the one in use ({_p9f_w[:110]!r})")
+    ok(len(re.findall(r"\byours\b", _p9f_w)) == 1 and "yours ${" not in _p9f_w
+       and "Allow WPA2 only if that access point is yours:" in _p9f_w,
+       f"'yours' appears once, in the ownership question ({len(re.findall(r'yours', _p9f_w))})")
+    # Rendered, with and without the address tail.
+    _p9f_r = _p9f_render([], _p9f_w[1:] + "`", [
+        {"wpa2_only_stronger": {"signal": 80, "current_signal": 40, "bssid_tail": "AB:CD"}},
+        {"wpa2_only_stronger": {"signal": 80, "current_signal": 40}}]) if _p9f_w else ([], "")
+    if _p9f_r is None:
+        print("SKIP  no node or typescript here to run the WPA2 notice; CI runs it")
+    else:
+        _p9f_o = _p9f_r[0] or []
+        ok(len(_p9f_o) == 2
+           and _p9f_o[0].startswith("A stronger access point (signal 80 of 100, the one in use 40, address ends AB:CD) offers only WPA2.")
+           and _p9f_o[1].startswith("A stronger access point (signal 80 of 100, the one in use 40) offers only WPA2."),
+           f"as the triage words it ({_p9f_o} {_p9f_r[1]})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F2 pass 9 a settings file that can't be read says to tap Reset settings, not to restart (C27 amended)")
+try:
+    _p9f_sx = _p9f_banner_expr("{(status?.settings_unwritable || status?.settings_link_refused) && (")
+    _p9f_cases = [{"settings_unwritable": True, "settings_unwritable_cause": c}
+                  for c in ("unread", "link", "space", "other", None)] + [{"settings_link_refused": True}]
+    _p9f_r = _p9f_render([], _p9f_sx, _p9f_cases) if _p9f_sx else ([], "")
+    if _p9f_r is None:
+        print("SKIP  no node or typescript here to run the settings banner; CI runs it")
+    else:
+        _p9f_o = _p9f_r[0] or [""] * 6
+        ok(_p9f_o[0] == "The plugin can't read its settings file, so changes aren't saved. Tap Reset settings under Actions.",
+           f"unread: names Reset settings ({_p9f_o[0]!r} {_p9f_r[1]})")
+        ok("Restart" not in _p9f_o[0] and "restart" not in _p9f_o[0], "and no restart, which would not help")
+        _p9f_link = "A folder on the way to the plugin's settings (~/homebrew/settings) is a link, which the plugin doesn't follow. Make it a real folder."
+        _p9f_rs = "The plugin couldn't save its settings, so changes may not last past a restart. Restart the device, then try again."
+        ok(_p9f_o[1:] == [_p9f_link,
+                          "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again.",
+                          _p9f_rs, _p9f_rs, _p9f_link],
+           f"link, space, other, absent and a refused link keep their texts ({_p9f_o[1:]})")
+    ok("Reset settings" in _src("src/components/ActionsSection.tsx") and '<PanelSection title="Actions">' in _src("src/components/ActionsSection.tsx"),
+       "the button it names is there, under Actions")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F3 pass 9 an after-wake move whose pin moved but WiFi didn't come back says it moved (C30)")
+try:
+    _p9f_consts = [_between(_F_IX, "const wakeMovePinMoved =", ";\n") + ";",
+                   _between(_F_IX, "const wakeMoveTurnedOff =", ";\n") + ";"]
+    _p9f_consts = [c for c in _p9f_consts if c != ";"]
+    _p9f_bx = _p9f_banner_expr('{wakeMoveOutcome === "off" && (')
+    _p9f_t = int(time.time())
+    def _p9f_st(pin_moved, lock_on):
+        _w = {"outcome": "off", "at": _p9f_t}
+        if pin_moved is not None:
+            _w["pin_moved"] = pin_moved
+        return {"live": {"lock_move_after_wake": _w}, "settings": {"bssid_lock_enabled": lock_on}}
+    _p9f_cases = [_p9f_st(True, True), _p9f_st(True, False), _p9f_st(None, True), _p9f_st(None, False),
+                  _p9f_st(False, False)]
+    _p9f_r = _p9f_render(_p9f_consts, _p9f_bx, _p9f_cases) if _p9f_bx else ([], "")
+    _p9f_moved = "After sleep, the lock moved to a stronger access point, but WiFi didn't come back."
+    _p9f_cant = "After sleep, the lock couldn't move to a stronger access point."
+    _p9f_off = "After sleep, the lock couldn't move to a stronger access point and was turned off."
+    if _p9f_r is None:
+        print("SKIP  no node or typescript here to run the after-wake banner; CI runs it")
+    else:
+        _p9f_o = _p9f_r[0] or [""] * 5
+        ok(_p9f_o[:2] == [_p9f_moved, _p9f_moved],
+           f"pin_moved: the banner says the lock moved, with the lock on or off ({_p9f_o[:2]} {_p9f_r[1]})")
+        ok(not any("couldn't move" in (x or "") for x in _p9f_o[:2]), "and never that it couldn't move")
+        ok(_p9f_o[2:] == [_p9f_cant, _p9f_off, _p9f_off],
+           f"without pin_moved the C22 texts stay, 'turned off' only with the lock off ({_p9f_o[2:]})")
+    _p9f_wr = _p7f_fn(_F_IX, "wakeMoveRowText")
+    _p9f_rr = _p7f_run(_p7f_fn(_P7F_UT, "timeAgo").replace("export function", "function") + _p9f_wr +
+                       "const t = Math.floor(Date.now() / 1000) - 300;\n"
+                       "const f: any = wakeMoveRowText;\n"
+                       "console.log(JSON.stringify([f('off', t, false, true), f('off', t, true, true),"
+                       " f('off', t, false, false), f('off', t, true, false), f('moved', t, false, true), f('back', t, false, true)]));\n") if _p9f_wr else None
+    if _p9f_wr and _p9f_rr is None:
+        print("SKIP  no node or typescript here to run the row line; CI runs it")
+    else:
+        _p9f_o = (_p7f_json(_p9f_rr) if _p9f_rr else None) or [""] * 6
+        _p9f_rm = "Moved to a stronger access point after sleep, but WiFi didn't come back, 5 min ago."
+        ok(_p9f_o[:2] == [_p9f_rm, _p9f_rm] and not any("Couldn't" in (x or "") for x in _p9f_o[:2]),
+           f"the row line for pin_moved says it moved ({_p9f_o[:2]} {(_p9f_rr or ('', '', ''))[2][-200:]})")
+        ok(_p9f_o[2:] == ["Couldn't move to a stronger access point after sleep, 5 min ago.",
+                          "Turned off after sleep: couldn't move to a stronger access point, 5 min ago.",
+                          "Moved to a stronger access point after sleep, 5 min ago.",
+                          "Stayed after sleep: the stronger access point refused, 5 min ago."],
+           f"and every other outcome keeps its line ({_p9f_o[2:]})")
+    ok("wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff, wakeMovePinMoved)" in _between(_F_IX, "const wakeMoveLine =", ";\n")
+       and "pin_moved?: boolean" in _between(_F_TY, "lock_move_after_wake?:", "\n"),
+       "the lock row is told, from the field the backend sends")
+except Exception as _e:
+    import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 # ---- QA pass 3 merge: where two owners' work meets ----
@@ -20361,9 +20494,14 @@ try:
     _mp7o_lock_on = _mp7o_on.group(2) if _mp7o_on else _mp7o_banner
     ok(not any(w in (_mp7o_lock_on + " " + _mp7o_row).lower() for w in ("turned off", "go back", "so it was")),
        "with the lock still on, neither says the lock was turned off or could not go back")
-    ok((not _mp7o_on or "wakeMoveTurnedOff" in _between(_F_IX, '{wakeMoveOutcome === "off" && (', "?"))
+    # Pass 9 F3: a branch ahead of it, keyed on pin_moved (C30), says the pin moved.
+    _mp7o_bn = _between(_F_IX, '{wakeMoveOutcome === "off" && (', "</Banner>")
+    ok((not _mp7o_on or "wakeMoveTurnedOff\n" in _between(_mp7o_bn, ":", "?"))
        and "!status?.settings?.bssid_lock_enabled" in _between(_F_IX, "const wakeMoveTurnedOff =", ";\n"),
        "and the branch that says it is keyed on the lock being off now")
+    ok(_between(_between(_mp7o_bn, "<Banner", "</Banner>"), "{", "?").strip() == "{wakeMovePinMoved"
+       and "pin_moved === true" in _between(_F_IX, "const wakeMovePinMoved =", ";\n"),
+       "the only branch that says the lock moved is keyed on pin_moved")
     # How long each side keeps it: the banner's two minutes and the 12 h cap.
     ok(m.Plugin._WAKE_MOVE_SHOWN_SECONDS == 120 and "const MESSAGE_TTL_MS = 2 * 60 * 1000;" in _F_IX
        and m.Plugin._WAKE_MOVE_KEPT_SECONDS == 12 * 3600 and "const WAKE_MOVE_KEPT_S = 12 * 60 * 60;" in _F_IX,
