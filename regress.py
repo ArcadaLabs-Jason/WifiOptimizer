@@ -30,6 +30,7 @@ m.STREAM_FLAG_FILE = os.path.join(_run_dir, "streaming")
 m.STREAM_HOLD_FILE = os.path.join(_run_dir, "streaming-hold")
 m.PCIE_BASELINE_FILE = os.path.join(_run_dir, "pcie-baseline")
 m.BACKEND_SWITCH_MARKER = os.path.join(_run_dir, "backend-switch")
+m.LEGACY_BACKEND_SWITCH_MARKER = os.path.join(_run_dir, "legacy-run", "backend-switch")
 m.UPDATE_LOCK_FILE = os.path.join(_run_dir, "update.lock")
 # The boot's "driver parameters at load" claim (contract C12), made by every
 # re-application before it writes last_enforced.
@@ -7491,7 +7492,7 @@ try:
             ("a signature file that is not text", _files(sig=b"\xff\xfe" + _REL_SIG.encode()),
              "This release's signature didn't check out, so it wasn't installed."),
             ("a signed list without the tarball", _files(sums=_no_tar, sig=_minisign(_no_tar, f"wifi-optimizer v{_VER}")),
-             "This release's signed checksums don't cover the update, so it wasn't installed."),
+             "This release isn't signed properly, so it wasn't installed."),
             ("the signature not downloadable", _files(sig="down"),
              "Couldn't download the release's signature. Try again later."),
             ("an oversized checksum list", _files(sums=b"x" * (m.RELEASE_SUMS_MAX + 1)),
@@ -10112,7 +10113,8 @@ except Exception as _e:
 
 section("D12 the region notice names the Steam Deck only on one")
 try:
-    for _fam, _want in (("rog_ally", False), ("legion_go", False), ("deck_oled", True), ("deck_lcd", True)):
+    # L20 pass 7: the self-managed notice names no device at all now.
+    for _fam, _want in (("rog_ally", False), ("legion_go", False), ("deck_oled", False), ("deck_lcd", False)):
         m._save_settings({**base_ap, "device_family": _fam})
         _msg = asyncio.run(Reg(SELF_MANAGED).set_regdomain("DE")).get("message", "")
         ok(bool(_msg) and ("Steam Deck" in _msg) is _want,
@@ -15004,7 +15006,9 @@ try:
                     "sha256": "0" * 64}
         def _launch_updater(self, argv): self.launched.append(list(argv))
 
-    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_custom_patterns": "mystreamer"})
+    # M-d pass 7: the user's own names count only while auto mode is on.
+    m._save_settings({**m.DEFAULT_SETTINGS, "streaming_custom_patterns": "mystreamer",
+                      "streaming_mode_enabled": True})
     _mp_p = _MpUp()
     _mp_r = asyncio.run(_mp_p.apply_update("9.9.9"))
     _mp_argv = _mp_p.launched[0] if _mp_p.launched else []
@@ -15867,10 +15871,13 @@ try:
     m._save_settings({**m.DEFAULT_SETTINGS, "supports_6ghz": True, "distro_id": "steamos"})
     _r16 = _P16()._six_ghz_refusal("dddddddd-0000-0000-0000-0000000000c6") or {}
     _msg16 = _r16.get("message", "")
-    # L6 pass 6: the way on, said as steps, with no internals in it.
-    ok("forget this network and join it again" in _msg16 and "WPA3 only" in _msg16
+    # L6 pass 6: the way on, said as steps, with no internals in it. L1
+    # pass 7 (M-a): this network to WPA3 Personal in Desktop Mode, never the
+    # router to WPA3 only, never forgetting the network.
+    ok("WPA3 Personal" in _msg16 and "Desktop Mode" in _msg16 and "forget" not in _msg16.lower()
+       and "router to WPA3 only" not in _msg16
        and "NetworkManager" not in _msg16 and "1.58.1" not in _msg16 and "SteamOS" not in _msg16,
-       f"the refusal gives the way on: forget and join again with the router on WPA3 only ({_msg16!r})")
+       f"the refusal gives the way on: this network to WPA3 Personal in Desktop Mode ({_msg16!r})")
     ok(all(ord(c) < 128 for c in _msg16) and " - " not in _msg16, "in plain ASCII, no dashes")
     m._save_settings(dict(m.DEFAULT_SETTINGS))
 except Exception as _e:
@@ -15888,6 +15895,7 @@ try:
             super().__init__(MESH, "02:00:00:00:00:11", signal_dbm=signal_dbm)
             self.pinned = "02:00:00:00:00:11"; self._ASSOCIATION_WAIT_SECONDS = 1.0
         def _get_active_connection_uuid(self): return _P17U
+        def _iface_driver(self, iface): return "ath11k_pci"   # M-b pass 7: the OLED's card
         def _run_cmd(self, cmd, timeout=5):
             if cmd[-1:] == ["general"]:
                 return _ok("connected:enabled")
@@ -16292,7 +16300,7 @@ import threading as _p6_thr, ast as _p6_ast
 
 _W6U = "eeeeeeee-0000-0000-0000-0000000000b6"
 _W6WEAK, _W6STRONG = "02:00:00:00:00:11", "02:00:00:00:00:51"
-_W6BUSY = "The access point lock is moving after sleep. Try again in a moment."
+_W6BUSY = "The access point lock is being checked after sleep. Try again in a moment."
 
 
 class _W6(m.Plugin):
@@ -16300,14 +16308,19 @@ class _W6(m.Plugin):
     clearly stronger one of the same network in range. NetworkManager and iw
     modelled; the game check, the scans and the radio cycles are the
     plugin's own, only the commands under them answer from the model."""
-    def __init__(self, game_delay=0.0, reachable=True, refused_stays=True, slow=False):
+    def __init__(self, game_delay=0.0, reachable=True, refused_stays=True, slow=False,
+                 card="ath11k_pci"):
         super().__init__()
-        self.slow = slow
+        self.slow = slow; self.card = card
         self.pin = _W6WEAK; self.on = _W6WEAK; self.mods = []; self.cycles = []
         self.game_delay = game_delay; self.game = False; self.reachable = reachable
         self.refused_stays = refused_stays; self.on_scan = None; self.on_cycle = None
         self._ASSOCIATION_WAIT_SECONDS = 0.5
     def _get_wifi_interface(self): return "wlan0"
+    def _iface_driver(self, iface):
+        # The Steam Deck OLED's card, the one the after-wake move runs on
+        # (M-b pass 7); card=None reads sysfs as the plugin does.
+        return self.card if self.card is not None else m.Plugin._iface_driver(self, iface)
     def _get_active_connection_uuid(self): return _W6U
     def _get_profile_ssid(self, uuid, timeout=5): return "Net"
     def _profile_key_mgmt(self, uuid): return "wpa-psk"
@@ -16423,25 +16436,34 @@ try:
                 return True
         return False
 
-    _l1_bad, _l1_pairs = [], 0
-    for _fn in _p6_ast.walk(_p6_ast.parse(open("main.py").read())):
-        if not isinstance(_fn, _p6_ast.AsyncFunctionDef):
-            continue
-        _inner = set()
-        for _n in _p6_ast.walk(_fn):
-            if _n is not _fn and isinstance(_n, (_p6_ast.FunctionDef, _p6_ast.AsyncFunctionDef, _p6_ast.Lambda)):
-                _inner.update(id(x) for x in _p6_ast.walk(_n))
-        _nodes = [n for n in _p6_ast.walk(_fn) if n is not _fn and id(n) not in _inner]
-        _chk = sorted(n.lineno for n in _nodes
-                      if isinstance(n, _p6_ast.Call) and getattr(n.func, "attr", "") in _l1_checks)
-        _aw = sorted(n.lineno for n in _nodes if isinstance(n, _p6_ast.Await))
-        for _c in sorted(n.lineno for n in _nodes if _l1_is_claim(n)):
-            _k = [k for k in _chk if k < _c]
-            if not _k:
+    def _l1_guard_gaps(tree):
+        """(gaps, pairs): every (function, check line, claim line) where
+        something that can yield to the event loop (await, and L18 pass 7:
+        async with and async for) sits between a guard check and its claim,
+        out of how many check-claim pairs."""
+        bad, pairs = [], 0
+        for fn in _p6_ast.walk(tree):
+            if not isinstance(fn, _p6_ast.AsyncFunctionDef):
                 continue
-            _l1_pairs += 1
-            if any(_k[-1] < a < _c for a in _aw):
-                _l1_bad.append((_fn.name, _k[-1], _c))
+            inner = set()
+            for n in _p6_ast.walk(fn):
+                if n is not fn and isinstance(n, (_p6_ast.FunctionDef, _p6_ast.AsyncFunctionDef, _p6_ast.Lambda)):
+                    inner.update(id(x) for x in _p6_ast.walk(n))
+            nodes = [n for n in _p6_ast.walk(fn) if n is not fn and id(n) not in inner]
+            chk = sorted(n.lineno for n in nodes
+                         if isinstance(n, _p6_ast.Call) and getattr(n.func, "attr", "") in _l1_checks)
+            aw = sorted(n.lineno for n in nodes
+                        if isinstance(n, (_p6_ast.Await, _p6_ast.AsyncWith, _p6_ast.AsyncFor)))
+            for c in sorted(n.lineno for n in nodes if _l1_is_claim(n)):
+                k = [x for x in chk if x < c]
+                if not k:
+                    continue
+                pairs += 1
+                if any(k[-1] < a < c for a in aw):
+                    bad.append((fn.name, k[-1], c))
+        return bad, pairs
+
+    _l1_bad, _l1_pairs = _l1_guard_gaps(_p6_ast.parse(open("main.py").read()))
     ok(_l1_pairs >= 9 and not _l1_bad,
        f"no await sits between a guard check and its claim, in any of {_l1_pairs} ({_l1_bad})")
     _src1 = open("main.py").read()
@@ -16519,10 +16541,16 @@ try:
     ok((_st7["live"].get("lock_move_after_wake") or {}).get("outcome") == "moved"
        and isinstance(_st7["live"]["lock_move_after_wake"].get("at"), int),
        f"and the status says it moved ({_st7['live'].get('lock_move_after_wake')})")
+    # M-c pass 7: kept past the banner's two minutes, until the user acts
+    # on the lock, at most 12 h.
     _p7._wake_move_outcome = (_p7._wake_move_outcome[0], _p7._wake_move_outcome[1],
                               _p7._wake_move_outcome[2] - 121)
+    ok("lock_move_after_wake" in _p7._with_activity({"live": {}})["live"],
+       "past two minutes it is still there, for the lock row")
+    _p7._wake_move_outcome = (_p7._wake_move_outcome[0], _p7._wake_move_outcome[1],
+                              _p7._wake_move_outcome[2] - 12 * 3600)
     ok("lock_move_after_wake" not in _p7._with_activity({"live": {}})["live"],
-       "for two minutes, then no more")
+       "and gone after 12 hours")
 
     # (2) While it runs.
     _w6_locked(); _p7 = _W6(game_delay=0.6)
@@ -16638,14 +16666,16 @@ try:
                    os.path.join(_kd_sys, "wlan0", "device", "driver", "module"))
         try:
             m.SYSFS_NET = _kd_sys
-            _w6_locked(); _pd = _W6()
+            _w6_locked(); _pd = _W6(card=None)
             asyncio.run(_pd._move_lock_after_wake())
         finally:
             m.SYSFS_NET = _kd_real_sys
         ok(not _pd.mods and not _pd.cycles, "nor when the interface's own driver is rtw88")
+        # M-b pass 7: an allow list now; the cards it leaves out are checked
+        # in "M-b pass 7".
         _w6_locked(); _pd = _W6()
         asyncio.run(_pd._move_lock_after_wake())
-        ok(_pd.pin.upper() == _W6STRONG, "while other cards still move")
+        ok(_pd.pin.upper() == _W6STRONG, "while the Steam Deck OLED's card still moves")
     finally:
         m.decky.logger.info = _kd_real_info
     m._save_settings(dict(m.DEFAULT_SETTINGS))
@@ -16779,14 +16809,15 @@ try:
        and not _p6.writes,
        f"no 6 GHz access point in range: that is the answer, not a router change ({_r6.get('message')!r})")
     _r6, _p6 = _l6_ask(present=True)
-    ok(_r6.get("message") == "6 GHz needs this network saved for WPA3. Set your router to WPA3 only, "
-                             "then forget this network and join it again."
+    # L1 pass 7 (M-a): this network to WPA3 Personal, not the router.
+    ok(_r6.get("message") == "6 GHz needs this network saved as WPA3. In Desktop Mode's network "
+                             "settings, set its security to WPA3 Personal."
        and "NetworkManager" not in _r6.get("message", ""),
        f"one in range and the profile saved for WPA2: the steps, plainly ({_r6.get('message')!r})")
     m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos", "wpa2_uuids": [_L6U]})
     _r6, _p6 = _l6_ask(present=True)
-    ok(_r6.get("message") == "6 GHz needs WPA3 only, and WPA2 is allowed on this network. "
-                             "Reset settings puts WPA3 only back."
+    ok(_r6.get("message") == "6 GHz needs WPA3, and Allow WPA2 is on for this network. In Desktop "
+                             "Mode's network settings, set its security back to WPA3 Personal."
        and "forget" not in _r6.get("message", ""),
        f"WPA2 allowed by the plugin itself: no advice to forget the network ({_r6.get('message')!r})")
     m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos"})
@@ -16808,31 +16839,43 @@ try:
     _KCU = "cccccccc-0000-0000-0000-0000000000c7"
 
     class _KC(m.Plugin):
+        """C21 (pass 7): a 6 GHz access point of this network in nmcli's cached list."""
         def __init__(self, km):
             super().__init__(); self.km = km; self._nm_version_seen = (1, 58, 0); self.logged = 0
         def _nm_version(self): return self._nm_version_seen
         def _profile_key_mgmt(self, uuid): return self.km
+        def _run_cmd(self, cmd, timeout=5):
+            if "wifi" in cmd and "list" in cmd:
+                return _ok("Home:02\\:00\\:00\\:00\\:00\\:61:70:5975 MHz:WPA3\n"
+                           "Home:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2 WPA3")
+            return _ok()
     m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos"})
     _report6 = getattr(_KC, "_report_six_ghz", None)
+
+    def _kc_report(p, st, band):
+        try:
+            p._report_six_ghz(m._load_settings(), st, _KCU, band, "wlan0", "Home")
+        except TypeError:
+            p._report_six_ghz(m._load_settings(), st, _KCU, band)
     _st_kc = {"live": {"wifi_backend": "wpa_supplicant"}}
     if _report6:
-        _KC("wpa-psk")._report_six_ghz(m._load_settings(), _st_kc, _KCU, "")
+        _kc_report(_KC("wpa-psk"), _st_kc, "")
     ok(_st_kc["live"].get("six_ghz_offered") is True
-       and (_st_kc["live"].get("six_ghz_refusal") or "").startswith("6 GHz needs this network saved for WPA3"),
+       and (_st_kc["live"].get("six_ghz_refusal") or "").startswith("6 GHz needs this network saved as WPA3"),
        f"offered, but refused for the profile in use: the reason is in live ({_st_kc['live']})")
     _st_kc = {"live": {"wifi_backend": "wpa_supplicant"}}
     if _report6:
-        _KC("sae")._report_six_ghz(m._load_settings(), _st_kc, _KCU, "")
+        _kc_report(_KC("sae"), _st_kc, "")
     ok("six_ghz_refusal" not in _st_kc["live"] and _st_kc["live"].get("six_ghz_offered") is True,
        "a WPA3 profile: nothing refused")
     _st_kc = {"live": {"wifi_backend": "wpa_supplicant"}}
     if _report6:
-        _KC("wpa-psk")._report_six_ghz(m._load_settings(), _st_kc, _KCU, "6GHz")
+        _kc_report(_KC("wpa-psk"), _st_kc, "6GHz")
     ok("six_ghz_refusal" not in _st_kc["live"], "already on 6 GHz: nothing to say")
     _src_kc = open("main.py").read()
     _col_kc = _src_kc[_src_kc.index("    def _collect_status"):]
-    ok("self._report_six_ghz(settings, status, uuid, live_band)" in _col_kc[:20000],
-       "and the status collector asks it")
+    ok("self._report_six_ghz(settings, status, uuid, live_band, iface, active_ssid() or \"\")"
+       in _col_kc[:20000], "and the status collector asks it, with the interface and the network")
     m._save_settings(dict(m.DEFAULT_SETTINGS))
 except Exception as _e:
     import traceback; traceback.print_exc()
@@ -16878,26 +16921,43 @@ try:
             return stalls[0]
         return asyncio.run(go())
 
-    class _L13Lock(_W6):
-        """The after-wake model, every nmcli call taking 1 s."""
-        def _get_profile_ssid(self, uuid, timeout=5): time.sleep(1.0); return "Net"
-        def _read_profile_field(self, uuid, field, timeout=5):
-            time.sleep(1.0); return _W6._read_profile_field(self, uuid, field, timeout)
-        def _nmcli_modify(self, u, k, v, timeout=5):
-            time.sleep(1.0); return _W6._nmcli_modify(self, u, k, v, timeout)
-    _w6_locked(); _p13 = _L13Lock()
-    _st13 = _l13_max_stall(lambda: _p13._lock_onto_best("wlan0", _W6U, moving=True, after_wake=True))
-    ok(_st13 < 0.5 and _p13.pin.upper() == _W6STRONG,
-       f"moving the lock: the event loop never waits on nmcli (longest stall {_st13:.2f} s)")
+    # L18 pass 7: judged by which thread each nmcli call runs on, not by a
+    # wall-clock threshold a loaded host could cross. The ticker's longest
+    # stall is still printed, as a report line only.
+    _l13_on_loop = []
 
-    _l5_locked_for_a(); _p13 = _L5Net(_L5Net.A, nm_delay=1.0)
+    def _l13_note(what):
+        if _p6_thr.current_thread() is _p6_thr.main_thread():
+            _l13_on_loop.append(what)
+
+    class _L13Lock(_W6):
+        """The after-wake model, every nmcli call taking 1 s and noting its thread."""
+        def _get_profile_ssid(self, uuid, timeout=5):
+            _l13_note("ssid"); time.sleep(1.0); return "Net"
+        def _read_profile_field(self, uuid, field, timeout=5):
+            _l13_note("read"); time.sleep(1.0); return _W6._read_profile_field(self, uuid, field, timeout)
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            _l13_note("modify"); time.sleep(1.0); return _W6._nmcli_modify(self, u, k, v, timeout)
+
+    class _L13Net(_L5Net):
+        def _nm(self):
+            _l13_note("nmcli"); _L5Net._nm(self)
+    _w6_locked(); _p13 = _L13Lock(); _l13_on_loop.clear()
+    _st13 = _l13_max_stall(lambda: _p13._lock_onto_best("wlan0", _W6U, moving=True, after_wake=True))
+    ok(not _l13_on_loop and _p13.pin.upper() == _W6STRONG,
+       f"moving the lock: no nmcli call on the event loop ({_l13_on_loop})")
+    print(f"      (longest event loop stall {_st13:.2f} s)")
+
+    _l5_locked_for_a(); _p13 = _L13Net(_L5Net.A, nm_delay=1.0); _l13_on_loop.clear()
     _p13.set_bssid_lock = lambda enabled: asyncio.sleep(0, result={"success": True})
     _st13 = _l13_max_stall(_p13.allow_wpa2)
-    ok(_st13 < 0.5, f"Allow WPA2: the same (longest stall {_st13:.2f} s)")
+    ok(not _l13_on_loop, f"Allow WPA2: the same ({_l13_on_loop})")
+    print(f"      (longest event loop stall {_st13:.2f} s)")
 
-    _l5_locked_for_a(); _p13 = _L5Net(_L5Net.A, nm_delay=1.0)
+    _l5_locked_for_a(); _p13 = _L13Net(_L5Net.A, nm_delay=1.0); _l13_on_loop.clear()
     _st13 = _l13_max_stall(lambda: _p13.set_band_preference(True, "a"))
-    ok(_st13 < 0.5, f"Force 5 GHz: the same (longest stall {_st13:.2f} s)")
+    ok(not _l13_on_loop, f"Force 5 GHz: the same ({_l13_on_loop})")
+    print(f"      (longest event loop stall {_st13:.2f} s)")
     m._save_settings(dict(m.DEFAULT_SETTINGS))
 except Exception as _e:
     import traceback; traceback.print_exc()
@@ -17407,8 +17467,8 @@ try:
         asyncio.sleep = _d_real_sleep
     ok("its own region" not in _m18 and "stayed on DE instead of US" in _m18,
        f"the region in force is named as it is ({_m18!r})")
-    ok(_m18 == "The WiFi card stayed on DE instead of US. That is normal on some cards, "
-               "and nothing else needs doing.", "in two short sentences")
+    ok(_m18 == "The WiFi card stayed on DE instead of US. That is normal on some cards.",
+       "in two short sentences")
     m._save_settings(dict(m.DEFAULT_SETTINGS))
 except Exception as _e:
     import traceback; traceback.print_exc()
@@ -17445,9 +17505,9 @@ try:
     m._save_settings({**m.DEFAULT_SETTINGS, "update_channel": "beta"})
     _kf_ver = m.decky.DECKY_PLUGIN_VERSION
     try:
-        m.decky.DECKY_PLUGIN_VERSION = "0.24.6-beta"
+        m.decky.DECKY_PLUGIN_VERSION = "0.24.7-beta"
         _ukf = asyncio.run(_KF(newest="0.24.2-beta").check_for_update())
-        _vkf = asyncio.run(_KF(newest="0.24.5-beta").check_for_update())
+        _vkf = asyncio.run(_KF(newest=_kf_floor).check_for_update())
     finally:
         m.decky.DECKY_PLUGIN_VERSION = _kf_ver
     ok(_ukf.get("update_available") is False,
@@ -17905,7 +17965,7 @@ try:
     try:
         m.decky.logger.info = staticmethod(lambda msg: None)
         for _mp6k_d in [_mp6k_drv or "rtw88", "rtw89", "mt7921e", "iwlwifi", "ath11k"]:
-            _w6_locked(driver=_mp6k_d); _mp6k_p = _W6()
+            _w6_locked(driver=_mp6k_d); _mp6k_p = _W6(card=_mp6k_d)
             asyncio.run(_mp6k_p._move_lock_after_wake())
             _mp6k_got[_mp6k_d] = _mp6k_p.pin.upper() == _W6STRONG
     finally:
@@ -17913,8 +17973,9 @@ try:
         m._save_settings(dict(m.DEFAULT_SETTINGS))
     ok(_mp6k_got.get(_mp6k_drv or "rtw88") is False,
        f"the real move leaves the lock where the panel says it does not move ({_mp6k_got})")
-    ok(all(_mp6k_got.get(d) for d in ("rtw89", "mt7921e", "iwlwifi", "ath11k")),
-       f"and moves on every other card, where the (i) says it does ({_mp6k_got})")
+    # M-b pass 7: only ath11k (the Steam Deck OLED) moves (C25).
+    ok(not any(_mp6k_got.get(d) for d in ("rtw89", "mt7921e", "iwlwifi")) and _mp6k_got.get("ath11k"),
+       f"and moves only on ath11k ({_mp6k_got})")
     _mp6k_row = _between(_F_RD, "| Stop background scanning |", "\n")
     _mp6k_list = _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
     ok("(never during a game or stream, and not yet on the Steam Deck LCD)" in _mp6k_row
@@ -17968,7 +18029,10 @@ try:
     # C14: the cached refusal as the status pass reports it.
     class _Mp6c6(m.Plugin):
         def _six_ghz_offered(self, settings, status): return True
-        def _six_ghz_refusal(self, uuid, quiet=False):
+        # C21 (pass 7): only with a 6 GHz access point of this network cached.
+        def _six_ghz_list(self, uuid, iface, ssid):
+            return [("02:00:00:00:00:61", 70, 5975, "WPA3")]
+        def _six_ghz_refusal(self, uuid, quiet=False, aps=None):
             return {"success": False, "error": "six_ghz_wpa_psk", "message": "6 GHz needs WPA3 here."}
     _mp6c_s6 = {"live": {}}
     _Mp6c6()._report_six_ghz({}, _mp6c_s6, "u6", "5GHz")
@@ -18010,6 +18074,928 @@ try:
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 7, LIFECYCLE ----
+import threading as _p7_thr
+
+section("L1 pass 7 Force 6 GHz is refused in the status only with a 6 GHz access point of this network in nmcli's cached list (C21)")
+try:
+    _L71U = "cccccccc-0000-0000-0000-0000000000d1"
+
+    class _P71(m.Plugin):
+        """NetworkManager 1.58.0 with a wpa-psk (or other) profile; nmcli's
+        cached access point list answered from rows, every call recorded."""
+        def __init__(self, km="wpa-psk", rows=()):
+            super().__init__(); self.km = km; self.rows = list(rows); self.calls = []
+            self._nm_version_seen = (1, 58, 0)
+        def _nm_version(self): return self._nm_version_seen
+        def _profile_key_mgmt(self, uuid): return self.km
+        def _read_profile_field(self, uuid, field, timeout=5): return ""
+        def _run_cmd(self, cmd, timeout=5):
+            self.calls.append(list(cmd))
+            if "wifi" in cmd and "list" in cmd:
+                return _ok("\n".join(self.rows))
+            return _ok()
+
+    def _l71(km="wpa-psk", rows=(), wpa2=False, band="", p=None):
+        m._save_settings({**base_ap, "supports_6ghz": True, "distro_id": "steamos",
+                          **({"wpa2_uuids": [_L71U]} if wpa2 else {})})
+        p = p or _P71(km, rows)
+        st = {"live": {"wifi_backend": "wpa_supplicant"}}
+        try:
+            p._report_six_ghz(m._load_settings(), st, _L71U, band, "wlan0", "Home")
+        except TypeError:          # 6c0cb39 took no interface or network name
+            p._report_six_ghz(m._load_settings(), st, _L71U, band)
+        return st["live"], p
+
+    _l71_low = ["Home:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2 WPA3",
+                "Home:02\\:00\\:00\\:00\\:00\\:24:90:2437 MHz:WPA2 WPA3",
+                "Other:02\\:00\\:00\\:00\\:00\\:99:80:5975 MHz:WPA3"]
+    _lv, _p71 = _l71(rows=_l71_low)
+    ok(_lv.get("six_ghz_offered") is True and "six_ghz_refusal" not in _lv,
+       f"(1) this network only on 2.4 and 5 GHz (another network on 6 GHz): offered, nothing refused ({_lv})")
+    _lv, _p71 = _l71(rows=[])
+    ok(_lv.get("six_ghz_offered") is True and "six_ghz_refusal" not in _lv,
+       f"(1) and with no cached list at all: nothing refused ({_lv})")
+
+    _l71_six = ["Home:02\\:00\\:00\\:00\\:00\\:61:70:5975 MHz:WPA3",
+                "Home:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2 WPA3"]
+    _lv, _p71 = _l71(rows=_l71_six)
+    _r71 = _lv.get("six_ghz_refusal", "")
+    ok("Desktop Mode" in _r71 and "WPA3 Personal" in _r71 and "forget" not in _r71.lower()
+       and "router to WPA3 only" not in _r71,
+       f"(2) a cached 6 GHz access point of this network: the reason says to set this network to "
+       f"WPA3 Personal in Desktop Mode, never forget it or the router ({_r71!r})")
+    ok(all(ord(c) < 128 for c in _r71) and " - " not in _r71, "(2) in plain ASCII, no dashes")
+    _lv, _p71 = _l71(rows=["Home:02\\:00\\:00\\:00\\:00\\:61:70:5975 MHz:WPA3",
+                           "Home:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2"])
+    _r71 = _lv.get("six_ghz_refusal", "")
+    ok("WPA2/WPA3" in _r71 and "only WPA2" in _r71 and "forget" not in _r71.lower(),
+       f"(3) one of its access points offers only WPA2: set them to WPA2/WPA3 first ({_r71!r})")
+    _lv, _p71 = _l71(rows=_l71_six, wpa2=True)
+    _r71 = _lv.get("six_ghz_refusal", "")
+    ok("set its security back" in _r71 and "Allow WPA2" in _r71,
+       f"(4) Allow WPA2 made it wpa-psk: set its security back ({_r71!r})")
+    _lv, _p71 = _l71(km="none", rows=_l71_low)
+    ok("six_ghz_refusal" not in _lv,
+       f"(5) an open network with no 6 GHz access point: nothing shown ({_lv})")
+
+    _lv, _p71 = _l71(rows=_l71_six)
+    _l71(rows=_l71_six, p=_p71)
+    _lists = [c for c in _p71.calls if "wifi" in c and "list" in c]
+    ok(len(_lists) == 1 and all(c[-2:] == ["--rescan", "no"] for c in _lists),
+       f"(6) the status path reads the cached list (--rescan no), once a minute ({_lists})")
+
+    # (7) The band reassertion, after a status pass asked the same quietly.
+    _l71_logged = []
+    _l71_info = m.decky.logger.info
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: _l71_logged.append(msg))
+        _lv, _p71 = _l71(rows=_l71_six)
+        _s71 = {**m._load_settings(), "band_preference_enabled": True, "band_preference": "6GHz"}
+        _st71 = {"drift": {"band_preference": True}, "live": {}}
+        _p71._apply_band({"uuid": _L71U, "value": "6GHz", "observed": ""}, _s71, _st71, {})
+    finally:
+        m.decky.logger.info = _l71_info
+    ok(any(l.startswith("Refusing band '6GHz'") for l in _l71_logged)
+       and not [c for c in _p71.calls if "modify" in c],
+       f"(7) the reassertion refuses, writes nothing and logs its refusal ({_l71_logged[-2:]})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L2 pass 7 the scan gate goes by the answer of the search it asked for, whatever the poll cadence")
+try:
+    _p72_proc = os.path.join(tempfile.mkdtemp(), "proc")
+    for _pid, _argv in (("4100", [b"/usr/lib/systemd/systemd"]), ("4200", [b"/usr/bin/bash", b"-l"])):
+        os.makedirs(os.path.join(_p72_proc, _pid))
+        open(os.path.join(_p72_proc, _pid, "cmdline"), "wb").write(b"\0".join(_argv) + b"\0")
+        open(os.path.join(_p72_proc, _pid, "status"), "w").write("Name:\tx\nPPid:\t1\n")
+    _p72_clock = [1000.0]
+    _p72_saved = (m.PROC_DIR, m.time.monotonic)
+
+    class _P72(Mesh):
+        """The mesh model, the process search real over a fixture /proc. A
+        status pass takes pass_len seconds (the clock moves on at its first
+        nmcli call)."""
+        def __init__(self, scan=MESH, key_mgmt="wpa-psk", pass_len=0):
+            super().__init__(scan, "02:00:00:00:00:11", signal_dbm=-84, key_mgmt=key_mgmt)
+            self.pinned = "02:00:00:00:00:11"; self.rescans = []; self.pass_len = pass_len
+            self.moved = False
+        def _run_cmd(self, cmd, timeout=5):
+            if not self.moved:
+                self.moved = True; _p72_clock[0] += self.pass_len
+            if "rescan" in cmd:
+                self.rescans.append(_p72_clock[0])
+                return _ok()
+            return Mesh._run_cmd(self, cmd, timeout)
+
+    _p72_live = {"bssid_lock": "02:00:00:00:00:11", "connected_bssid": "02:00:00:00:00:11"}
+    _p72_link = "Connected to 02:00:00:00:00:11 (on wlan0)\n\tsignal: -84 dBm\n"
+    _p72_set = {**base_ap, "bssid_lock_enabled": True, "bssid_lock_value": "02:00:00:00:00:11",
+                "bssid_lock_connection_uuid": "eeeeeeee-0000-0000-0000-0000000000a8",
+                "streaming_mode_enabled": False}
+    _p72_reach_scan = "\n".join(["Net:02\\:00\\:00\\:00\\:00\\:11:45:5745 MHz:WPA2 WPA3",
+                                 "Net:02\\:00\\:00\\:00\\:00\\:61:100:5180 MHz:WPA2"])
+    try:
+        m.PROC_DIR = _p72_proc
+        m.time.monotonic = lambda: _p72_clock[0]
+        m._save_settings(dict(_p72_set))
+        _p72_bad = []
+        for _step in (3, 6, 10, 20):
+            for _plen in (0, 4):
+                _p72_clock[0] = 1000.0
+                _g = _P72(pass_len=_plen); _found = None
+                while _p72_clock[0] - 1000.0 < 240:
+                    _g.moved = False
+                    _g._report_lock_weaker(_p72_set, {"live": dict(_p72_live)},
+                                           _p72_set["bssid_lock_connection_uuid"], "wlan0", "Net", _p72_link)
+                    if getattr(_g, "_lock_weaker", None) and _found is None:
+                        _found = _p72_clock[0] - 1000.0
+                    time.sleep(0.005)
+                    _p72_clock[0] += _step
+                _first = _g.rescans[0] - 1000.0 if _g.rescans else None
+                if _first is None or _first > 120 or _found is None:
+                    _p72_bad.append(("lock-weaker", _step, _plen, _first, _found))
+                _p72_clock[0] = 5000.0
+                _gb = _P72(_p72_reach_scan, key_mgmt="sae", pass_len=_plen)
+                _gb._nm_version_seen = (1, 58, 1); _reach = None
+                while _p72_clock[0] - 5000.0 < 240:
+                    _gb.moved = False
+                    _gb._recheck_security_reach(_p72_set["bssid_lock_connection_uuid"], "wlan0", "Net",
+                                                "02:00:00:00:00:11", _p72_set, "02:00:00:00:00:11")
+                    if getattr(_gb, "_wpa2_blocked", None) and _reach is None:
+                        _reach = _p72_clock[0] - 5000.0
+                    time.sleep(0.005)
+                    _p72_clock[0] += _step
+                _first = _gb.rescans[0] - 5000.0 if _gb.rescans else None
+                if _first is None or _first > 120 or _reach is None:
+                    _p72_bad.append(("WPA2-reach", _step, _plen, _first, _reach))
+        ok(not _p72_bad,
+           f"(1) polls 3, 6, 10 and 20 s apart, each pass taking 0 or 4 s: both checks ask for a rescan "
+           f"in the first two minutes and report (failed: {_p72_bad})")
+
+        # (2) 07's t_b shape: checks 5.6 s apart, an instant search.
+        _p72b = m.Plugin(); _ans = []
+        for _ in range(4):
+            _ans.append(_p72b._stream_running_now(dict(m.DEFAULT_SETTINGS)))
+            _p72_clock[0] += 5.6
+        ok(_ans == [False, False, False, False],
+           f"(2) checks 5.6 s apart with an instant search: nothing running, every time ({_ans})")
+
+        # (3) A search taking 3 s: answered at the next call, 7 s later,
+        # through the ticket; not when Steam started a game after it began.
+        def _p72_slow(progress=None, skip=frozenset()):
+            time.sleep(3.0); return [("4200", b"/usr/bin/bash\0-l\0", "1", "bash")]
+        _p72c = m.Plugin(); _p72c._read_processes = _p72_slow
+        _a1 = _p72c._stream_running_now(dict(m.DEFAULT_SETTINGS))
+        time.sleep(2.6)
+        _p72_clock[0] += 7
+        _a2 = _p72c._stream_running_now(dict(m.DEFAULT_SETTINGS))
+        ok(_a1 is None and _a2 is False,
+           f"(3) a 3 s search: not known at first, then its answer at the next call ({_a1}, {_a2})")
+        _p72d = m.Plugin(); _p72d._read_processes = _p72_slow
+        _b1 = _p72d._stream_running_now(dict(m.DEFAULT_SETTINGS))
+        _p72d._app_event_at = _p72_clock[0] + 0.5        # Steam started a game meanwhile
+        time.sleep(2.6)
+        _p72_clock[0] += 17                                 # and that is past _APP_EVENT_SECONDS now
+        _b2 = _p72d._stream_running_now(dict(m.DEFAULT_SETTINGS))
+        ok(_b1 is None and _b2 is None,
+           f"(3) a game started after that search began: its answer is not gone by ({_b1}, {_b2})")
+        time.sleep(3.2)                                     # let the last slow search end
+
+        # (4) A snapshot's stamp is when its list was taken.
+        def _p72_two(progress=None, skip=frozenset()):
+            _p72_clock[0] += 2; return []
+        _p72e = m.Plugin(); _p72e._read_processes = _p72_two
+        _t0 = _p72_clock[0]
+        _snap = _p72e._proc_snapshot(2.0)
+        ok(_snap is not None and _snap[0] == _t0,
+           f"(4) a search that took 2 s is stamped with its start ({_snap and _snap[0] - _t0})")
+    finally:
+        m.PROC_DIR, m.time.monotonic = _p72_saved
+    _src72 = open("main.py").read()
+    ok(not re.search(r"wait\s*=\s*0\b[^)\n]*fresh\s*=|fresh\s*=[^)\n]*wait\s*=\s*0\b", _src72)
+       and "_SCAN_GATE_FRESH_SECONDS" not in _src72,
+       "(5) no caller passes fresh= with wait=0, and the scan gate's own window is gone")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+class _W7(_W6):
+    """_W6 on the Steam Deck OLED's card (ath11k), the one card the
+    after-wake move runs on (M-b); the interface's driver read from the
+    model rather than sysfs."""
+    def __init__(self, card="ath11k_pci", **kw):
+        super().__init__(**kw); self.card = card
+    def _iface_driver(self, iface):
+        return self.card if self.card is not None else _W6._iface_driver(self, iface)
+
+
+section("L3 pass 7 an access point that refused an after-wake move is left alone at later wakes, until the user acts on the lock")
+try:
+    _l73_logged = []
+    _l73_info = m.decky.logger.info
+    _l73_clock = [1_800_000_000.0]
+    _l73_time = m.time.time
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: _l73_logged.append(msg))
+        m.time.time = lambda: _l73_clock[0]
+        _w6_locked(); _p73 = _W7(reachable=False, refused_stays=True)
+        _l73_cycles = []
+        for _wake in range(3):                       # three wakes 8 h apart
+            _before = len(_p73.cycles)
+            asyncio.run(_p73._move_lock_after_wake())
+            _l73_cycles.append(len(_p73.cycles) - _before)
+            _l73_clock[0] += 8 * 3600
+        ok(_l73_cycles == [2, 0, 0],
+           f"the first wake tries the stronger one (two radio cycles), the next two do not ({_l73_cycles})")
+        ok(any(l.startswith("After waking, the BSSID lock was left as it is")
+               and _W6STRONG.upper() in l.upper() for l in _l73_logged),
+           f"and the log names the refusal ({[l for l in _l73_logged if 'left as it is' in l][-1:]})")
+        _s73 = m._load_settings()
+        ok(_s73.get("ap_wake_refusals") == [_W6STRONG.upper()],
+           f"the refusal is in the settings, and survives a reload ({_s73.get('ap_wake_refusals')})")
+        _cs73 = m._clean_settings({**m.DEFAULT_SETTINGS, "ap_wake_refusals": [
+            "02:00:00:00:00:51", "not-a-mac", 5, "02:00:00:00:00:61"]})
+        ok(_cs73.get("ap_wake_refusals") == ["02:00:00:00:00:51", "02:00:00:00:00:61"],
+           f"a malformed entry is dropped on load ({_cs73.get('ap_wake_refusals')})")
+        # The user turns the lock on again: the next wake may try it again.
+        asyncio.run(_p73.set_bssid_lock(True))
+        ok(not m._load_settings().get("ap_wake_refusals"), "turning the lock on clears the list")
+        _l73_clock[0] += 8 * 3600
+        _w6_locked(); _p73b = _W7(reachable=False, refused_stays=True)
+        _before = len(_p73b.cycles)
+        asyncio.run(_p73b._move_lock_after_wake())
+        ok(len(_p73b.cycles) - _before == 2, "and the next wake tries the stronger one again")
+        # Manual moves keep the 15-minute rule: a Move the user presses now
+        # still tries the refused one after the cooldown.
+        _l73_clock[0] += 8 * 3600
+        _w6_locked(ap_wake_refusals=[_W6STRONG.upper()])
+        _p73c = _W7(reachable=True)
+        _t73 = _p73c._lock_target("wlan0", "Net", _W6WEAK, m._load_settings(),
+                                  "Connected to 02:00:00:00:00:11\n\tsignal: -84 dBm\n", _W6U)
+        ok(_t73[0] is not None and _t73[0][0] == _W6STRONG.upper(),
+           f"a manual move is not held by the after-wake list ({_t73[0]})")
+    finally:
+        m.decky.logger.info = _l73_info
+        m.time.time = _l73_time
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L4 pass 7 the install floor is 0.24.6-beta (C26)")
+try:
+    _src74 = open("main.py").read()
+    ok(re.search(r'^MIN_INSTALL_VERSION = "0\.24\.6-beta"$', _src74, re.M) is not None
+       and _REAL_MIN_INSTALL_VERSION == "0.24.6-beta",
+       f"the floor line reads MIN_INSTALL_VERSION = \"0.24.6-beta\" ({_REAL_MIN_INSTALL_VERSION!r})")
+
+    class _KF7(m.Plugin):
+        def __init__(self, newest=""):
+            super().__init__(); self.fetched = []; self.newest = newest
+        def _fetch_release_file(self, url, cap, deadline):
+            self.fetched.append(url); return {"missing": True, "data": None}
+        async def _github_api(self, url):
+            return _ok(json.dumps([{"tag_name": "v" + self.newest, "prerelease": True, "draft": False}]))
+        def _newest_release(self, data): return self.newest
+    _l74_ver = m.decky.DECKY_PLUGIN_VERSION
+    try:
+        m.MIN_INSTALL_VERSION = _REAL_MIN_INSTALL_VERSION
+        m._save_settings({**m.DEFAULT_SETTINGS, "update_channel": "beta"})
+        m.decky.DECKY_PLUGIN_VERSION = "0.24.6-beta"
+        _u74 = asyncio.run(_KF7(newest="0.24.5-beta").check_for_update())
+        ok(_u74.get("update_available") is False,
+           f"0.24.6-beta pulled, 0.24.5-beta the newest left: no 'go back to' is offered ({_u74})")
+        _k74 = _KF7()
+        _r74 = asyncio.run(_k74._signed_release("0.24.5-beta"))
+        ok(_r74.get("ok") is False and not _k74.fetched,
+           f"and 0.24.5-beta is refused before anything is downloaded ({_r74})")
+        _k74 = _KF7()
+        asyncio.run(_k74._signed_release("0.24.6"))
+        ok(_k74.fetched, "stable 0.24.6 is not below the floor")
+    finally:
+        m.decky.DECKY_PLUGIN_VERSION = _l74_ver
+        m.MIN_INSTALL_VERSION = "0.0.0"
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L5 pass 7 the settings-link and could-not-save banners clear once the folder is fixed, with no save (C23)")
+try:
+    _l75_saved_file = m.SETTINGS_FILE
+    _l75_top = tempfile.mkdtemp()
+    _l75_err = m.decky.logger.error
+    try:
+        m.decky.logger.error = staticmethod(lambda msg: None)
+        os.makedirs(os.path.join(_l75_top, "away", "settings"))
+        os.makedirs(os.path.join(_l75_top, "home"))
+        os.symlink(os.path.join(_l75_top, "away", "settings"), os.path.join(_l75_top, "home", "settings"))
+        m.SETTINGS_FILE = os.path.join(_l75_top, "home", "settings", "settings.json")
+        _p75 = m.Plugin()
+        m._load_settings()
+        try:
+            m._save_settings(dict(m.DEFAULT_SETTINGS)); _raised75 = False
+        except OSError:
+            _raised75 = True
+        _st75 = _p75._with_activity({"live": {}})
+        ok(_raised75 and _st75.get("settings_link_refused") is True and _st75.get("settings_unwritable") is True,
+           f"behind a link: the save is refused and both are said ({_raised75}, {_st75.get('settings_link_refused')}, "
+           f"{_st75.get('settings_unwritable')})")
+        # The user takes the link away and moves the folder back.
+        os.remove(os.path.join(_l75_top, "home", "settings"))
+        os.rename(os.path.join(_l75_top, "away", "settings"), os.path.join(_l75_top, "home", "settings"))
+        m._load_settings()                             # the next status read
+        _st75 = _p75._with_activity({"live": {}})
+        ok(_st75.get("settings_link_refused") is False and _st75.get("settings_unwritable") is False
+           and os.listdir(os.path.join(_l75_top, "home", "settings")) == [],
+           f"fixed: the next status says neither, with no save in between ({_st75.get('settings_link_refused')}, "
+           f"{_st75.get('settings_unwritable')}, {os.listdir(os.path.join(_l75_top, 'home', 'settings'))})")
+
+        # A full disk, cleared.
+        _l75_write = m._write_settings
+        def _l75_full(data):
+            raise OSError(28, "No space left on device")
+        m._write_settings = _l75_full
+        try:
+            try:
+                m._save_settings(dict(m.DEFAULT_SETTINGS))
+            except OSError:
+                pass
+        finally:
+            m._write_settings = _l75_write
+        ok(_p75._with_activity({"live": {}}).get("settings_unwritable") is True, "a full disk: said")
+        time.sleep(getattr(m, "_SAVE_RECHECK_SECONDS", 0) + 0.05)
+        m._load_settings()
+        ok(_p75._with_activity({"live": {}}).get("settings_unwritable") is False,
+           "and once space is back, the next status read clears it with no save")
+    finally:
+        m.decky.logger.error = _l75_err
+        m.SETTINGS_FILE = _l75_saved_file
+        m._SETTINGS_STATE.update({"save_failed": False, "link_refused": False})
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L6 pass 7 the after-wake move's outcome lasts until the user acts on the lock, and 'off' is said (C22, M-c)")
+try:
+    def _l76_outcome(p):
+        return (p._with_activity({"live": {}})["live"].get("lock_move_after_wake") or {}).get("outcome")
+
+    class _W76(_W7):
+        """The old pin cannot be written back; clearing it can be made to fail too."""
+        def __init__(self, clear_ok=True, **kw):
+            super().__init__(**kw); self.clear_ok = clear_ok
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            if k == "802-11-wireless.bssid" and v.upper() == _W6WEAK and self.mods:
+                self.mods.append((k, v)); return {"success": False, "stdout": "", "stderr": "x", "returncode": 1}
+            if k == "802-11-wireless.bssid" and v == "" and not self.clear_ok:
+                self.mods.append((k, v)); return {"success": False, "stdout": "", "stderr": "x", "returncode": 1}
+            return _W7._nmcli_modify(self, u, k, v, timeout)
+    _w6_locked(); _p76 = _W76(reachable=False, refused_stays=True)
+    asyncio.run(_p76._move_lock_after_wake())
+    ok(_l76_outcome(_p76) == "off" and m._load_settings().get("bssid_lock_enabled") is False,
+       f"the old pin could not go back and the lock was turned off: outcome off ({_l76_outcome(_p76)})")
+    _w6_locked(); _p76 = _W76(clear_ok=False, reachable=False, refused_stays=True)
+    asyncio.run(_p76._move_lock_after_wake())
+    ok(_l76_outcome(_p76) == "off", f"and when the pin could not be changed at all ({_l76_outcome(_p76)})")
+
+    class _W76Off(_W7):
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); return False
+    _w6_locked(); _p76 = _W76Off()
+    asyncio.run(_p76._move_lock_after_wake())
+    ok(_l76_outcome(_p76) == "off", f"the radio did not come back on: outcome off ({_l76_outcome(_p76)})")
+
+    # "moved" stays past the banner's two minutes, up to 12 h, until the
+    # user acts on the lock.
+    _w6_locked(); _p76 = _W7()
+    asyncio.run(_p76._move_lock_after_wake())
+    _o = _p76._wake_move_outcome
+    _p76._wake_move_outcome = (_o[0], _o[1], _o[2] - 180)
+    ok(_l76_outcome(_p76) == "moved", "3 minutes after a move, with nothing done since: still reported")
+    _p76._wake_move_outcome = (_o[0], _o[1], _o[2] - 12 * 3600 - 1)
+    ok(_l76_outcome(_p76) is None, "and not past 12 hours")
+
+    class _W76Reset(_W7, _W6Reset):
+        pass
+    _w6_locked(); _p76 = _W76Reset()
+    asyncio.run(_p76._move_lock_after_wake())
+    _o = _p76._wake_move_outcome
+    _p76._wake_move_outcome = (_o[0], _o[1], _o[2] - 30)
+    asyncio.run(_p76.reset_settings())
+    ok(_l76_outcome(_p76) is None, "Reset 30 s after a move: no outcome")
+    _w6_locked(); _p76 = _W7()
+    asyncio.run(_p76._move_lock_after_wake())
+    asyncio.run(_p76.set_bssid_lock(False))
+    ok(_l76_outcome(_p76) is None, "nor after the lock is turned off")
+    _w6_locked(); _p76 = _W7()
+    asyncio.run(_p76._move_lock_after_wake())
+    _w6_locked(); asyncio.run(_p76.move_bssid_lock())
+    ok(_l76_outcome(_p76) is None, "nor after Move")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L7 pass 7 a change refused during the after-wake check says the lock is being checked")
+try:
+    _p77 = m.Plugin(); _p77._wake_move_running = True
+    _r77 = _p77._busy_result().get("message", "")
+    ok("being checked" in _r77 and "is moving" not in _r77, f"the busy text ({_r77!r})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L8 pass 7 a Move that landed and an Allow WPA2 that needed nothing more say so")
+try:
+    _w6_locked(); _p78 = _W7(); _p78.on = _W6STRONG
+    _r78 = asyncio.run(_p78._verify_lock_move("wlan0", _W6U, _W6WEAK, _W6STRONG, True))
+    ok(_r78.get("success") and _r78.get("message") == "Moved to the stronger access point.",
+       f"a move that landed says so ({_r78.get('message')!r})")
+    _w6_locked(); _p78 = _W7(); _p78.on = _W6STRONG
+    _r78 = asyncio.run(_p78._verify_lock_move("wlan0", _W6U, _W6WEAK, _W6STRONG, True, after_wake=True))
+    ok(_r78.get("success") and not _r78.get("message"), "the after-wake move sets none")
+    m._save_settings({**base_ap})                       # no lock, so no relock
+    _p78 = _L5Net(_L5Net.A)
+    _r78 = asyncio.run(_p78.allow_wpa2())
+    ok(_r78.get("success") and _r78.get("message") == "WPA2 allowed on this network.",
+       f"Allow WPA2 with nothing else to say says it is done ({_r78})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L9 pass 7 a first search slower than the wait keeps the fixes of a stream already flagged")
+try:
+    _l79_root, _l79_mk = _p6_proc_dir()
+    _l79_saved = (m.PROC_DIR,)
+    try:
+        m.PROC_DIR = _l79_root
+        _l79_mk(4242, 1, ["/usr/bin/moonlight", "stream"], "moonlight")
+        m._save_settings({**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True, "power_save_disabled": True})
+        open(m.STREAM_FLAG_FILE, "w").write("1\n")
+
+        class _P79(m.Plugin):
+            def __init__(self):
+                super().__init__(); self.reverted = 0; self.reapplied = 0
+            def _read_processes(self, progress=None, skip=frozenset()):
+                time.sleep(3.0)                       # a load whose first search is slow
+                return m.Plugin._read_processes(self, progress, skip)
+            def _revert_volatile_fixes(self, settings): self.reverted += 1
+            async def reapply_volatile(self): self.reapplied += 1; return {"applied": 1}
+            async def _drop_persistent_power_save(self): return None
+            def _start_streaming_watch(self): pass
+        _p79 = _P79()
+        asyncio.run(_p79._startup_streaming(m._load_settings()))
+        ok(os.path.exists(m.STREAM_FLAG_FILE) and _p79.reverted == 0,
+           f"at load, no search answered yet: the flag and the fixes stay ({os.path.exists(m.STREAM_FLAG_FILE)}, "
+           f"reverted {_p79.reverted})")
+        time.sleep(1.2)                                  # that search answers
+        asyncio.run(_p79._stream_pass())
+        ok(os.path.exists(m.STREAM_FLAG_FILE) and _p79.reverted == 0
+           and (getattr(_p79, "_stream_match", None) or {}).get("app") == "Moonlight",
+           f"and the next pass finds Moonlight and keeps them ({getattr(_p79, '_stream_match', None)})")
+        time.sleep(3.2)                                  # let the pass's own search end
+    finally:
+        m.PROC_DIR, = _l79_saved
+        if os.path.exists(m.STREAM_FLAG_FILE):
+            os.remove(m.STREAM_FLAG_FILE)
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L10 pass 7 turning auto mode on looks only for the apps that are ticked")
+try:
+    _l710_root, _l710_mk = _p6_proc_dir()
+    _l710_saved = m.PROC_DIR
+    try:
+        m.PROC_DIR = _l710_root
+        _l710_mk(4242, 1, ["/usr/bin/moonlight", "stream"], "moonlight")
+        m._save_settings({**m.DEFAULT_SETTINGS, "streaming_apps": {"moonlight": False},
+                          "power_save_disabled": True})
+
+        class _P710(m.Plugin):
+            def _run_cmd(self, cmd, timeout=5): return _ok()
+            async def _drop_persistent_power_save(self): return None
+            def _start_streaming_watch(self): pass
+            async def reapply_volatile(self): return {"success": True, "applied": 0, "total": 0}
+            def _revert_volatile_fixes(self, settings): pass
+        _p710 = _P710()
+        _r710 = asyncio.run(_p710.set_streaming_mode(True))
+        ok(_r710.get("success") and not os.path.exists(m.STREAM_FLAG_FILE)
+           and not getattr(_p710, "_stream_match", None),
+           f"Moonlight unticked and running: no fixes, no stream named ({os.path.exists(m.STREAM_FLAG_FILE)}, "
+           f"{getattr(_p710, '_stream_match', None)})")
+    finally:
+        m.PROC_DIR = _l710_saved
+        if os.path.exists(m.STREAM_FLAG_FILE):
+            os.remove(m.STREAM_FLAG_FILE)
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L11 pass 7 a process a stuck search held is read again once that search ends, and no more than four are left behind")
+try:
+    _l711_root, _l711_mk = _p6_proc_dir()
+    _l711_saved = m.PROC_DIR
+    _l711_err = m.decky.logger.error
+    try:
+        m.decky.logger.error = staticmethod(lambda msg: None)
+        m.PROC_DIR = _l711_root
+        # (a) Stuck on 42, then 42 recovers.
+        _l711_mk(42, 1, [], "moonlight", fifo=True)
+        _p711 = m.Plugin(); _p711._PROC_SCAN_STUCK_SECONDS = 0.3
+        _p711._proc_snapshot(0.1)                       # the search that sticks on 42
+        time.sleep(0.4)
+        _p711._proc_snapshot(0.5)                       # left behind; the next skips 42
+        _p6_release_fifos(_l711_root)                   # 42's read returns
+        time.sleep(0.3)
+        _l711_mk(42, 1, ["/usr/bin/moonlight", "stream"], "moonlight")
+        time.sleep(1.1)
+        _snap711 = _p711._proc_snapshot(1.0)
+        ok(_snap711 is not None and any(e[0] == "42" for e in _snap711[1]),
+           f"(a) once the search stuck on it has ended, the next search reads 42 again "
+           f"({[e[0] for e in (_snap711 or (0, []))[1]]})")
+
+        # (b) Five processes stuck in turn: at most four searches left behind.
+        _l711b_root, _l711b_mk = _p6_proc_dir()
+        m.PROC_DIR = _l711b_root
+        for _pid in (51, 52, 53, 54, 55):
+            _l711b_mk(_pid, 1, [], "bash", fifo=True)
+        _p711b = m.Plugin(); _p711b._PROC_SCAN_STUCK_SECONDS = 0.2
+        for _ in range(7):
+            _p711b._proc_snapshot(0.05)
+            time.sleep(0.3)
+        _st711 = _p711b._proc_scan_state()
+
+        def _l711_event(x):
+            return x[0] if isinstance(x, tuple) else x
+        _stuck711 = sum(1 for x in _st711["abandoned"] if not _l711_event(x).is_set())
+        _stuck711 += 1 if (_st711["pending"] is not None and not _st711["pending"].is_set()) else 0
+        ok(_stuck711 == 4, f"(b) four searches stuck, no fifth started ({_stuck711})")
+        _p6_release_fifos(_l711b_root)
+
+        # (c) A search stuck reading status names the process it is on.
+        _l711c_root, _l711c_mk = _p6_proc_dir()
+        m.PROC_DIR = _l711c_root
+        _l711c_mk(77, 1, ["/usr/bin/bash"], "bash")
+        os.remove(os.path.join(_l711c_root, "77", "status"))
+        os.mkfifo(os.path.join(_l711c_root, "77", "status"))
+        _p711c = m.Plugin()
+        _p711c._proc_snapshot(0.2)
+        _prog711 = (_p711c._proc_scan_state().get("progress") or {}).get("pid")
+        ok(_prog711 == "77", f"(c) stuck in a status read, the search records the pid ({_prog711!r})")
+        _p6_release_fifos(_l711c_root)
+        time.sleep(0.2)
+    finally:
+        m.decky.logger.error = _l711_err
+        _p6_release_fifos(_l711_root)
+        m.PROC_DIR = _l711_saved
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L12 pass 7 Custom DNS on a 17th network keeps nmcli off the event loop")
+try:
+    _L712U = "dddddddd-0000-0000-0000-0000000000c1"
+
+    class _P712(m.Plugin):
+        """Every nmcli step recorded with whether it ran on the event loop's
+        thread; taking DNS off the oldest network (past the cap) takes 1 s."""
+        def __init__(self):
+            super().__init__(); self.on_loop = []
+        def _note(self, what):
+            if _p7_thr.current_thread() is _p7_thr.main_thread():
+                self.on_loop.append(what)
+        def _backend_is_iwd(self): return False
+        def _resolve_uuid(self, msg=None): self._note("resolve"); return _L712U, None
+        def _read_profile_field(self, uuid, field, timeout=5): self._note("read"); return ""
+        def _nmcli_modify(self, uuid, key, value, timeout=5): self._note("modify " + key); return _ok()
+        def _clear_dns(self, uuid, timeout=2):
+            self._note("clear_dns"); time.sleep(1.0); return True
+        def _hard_reconnect(self, uuid=None): self._note("reconnect"); return True
+    _l712_others = [f"dddddddd-0000-0000-0000-0000000001{i:02d}" for i in range(16)]
+    m._save_settings({**base_ap, "dns_uuids": list(_l712_others)})
+    _p712 = _P712()
+    _r712 = asyncio.run(_p712.set_dns(True, "cloudflare"))
+    ok(_r712.get("success") and not _p712.on_loop
+       and len(m._load_settings().get("dns_uuids", [])) == 16,
+       f"no nmcli step runs on the event loop, and the list stays at the cap ({_p712.on_loop}, {_r712})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L13 pass 7 a band change pressed just before uninstall writes nothing after teardown and leaves no settings")
+try:
+    _d713, _restore713 = _l_paths()
+    try:
+        class _L713(_LReset):
+            U = "dddddddd-0000-0000-0000-0000000000d3"
+            def __init__(self):
+                super().__init__(); self.writes = []; self.torn_at = None
+            def _backend_is_iwd(self): return False
+            def _resolve_uuid(self, msg=None): return self.U, None
+            def _get_profile_ssid(self, uuid, timeout=5): return "Home"
+            def _profile_band(self, uuid): return ""
+            def _read_profile_field(self, uuid, field, timeout=5): return ""
+            def _lock_is_for_this_network(self, settings, uuid, ssid): return True
+            def _nmcli_modify(self, uuid, key, value, timeout=5):
+                # Recorded when asked for, before it runs.
+                self.writes.append((time.monotonic(), key, value, self.torn_at is not None))
+                if key == "802-11-wireless.band" and value == "a" and self.torn_at is None:
+                    time.sleep(2.0)                      # NetworkManager slow to answer
+                return _ok()
+            def _hard_reconnect(self, uuid=None): return True
+            def _teardown(self, deadline):
+                self.torn_at = time.monotonic()
+                return m.Plugin._teardown(self, deadline)
+        m._save_settings({**base_ap, "bssid_lock_enabled": True, "bssid_lock_value": "02:00:00:00:00:a1",
+                          "bssid_lock_connection_uuid": _L713.U, "bssid_lock_uuids": [_L713.U],
+                          "pins_owned": ["802-11-wireless.bssid"]})
+        _p713 = _L713()
+
+        async def _l713_race():
+            band = asyncio.ensure_future(_p713.set_band_preference(True, "a"))
+            await asyncio.sleep(0.5)
+            await _p713._uninstall()
+            return await band
+        _r713 = asyncio.run(_l713_race())
+        time.sleep(0.1)
+        _late713 = [(k, v) for t, k, v, td in _p713.writes
+                    if not td and _p713.torn_at is not None and t > _p713.torn_at]
+        ok(_p713.torn_at is not None and not _late713,
+           f"no profile write is asked for after the teardown started ({_late713})")
+        ok(not os.path.exists(m.SETTINGS_FILE) and not os.path.isdir(os.path.dirname(m.SETTINGS_FILE)),
+           f"and no settings file comes back ({os.path.exists(m.SETTINGS_FILE)})")
+        ok(_r713.get("message") == "The plugin is being uninstalled.",
+           f"the band change says why it stopped ({_r713})")
+    finally:
+        _restore713()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L14 pass 7 uninstall takes away a save's leftover copies, and the settings folder with them")
+try:
+    _d714, _restore714 = _l_paths()
+    try:
+        m._save_settings({**base_ap})
+        _f714 = os.path.dirname(m.SETTINGS_FILE)
+        open(os.path.join(_f714, ".settings-0123456789ab.tmp"), "w").write("{}")
+        open(os.path.join(_f714, "settings.json.tmp"), "w").write("{}")
+        open(os.path.join(_f714, "notes.txt"), "w").write("the user's own")
+        asyncio.run(_LReset()._uninstall())
+        ok(sorted(os.listdir(_f714)) == ["notes.txt"] if os.path.isdir(_f714) else False,
+           f"both copies go, and a file of the user's stays ({os.listdir(_f714) if os.path.isdir(_f714) else 'gone'})")
+        os.remove(os.path.join(_f714, "notes.txt"))
+        m._save_settings({**base_ap})
+        open(os.path.join(_f714, ".settings-ba9876543210.tmp"), "w").write("{}")
+        open(os.path.join(_f714, "settings.json.tmp"), "w").write("{}")
+        asyncio.run(_LReset()._uninstall())
+        ok(not os.path.exists(_f714), "with nothing else there, the folder goes too")
+    finally:
+        _restore714()
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L15 pass 7 a backend switch 0.24.5-beta left in /run is settled, and its marker removed")
+try:
+    _l715_path = getattr(m, "LEGACY_BACKEND_SWITCH_MARKER", os.path.join(_run_dir, "legacy-run", "backend-switch"))
+    os.makedirs(os.path.dirname(_l715_path), exist_ok=True)
+    open(_l715_path, "w").write("iwd wpa_supplicant\n")
+    for _p in (m.BACKEND_SWITCH_MARKER,):
+        if os.path.exists(_p): os.remove(_p)
+
+    class _P715(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.cmds = []
+        def _run_cmd(self, cmd, timeout=5): self.cmds.append(list(cmd)); return _ok()
+        def _effective_generic_backend(self): return "wpa_supplicant"
+    _l715_info = m.decky.logger.info
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: None)
+        _p715 = _P715(); _p715._reconcile_backend_switch()
+    finally:
+        m.decky.logger.info = _l715_info
+    ok(["/usr/bin/systemctl", "disable", "iwd"] in _p715.cmds and not os.path.exists(_l715_path),
+       f"a valid marker only at the old path: the switch is settled and the marker removed "
+       f"({_p715.cmds}, {os.path.exists(_l715_path)})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L16 pass 7 the update script gives up on a pgrep that does not answer, as playing")
+try:
+    import subprocess as _l716_sp
+    if not os.path.exists("/bin/bash"):
+        print("SKIP  no /bin/bash here")
+    else:
+        _l716_bin = tempfile.mkdtemp()
+        open(os.path.join(_l716_bin, "pgrep"), "w").write("#!/bin/sh\nsleep 30\n")
+        os.chmod(os.path.join(_l716_bin, "pgrep"), 0o755)
+        _fn716 = m.UPDATE_SCRIPT[m.UPDATE_SCRIPT.index("playing() {"):]
+        _fn716 = _fn716[:_fn716.index("\n}\n") + 3]
+        _body716 = ("STREAM_PATTERNS='moonlight'\nOWNER=''\nTMP=$(mktemp -d) || exit 1\n"
+                    "trap 'rm -rf \"$TMP\"' EXIT\n"
+                    + _fn716.replace("/run/wifi-optimizer/streaming", "/nonexistent/wo-streaming")
+                    + "if playing; then echo yes; else echo no; fi\n")
+        _t716 = time.monotonic()
+        try:
+            _o716 = _l716_sp.run(["/bin/bash", "-c", _body716], capture_output=True, text=True, timeout=40,
+                                 env={**os.environ, "PATH": _l716_bin + ":" + os.environ.get("PATH", "")}).stdout.strip()
+        except _l716_sp.TimeoutExpired:
+            _o716 = "timed out"
+        _took716 = time.monotonic() - _t716
+        ok(_o716 == "yes" and _took716 < 5,
+           f"a stuck pgrep: playing() answers within 5 s, as playing ({_o716!r}, {_took716:.1f} s)")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L17 pass 7 an after-wake move that leaves WiFi down says so in the journal (C24)")
+try:
+    _L717_LINE = ["/usr/bin/logger", "-t", "wifi-optimizer", "--", "after-wake lock move: WiFi did not come back"]
+
+    class _W717(_W7):
+        """Nothing associates again after the radio cycle; every command recorded."""
+        def __init__(self, dead=True, **kw):
+            super().__init__(**kw); self.cmds = []; self.dead = dead
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game)
+            if self.dead:
+                self.on = ""
+                return True
+            return _W7._hard_reconnect(self, uuid)
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(list(cmd)); return _W7._run_cmd(self, cmd, timeout)
+    _w6_locked(); _p717 = _W717()
+    asyncio.run(_p717._move_lock_after_wake())
+    _lines717 = [c for c in _p717.cmds if c[:1] == ["/usr/bin/logger"]]
+    ok(_lines717 == [_L717_LINE], f"a move after which nothing associates: exactly one journal line ({_lines717})")
+
+    class _W717Off(_W717):
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); return False
+    _w6_locked(); _p717 = _W717Off()
+    asyncio.run(_p717._move_lock_after_wake())
+    _lines717 = [c for c in _p717.cmds if c[:1] == ["/usr/bin/logger"]]
+    ok(_lines717 == [_L717_LINE], f"the radio not coming back on: the same one line ({_lines717})")
+
+    _w6_locked(); _p717 = _W717(dead=False, reachable=False, refused_stays=False)
+    asyncio.run(_p717._move_lock_after_wake())
+    _lines717 = [c for c in _p717.cmds if c[:1] == ["/usr/bin/logger"]]
+    ok(_lines717 == [], f"a refusal the old pin recovers from: no line ({_lines717})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L18 pass 7 the guard checker sees async with and async for between a check and its claim")
+try:
+    _l718_gaps = globals().get("_l1_guard_gaps")
+    _l718_planted = '''
+class P:
+    async def setter(self):
+        if self._profile_change_refused():
+            return
+        async with self._stream_guard():
+            pass
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
+
+    async def walker(self):
+        if self._profile_change_refused():
+            return
+        async for _x in self.things():
+            pass
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
+
+    async def fine(self):
+        if self._profile_change_refused():
+            return
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
+'''
+    _l718_bad, _l718_pairs = _l718_gaps(_p6_ast.parse(_l718_planted)) if _l718_gaps else ([], 0)
+    ok(_l718_pairs == 3 and sorted(b[0] for b in _l718_bad) == ["setter", "walker"],
+       f"a planted async with and async for are flagged, the plain claim is not ({_l718_bad})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("M-b pass 7 the after-wake move runs only on ath11k, the Steam Deck OLED's card (C25)")
+try:
+    _mb_info = m.decky.logger.info
+    _mb_got = {}
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: None)
+        for _mb_d in ("rtw88", "rtw89", "mt7921e", "iwlwifi", "ath12k", "ath11k_pci"):
+            _w6_locked(driver=_mb_d); _mb_p = _W7(card=_mb_d)
+            asyncio.run(_mb_p._move_lock_after_wake())
+            _mb_got[_mb_d] = _mb_p.pin.upper() == _W6STRONG
+        _w6_locked(driver="ath11k_pci"); _mb_p = _W7(card="")
+        asyncio.run(_mb_p._move_lock_after_wake())
+        _mb_got["ath11k_pci, interface unknown"] = _mb_p.pin.upper() == _W6STRONG
+        _w6_locked(driver=""); _mb_p = _W7(card="ath11k_pci")
+        asyncio.run(_mb_p._move_lock_after_wake())
+        _mb_got["driver unknown"] = _mb_p.pin.upper() == _W6STRONG
+    finally:
+        m.decky.logger.info = _mb_info
+    ok(_mb_got == {"rtw88": False, "rtw89": False, "mt7921e": False, "iwlwifi": False, "ath12k": False,
+                   "ath11k_pci": True, "ath11k_pci, interface unknown": False, "driver unknown": False},
+       f"only ath11k, on both checks, moves; an unknown card never does ({_mb_got})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("M-d pass 7 before a reconnect or a scan every built-in app counts; the user's own names only with auto mode on")
+try:
+    _md_p = m.Plugin()
+    _md_procs = [("300", b"/app/bin/streaming_client\0--connect\0", "1", "streaming_clien"),
+                 ("301", b"/usr/bin/moonlight\0stream\0host\0", "1", "moonlight")]
+    _md_p._read_processes = lambda progress=None, skip=frozenset(): list(_md_procs)
+    _md_s = {**m.DEFAULT_SETTINGS, "streaming_mode_enabled": True,
+             "streaming_apps": {"steam_remote_play": False, "moonlight": False}}
+    ok(_md_p._game_or_stream_known(_md_s) is True,
+       "auto mode on, Moonlight and Steam Remote Play unticked and both running: a stream, for the move")
+    _md_p._proc_scan = None
+    ok(_md_p._stream_running_now(_md_s) is True, "and for the scan checks")
+    ok(not any(pt == "moonlight" for _l, pt in _md_p._stream_patterns(_md_s)),
+       "while auto mode itself still leaves an unticked app alone (K-g)")
+    _md_procs[:] = [("400", b"/opt/google/chrome/chrome\0", "1", "chrome")]
+    _md_off = {**m.DEFAULT_SETTINGS, "streaming_mode_enabled": False, "streaming_custom_patterns": "chrome"}
+    _md_p._proc_scan = None
+    ok(_md_p._game_or_stream_known(_md_off) is False,
+       "auto mode off: a hidden name of the user's (chrome) blocks no move")
+    _md_p._proc_scan = None
+    ok(_md_p._update_blocker(_md_off) is None, "nor an update")
+    _md_on = {**_md_off, "streaming_mode_enabled": True}
+    _md_p._proc_scan = None
+    ok(_md_p._game_or_stream_known(_md_on) is True, "with auto mode on, where it is shown, it counts")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("L19 L20 L21 L22 pass 7 texts")
+try:
+    _src719 = open("main.py").read()
+    ok("Some PCIe power saving couldn't be turned off. The rest is on." in _src719
+       and "Nothing to do." not in _src719, "L19: the PCIe note in two plain sentences")
+    m._save_settings({**base_ap, "device_family": "deck_oled"})
+    _m720 = asyncio.run(Reg(SELF_MANAGED).set_regdomain("DE")).get("message", "")
+    ok(_m720.endswith("and ignores this setting. That is normal and hides no band.")
+       and "Steam Deck" not in _m720 and _m720.startswith("This device's WiFi uses "),
+       f"L20: the self-managed region notice ({_m720!r})")
+    ok("This release isn't signed properly, so it wasn't installed." in _src719
+       and "signed checksums don't cover" not in _src719, "L21: the unsigned-tarball refusal")
+    _w6_locked()
+    _l722_logged = []
+    _l722_info = m.decky.logger.info
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: _l722_logged.append(msg))
+        asyncio.run(_W7(reachable=False, refused_stays=True)._move_lock_after_wake())
+    finally:
+        m.decky.logger.info = _l722_info
+    ok(not any("move did not go through (move_failed)" in l for l in _l722_logged)
+       and any(l == "After waking, the BSSID lock went back: the stronger access point refused the connection"
+               for l in _l722_logged),
+       f"L22: a refused after-wake move says it went back ({[l for l in _l722_logged if 'After waking' in l]})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 
 section("this file: no section rebinds a helper the others share")
 try:

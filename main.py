@@ -344,11 +344,14 @@ VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?\Z")
 # The oldest release the updater installs. Someone holding the GitHub account
 # but not the signing key could otherwise delete newer releases and offer a
 # signed one from before a security fix as the beta channel's "go back to".
-# 0.24.5-beta is the first with the settings-link and dispatcher hardening of
-# QA passes 3 and 4. The release procedure raises it whenever a security fix
-# ships; release.sh reads it in exactly this shape. Older ones still install
-# by hand (install.sh, or the zip from Decky).
-MIN_INSTALL_VERSION = "0.24.5-beta"
+# 0.24.6-beta is the first with the update and apply locks private to root,
+# the dispatcher's stuck-tool search limited to root's processes and the
+# diagnostics' journal reads limited to root's lines, on top of the
+# settings-link and dispatcher hardening of QA passes 3 and 4. The release
+# procedure raises it whenever a security fix ships; release.sh reads it in
+# exactly this shape. Older ones still install by hand (install.sh, or the
+# zip from Decky).
+MIN_INSTALL_VERSION = "0.24.6-beta"
 
 # How far the update script has got, as "<phase> <version>". In /run for the
 # same reason as ENFORCED_FILE: the panel acts on what it says, so only root
@@ -404,11 +407,10 @@ PROC_SCAN_WAIT_SECONDS = 2.0
 # side waits this long for the other, then logs it and carries on.
 APPLY_LOCK_FILE = "/run/wifi-optimizer/apply.lock"
 APPLY_LOCK_WAIT_SECONDS = 10.0
-# How old the last search's answer may be for the status poll to go by it.
-# The poll never waits on a search; it starts one and reads the answer at a
-# later poll.
+# How old, from when it started, the last search's answer may be for a caller
+# to go by it when the search it waited for has not answered.
 PROC_SCAN_FRESH_SECONDS = 15.0
-# Per thread: set by _stream_running_now around its _find_stream call.
+# Per thread: set by _known_running around its _find_stream call.
 _PROC_SCAN_LOCAL = threading.local()
 # The update script's own command line (bash, then the script in the
 # directory apply_update made), so the search never takes it, or anything it
@@ -422,6 +424,9 @@ _UPDATE_SCRIPT_ARG_RE = re.compile(r"\A(?:.*/)?wifi-optimizer-update-[^/]+/updat
 # in the plugin's root-only directory, which uninstall and the dispatcher's
 # self-removal already take away.
 BACKEND_SWITCH_MARKER = "/var/lib/wifi-optimizer/backend-switch"
+# Where 0.24.5-beta and earlier kept it. A switch one of them was cut off in
+# (install.sh run while it switched) is settled from there, in the same boot.
+LEGACY_BACKEND_SWITCH_MARKER = "/run/wifi-optimizer/backend-switch"
 # This boot's id, which tells a marker from an earlier boot.
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
 # What the PCIe power files held before we first changed them this boot.
@@ -524,6 +529,9 @@ SYSCTL_DEFAULTS = {
     "net.ipv4.tcp_slow_start_after_idle": "1",
 }
 
+# How many access points that refused an after-wake move are remembered.
+_MAX_WAKE_REFUSALS = 16
+
 DEFAULT_SETTINGS = {
     "model": "unknown",
     "driver": "unknown",
@@ -579,6 +587,10 @@ DEFAULT_SETTINGS = {
     "ipv6_uuids": [],
     # Access points that accepted a scan but refused an association, and when.
     "ap_move_failures": {},
+    # Access points that refused an after-wake lock move. Later after-wake
+    # moves skip them whatever their age, until the user next turns the lock
+    # on or off, presses Move or runs Reset. Newest last.
+    "ap_wake_refusals": [],
     "buffer_tuning_enabled": False,
     # What the buffer sysctls were before our first change, and the kernel
     # they were read on, so turning tuning off puts back what the system had.
@@ -1396,8 +1408,12 @@ def _read_settings_file() -> dict:
         # Not blocking on a FIFO planted at this name, which would hang the
         # plugin on its first read; only ever a regular file; and not through
         # a link, at the name or anywhere in the user's directories above it.
+        # Whether a link is refused on the way is worked out again at every
+        # read (contract C23): _log_refused_link sets it back if one is.
+        _SETTINGS_STATE["link_refused"] = False
         dfd = _open_dir_no_follow(os.path.dirname(SETTINGS_FILE))
         try:
+            _recheck_settings_writable(dfd)
             fd = os.open(os.path.basename(SETTINGS_FILE),
                          os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dfd)
         finally:
@@ -1448,6 +1464,49 @@ def _read_settings_file() -> dict:
     return settings
 
 
+# Linux's "no space left on device" (errno is not among the modules Decky
+# bundles).
+_ENOSPC = 28
+# How often a settings read checks again whether a folder that refused a save
+# (behind a link, or full) takes one now.
+_SAVE_RECHECK_SECONDS = 2.0
+
+
+def _recheck_settings_writable(dfd: int):
+    """After a save failed because the folder was behind a link or full, see
+    whether it takes one now (contract C23), so "couldn't save its settings"
+    clears once the user has fixed it, without waiting for a save. One small
+    write to a temporary name in the folder (dfd), removed at once, at most
+    once a _SAVE_RECHECK_SECONDS, and only while that failure stands."""
+    if (not _SETTINGS_STATE["save_failed"]
+            or _SETTINGS_STATE.get("save_failed_cause") not in ("link", "space")):
+        return
+    now = time.monotonic()
+    if now - _SETTINGS_STATE.get("save_rechecked", -_SAVE_RECHECK_SECONDS) < _SAVE_RECHECK_SECONDS:
+        return
+    _SETTINGS_STATE["save_rechecked"] = now
+    name = f".settings-{os.urandom(6).hex()}.tmp"
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+    except OSError:
+        return
+    try:
+        os.write(fd, b"\0" * 4096)
+        os.fsync(fd)
+        took = True
+    except OSError:
+        took = False
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except OSError:
+            pass
+    if took:
+        _SETTINGS_STATE["save_failed"] = False
+        _SETTINGS_STATE["save_failed_cause"] = None
+
+
 def _defaults_for_unparsed(read_stat: os.stat_result, reason: Exception) -> dict:
     """The defaults standing in for a settings file that does not parse. Set
     aside first; when that fails (something at the .corrupt name, say), the
@@ -1489,8 +1548,10 @@ def _unread_settings_in_place() -> bool:
 # unread: the regular file a failed read left in place (see _note_unread_settings).
 # aside_failed: the identity of the last set-aside that failed (see
 # _set_aside_corrupt_settings), so it is neither retried nor logged again.
+# save_failed_cause: "link" (behind a link), "space" (ENOSPC) or "other",
+# for the settings reads that check again (_recheck_settings_writable).
 _SETTINGS_STATE = {"read_failed": False, "save_failed": False, "unread": None,
-                   "aside_failed": None, "link_refused": False}
+                   "aside_failed": None, "link_refused": False, "save_failed_cause": None}
 
 
 def _default_settings() -> dict:
@@ -1588,6 +1649,10 @@ def _clean_settings(data: dict) -> dict:
         if isinstance(k, str) and BSSID_RE.match(k)
         and isinstance(v, (int, float)) and not isinstance(v, bool)
     }
+    merged["ap_wake_refusals"] = list(dict.fromkeys(
+        b.upper() for b in merged.get("ap_wake_refusals", [])
+        if isinstance(b, str) and BSSID_RE.match(b)
+    ))[-_MAX_WAKE_REFUSALS:]
     # Only ever compared, but a malformed value would never match and would
     # keep the notice up however often it was dismissed. bool is excluded by
     # name because Python counts it as an int.
@@ -1643,8 +1708,12 @@ def _save_settings(data: dict):
             _write_settings(merged)
         except Exception as e:
             _SETTINGS_STATE["save_failed"] = True
+            _SETTINGS_STATE["save_failed_cause"] = (
+                "link" if _SETTINGS_STATE.get("link_refused")
+                else "space" if getattr(e, "errno", None) == _ENOSPC else "other")
             raise SettingsSaveError(f"settings not saved: {e}") from e
         _SETTINGS_STATE["save_failed"] = False
+        _SETTINGS_STATE["save_failed_cause"] = None
         _SETTINGS_STATE["link_refused"] = False
         _SETTINGS_GEN[0] += 1
         if isinstance(data, _LoadedSettings):
@@ -2042,9 +2111,10 @@ EXPECTED="$6"
 # The tarball's sha256, from the release's signed SHA256SUMS. It is what
 # makes the download trustworthy, so there is no way on without one.
 EXPECTED_SHA="${7:-}"
-# What counts as a stream, as one extended regex: the streaming apps the user
-# has ticked and their own process names, the same ones the plugin watches.
-# Empty when nothing is watched, and then only a game counts. Read from a file
+# What counts as a stream, as one extended regex, the same as the plugin's
+# update check: with auto mode on, the streaming apps ticked and the user's
+# own process names; with it off, every streaming app (M-d). Empty when
+# nothing is watched, and then only a game counts. Read from a file
 # the plugin leaves in this script's own directory, never from an argument:
 # anything on a command line is there for a process search to find, and this
 # script searching for the patterns would find itself.
@@ -2208,33 +2278,53 @@ set_state restarting
 # Restarting plugin_loader restarts Steam, which ends a game. The panel only
 # checked for one when the update started, and a download can take minutes,
 # so look again and wait for it (or a stream) to end. A stream is one the
-# plugin has flagged, or one of the apps the user has it watch running with
-# auto mode off, when nothing flags it. pgrep's answer goes to a file rather
-# than through $(...), whose subshell is a copy of this script under another
-# PID that pgrep would list. Never a stream, as in the plugin's own search:
+# plugin has flagged, or a process matching STREAM_PATTERNS (above), when
+# nothing flags it. pgrep's answer goes to a file rather than through $(...),
+# whose subshell is a copy of this script under another PID that pgrep would
+# list; pgrep runs as a background job, which is pgrep itself and no copy.
+# Never a stream, as in the plugin's own search:
 # this script and what it runs, the plugin's backend and what it runs (its
 # PID is in "owner"; curl and nmcli carry addresses a name can match), any
 # Decky plugin's backend (each is titled "<Name> (/.../homebrew/plugins/
 # <dir>/main.py)", and a name like "moondeck" matches one that always runs)
-# and Decky's PluginLoader. Read with builtins only, no fork.
+# and Decky's PluginLoader. pgrep and each command line read can hang on a process whose
+# memory is stuck in the kernel, so each is waited for 3 s at most and left
+# behind after that, without the update lock (fd 9), which counts as playing.
 # Fails closed: when the answer cannot be had or read back whole (a full
 # /tmp), it counts as playing, since restarting Decky would end the game.
 playing() {
-    local rc pid last="" arg0 key val ppid depth
-    pgrep -if "steamlaunch appid=${STREAM_PATTERNS:+|$STREAM_PATTERNS}" 2>/dev/null > "$TMP/pids"
-    rc=$?
+    local rc pid last="" arg0 key val ppid depth pg line
+    # pgrep runs in a background job of its own, which says its exit status
+    # on a FIFO only this call reads (one left behind says its own later),
+    # and is waited for there 3 s at most. The job is a copy of this script
+    # that pgrep can list, so its PID is skipped below.
+    PLAYING_CALLS=$(( ${PLAYING_CALLS:-0} + 1 ))
+    mkfifo -m 0600 "$TMP/pgrep-$PLAYING_CALLS" 2>/dev/null || return 0
+    exec 6<> "$TMP/pgrep-$PLAYING_CALLS" || return 0
+    { pgrep -if "steamlaunch appid=${STREAM_PATTERNS:+|$STREAM_PATTERNS}" 2>/dev/null > "$TMP/pids"
+      echo "rc=$?" >&6; } </dev/null >/dev/null 2>&1 9>&- &
+    pg=$!
+    line=""
+    IFS= read -t 3 -r line <&6
+    exec 6>&-
+    rc="${line#rc=}"
     [ "$rc" = 0 ] || [ "$rc" = 1 ] || return 0
     printf 'done\n' 2>/dev/null >> "$TMP/pids" || return 0
     while IFS= read -r pid; do
         last="$pid"
         case "$pid" in
             done) continue ;;
-            "$$") continue ;;
+            "$$"|"$pg") continue ;;
             ''|*[!0-9]*) return 0 ;;
         esac
         [ -n "$OWNER" ] && [ "$pid" = "$OWNER" ] && continue
         arg0=""
-        IFS= read -r -d '' arg0 2>/dev/null < "/proc/$pid/cmdline"
+        exec 7< <(exec </dev/null 2>/dev/null 6>&- 9>&-
+                  IFS= read -r -d '' arg0 < "/proc/$pid/cmdline"; printf 'a=%s\n' "$arg0")
+        line=""
+        IFS= read -t 3 -r line <&7
+        exec 7<&-
+        case "$line" in a=*) arg0="${line#a=}" ;; *) return 0 ;; esac
         case "$arg0" in
             *" (/"*"/homebrew/plugins/"*"/main.py)"*) continue ;;
         esac
@@ -3807,9 +3897,9 @@ class Plugin:
             return True
         done = self._nmcli_modify(uuid, "802-11-wireless-security.key-mgmt", "sae",
                                   timeout=timeout)
-        # The 6 GHz answer kept for this profile (contract C14) is out of date.
+        # The 6 GHz answer kept for this profile (contract C21) is out of date.
         self._six_ghz_checked = {k: v for k, v in getattr(self, "_six_ghz_checked", {}).items()
-                                 if k != uuid}
+                                 if k[0] != uuid}
         return done["success"] or "unknown connection" in (done.get("stderr") or "").lower()
 
     def _clear_dns(self, uuid: str, timeout: float = 2) -> bool:
@@ -3859,7 +3949,7 @@ class Plugin:
         elif getattr(self, "_wake_move_running", False):
             # The move a wake makes on its own: nobody pressed anything, so
             # "another WiFi change" would send them looking for one.
-            result["message"] = "The access point lock is moving after sleep. Try again in a moment."
+            result["message"] = "The access point lock is being checked after sleep. Try again in a moment."
         elif self._backend_switch_running():
             result["message"] = "Wait for the WiFi backend switch to finish, then try again."
         return result
@@ -4802,6 +4892,15 @@ class Plugin:
                             "_uninstall went on without waiting longer for a change under way")
                         break
                     held.append(guard)
+                # And a profile change under way (the lock, Move, the band,
+                # DNS, IPv6, Allow WPA2): each writes nothing more from here,
+                # and one between two steps ends at its next.
+                while (getattr(self, "_profile_change_depth", 0) > 0
+                       and time.monotonic() < until):
+                    await asyncio.sleep(0.05)
+                if getattr(self, "_profile_change_depth", 0) > 0:
+                    decky.logger.info(
+                        "_uninstall went on without waiting longer for a WiFi change under way")
                 await asyncio.to_thread(self._teardown, deadline)
             finally:
                 for guard in reversed(held):
@@ -4931,9 +5030,37 @@ class Plugin:
             # it), and the settings folder once nothing in it is kept.
             self._rotate_logs(keep=0)
             if SETTINGS_FILE in users:
+                self._remove_settings_temps()
                 self._remove_settings_dir()
         finally:
             self._cmd_deadline = None
+
+    # What a save cut off part way leaves in the settings folder
+    # (_save_settings), and what an older version's save did.
+    _SETTINGS_TEMP_RE = re.compile(r"\A(?:\.settings-[0-9a-f]{12}\.tmp|settings\.json\.tmp)\Z")
+
+    def _remove_settings_temps(self):
+        """Remove a save's leftover copies of the settings, so the folder can
+        go too. Listed through the folder as opened without following links,
+        and each removed the same way."""
+        folder = os.path.dirname(SETTINGS_FILE)
+        try:
+            dfd = _open_dir_no_follow(folder)
+        except OSError:
+            return
+        try:
+            names = [n for n in os.listdir(dfd) if self._SETTINGS_TEMP_RE.match(n)]
+        except OSError:
+            names = []
+        finally:
+            os.close(dfd)
+        for name in names:
+            try:
+                _remove_no_follow(os.path.join(folder, name))
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                decky.logger.error(f"_uninstall could not remove a settings copy: {e}")
 
     def _remove_settings_dir(self):
         """Remove the plugin's settings folder if it is empty. The folder is
@@ -5293,18 +5420,11 @@ class Plugin:
                 "self_managed": after.get("self_managed", False),
                 "changeable": after.get("changeable", False),
             }
-            # The Steam Deck is named only on one: the panel shows this on
-            # every device the plugin runs on.
-            on_deck = settings.get("device_family") in ("deck_lcd", "deck_oled")
-            normal = ("That is normal on many handhelds, the Steam Deck included, "
-                      if on_deck else "That is normal on many handhelds, ")
             governing = after.get("governing", "")
             if after.get("self_managed"):
                 result["message"] = (
-                    f"This device's WiFi carries {self._region_words(governing, country)} "
-                    "and ignores this "
-                    "setting, so the channels available to you have not "
-                    "changed. " + normal + "and does not mean a band is missing."
+                    f"This device's WiFi uses {self._region_words(governing, country)} "
+                    "and ignores this setting. That is normal and hides no band."
                 )
             elif country and after.get("readable") and after.get("governing") != country:
                 # Not self-managed, and still not on the chosen region: a card
@@ -5318,10 +5438,7 @@ class Plugin:
                          else self._region_words(governing, country))
                 where = (f"is on {named}" if governing == "98"
                          else f"stayed on {named} instead of {country}")
-                result["message"] = (
-                    f"The WiFi card {where}. That is normal on some cards, "
-                    "and nothing else needs doing."
-                )
+                result["message"] = f"The WiFi card {where}. That is normal on some cards."
             decky.logger.info(
                 f"regdomain set to {target!r}: governing="
                 f"{after.get('governing')!r} self_managed={after.get('self_managed')}"
@@ -6372,7 +6489,9 @@ class Plugin:
         outcome = getattr(self, "_wake_move_outcome", None)
         live = status.get("live")
         if isinstance(live, dict):
-            if outcome and time.monotonic() - outcome[2] < self._WAKE_MOVE_SHOWN_SECONDS:
+            # Kept until the user next acts on the lock, at most 12 h
+            # (contract C22): the panel is seldom open at a wake.
+            if outcome and time.monotonic() - outcome[2] < self._WAKE_MOVE_KEPT_SECONDS:
                 live["lock_move_after_wake"] = {"outcome": outcome[0], "at": outcome[1]}
             else:
                 live.pop("lock_move_after_wake", None)
@@ -6575,7 +6694,7 @@ class Plugin:
         # but the profile drifting here may be another saved copy of the
         # network, which it never saw. One that cannot join a 6 GHz access
         # point is left alone, with the drift still reported.
-        if action["value"] == "6GHz" and self._six_ghz_refusal_cached(uuid):
+        if action["value"] == "6GHz" and self._six_ghz_refusal_cached(uuid, quiet=False):
             return
         healed = self._nmcli_modify(
             uuid, "802-11-wireless.band", action["value"], timeout=2
@@ -7063,21 +7182,26 @@ class Plugin:
                 + ("WiFi did not reconnect" if not (state or "").startswith("connected")
                    else "it could not be told whether a game or stream is running"))
 
-    # How long get_status reports the outcome of an after-wake move that
-    # reconnected (contract C13).
+    # How long the panel shows the outcome of an after-wake move as a banner
+    # (contract C22); after that it is a line on the lock row.
     _WAKE_MOVE_SHOWN_SECONDS = 120
+    # How long get_status reports that outcome at most (M-c): until the user
+    # next acts on the lock (_user_acted_on_lock), and never past this.
+    _WAKE_MOVE_KEPT_SECONDS = 12 * 3600
 
-    # The cards the after-wake move leaves alone (K-d). rtw88 (the Steam Deck
-    # LCD) has an open failure to power back on after sleep, and the move's
-    # radio cycle is a full power off and on, at the most fragile moment.
-    # The lock-weaker notice still offers Move there with the panel open.
-    _NO_WAKE_MOVE_DRIVERS = ("rtw88",)
+    # The only cards the after-wake move runs on (M-b, contract C25): ath11k,
+    # the Steam Deck OLED's, the one it was measured on. Its radio cycle is a
+    # full power off and on at the most fragile moment, so a card nobody has
+    # measured it on (rtw88 on the LCD has an open failure to power back on
+    # after sleep) is left alone. The lock-weaker notice still offers Move
+    # everywhere with the panel open.
+    _WAKE_MOVE_DRIVERS = ("ath11k",)
 
     def _no_wake_move_driver(self, driver) -> bool:
         """Whether driver (the settings' "driver", or the module behind the
-        locked interface) is one the after-wake move leaves alone: rtw88 in
-        any of its names (rtw88, rtw88_pci, rtw88_8822ce)."""
-        return isinstance(driver, str) and driver.startswith(self._NO_WAKE_MOVE_DRIVERS)
+        locked interface) is one the after-wake move leaves alone: any but
+        ath11k in its names (ath11k, ath11k_pci), and an unknown one too."""
+        return not (isinstance(driver, str) and driver.startswith(self._WAKE_MOVE_DRIVERS))
 
     def _iface_driver(self, iface: str) -> str:
         """The DRIVER_PROFILES key of the module behind iface, "" if unknown."""
@@ -7091,7 +7215,9 @@ class Plugin:
     async def _move_lock_after_wake(self) -> bool:
         """_wake_lock_check's one attempt: the same path as Move the lock
         (_lock_onto_best with moving=True: fresh scans, the same margin,
-        verify and roll back, the failure cooldown), only while the lock
+        verify and roll back, the failure cooldown, and never an access
+        point that refused an earlier after-wake move until the user acts
+        on the lock, ap_wake_refusals), only while the lock
         holds on a weak link, and never during a game, a stream, an update,
         a profile change or a backend switch. One log line says what
         happened or why not. False, with nothing done, while it cannot yet
@@ -7128,16 +7254,26 @@ class Plugin:
             if self._no_wake_move_driver(await asyncio.to_thread(self._iface_driver, iface)):
                 return leave("it does not move on its own on this WiFi card")
             result = await self._lock_onto_best(iface, uuid, moving=True, after_wake=True)
-            if result.get("reconnected"):
-                if result.get("success"):
-                    outcome = "moved"
-                elif result.get("error") == "move_failed" and result.get("restored"):
-                    outcome = "back"
-                else:
-                    outcome = None
-                if outcome:
-                    self._wake_move_outcome = (outcome, int(time.time()), time.monotonic())
-            if (not result.get("success") and not result.get("logged")
+            radio_off = result.get("message") == self._RADIO_OFF_RESULT["message"]
+            outcome = None
+            if result.get("success") and result.get("reconnected"):
+                outcome = "moved"
+            elif result.get("error") == "move_failed":
+                # Without restored: the old pin could not be written back,
+                # and the lock was turned off or left on the refusing one.
+                outcome = "back" if result.get("restored") else "off"
+            elif radio_off:
+                outcome = "off"
+            if outcome:
+                self._wake_move_outcome = (outcome, int(time.time()), time.monotonic())
+            if radio_off or result.get("wifi_not_back"):
+                self._log_wake_move_death()
+            if result.get("error") == "move_failed":
+                # The refusal and the rollback are logged already.
+                if result.get("restored") and not result.get("logged"):
+                    decky.logger.info("After waking, the BSSID lock went back: the stronger "
+                                      "access point refused the connection")
+            elif (not result.get("success") and not result.get("logged")
                     and result.get("error") not in ("game_running",)):
                 leave(f"the move did not go through ({result.get('error', 'unexpected')})")
             return True
@@ -7147,6 +7283,17 @@ class Plugin:
             self._profile_change_depth = max(
                 0, getattr(self, "_profile_change_depth", 1) - 1
             )
+
+    def _log_wake_move_death(self):
+        """One journal line under the plugin's tag (contract C24): the
+        after-wake move's radio cycle left WiFi down, which the wake-failure
+        rule cannot see on its own, since NetworkManager's "up" came before
+        the move."""
+        result = self._run_cmd(["/usr/bin/logger", "-t", JOURNAL_TAG, "--",
+                                "after-wake lock move: WiFi did not come back"], timeout=3)
+        if not result.get("success"):
+            decky.logger.error(
+                f"Could not log the after-wake move's end: {_tool_text((result.get('stderr') or '')[:120])}")
 
     # How long after Steam starts or stops a game (poke_detection) a game
     # counts as running for the checks before a reconnect nobody asked for.
@@ -7159,36 +7306,40 @@ class Plugin:
 
     def _game_or_stream_known(self, settings: dict, wait: float = PROC_SCAN_WAIT_SECONDS,
                               fresh: float = PROC_SCAN_FRESH_SECONDS) -> bool | None:
-        """Whether a game or stream is running, from a process search no
-        older than fresh seconds, or None when there is none to go by. With
-        a wait (in a worker thread), it waits that long for a search started
-        now. Never "not running" for want of an answer: the plain search
-        answers from whatever it last had, and a move made on that could
-        reconnect in the middle of a game. The one test for every check
-        before a reconnect or a scan nobody asked for: the flag, the hold, a
-        game just started or stopped (poke_detection), a SteamLaunch game
-        and the stream apps."""
+        """Whether a game or stream is running, from a process search started
+        no more than fresh seconds ago, or None when there is none to go by.
+        It waits up to wait (in a worker thread) for a search started now.
+        Never "not running" for want of an answer: the plain search answers
+        from whatever it last had, and a move made on that could reconnect
+        in the middle of a game. The one test for every check before a
+        reconnect or a scan nobody asked for: the flag, the hold, a game
+        just started or stopped (poke_detection), a SteamLaunch game and the
+        stream apps (_reconnect_guard_patterns)."""
         if (os.path.isfile(STREAM_FLAG_FILE) or os.path.isfile(STREAM_HOLD_FILE)
                 or self._app_event_recent()):
             return True
-        return self._known_running([self._GAME_PATTERN] + self._stream_patterns(settings),
-                                   wait, fresh)
+        return self._known_running(
+            [self._GAME_PATTERN] + self._reconnect_guard_patterns(settings), wait, fresh)
 
     def _known_running(self, patterns: list, wait: float = PROC_SCAN_WAIT_SECONDS,
-                       fresh: float = PROC_SCAN_FRESH_SECONDS) -> bool | None:
-        """Whether a process matching patterns runs, from a search no older
-        than fresh seconds (waiting up to wait for one started now), or None
-        when there is none that recent."""
+                       fresh: float = PROC_SCAN_FRESH_SECONDS,
+                       since: float | None = None) -> bool | None:
+        """Whether a process matching patterns runs, from a search started
+        no more than fresh seconds ago (waiting up to wait for one started
+        now), or None when there is none that recent. With since, only the
+        answer of a search started at or after since counts, however old."""
         if wait > 0:
             self._proc_snapshot(wait)
         _PROC_SCAN_LOCAL.no_wait = True
         _PROC_SCAN_LOCAL.unknown = False
         _PROC_SCAN_LOCAL.fresh = fresh
+        _PROC_SCAN_LOCAL.since = since
         try:
             found = self._find_stream(patterns)
         finally:
             _PROC_SCAN_LOCAL.no_wait = False
             _PROC_SCAN_LOCAL.fresh = PROC_SCAN_FRESH_SECONDS
+            _PROC_SCAN_LOCAL.since = None
         if found is not None:
             return True
         return None if _PROC_SCAN_LOCAL.unknown else False
@@ -8041,6 +8192,26 @@ class Plugin:
         parsed["changeable"] = bool(result["success"]) and not parsed["self_managed"]
         return parsed
 
+    @staticmethod
+    def _wake_refusals(settings: dict) -> set:
+        """Access points that refused an after-wake move since the user last
+        acted on the lock. Validated again: the file is the desktop user's."""
+        return {b.upper() for b in (settings.get("ap_wake_refusals") or [])
+                if isinstance(b, str) and BSSID_RE.match(b)}
+
+    def _user_acted_on_lock(self):
+        """The user turned the lock on or off, pressed Move or ran Reset: the
+        after-wake move's outcome is no longer news, and an access point that
+        refused it may be tried again at the next wake."""
+        self._wake_move_outcome = None
+        settings = _load_settings()
+        if settings.get("ap_wake_refusals"):
+            settings["ap_wake_refusals"] = []
+            try:
+                _save_settings(settings)
+            except OSError as e:
+                self._log_throttled("ap_failure_save", f"Could not clear the after-wake refusals: {e}")
+
     def _recent_ap_failures(self, settings: dict) -> set:
         """Access points that refused an association recently.
 
@@ -8059,13 +8230,17 @@ class Plugin:
                 out.add(bssid.upper())
         return out
 
-    def _record_ap_failure(self, bssid: str, stamp: bool = True):
+    def _record_ap_failure(self, bssid: str, stamp: bool = True, after_wake: bool = False):
         """Remember that this access point would not accept us. stamp: a
         change the user made (not the after-wake move), which sets "Last
-        changed"."""
+        changed". after_wake: the after-wake move's refusal, also kept until
+        the user next acts on the lock (_wake_refusals)."""
         if not bssid or not BSSID_RE.match(bssid):
             return
         settings = _load_settings()
+        if after_wake:
+            kept = [b for b in settings.get("ap_wake_refusals", []) if b != bssid.upper()]
+            settings["ap_wake_refusals"] = (kept + [bssid.upper()])[-_MAX_WAKE_REFUSALS:]
         failures = dict(settings.get("ap_move_failures") or {})
         failures[bssid.upper()] = int(time.time())
         # Keep the newest few. Unbounded growth in a file parsed on every
@@ -8113,7 +8288,7 @@ class Plugin:
         return averaged
 
     def _lock_candidates(
-        self, aps: list, ssid: str, settings: dict, key_mgmt: str
+        self, aps: list, ssid: str, settings: dict, key_mgmt: str, after_wake: bool = False
     ) -> list[tuple[str, int, int, str]]:
         """The access points of this network the lock could pin this profile to.
 
@@ -8127,12 +8302,16 @@ class Plugin:
         constraint and not a suggestion: choosing an access point on the other
         band would write a profile whose band and address contradict, which is
         the one state that stops it associating at all. And an access point
-        that refused us recently is left alone until its cooldown runs out.
+        that refused us recently is left alone until its cooldown runs out;
+        for the after-wake move, one that refused an after-wake move is left
+        alone until the user next acts on the lock.
         """
         if key_mgmt:
             aps = [ap for ap in aps if self._ap_accepts(ap[3], key_mgmt)]
         aps = self._on_preferred_band(aps, ssid, settings)
         refused = self._recent_ap_failures(settings)
+        if after_wake:
+            refused = refused | self._wake_refusals(settings)
         if refused:
             aps = [ap for ap in aps if ap[0] not in refused]
         return aps
@@ -8148,7 +8327,7 @@ class Plugin:
 
     def _lock_target(
         self, iface: str, ssid: str, current: str, settings: dict,
-        link: str = "", uuid: str = ""
+        link: str = "", uuid: str = "", after_wake: bool = False
     ) -> tuple[tuple[str, int, int, str] | None, int | None]:
         """The AP worth moving to (or None), and the signal of the one we are on.
 
@@ -8162,11 +8341,21 @@ class Plugin:
         both sides of the comparison it was made on. It is None when the scan
         cannot see the access point we are on.
         """
+        self._wake_refusal_held = None
         if self._link_is_strong(link):
             return None, None
         aps = self._sampled_access_points(iface, ssid)
         key_mgmt = self._profile_key_mgmt(uuid) if uuid and aps else ""
-        aps = self._lock_candidates(aps, ssid, settings, key_mgmt)
+        if after_wake:
+            # What it would have moved to without the after-wake refusals,
+            # so the log can say an earlier refusal is why it stays.
+            unskipped = self._lock_candidates(aps, ssid, settings, key_mgmt)
+            mine = next((ap for ap in unskipped if ap[0] == current.upper()), None)
+            if (unskipped and mine and unskipped[0][0] != mine[0]
+                    and unskipped[0][1] - mine[1] >= self._AP_UPGRADE_MARGIN
+                    and unskipped[0][0] in self._wake_refusals(settings)):
+                self._wake_refusal_held = unskipped[0][0]
+        aps = self._lock_candidates(aps, ssid, settings, key_mgmt, after_wake=after_wake)
         if not aps:
             return None, None
         best = aps[0]
@@ -9042,14 +9231,13 @@ class Plugin:
 
         None (falsy, as not fresh) when a scan is due and whether a stream
         is running is not known yet: the caller looks again at the next poll
-        rather than after its own throttle, since the search started now has
-        answered by then and an answer older than PROC_SCAN_FRESH_SECONDS is
-        not gone by.
+        rather than after its own throttle, and the search this one started
+        answers it then (_stream_running_now).
         """
         asked = getattr(self, "_lock_scan_at", None)
         if asked is None or now - asked >= self._LOCK_SCAN_SECONDS:
-            # Without waiting on the process search: this runs in the
-            # status read, which a search stuck in the kernel would hold
+            # Waiting a second at most on the process search: this runs in
+            # the status read, which a search stuck in the kernel would hold
             # for good. Not known yet means ask again at the next poll.
             streaming = self._stream_running_now(settings)
             if streaming is None:
@@ -9090,19 +9278,56 @@ class Plugin:
         than PROC_SCAN_FRESH_SECONDS (waiting for one under way), or None."""
         return self._known_running(patterns)
 
-    # How old a process search may be for the lock-weaker and WPA2-reach
-    # checks to ask for a scan on it: a forced rescan in the first seconds
-    # of a stream or a game is the stutter the checks exist to avoid.
-    _SCAN_GATE_FRESH_SECONDS = 5.0
+    # How long the lock-weaker and WPA2-reach checks wait for the process
+    # search they start. In the status worker thread (never the event loop)
+    # and only when a scan is due, once a _LOCK_SCAN_SECONDS, so at most this
+    # long a minute.
+    _SCAN_GATE_WAIT_SECONDS = 1.0
 
     def _stream_running_now(self, settings: dict) -> bool | None:
-        """Whether a game or stream is running, for the status read, which
-        never waits on the process search (one stuck in the kernel held every
-        status read after it): it goes by the last search's answer while that
-        is under _SCAN_GATE_FRESH_SECONDS old, starting a new search for the
-        next poll, and answers None while there is none to go by. A game
-        counts as much as a stream: a forced scan stutters either."""
-        return self._game_or_stream_known(settings, wait=0, fresh=self._SCAN_GATE_FRESH_SECONDS)
+        """Whether a game or stream is running, for the lock-weaker and
+        WPA2-reach checks before they ask for a scan: a forced rescan in the
+        first seconds of a stream or a game is the stutter they exist to
+        avoid, and a game counts as much as a stream.
+
+        Goes only by a search started at or after this call (or in the
+        _PROC_SCAN_REUSE_SECONDS before it), waiting up to
+        _SCAN_GATE_WAIT_SECONDS for it, so how far apart the status reads
+        run never matters. A search slower than that (one stuck in the
+        kernel held every status read after it, so none waits longer) is
+        kept as a ticket: a later call takes the answer of a search started
+        at or after the ticket, unless Steam started or stopped a game
+        (poke_detection) after that search started. None until then; the
+        caller asks again at its next pass."""
+        if (os.path.isfile(STREAM_FLAG_FILE) or os.path.isfile(STREAM_HOLD_FILE)
+                or self._app_event_recent()):
+            return True
+        asked = time.monotonic()
+        ticket = getattr(self, "_scan_gate_ticket", None)
+        # A ticket left by a pass the panel closed on is not gone by: its
+        # answer could be from long before a game started. A search started
+        # under _PROC_SCAN_REUSE_SECONDS before this call counts as this
+        # call's, as it does for every caller.
+        if ticket is None or asked - ticket >= self._LOCK_SCAN_SECONDS:
+            ticket = asked - self._PROC_SCAN_REUSE_SECONDS
+        required = ticket
+        event = getattr(self, "_app_event_at", None)
+        if event is not None and event > required:
+            required = event
+        state = self._proc_scan_state()
+        last = state["last"]
+        if last is None or last[0] < required:
+            deadline = asked + self._SCAN_GATE_WAIT_SECONDS
+            # Twice at most: the first may wait out a search started before
+            # this call, and then one of its own is started.
+            for _ in range(2):
+                last = self._proc_snapshot(max(0.0, deadline - time.monotonic()), since=required)
+                if (last is not None and last[0] >= required) or time.monotonic() >= deadline:
+                    break
+        answer = self._known_running([self._GAME_PATTERN] + self._reconnect_guard_patterns(settings),
+                                     wait=0, since=required)
+        self._scan_gate_ticket = ticket if answer is None else None
+        return answer
 
     async def allow_wpa2(self) -> dict:
         """Let a WPA3-only profile use the WPA2-only access points of its network.
@@ -9149,8 +9374,12 @@ class Plugin:
             # or shutdown inside it left the profile on WPA2 with no record.
             settings = _load_settings()
             known = [u for u in settings.get("wpa2_uuids", []) if u != uuid] + [uuid]
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             capped = await asyncio.to_thread(
                 self._capped, known, "802-11-wireless-security.key-mgmt")
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             # Loaded again after the await, so a save made meanwhile stays.
             settings = _load_settings()
             had_record = uuid in settings.get("wpa2_uuids", [])
@@ -9168,6 +9397,8 @@ class Plugin:
                 settings["wpa2_uuids"] = [u for u in settings.get("wpa2_uuids", []) if u != uuid]
                 _save_settings(settings)
 
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             done = await asyncio.to_thread(
                 self._nmcli_modify, uuid, "802-11-wireless-security.key-mgmt", "wpa-psk"
             )
@@ -9197,7 +9428,7 @@ class Plugin:
                         "message": "Couldn't reconnect, so the network was left as it was."}
             decky.logger.info(f"Allowed WPA2 alongside WPA3 on {uuid}")
             # The profile's security changed: the 6 GHz answer kept for it
-            # (contract C14) is out of date.
+            # (contract C21) is out of date.
             self._six_ghz_checked = {}
             self._wpa2_blocked = None
             self._reach_checked_at = 0.0
@@ -9230,6 +9461,8 @@ class Plugin:
                     # stayed on the access point in use because the stronger
                     # one would not take): passed on as it is.
                     result["message"] = relocked["message"]
+            # Said, since the finding clears and takes its banner with it.
+            result.setdefault("message", "WPA2 allowed on this network.")
             return result
         except Exception as e:
             decky.logger.error(f"allow_wpa2 error: {e}")
@@ -9747,7 +9980,7 @@ class Plugin:
                 uuid, "802-11-wireless.band", timeout=T
             )
             status["live"]["band"] = live_band
-            self._report_six_ghz(settings, status, uuid, live_band)
+            self._report_six_ghz(settings, status, uuid, live_band, iface, active_ssid() or "")
             if (live_band and not settings.get("band_preference_enabled")
                     and "802-11-wireless.band" not in settings.get("pins_owned", [])):
                 status["external"]["band"] = True
@@ -9952,10 +10185,7 @@ class Plugin:
                     # but the toggle also promises the PCIe power states and some
                     # did not take. Said without their names, which mean nothing
                     # to the reader; _apply_pcie_aspm_fix logs them.
-                    notes.append(
-                        "Some PCIe power saving couldn't be turned off; the rest "
-                        "is applied. Nothing to do."
-                    )
+                    notes.append("Some PCIe power saving couldn't be turned off. The rest is on.")
                 if notes:
                     result["message"] = " ".join(notes)
                 return result
@@ -10339,6 +10569,8 @@ class Plugin:
             self, "_profile_change_depth", 0
         ) + 1
         try:
+            # The user deciding again, either way.
+            await asyncio.to_thread(self._user_acted_on_lock)
 
             if enabled:
                 if await asyncio.to_thread(self._backend_is_iwd):
@@ -10460,10 +10692,17 @@ class Plugin:
         # which is what makes awaiting here safe.
         moved_to, here_signal = await asyncio.to_thread(
             self._lock_target,
-            iface, active_ssid or "", bssid, _load_settings(), link_out, uuid,
+            iface, active_ssid or "", bssid, _load_settings(), link_out, uuid, after_wake,
         )
         # after_wake: the move a wake made on its own (_move_lock_after_wake).
         verb = "After waking, moving" if after_wake else "Moving"
+        held_by = getattr(self, "_wake_refusal_held", None) if after_wake else None
+        if moving and not moved_to and held_by:
+            decky.logger.info(
+                f"After waking, the BSSID lock was left as it is: {held_by}, the stronger "
+                "access point, refused a move after an earlier wake")
+            return {"success": True, "bssid_locked": True, "logged": True,
+                    "message": "No clearly stronger access point found, so the lock stayed."}
         if moving and not moved_to:
             decky.logger.info(
                 f"{'After waking, not' if after_wake else 'Not'} moving the BSSID lock: "
@@ -10505,6 +10744,8 @@ class Plugin:
         previous_pin = previous_pin.replace("\\", "")
         if previous_pin and not BSSID_RE.match(previous_pin):
             previous_pin = ""
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
         result = await asyncio.to_thread(
             self._nmcli_modify, uuid, "802-11-wireless.bssid", chosen)
         if not result["success"]:
@@ -10520,6 +10761,8 @@ class Plugin:
         if uuid not in known:
             known.append(uuid)
         capped = await asyncio.to_thread(self._capped, known, "802-11-wireless.bssid")
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
         # Loaded again after the await: a save made meanwhile stays.
         settings = _load_settings()
         settings["bssid_lock_enabled"] = True
@@ -10546,6 +10789,14 @@ class Plugin:
                                                 after_wake=after_wake)
         return {"success": True, "bssid_locked": True, "reconnected": True}
 
+    async def _wifi_not_back(self, iface: str, no_link: bool) -> dict:
+        """{"wifi_not_back": True} when the after-wake move's verify saw no
+        association at all and none follows the rollback either, else {}."""
+        if not no_link:
+            return {}
+        again = await self._await_association(iface)
+        return {} if again["bssid"] else {"wifi_not_back": True}
+
     async def _verify_lock_move(self, iface: str, uuid: str, previous: str,
                                 chosen: str, moving: bool, after_wake: bool = False) -> dict:
         """Check a moved lock landed, and put the previous pin back if not.
@@ -10564,19 +10815,30 @@ class Plugin:
         save = _save_settings if after_wake else _save_settings_with_timestamp
         landed = await self._await_association(iface)
         if landed["bssid"].upper() == chosen.upper():
-            return {"success": True, "bssid_locked": True, "reconnected": True}
+            if after_wake:
+                return {"success": True, "bssid_locked": True, "reconnected": True}
+            return {"success": True, "bssid_locked": True, "reconnected": True,
+                    "message": "Moved to the stronger access point."}
         if self._card_not_responding({"stderr": landed.get("error", "")}):
             # An iw stuck in the driver says nothing about the access point:
             # it is not recorded as refusing us, and the pin is left alone.
             # Restoring and reconnecting would only queue more commands
             # behind the stuck one.
             return self._not_responding_result("BSSID lock move", landed["error"])
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
         decky.logger.error(
             f"Could not associate to {chosen} after moving "
             f"the lock; restoring {previous} and leaving it "
             f"alone for a while"
         )
-        self._record_ap_failure(chosen, stamp=not after_wake)
+        self._record_ap_failure(chosen, stamp=not after_wake, after_wake=after_wake)
+        # Associated nowhere at all in the wait: WiFi may be dead rather than
+        # the access point refusing, so the after-wake move looks again once
+        # it has put the old pin back (contract C24).
+        no_link = after_wake and not landed["bssid"]
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
         put_back = await asyncio.to_thread(
             self._nmcli_modify, uuid, "802-11-wireless.bssid", previous)
         restored = _load_settings()
@@ -10588,8 +10850,12 @@ class Plugin:
                 f"Could not restore the lock to {previous} on {uuid}: "
                 f"{_tool_text(put_back.get('stderr', '')[:120])}; turning the lock off"
             )
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             cleared = await asyncio.to_thread(
                 self._nmcli_modify, uuid, "802-11-wireless.bssid", "")
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             restored = _load_settings()
             if cleared["success"]:
                 restored["bssid_lock_enabled"] = False
@@ -10611,8 +10877,10 @@ class Plugin:
                 decky.logger.error(f"BSSID lock: the settings could not record the rollback: {e}")
             if not await self._reconnect(uuid):
                 return dict(self._RADIO_OFF_RESULT)
-            return {"success": False, "error": "move_failed",
-                    "reconnected": True, "message": message}
+            return {"success": False, "error": "move_failed", "reconnected": True,
+                    "message": message, **(await self._wifi_not_back(iface, no_link))}
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
         restored["bssid_lock_value"] = previous
         unsaved = None
         try:
@@ -10650,6 +10918,7 @@ class Plugin:
                     "connection, so the lock went back to the one you "
                     "were on."
                 ),
+                **(await self._wifi_not_back(iface, no_link)),
             }
         return {
             "success": True,
@@ -10678,6 +10947,7 @@ class Plugin:
             self, "_profile_change_depth", 0
         ) + 1
         try:
+            await asyncio.to_thread(self._user_acted_on_lock)
             if await asyncio.to_thread(self._backend_is_iwd):
                 return {"success": False, "error": "needs_wpa_supplicant",
                         "message": "The access point lock " + self._NEEDS_WPA_SUPPLICANT}
@@ -10799,15 +11069,53 @@ class Plugin:
         )
         return self._nm_version_seen
 
-    def _report_six_ghz(self, settings: dict, status: dict, uuid: str, live_band: str):
+    # How long the status pass goes by one read of nmcli's cached access
+    # point list for the Force 6 GHz row, per profile.
+    _SIX_GHZ_LIST_SECONDS = 60
+
+    def _report_six_ghz(self, settings: dict, status: dict, uuid: str, live_band: str,
+                        iface: str = "", ssid: str = ""):
         """Whether Force 6 GHz is offered, and when it is but this profile
-        cannot be held to 6 GHz here, why (contract C14): the panel shows the
-        row disabled with that reason. From the status collector."""
+        cannot be held to 6 GHz here, why (contract C21): the panel shows the
+        row disabled with that reason. The same order as a press: only when
+        nmcli's cached list has a 6 GHz access point of this network, since
+        with none in range the reason to give is that one, and a press gives
+        it. From the status collector, in the status worker thread."""
         status["live"]["six_ghz_offered"] = self._six_ghz_offered(settings, status)
-        if status["live"]["six_ghz_offered"] and live_band != "6GHz":
-            refused = self._six_ghz_refusal_cached(uuid)
-            if refused:
-                status["live"]["six_ghz_refusal"] = refused["message"]
+        if not status["live"]["six_ghz_offered"] or live_band == "6GHz":
+            return
+        aps = self._six_ghz_list(uuid, iface, ssid)
+        if not any(self._freq_band(ap[2]) == "6GHz" for ap in aps):
+            return
+        refused = self._six_ghz_refusal_cached(uuid, quiet=True, aps=aps)
+        if refused:
+            status["live"]["six_ghz_refusal"] = refused["message"]
+
+    def _six_ghz_list(self, uuid: str, iface: str, ssid: str) -> list:
+        """This network's access points in nmcli's cached list (no scan, no
+        wait), read at most once a _SIX_GHZ_LIST_SECONDS per profile."""
+        if not iface or not ssid:
+            return []
+        now = time.monotonic()
+        seen = getattr(self, "_six_ghz_lists", {})
+        if uuid in seen and now - seen[uuid][0] < self._SIX_GHZ_LIST_SECONDS:
+            return seen[uuid][1]
+        aps = self._visible_access_points(iface, ssid, cached_only=True)
+        self._six_ghz_lists = {**seen, uuid: (now, aps)}
+        return aps
+
+    @staticmethod
+    def _six_ghz_list_kind(aps) -> str:
+        """Which wpa-psk text fits this network's access points: "wpa2" when
+        one offers only WPA2, "sae" when every one accepts WPA3, "" with no
+        list."""
+        if not aps:
+            return ""
+        if any("WPA2" in ap[3] and "WPA3" not in ap[3] for ap in aps):
+            return "wpa2"
+        if all(Plugin._ap_accepts(ap[3], "sae") for ap in aps):
+            return "sae"
+        return ""
 
     def _six_ghz_offered(self, settings: dict, status: dict) -> bool:
         """Whether the panel offers Force 6 GHz: the card and NetworkManager
@@ -10821,7 +11129,7 @@ class Plugin:
             and status.get("live", {}).get("wifi_backend") != "iwd"
         )
 
-    def _six_ghz_refusal(self, uuid: str, quiet: bool = False) -> dict | None:
+    def _six_ghz_refusal(self, uuid: str, quiet: bool = False, aps=None) -> dict | None:
         """Why this profile cannot be held to 6 GHz here, or None if it can.
 
         Every 6 GHz access point uses WPA3. A profile saved for WPA3 (sae)
@@ -10831,7 +11139,8 @@ class Plugin:
         connect when asked but never on its own, so after sleep or a dropout
         it would stay disconnected. Anything else, open or enterprise, is
         refused rather than guessed at. quiet: the status pass asking, which
-        logs nothing.
+        logs nothing. aps: this network's access points from nmcli's cached
+        list, when the caller has it, to say what to change.
         """
         def refuse(message):
             if not quiet:
@@ -10852,17 +11161,24 @@ class Plugin:
         if key_mgmt != "wpa-psk":
             return refuse("6 GHz needs a network secured with a WPA3 password.")
         if version < NM_6GHZ_WPA_PSK:
-            # The profile keeps the security it was saved with: setting the
-            # router to WPA3 only later does not change it. NetworkManager
-            # 1.58.0 saves a network that offers only WPA3 as sae, so joining
-            # it again after the router change is the way on there. Where
-            # Allow WPA2 made it wpa-psk, putting WPA3 only back is enough,
-            # and forgetting the network would lose every setting on it.
+            # The profile keeps the security it was saved with. Changing just
+            # this profile to WPA3 Personal (sae) in Desktop Mode keeps its
+            # uuid, so the lock, DNS, IPv6 and band settings stay, and changes
+            # nothing for other devices; forgetting the network would lose
+            # every setting on it, and a router set to WPA3 only cuts off
+            # every WPA2 only device in the home. An sae profile cannot join
+            # an access point that offers only WPA2, so those come first.
+            kind = self._six_ghz_list_kind(aps)
+            if kind == "wpa2":
+                return refuse("6 GHz needs this network saved as WPA3, and some of its "
+                              "access points offer only WPA2. Set them to WPA2/WPA3 in "
+                              "your router first.")
             if uuid in settings.get("wpa2_uuids", []):
-                return refuse("6 GHz needs WPA3 only, and WPA2 is allowed on this "
-                              "network. Reset settings puts WPA3 only back.")
-            return refuse("6 GHz needs this network saved for WPA3. Set your router "
-                          "to WPA3 only, then forget this network and join it again.")
+                return refuse("6 GHz needs WPA3, and Allow WPA2 is on for this network. "
+                              "In Desktop Mode's network settings, set its security back "
+                              "to WPA3 Personal.")
+            return refuse("6 GHz needs this network saved as WPA3. In Desktop Mode's "
+                          "network settings, set its security to WPA3 Personal.")
         pmf = self._read_profile_field(uuid, "802-11-wireless-security.pmf")
         if pmf.split(" ")[0] in ("1", "disable"):
             return refuse(
@@ -10872,19 +11188,23 @@ class Plugin:
             )
         return None
 
-    # How long the reassertion trusts an answer from _six_ghz_refusal. It
-    # costs up to three nmcli calls on the event loop, and a profile's
-    # security changes rarely.
+    # How long the status pass and the reassertion trust an answer from
+    # _six_ghz_refusal. It costs up to three nmcli calls in the status worker
+    # thread, and a profile's security changes rarely.
     _SIX_GHZ_CHECK_SECONDS = 600
 
-    def _six_ghz_refusal_cached(self, uuid: str) -> dict | None:
-        """_six_ghz_refusal for the status pass, asked once per profile a while."""
+    def _six_ghz_refusal_cached(self, uuid: str, quiet: bool = False, aps=None) -> dict | None:
+        """_six_ghz_refusal for the status pass (quiet) and the reassertion
+        (which logs its refusal), asked once per profile a while. Kept apart
+        for each, so the reassertion's refusal is logged once a while too,
+        and per kind of access point list, so the text follows the list."""
         now = time.monotonic()
+        key = (uuid, bool(quiet), self._six_ghz_list_kind(aps))
         seen = getattr(self, "_six_ghz_checked", {})
-        if uuid in seen and now - seen[uuid][0] < self._SIX_GHZ_CHECK_SECONDS:
-            return seen[uuid][1]
-        refused = self._six_ghz_refusal(uuid, quiet=True)
-        self._six_ghz_checked = {**seen, uuid: (now, refused)}
+        if key in seen and now - seen[key][0] < self._SIX_GHZ_CHECK_SECONDS:
+            return seen[key][1]
+        refused = self._six_ghz_refusal(uuid, quiet=quiet, aps=aps)
+        self._six_ghz_checked = {**seen, key: (now, refused)}
         return refused
 
     def _profile_band(self, uuid: str) -> str | None:
@@ -11060,6 +11380,8 @@ class Plugin:
                 and await asyncio.to_thread(
                     self._lock_is_for_this_network, settings, uuid, scope_ssid)
             )
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             result = await asyncio.to_thread(
                 self._nmcli_modify, uuid, "802-11-wireless.band", value)
             if not result["success"]:
@@ -11074,28 +11396,9 @@ class Plugin:
             # Temporarily clear BSSID lock so NM can find an AP on the
             # requested band. Re-lock to the new BSSID after reconnect.
             if enabled and had_bssid_lock:
-                unlocked = await asyncio.to_thread(
-                    self._nmcli_modify, uuid, "802-11-wireless.bssid", "")
-                if not unlocked["success"]:
-                    # The band is already written. Leaving an address from the
-                    # other band beside it gives a profile no access point
-                    # satisfies, and the reconnect below would activate it.
-                    # Put the band back and report, rather than strand it.
-                    rollback = await asyncio.to_thread(
-                        self._nmcli_modify, uuid, "802-11-wireless.band", previous_band
-                    )
-                    if not rollback["success"]:
-                        decky.logger.error(
-                            "Could not undo the band write after the lock "
-                            "release failed; this profile may not associate: "
-                            f"{_tool_text(rollback.get('stderr', '')[:120])}"
-                        )
-                    return {
-                        "success": False,
-                        "error": "nmcli_failed",
-                        "message": "Couldn't release the access point lock for the band change. Try again in a moment.",
-                        "detail": unlocked["stderr"],
-                    }
+                failed = await self._band_release_lock(uuid, previous_band)
+                if failed:
+                    return failed
 
             capped = None
             if enabled:
@@ -11103,6 +11406,8 @@ class Plugin:
                 if uuid not in known:
                     known.append(uuid)
                 capped = await asyncio.to_thread(self._capped, known, "802-11-wireless.band")
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             # Loaded after the last await, so nothing saved meanwhile is lost,
             # and kept as it was for _confirm_six_ghz to put back.
             settings = _load_settings()
@@ -11138,6 +11443,8 @@ class Plugin:
                 # BSSID back. Must not be time.sleep here: this is an async
                 # method, and a blocking sleep stalls the whole event loop.
                 await asyncio.sleep(3)
+                if self._tearing_down_now():
+                    return dict(self._TEARING_DOWN_RESULT)
                 pinned = await asyncio.to_thread(self._relock_pin, uuid)
                 if pinned:
                     self._record_relock(pinned)
@@ -11150,6 +11457,35 @@ class Plugin:
             self._profile_change_depth = max(
                 0, getattr(self, "_profile_change_depth", 1) - 1
             )
+
+    async def _band_release_lock(self, uuid: str, previous_band: str) -> dict | None:
+        """set_band_preference's release of the lock's pin before the band
+        change, or the refusal to return. None once released."""
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
+        unlocked = await asyncio.to_thread(
+            self._nmcli_modify, uuid, "802-11-wireless.bssid", "")
+        if unlocked["success"]:
+            return None
+        # The band is already written. Leaving an address from the other
+        # band beside it gives a profile no access point satisfies, and the
+        # reconnect after it would activate it. Put the band back and
+        # report, rather than strand it.
+        rollback = await asyncio.to_thread(
+            self._nmcli_modify, uuid, "802-11-wireless.band", previous_band
+        )
+        if not rollback["success"]:
+            decky.logger.error(
+                "Could not undo the band write after the lock "
+                "release failed; this profile may not associate: "
+                f"{_tool_text(rollback.get('stderr', '')[:120])}"
+            )
+        return {
+            "success": False,
+            "error": "nmcli_failed",
+            "message": "Couldn't release the access point lock for the band change. Try again in a moment.",
+            "detail": unlocked["stderr"],
+        }
 
     def _clear_other_bands(self, settings: dict, uuid: str) -> list:
         """Take the band off every profile the preference was written to but
@@ -11215,6 +11551,8 @@ class Plugin:
 
             previous = self._read_profile_field(uuid, "ipv4.dns")
             previous_v6 = self._read_profile_field(uuid, "ipv6.ignore-auto-dns")
+            if self._tearing_down_now():
+                return None, "", dict(self._TEARING_DOWN_RESULT)
             result = self._nmcli_modify(uuid, "ipv4.dns", servers)
             if not result["success"]:
                 self._log_detail("set_dns", result["stderr"])
@@ -11266,6 +11604,8 @@ class Plugin:
             # leaves a profile that ignores DHCP DNS and has none of its
             # own, so it reconnects with no resolvers at all - and with
             # DNS recorded as off, the drift check would not report it.
+            if self._tearing_down_now():
+                return None, "", dict(self._TEARING_DOWN_RESULT)
             restored = self._nmcli_modify(uuid, "ipv4.ignore-auto-dns", "no")
             if not restored["success"]:
                 self._log_detail("set_dns", restored["stderr"])
@@ -11317,6 +11657,8 @@ class Plugin:
                 self._dns_profile_change, enabled, provider, custom_servers)
             if err:
                 return err
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
 
             # Every other profile we wrote to, not just the one in use. One
             # we cannot reach stays listed for the next attempt. Up to
@@ -11326,14 +11668,23 @@ class Plugin:
             if not enabled:
                 others = [u for u in _load_settings().get("dns_uuids", []) if u != uuid]
                 kept = set(await asyncio.to_thread(
-                    lambda: [u for u in others if not self._clear_dns(u)]))
-            settings = _load_settings()
-            known = [u for u in settings.get("dns_uuids", []) if u != uuid]
+                    lambda: [u for u in others
+                             if self._tearing_down_now() or not self._clear_dns(u)]))
+            known = [u for u in _load_settings().get("dns_uuids", []) if u != uuid]
             if enabled:
                 known.append(uuid)
             else:
                 known = [u for u in known if u not in others or u in kept]
-            settings["dns_uuids"] = self._capped(known, "ipv4.dns")
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
+            # In a worker thread: past the cap, _capped takes DNS off the
+            # oldest profile, up to three nmcli calls.
+            capped = await asyncio.to_thread(self._capped, known, "ipv4.dns")
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
+            # Loaded after the await, so nothing saved meanwhile is lost.
+            settings = _load_settings()
+            settings["dns_uuids"] = capped
             settings["dns_enabled"] = enabled
             if enabled:
                 settings["dns_provider"] = provider
@@ -11370,6 +11721,8 @@ class Plugin:
                 return err
 
             method = "disabled" if disabled else "auto"
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             result = await asyncio.to_thread(self._nmcli_modify, uuid, "ipv6.method", method)
             if not result["success"]:
                 self._log_detail("set_ipv6", result["stderr"])
@@ -11391,6 +11744,8 @@ class Plugin:
                 known = await asyncio.to_thread(self._capped, known, "ipv6.method")
             else:
                 known = [u for u in known if u != uuid]
+            if self._tearing_down_now():
+                return dict(self._TEARING_DOWN_RESULT)
             # Loaded after the await, so nothing saved meanwhile is lost.
             settings = _load_settings()
             settings["ipv6_disabled"] = disabled
@@ -12176,9 +12531,16 @@ class Plugin:
             decky.logger.error(f"repair_drifted error: {e}")
             return self._unexpected_response(e)
 
-    # What Reset answers once uninstall has started under it.
+    # What Reset answers once uninstall has started under it, and every
+    # profile setter at its next write or save.
     _TEARING_DOWN_RESULT = {"success": False, "error": "busy",
                             "message": "The plugin is being uninstalled."}
+
+    def _tearing_down_now(self) -> bool:
+        """Whether uninstall has started: a profile setter then writes no pin
+        and saves no settings, since teardown may have taken them off and
+        removed the file already (L13)."""
+        return bool(getattr(self, "_tearing_down", False))
 
     # How long Reset spends taking pins off profiles. Ones it does not reach
     # stay tracked, and the leftover-pin cleanup takes them off later.
@@ -12194,6 +12556,9 @@ class Plugin:
             return self._busy_result()
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         try:
+            # The after-wake move's outcome is no longer news (C22); the
+            # refusals list goes with the rest of the settings.
+            self._wake_move_outcome = None
             # And no streaming pass may put the fixes back while they come
             # off, or take them off half way through.
             async with self._stream_guard():
@@ -12436,18 +12801,37 @@ class Plugin:
         return {"success": True, "paused": True, "message": self._PAUSED_MESSAGE}
 
     def _stream_patterns(self, settings: dict) -> list[tuple[str, str]]:
-        """(label, pattern) for every app watched, the user's own last.
+        """(label, pattern) for every app watched, the user's own last: what
+        auto mode turns the fixes on for, and what blocks an update.
 
-        The app ticks count only while auto mode is on: with it off the panel
-        hides them, and choices nobody can see must not decide what blocks an
-        update or a lock move. Then every app counts (K-g)."""
-        watched = (settings.get("streaming_apps", {})
-                   if settings.get("streaming_mode_enabled") else {})
+        The app ticks and the user's own names count only while auto mode is
+        on: with it off the panel hides them, and choices nobody can see must
+        not decide what blocks an update. Then every built-in app counts
+        (K-g, M-d)."""
+        auto = settings.get("streaming_mode_enabled")
+        watched = settings.get("streaming_apps", {}) if auto else {}
         out = [(label, pattern) for app_id, label, patterns in STREAMING_APPS
                if watched.get(app_id, True) for pattern in patterns]
-        kept, _refused = _parse_stream_patterns(settings.get("streaming_custom_patterns", ""))
-        out.extend((pattern, pattern) for pattern in kept)
+        if auto:
+            out.extend(self._custom_patterns(settings))
         return out
+
+    def _reconnect_guard_patterns(self, settings: dict) -> list[tuple[str, str]]:
+        """(label, pattern) for the checks before a reconnect or a scan
+        nobody asked for (the after-wake move and its rollback, the
+        lock-weaker and WPA2-reach scans): every built-in app whatever its
+        tick, since a stream left unticked still stutters, and the user's own
+        names only while auto mode is on, where the panel shows them (M-d)."""
+        out = [(label, pattern) for _app_id, label, patterns in STREAMING_APPS
+               for pattern in patterns]
+        if settings.get("streaming_mode_enabled"):
+            out.extend(self._custom_patterns(settings))
+        return out
+
+    @staticmethod
+    def _custom_patterns(settings: dict) -> list[tuple[str, str]]:
+        kept, _refused = _parse_stream_patterns(settings.get("streaming_custom_patterns", ""))
+        return [(pattern, pattern) for pattern in kept]
 
     _GAME_PATTERN = ("game", "steamlaunch appid=")
 
@@ -12491,17 +12875,40 @@ class Plugin:
         """
         if not patterns:
             return None
-        # The status read's call (_stream_running_now): no wait, and an
-        # answer too old to go by is said to be unknown.
+        # _known_running's call: it has waited already, so this goes by the
+        # last answer without starting another search, and one too old to go
+        # by (or started before since) is said to be unknown.
         no_wait = getattr(_PROC_SCAN_LOCAL, "no_wait", False)
-        snapshot = self._proc_snapshot(0 if no_wait else wait)
-        if no_wait and not self._snapshot_fresh(
-                snapshot, getattr(_PROC_SCAN_LOCAL, "fresh", PROC_SCAN_FRESH_SECONDS)):
-            _PROC_SCAN_LOCAL.unknown = True
-            return None
+        if no_wait:
+            snapshot = self._proc_scan_state()["last"]
+            since = getattr(_PROC_SCAN_LOCAL, "since", None)
+            if since is not None:
+                usable = snapshot is not None and snapshot[0] >= since
+            else:
+                usable = self._snapshot_fresh(
+                    snapshot, getattr(_PROC_SCAN_LOCAL, "fresh", PROC_SCAN_FRESH_SECONDS))
+            if not usable:
+                _PROC_SCAN_LOCAL.unknown = True
+                return None
+        else:
+            snapshot = self._proc_snapshot(wait)
         if snapshot is None:
+            # No search has answered yet: not the same as nothing running
+            # (_search_stream).
+            _PROC_SCAN_LOCAL.unanswered = True
             return None
         return self._match_snapshot(snapshot, patterns)
+
+    def _search_stream(self, patterns: list[tuple[str, str]]) -> tuple[dict | None, bool]:
+        """(_find_stream's answer, whether that is "not known yet": no
+        search has answered yet, as at a load whose first search is slower
+        than PROC_SCAN_WAIT_SECONDS). In a worker thread."""
+        _PROC_SCAN_LOCAL.unanswered = False
+        try:
+            found = self._find_stream(patterns)
+            return found, found is None and getattr(_PROC_SCAN_LOCAL, "unanswered", False)
+        finally:
+            _PROC_SCAN_LOCAL.unanswered = False
 
     def _match_snapshot(self, snapshot, patterns: list[tuple[str, str]]) -> dict | None:
         """_find_stream's match over one search's answer. Reads nothing from
@@ -12540,18 +12947,21 @@ class Plugin:
     # Searches left behind stuck in the kernel before no more are started.
     _PROC_SCAN_MAX_STUCK = 4
 
-    def _proc_snapshot(self, wait: float = PROC_SCAN_WAIT_SECONDS):
-        """(monotonic time, [(pid, raw cmdline, parent pid, name)]) from a
-        search started now or already under way, or the last one finished
-        when it has not answered within wait seconds. None when no search
-        has finished yet.
+    def _proc_snapshot(self, wait: float = PROC_SCAN_WAIT_SECONDS, since: float | None = None):
+        """(monotonic time the search started, [(pid, raw cmdline, parent
+        pid, name)]) from a search started now or already under way, or the
+        last one finished when it has not answered within wait seconds. None
+        when no search has finished yet. With since, a search started before
+        since is never answered from again.
 
         The search runs in a thread of its own, one at a time, so ten
         callers at once make one search, and one stuck in the kernel keeps
         one thread rather than every caller's. One stuck for longer than
         _PROC_SCAN_STUCK_SECONDS is left behind: the next search skips the
-        process it was reading, and every one found stuck before, so one
-        stuck process does not end process detection until a restart.
+        process it was reading, and every one a search still stuck was
+        reading, so one stuck process does not end process detection until
+        a restart. Once a search left behind finishes, its process is read
+        again. At most _PROC_SCAN_MAX_STUCK are left behind at once.
         """
         state = self._proc_scan_state()
         now = time.monotonic()
@@ -12559,24 +12969,25 @@ class Plugin:
             pending = state["pending"]
             if (pending is not None and not pending.is_set()
                     and now - state["started"] > self._PROC_SCAN_STUCK_SECONDS):
-                state["abandoned"] = [e for e in state["abandoned"] if not e.is_set()]
-                if len(state["abandoned"]) < self._PROC_SCAN_MAX_STUCK:
-                    stuck = (state["progress"] or {}).get("pid")
-                    if stuck:
-                        state["stuck_pids"].add(stuck)
-                    state["abandoned"].append(pending)
-                    self._note_proc_scan_stuck(state, pending, now)
-                    pending = state["pending"] = None
-                elif not state["full_said"]:
+                state["abandoned"].append((pending, (state["progress"] or {}).get("pid")))
+                self._note_proc_scan_stuck(state, pending, now)
+                pending = state["pending"] = None
+            # (event, pid it was stuck on) for each search left behind that
+            # has not finished: only those processes are skipped.
+            state["abandoned"] = [(e, pid) for e, pid in state["abandoned"] if not e.is_set()]
+            state["stuck_pids"] = {pid for _e, pid in state["abandoned"] if pid}
+            last = state["last"]
+            if (pending is None and last is not None and now - last[0] < self._PROC_SCAN_REUSE_SECONDS
+                    and (since is None or last[0] >= since)):
+                return last
+            if pending is None and len(state["abandoned"]) >= self._PROC_SCAN_MAX_STUCK:
+                if not state["full_said"]:
                     state["full_said"] = True
                     decky.logger.error(
                         f"{self._PROC_SCAN_MAX_STUCK} process searches are stuck; no more are "
-                        "started until the plugin restarts")
-            last = state["last"]
-            if pending is None and last is not None and now - last[0] < self._PROC_SCAN_REUSE_SECONDS:
-                return last
-            if pending is None and len([e for e in state["abandoned"] if not e.is_set()]) \
-                    <= self._PROC_SCAN_MAX_STUCK:
+                        "started until one of them finishes")
+            elif pending is None:
+                state["full_said"] = False
                 pending = state["pending"] = threading.Event()
                 state["started"] = now
                 state["progress"] = progress = {"pid": None}
@@ -12624,9 +13035,11 @@ class Plugin:
         finally:
             with state["lock"]:
                 # A search left behind that finishes late has older news than
-                # the one that replaced it, and is not kept over it.
+                # the one that replaced it, and is not kept over it. Stamped
+                # with when the list was taken, not when the search ended:
+                # every age is measured from there.
                 if entries is not None and started >= state["last_started"]:
-                    state["last"] = (time.monotonic(), entries)
+                    state["last"] = (started, entries)
                     state["last_started"] = started
                     state["stuck_said"] = None
                 if state["pending"] is done:
@@ -12648,6 +13061,10 @@ class Plugin:
         out = []
         for pid in pids:
             base = os.path.join(PROC_DIR, pid)
+            # Before any read of it: a search stuck on this process, in any
+            # of the three reads, says so.
+            if progress is not None:
+                progress["pid"] = pid
             try:
                 with open(os.path.join(base, "status"), "rb") as f:
                     status = f.read(4096).decode("utf-8", "replace")
@@ -12660,8 +13077,6 @@ class Plugin:
                     name = f.read(64).decode("utf-8", "replace").strip()
             except OSError:
                 name = ""
-            if progress is not None:
-                progress["pid"] = pid
             try:
                 with open(os.path.join(base, "cmdline"), "rb") as f:
                     raw = f.read(4096)
@@ -12776,7 +13191,7 @@ class Plugin:
         if not settings.get("streaming_mode_enabled"):
             return
         seen = getattr(self, "_stream_epoch", 0)
-        found = await asyncio.to_thread(self._find_stream, self._stream_patterns(settings))
+        found, unknown = await asyncio.to_thread(self._search_stream, self._stream_patterns(settings))
         async with self._stream_guard():
             # A settled pass, Reset or the toggle that ran while this one
             # searched has changed what it searched for, or taken the fixes
@@ -12785,9 +13200,9 @@ class Plugin:
             # after they came off. The search is bounded now
             # (PROC_SCAN_WAIT_SECONDS), so it cannot hold the guard for good.
             if getattr(self, "_stream_epoch", 0) != seen:
-                found = await asyncio.to_thread(
-                    self._find_stream, self._stream_patterns(_load_settings()))
-            await self._stream_pass_locked(settle, found)
+                found, unknown = await asyncio.to_thread(
+                    self._search_stream, self._stream_patterns(_load_settings()))
+            await self._stream_pass_locked(settle, found, unknown)
             if settle:
                 self._bump_stream_epoch()
 
@@ -12803,9 +13218,12 @@ class Plugin:
             self._stream_lock = asyncio.Lock()
         return self._stream_lock
 
-    async def _stream_pass_locked(self, settle: bool = False, found: dict | None = None):
+    async def _stream_pass_locked(self, settle: bool = False, found: dict | None = None,
+                                  unknown: bool = False):
         """_stream_pass's work, with the guard held. found is the stream the
-        search (made before the guard was taken) found running, or None."""
+        search (made before the guard was taken) found running, or None.
+        unknown: no search has answered yet, so None says nothing; with the
+        flag up the fixes stay as they are until a pass that knows."""
         # Looked at again now the guard is held. Everything that turns auto
         # mode off takes the guard, but the search ran before this pass had
         # it, and a pass that went on regardless would put the fixes back
@@ -12815,6 +13233,8 @@ class Plugin:
             return
         held = os.path.isfile(STREAM_HOLD_FILE)
         was_open = os.path.isfile(STREAM_FLAG_FILE)
+        if unknown and not found and not held and was_open:
+            return
         if found or held:
             self._stream_match = found
             self._stream_misses = 0
@@ -12977,18 +13397,22 @@ class Plugin:
                 return self._busy_result()
             # Searched before the guard is taken, for the reason _stream_pass
             # gives: a search that never returns must not hold it.
-            found = None
+            # With the patterns auto mode will have once it is on: before the
+            # save, ones built from the settings as they are ignore the app
+            # ticks, and an app the user unticked turned the fixes on.
+            def turning_on_patterns():
+                return self._stream_patterns({**_load_settings(), "streaming_mode_enabled": True})
+            found, unknown = None, False
             seen = getattr(self, "_stream_epoch", 0)
             if enabled:
-                found = await asyncio.to_thread(
-                    self._find_stream, self._stream_patterns(_load_settings()))
+                found, unknown = await asyncio.to_thread(self._search_stream, turning_on_patterns())
             # Taken first, so a pass already applying or taking off the fixes
             # (in a worker thread, which cancelling would not stop) finishes
             # before this changes anything. The watch then ends on its own.
             async with self._stream_guard():
                 if enabled and getattr(self, "_stream_epoch", 0) != seen:
-                    found = await asyncio.to_thread(
-                        self._find_stream, self._stream_patterns(_load_settings()))
+                    found, unknown = await asyncio.to_thread(
+                        self._search_stream, turning_on_patterns())
                 self._bump_stream_epoch()
                 settings = _load_settings()
                 settings["streaming_mode_enabled"] = bool(enabled)
@@ -13005,7 +13429,7 @@ class Plugin:
                     # on. A settled pass takes them off unless a stream runs.
                     self._set_stream_flag(True)
                     self._stream_misses = 0
-                    await self._stream_pass_locked(True, found)
+                    await self._stream_pass_locked(True, found, unknown)
                 else:
                     for path in (STREAM_FLAG_FILE, STREAM_HOLD_FILE):
                         self._set_stream_flag(False, path)
@@ -13497,7 +13921,7 @@ class Plugin:
         name = f"wifi-optimizer-v{version}.tar.gz"
         sha256 = check["sha256"].get(name)
         if not sha256:
-            return refuse("This release's signed checksums don't cover the update, so it wasn't installed.",
+            return refuse("This release isn't signed properly, so it wasn't installed.",
                           f"{name} not in SHA256SUMS")
         decky.logger.info(f"Release v{version} signature verified, {name} sha256={sha256}")
         return {"ok": True, "url": f"{base}/{name}", "sha256": sha256}
@@ -14475,11 +14899,11 @@ class Plugin:
         """Backend switch for non-SteamOS systems (Bazzite, CachyOS, etc.).
         Writes NM config directly and manages systemd services.
 
-        A marker in /run says a switch is under way until it ends one way or
-        the other. A plugin reload or a kill part way leaves it behind, and
-        the next load finishes or undoes the switch (see
-        _reconcile_backend_switch) rather than leave NetworkManager pointed
-        at a backend that is not running.
+        A marker in /var/lib/wifi-optimizer says a switch is under way until
+        it ends one way or the other. A plugin reload or a kill part way
+        leaves it behind, and the next load finishes or undoes the switch
+        (see _reconcile_backend_switch) rather than leave NetworkManager
+        pointed at a backend that is not running.
         """
         other = "iwd" if target == "wpa_supplicant" else "wpa_supplicant"
         cancelled = False
@@ -14802,25 +15226,22 @@ class Plugin:
         finished (new one enabled and running, old one disabled and
         stopped). It does not: the old one is put back.
         """
+        words = None
         try:
             dfd = self._marker_dir_fd()
         except OSError:
-            return
-        try:
-            fd = os.open(os.path.basename(BACKEND_SWITCH_MARKER),
-                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
-        except OSError:
-            return
-        finally:
-            os.close(dfd)
-        try:
-            words = (os.read(fd, 128).decode("ascii", "replace").split()
-                     if _is_regular(os.fstat(fd).st_mode) else [])
-        except OSError:
-            words = []
-        finally:
-            os.close(fd)
-        self._set_backend_marker(None)
+            dfd = None
+        if dfd is not None:
+            try:
+                words = self._marker_words(dfd, os.path.basename(BACKEND_SWITCH_MARKER))
+            finally:
+                os.close(dfd)
+        if words is not None:
+            self._set_backend_marker(None)
+        else:
+            words = self._legacy_marker_words()
+            if words is None:
+                return
         backends = ("iwd", "wpa_supplicant")
         if len(words) not in (2, 3) or words[0] not in backends or words[1] not in backends:
             return
@@ -14842,6 +15263,48 @@ class Plugin:
                 f"taken; put {other} back"
                 + ("" if present else ", but no WiFi interface came back; a reboot brings it back")
             )
+
+    @staticmethod
+    def _marker_words(dfd: int, name: str) -> list | None:
+        """The words of the marker name in the directory dfd, [] for one that
+        is not a regular file or cannot be read, None when there is none."""
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except OSError:
+            return None
+        try:
+            return (os.read(fd, 128).decode("ascii", "replace").split()
+                    if _is_regular(os.fstat(fd).st_mode) else [])
+        except OSError:
+            return []
+        finally:
+            os.close(fd)
+
+    def _legacy_marker_words(self) -> list | None:
+        """The marker where 0.24.5-beta and earlier kept it, read once and
+        removed, with the same checks: its directory opened without links,
+        and only when it is root's."""
+        try:
+            dfd = _open_dir_no_follow(os.path.dirname(LEGACY_BACKEND_SWITCH_MARKER))
+        except OSError:
+            return None
+        name = os.path.basename(LEGACY_BACKEND_SWITCH_MARKER)
+        try:
+            if os.fstat(dfd).st_uid != os.geteuid():
+                return None
+            words = self._marker_words(dfd, name)
+            if words is None:
+                return None
+            for leftover in (name + ".tmp", name):
+                try:
+                    os.unlink(leftover, dir_fd=dfd)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    decky.logger.error(f"Could not remove the old backend switch marker: {e}")
+            return words
+        finally:
+            os.close(dfd)
 
     def _settle_switch_from_earlier_boot(self, other: str, target: str):
         """_reconcile_backend_switch for a switch a restart cut off: by the
