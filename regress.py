@@ -12445,6 +12445,34 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("F10 pass 8 an after-wake move that turned the lock off says so, banner and row line (C22 amended)")
+try:
+    _p8f_bn = _p7f_flat(_between(_F_IX, '{wakeMoveOutcome === "off" && (', "</Banner>"))
+    ok('wakeMoveTurnedOff ? "After sleep, the lock couldn\'t move to a stronger access point and was turned off." '
+       ': "After sleep, the lock couldn\'t move to a stronger access point."' in _p8f_bn,
+       f"the banner says turned off only when the lock is off now ({_p8f_bn.strip()[-200:]!r})")
+    _p8f_to = _between(_F_IX, "const wakeMoveTurnedOff =", ";\n")
+    ok('wakeMove?.outcome === "off"' in _p8f_to and "!status?.settings?.bssid_lock_enabled" in _p8f_to,
+       "which is an 'off' outcome with the lock off")
+    ok("wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff)" in _between(_F_IX, "const wakeMoveLine =", ";\n"),
+       "the row line is told the same")
+    _p8f_wr = _p7f_fn(_F_IX, "wakeMoveRowText")
+    _p8f_r = _p7f_run(_p7f_fn(_P7F_UT, "timeAgo").replace("export function", "function") + _p8f_wr +
+                      "const t = Math.floor(Date.now() / 1000) - 300;\n"
+                      "console.log(JSON.stringify([(wakeMoveRowText as any)('off', t, true), (wakeMoveRowText as any)('off', t, false),"
+                      " (wakeMoveRowText as any)('moved', t, true)]));\n") if _p8f_wr else None
+    if _p8f_wr and _p8f_r is None:
+        print("SKIP  no node or typescript here to run the row line; CI runs it")
+    else:
+        _p8f_o = _p7f_json(_p8f_r) if _p8f_r else None
+        ok(_p8f_o == ["Turned off after sleep: couldn't move to a stronger access point, 5 min ago.",
+                      "Couldn't move to a stronger access point after sleep, 5 min ago.",
+                      "Moved to a stronger access point after sleep, 5 min ago."],
+           f"the row line for each branch ({_p8f_o} {(_p8f_r or ('', '', ''))[2][-200:]})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 # ---- QA pass 3 merge: where two owners' work meets ----
 section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
 # The dispatcher records the system's PCIe values only while last_enforced is
@@ -20060,8 +20088,15 @@ try:
     _mp7o_row = _mp7o_off.group(1) if _mp7o_off else ""
     ok(_mp7o_row == "Couldn't move to a stronger access point after sleep, ${ago}.",
        f"and so does its lock row line ({_mp7o_row!r})")
-    ok(not any(w in (_mp7o_banner + " " + _mp7o_row).lower() for w in ("turned off", "go back", "so it was")),
-       "neither says the lock was turned off or could not go back, which only some of those ends are")
+    # Pass 8 F10: "turned off" only in the branch where the lock is off now,
+    # which no action of the user's explains (each clears the outcome).
+    _mp7o_on = re.search(r'\?\s*"([^"]*)"\s*:\s*"([^"]*)"', _mp7o_banner)
+    _mp7o_lock_on = _mp7o_on.group(2) if _mp7o_on else _mp7o_banner
+    ok(not any(w in (_mp7o_lock_on + " " + _mp7o_row).lower() for w in ("turned off", "go back", "so it was")),
+       "with the lock still on, neither says the lock was turned off or could not go back")
+    ok((not _mp7o_on or "wakeMoveTurnedOff" in _between(_F_IX, '{wakeMoveOutcome === "off" && (', "?"))
+       and "!status?.settings?.bssid_lock_enabled" in _between(_F_IX, "const wakeMoveTurnedOff =", ";\n"),
+       "and the branch that says it is keyed on the lock being off now")
     # How long each side keeps it: the banner's two minutes and the 12 h cap.
     ok(m.Plugin._WAKE_MOVE_SHOWN_SECONDS == 120 and "const MESSAGE_TTL_MS = 2 * 60 * 1000;" in _F_IX
        and m.Plugin._WAKE_MOVE_KEPT_SECONDS == 12 * 3600 and "const WAKE_MOVE_KEPT_S = 12 * 60 * 60;" in _F_IX,

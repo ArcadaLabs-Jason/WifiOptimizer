@@ -89,11 +89,16 @@ const WAKE_MOVE_DRIVER = "ath11k";
 // How long the backend keeps an after-wake move's outcome at most (C22).
 const WAKE_MOVE_KEPT_S = 12 * 60 * 60;
 // The lock row's line for an after-wake move's outcome, once its banner is
-// gone (C22).
-function wakeMoveRowText(outcome: "moved" | "back" | "off", at: number): string | undefined {
+// gone (C22). lockOff: the lock is off now, so the move turned it off.
+function wakeMoveRowText(
+  outcome: "moved" | "back" | "off",
+  at: number,
+  lockOff: boolean = false,
+): string | undefined {
   const ago = timeAgo(at);
   if (outcome === "moved") return `Moved to a stronger access point after sleep, ${ago}.`;
   if (outcome === "back") return `Stayed after sleep: the stronger access point refused, ${ago}.`;
+  if (outcome === "off" && lockOff) return `Turned off after sleep: couldn't move to a stronger access point, ${ago}.`;
   if (outcome === "off") return `Couldn't move to a stronger access point after sleep, ${ago}.`;
   return undefined;
 }
@@ -1379,9 +1384,13 @@ function Content() {
   const wakeMove = status?.live?.lock_move_after_wake;
   const wakeMoveOutcome =
     wakeMove && Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000 ? wakeMove.outcome : null;
+  // One "off" for every end the move could not finish (C22). Any lock
+  // action of the user's clears the outcome, so a lock that is off while it
+  // is still held was turned off by the move.
+  const wakeMoveTurnedOff = wakeMove?.outcome === "off" && !status?.settings?.bssid_lock_enabled;
   const wakeMoveLine =
     wakeMove && !wakeMoveOutcome && Date.now() / 1000 - wakeMove.at < WAKE_MOVE_KEPT_S
-      ? wakeMoveRowText(wakeMove.outcome, wakeMove.at)
+      ? wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff)
       : undefined;
   const isBusy = busyState || changeRunning;
   const connected = status?.connected ?? false;
@@ -1567,11 +1576,13 @@ function Content() {
       )}
       {/* The move failed and the old pin could not be put back, or the
           radio did not come back on (C22). The lock may be off or still
-          on, so this says only that it could not move; the lock row
-          shows which. */}
+          on: only when it is off now does this say the move turned it
+          off. */}
       {wakeMoveOutcome === "off" && (
         <Banner variant="warning">
-          After sleep, the lock couldn't move to a stronger access point.
+          {wakeMoveTurnedOff
+            ? "After sleep, the lock couldn't move to a stronger access point and was turned off."
+            : "After sleep, the lock couldn't move to a stronger access point."}
         </Banner>
       )}
 
