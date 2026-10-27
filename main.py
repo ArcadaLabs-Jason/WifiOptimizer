@@ -6864,6 +6864,9 @@ class Plugin:
             # (contract C22): the panel is seldom open at a wake.
             if outcome and time.monotonic() - outcome[2] < self._WAKE_MOVE_KEPT_SECONDS:
                 live["lock_move_after_wake"] = {"outcome": outcome[0], "at": outcome[1]}
+                # Contract C30: only for an "off" whose pin was moved.
+                if outcome[0] == "off" and len(outcome) > 3 and outcome[3]:
+                    live["lock_move_after_wake"]["pin_moved"] = True
             else:
                 live.pop("lock_move_after_wake", None)
         return status
@@ -7748,6 +7751,10 @@ class Plugin:
             # The card stopped answering after the move's radio cycle: the pin
             # names the new access point and WiFi is not back (contract C24).
             stuck = result.get("error") == "not_responding" and result.get("pin_moved")
+            # Contract C30: an "off" whose pin names the stronger access
+            # point, so the panel does not say the lock couldn't move there.
+            # Not every radio-off end: after a rollback the pin is the old one.
+            pin_moved = bool((radio_off or stuck) and result.get("pin_moved"))
             outcome = None
             if result.get("success") and result.get("reconnected"):
                 outcome = "moved"
@@ -7758,7 +7765,8 @@ class Plugin:
             elif radio_off or stuck:
                 outcome = "off"
             if outcome:
-                self._wake_move_outcome = (outcome, int(time.time()), time.monotonic())
+                self._wake_move_outcome = (outcome, int(time.time()), time.monotonic(),
+                                           pin_moved)
             if radio_off or stuck or result.get("wifi_not_back"):
                 # logger can take seconds right after a wake: off the loop.
                 await asyncio.to_thread(self._log_wake_move_death)
@@ -11333,7 +11341,10 @@ class Plugin:
                 self._nmcli_modify, uuid, "802-11-wireless.bssid", previous_pin)
             return self._unexpected_response(e)
         if not await self._reconnect(uuid):
-            return dict(self._RADIO_OFF_RESULT)
+            # pin_moved: the pin names the stronger access point, so the
+            # device joins it once the radio is back (contract C30).
+            return {**self._RADIO_OFF_RESULT, "pin_moved": True} if moved_to \
+                else dict(self._RADIO_OFF_RESULT)
 
         if moved_to:
             return await self._verify_lock_move(iface, uuid, bssid, chosen, moving,
@@ -11428,7 +11439,10 @@ class Plugin:
             except SettingsSaveError as e:
                 decky.logger.error(f"BSSID lock: the settings could not record the rollback: {e}")
             if not await self._reconnect(uuid):
-                return dict(self._RADIO_OFF_RESULT)
+                # Still pinned to chosen when the pin could not be cleared
+                # either (contract C30); cleared, the lock is off.
+                return ({**self._RADIO_OFF_RESULT, "pin_moved": True} if not cleared["success"]
+                        else dict(self._RADIO_OFF_RESULT))
             return {"success": False, "error": "move_failed", "reconnected": True,
                     "message": message, **(await self._wifi_not_back(iface, no_link))}
         if self._tearing_down_now():

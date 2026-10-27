@@ -21724,6 +21724,84 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+section("L3 pass 9 an after-wake 'off' whose pin was moved says so (pin_moved, C30); every other end does not")
+try:
+    def _p903(plugin):
+        """The after-wake move run; what the status sends for it."""
+        _p8_wake_move(plugin)
+        return plugin._with_activity({"live": {}})["live"].get("lock_move_after_wake") or {}
+
+    # The card stops responding after the move's radio cycle (pass 8 L1's end).
+    _w6_locked(); _p903a = _W8Stuck()
+    _s903 = _p903(_p903a)
+    ok(_s903.get("outcome") == "off" and _s903.get("pin_moved") is True
+       and _p903a.pin.upper() == _W6STRONG,
+       f"the card stuck after the move: 'off' with pin_moved, the pin on the stronger one ({_s903})")
+
+    # The radio does not come back on after the pin was written.
+    class _W903Off(_W8Stuck):
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); return False
+    _w6_locked(); _p903b = _W903Off()
+    _s903 = _p903(_p903b)
+    ok(_s903.get("outcome") == "off" and _s903.get("pin_moved") is True
+       and _p903b.pin.upper() == _W6STRONG,
+       f"the radio not back after the move: 'off' with pin_moved ({_s903})")
+
+    # Refused, and the old pin could not be written back: cleared, lock off.
+    class _W903NoBack(_W7):
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            if k == "802-11-wireless.bssid" and v.upper() == _W6WEAK:
+                self.mods.append((k, v))
+                return {"success": False, "stdout": "", "stderr": "nope", "returncode": 1}
+            return _W7._nmcli_modify(self, u, k, v, timeout)
+    _w6_locked(); _p903c = _W903NoBack(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903c)
+    ok(_s903.get("outcome") == "off" and "pin_moved" not in _s903 and _p903c.pin == "",
+       f"a refused move whose old pin could not go back: 'off' without pin_moved ({_s903}, pin {_p903c.pin!r})")
+
+    # Refused, the old pin written back, then the radio does not come back on:
+    # the pin is the old one, so not moved either.
+    class _W903BackOff(_W7):
+        def _hard_reconnect(self, uuid=None):
+            if len(self.cycles) >= 1:
+                self.cycles.append(self.game); return False
+            return _W7._hard_reconnect(self, uuid)
+    _w6_locked(); _p903d = _W903BackOff(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903d)
+    ok(_s903.get("outcome") == "off" and "pin_moved" not in _s903 and _p903d.pin.upper() == _W6WEAK,
+       f"the old pin back, then the radio not back: 'off' without pin_moved ({_s903}, pin {_p903d.pin})")
+
+    # Neither the old pin nor a cleared one could be written, then the radio
+    # did not come back: the pin still names the stronger one.
+    class _W903Stays(_W7):
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            if k == "802-11-wireless.bssid" and v.upper() != _W6STRONG:
+                self.mods.append((k, v))
+                return {"success": False, "stdout": "", "stderr": "nope", "returncode": 1}
+            return _W7._nmcli_modify(self, u, k, v, timeout)
+        def _hard_reconnect(self, uuid=None):
+            if len(self.cycles) >= 1:
+                self.cycles.append(self.game); return False
+            return _W7._hard_reconnect(self, uuid)
+    _w6_locked(); _p903g = _W903Stays(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903g)
+    ok(_s903.get("outcome") == "off" and _s903.get("pin_moved") is True and _p903g.pin.upper() == _W6STRONG,
+       f"the pin left on the stronger one, then the radio not back: 'off' with pin_moved ({_s903})")
+
+    # Moved, and back where it was: no pin_moved on either.
+    _w6_locked(); _p903e = _W7()
+    _s903 = _p903(_p903e)
+    ok(_s903 == {"outcome": "moved", "at": _s903.get("at")}, f"a move that landed: 'moved' only ({_s903})")
+    _w6_locked(); _p903f = _W7(reachable=False, refused_stays=True)
+    _s903 = _p903(_p903f)
+    ok(_s903.get("outcome") == "back" and "pin_moved" not in _s903, f"a move that went back: 'back' only ({_s903})")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
