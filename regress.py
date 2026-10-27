@@ -12169,7 +12169,8 @@ try:
     ok('lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };' in _F_TY,
        "the panel reads the three outcomes the backend sends")
     ok('wakeMoveOutcome === "off"' in _F_IX
-       and "After sleep, the lock couldn't move or go back, so it was turned off." in _p7f_flat(_F_IX),
+       # Merge p7: one text true for every end the backend sends as "off".
+       and "After sleep, the lock couldn't move to a stronger access point." in _p7f_flat(_F_IX),
        "off has its banner, like moved and back")
     ok("Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000" in _between(_F_IX, "const wakeMoveOutcome =", ";\n"),
        "the banners last the first 120 s")
@@ -12193,7 +12194,7 @@ try:
             _p7f_o = _p7f_json(_p7f_r)
             ok(_p7f_o == ["Moved to a stronger access point after sleep, 5 min ago.",
                           "Stayed after sleep: the stronger access point refused, 5 min ago.",
-                          "Turned off after sleep: it couldn't move or go back, 5 min ago."],
+                          "Couldn't move to a stronger access point after sleep, 5 min ago."],
                f"each outcome with the time ago ({_p7f_o} {_p7f_r[2][-200:]})")
 except Exception as _e:
     import traceback; traceback.print_exc()
@@ -19875,6 +19876,83 @@ try:
     ok(re.search(m._WAKE_EVENT_GREP, _mp7w_line) is not None
        and [k for _t, k in m._wake_events(_mp7w_line)] == ["move_down"],
        f"and counts the written line as the move taking WiFi down ({m._wake_events(_mp7w_line)})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("merge p7: every end the backend sends as 'off' gets a panel text that is true for it (C22)")
+# LIFECYCLE L6 sends "off" for three ends of the after-wake move: the lock
+# turned off, the lock left on (pinned to the refusing access point) when the
+# pin could not be changed, and the radio not coming back on. One key for all
+# three (lead's decision), so the panel's banner and row line must not say
+# which: they say only that the move failed. The lock row shows on or off.
+try:
+    class _Mp7o(_W7):
+        """The old pin cannot be written back; clearing it can fail too."""
+        def __init__(self, clear_ok=True, **kw):
+            super().__init__(**kw); self.clear_ok = clear_ok
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            if k == "802-11-wireless.bssid" and v.upper() == _W6WEAK and self.mods:
+                self.mods.append((k, v)); return {"success": False, "stdout": "", "stderr": "x", "returncode": 1}
+            if k == "802-11-wireless.bssid" and v == "" and not self.clear_ok:
+                self.mods.append((k, v)); return {"success": False, "stdout": "", "stderr": "x", "returncode": 1}
+            return _W7._nmcli_modify(self, u, k, v, timeout)
+
+    class _Mp7oRadio(_W7):
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); return False
+
+    _mp7o_info = m.decky.logger.info
+    _mp7o_ends = {}
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: None)
+        for _mp7o_name, _mp7o_p in [("lock turned off", lambda: _Mp7o(reachable=False, refused_stays=True)),
+                                    ("pin not changed", lambda: _Mp7o(clear_ok=False, reachable=False,
+                                                                       refused_stays=True)),
+                                    ("radio not back", lambda: _Mp7oRadio())]:
+            _w6_locked(); _mp7o_q = _mp7o_p()
+            asyncio.run(_mp7o_q._move_lock_after_wake())
+            _mp7o_w = _mp7o_q._with_activity({"live": {}})["live"].get("lock_move_after_wake") or {}
+            _mp7o_ends[_mp7o_name] = (_mp7o_w.get("outcome"), m._load_settings().get("bssid_lock_enabled"),
+                                      _mp7o_w.get("at"))
+    finally:
+        m.decky.logger.info = _mp7o_info
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+    ok(all(v[0] == "off" for v in _mp7o_ends.values())
+       and {v[1] for v in _mp7o_ends.values()} == {True, False},
+       f"the backend sends 'off' with the lock left on in one end and turned off in another ({_mp7o_ends})")
+    ok(all(isinstance(v[2], int) and abs(v[2] - time.time()) < 30 for v in _mp7o_ends.values()),
+       "with 'at' in Unix seconds")
+    _mp7o_outs = set(re.findall(r'wakeMoveOutcome === "([^"]+)"', _F_IX))
+    _mp7o_banner = _p7f_flat(_between(_F_IX, '{wakeMoveOutcome === "off" && (', "</Banner>"))
+    ok("off" in _mp7o_outs and "After sleep, the lock couldn't move to a stronger access point." in _mp7o_banner,
+       f"the panel's 'off' banner says the move failed ({_mp7o_banner.strip()[-120:]!r})")
+    _mp7o_fn = _p7f_fn(_F_IX, "wakeMoveRowText")
+    _mp7o_off = re.search(r'if \(outcome === "off"\) return `([^`]*)`;', _mp7o_fn)
+    _mp7o_row = _mp7o_off.group(1) if _mp7o_off else ""
+    ok(_mp7o_row == "Couldn't move to a stronger access point after sleep, ${ago}.",
+       f"and so does its lock row line ({_mp7o_row!r})")
+    ok(not any(w in (_mp7o_banner + " " + _mp7o_row).lower() for w in ("turned off", "go back", "so it was")),
+       "neither says the lock was turned off or could not go back, which only some of those ends are")
+    # How long each side keeps it: the banner's two minutes and the 12 h cap.
+    ok(m.Plugin._WAKE_MOVE_SHOWN_SECONDS == 120 and "const MESSAGE_TTL_MS = 2 * 60 * 1000;" in _F_IX
+       and m.Plugin._WAKE_MOVE_KEPT_SECONDS == 12 * 3600 and "const WAKE_MOVE_KEPT_S = 12 * 60 * 60;" in _F_IX,
+       "the backend and the panel keep it the same two minutes as a banner and 12 h at most")
+    # Turning the lock on clears it too (L6 pass 7 covers off, Move and Reset).
+    _mp7o_info = m.decky.logger.info
+    try:
+        m.decky.logger.info = staticmethod(lambda msg: None)
+        _w6_locked(); _mp7o_q = _Mp7o(reachable=False, refused_stays=True)
+        asyncio.run(_mp7o_q._move_lock_after_wake())
+        _mp7o_had = (_mp7o_q._with_activity({"live": {}})["live"].get("lock_move_after_wake") or {}).get("outcome")
+        asyncio.run(_mp7o_q.set_bssid_lock(True))
+        _mp7o_now = _mp7o_q._with_activity({"live": {}})["live"].get("lock_move_after_wake")
+    finally:
+        m.decky.logger.info = _mp7o_info
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+    ok(_mp7o_had == "off" and _mp7o_now is None,
+       f"turning the lock back on after an 'off' clears it ({_mp7o_had} -> {_mp7o_now})")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

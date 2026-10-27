@@ -59,9 +59,10 @@ export interface LiveStatus {
   six_ghz_refusal?: string;
   /** What the lock's move by itself after a wake came to (C13, C22): "moved"
    * onto the stronger access point, "back" on the previous one after the
-   * stronger refused, or "off" when the previous one could not be put back
-   * and the lock was turned off. Kept until the user next acts on the lock,
-   * at most 12 h; "at" is in Unix seconds. */
+   * stronger refused, or "off" when the move failed and the previous one
+   * could not be put back (the lock then turned off, or left on the refusing
+   * one) or the radio did not come back on. Kept until the user next acts on
+   * the lock, at most 12 h; "at" is in Unix seconds. */
   lock_move_after_wake?: { outcome: "moved" | "back" | "off"; at: number };
   buffer_tuning_applied?: boolean;
   cake_applied?: boolean;

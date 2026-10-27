@@ -94,7 +94,7 @@ function wakeMoveRowText(outcome: "moved" | "back" | "off", at: number): string 
   const ago = timeAgo(at);
   if (outcome === "moved") return `Moved to a stronger access point after sleep, ${ago}.`;
   if (outcome === "back") return `Stayed after sleep: the stronger access point refused, ${ago}.`;
-  if (outcome === "off") return `Turned off after sleep: it couldn't move or go back, ${ago}.`;
+  if (outcome === "off") return `Couldn't move to a stronger access point after sleep, ${ago}.`;
   return undefined;
 }
 // An iw stuck in the driver, or a card the system can no longer use. Copy
@@ -1541,12 +1541,13 @@ function Content() {
           After sleep, a stronger access point refused the connection. The lock stayed.
         </Banner>
       )}
-      {/* The stronger one refused and the old pin could not be put back,
-          so the lock was turned off rather than leave WiFi pinned to
-          nothing (C22). */}
+      {/* The move failed and the old pin could not be put back, or the
+          radio did not come back on (C22). The lock may be off or still
+          on, so this says only that it could not move; the lock row
+          shows which. */}
       {wakeMoveOutcome === "off" && (
         <Banner variant="warning">
-          After sleep, the lock couldn't move or go back, so it was turned off.
+          After sleep, the lock couldn't move to a stronger access point.
         </Banner>
       )}
 
