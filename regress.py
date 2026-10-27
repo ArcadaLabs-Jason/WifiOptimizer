@@ -21635,6 +21635,95 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+section("L2 pass 9 a settings file that could not be read is said as such (cause 'unread', C27), and Reset clears it")
+try:
+    _sf902 = m.SETTINGS_FILE
+    _st902 = dict(m._SETTINGS_STATE)
+    _d902, _restore902 = _l_paths()
+    try:
+        def _p902_cause():
+            w = m.Plugin()._with_activity({"live": {}})
+            return w.get("settings_unwritable"), w.get("settings_unwritable_cause")
+
+        # A file that does not parse and cannot be set aside: a folder the
+        # user left at settings.json.corrupt (05's p_corrupt end state).
+        os.mkdir(m.SETTINGS_FILE + ".corrupt")
+        open(m.SETTINGS_FILE, "w").write("{not json")
+        _s902 = m._load_settings(); _s902["update_notify"] = False
+        try:
+            m._save_settings(_s902); _e902 = None
+        except Exception as _x:
+            _e902 = _x
+        ok(isinstance(_e902, m.SettingsSaveError) and open(m.SETTINGS_FILE).read() == "{not json",
+           f"a file that does not parse and cannot be set aside is kept, and the save is refused ({_e902})")
+        ok(_p902_cause() == (True, "unread"), f"said with cause 'unread', not 'other' ({_p902_cause()})")
+        os.rmdir(m.SETTINGS_FILE + ".corrupt")
+
+        # A read that failed with an I/O error (noted as the read does).
+        m._SETTINGS_STATE.update({"save_failed": False, "save_failed_cause": None})
+        open(m.SETTINGS_FILE, "w").write(json.dumps({**m.DEFAULT_SETTINGS, "update_notify": False}))
+        m._note_unread_settings()
+        try:
+            m._save_settings(dict(m.DEFAULT_SETTINGS)); _e902 = None
+        except Exception as _x:
+            _e902 = _x
+        ok(isinstance(_e902, m.SettingsSaveError) and _p902_cause() == (True, "unread"),
+           f"an I/O error on the read: the save is refused with cause 'unread' ({_e902}, {_p902_cause()})")
+        # The refusal inside the merge too: a copy loaded before another
+        # save, after which the file was replaced by one that does not parse
+        # and cannot be set aside.
+        m._SETTINGS_STATE.update({"save_failed": False, "save_failed_cause": None,
+                                  "unread": None, "read_failed": False})
+        _c902 = m._load_settings()
+        m._save_settings(m._load_settings())           # saved over since _c902 was loaded
+        open(m.SETTINGS_FILE, "w").write("{not json")
+        os.mkdir(m.SETTINGS_FILE + ".corrupt")
+        _c902["update_notify"] = True
+        try:
+            m._save_settings(_c902); _e902 = None
+        except Exception as _x:
+            _e902 = _x
+        os.rmdir(m.SETTINGS_FILE + ".corrupt")
+        ok(isinstance(_e902, m.SettingsSaveError) and open(m.SETTINGS_FILE).read() == "{not json"
+           and _p902_cause() == (True, "unread"),
+           f"and the refusal inside the merge says 'unread' too ({_e902}, {_p902_cause()})")
+
+        # A write that fails for another reason keeps "other".
+        m._SETTINGS_STATE.update({"unread": None, "read_failed": False})
+        _wr902 = m._write_settings
+        try:
+            def _eio(data):
+                raise OSError(5, "Input/output error")
+            m._write_settings = _eio
+            try:
+                m._save_settings(m._load_settings())
+            except m.SettingsSaveError:
+                pass
+        finally:
+            m._write_settings = _wr902
+        ok(_p902_cause() == (True, "other"), f"a write that fails otherwise keeps 'other' ({_p902_cause()})")
+
+        # Reset sets the unread file aside, its save lands, and the cause is gone.
+        m._note_unread_settings()
+        try:
+            m._save_settings(m._load_settings())
+        except m.SettingsSaveError:
+            pass
+        _r902 = asyncio.run(_LReset().reset_settings())
+        ok(_r902.get("success") is True and os.path.isfile(m.SETTINGS_FILE + ".corrupt")
+           and _p902_cause() == (False, None),
+           f"after Reset sets it aside and saves, nothing says the settings can't be saved "
+           f"({_r902.get('error')}, {_p902_cause()})")
+    finally:
+        _restore902()
+        m.SETTINGS_FILE = _sf902
+        m._SETTINGS_STATE.clear(); m._SETTINGS_STATE.update(_st902)
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast

@@ -1597,8 +1597,10 @@ def _unread_settings_in_place() -> bool:
 # unread: the regular file a failed read left in place (see _note_unread_settings).
 # aside_failed: the identity of the last set-aside that failed (see
 # _set_aside_corrupt_settings), so it is neither retried nor logged again.
-# save_failed_cause: "link" (behind a link), "space" (ENOSPC) or "other",
-# for the settings reads that check again (_recheck_settings_writable).
+# save_failed_cause: "link" (behind a link), "space" (ENOSPC), "unread" (the
+# file there could not be read, so no save may replace it) or "other", for
+# the settings reads that check again (_recheck_settings_writable) and the
+# panel's advice (contract C27).
 _SETTINGS_STATE = {"read_failed": False, "save_failed": False, "unread": None,
                    "aside_failed": None, "link_refused": False, "save_failed_cause": None}
 
@@ -1735,8 +1737,10 @@ def _save_settings(data: dict):
     """
     with _SETTINGS_LOCK:
         if _unread_settings_in_place():
+            # "unread" (C27): a restart reads the same file again and fails
+            # again; Reset is what sets it aside.
             _SETTINGS_STATE["save_failed"] = True
-            _SETTINGS_STATE["save_failed_cause"] = "other"
+            _SETTINGS_STATE["save_failed_cause"] = "unread"
             raise SettingsSaveError("settings not saved: the file there could not be read")
         merged = data
         if isinstance(data, _LoadedSettings) and data._gen != _SETTINGS_GEN[0]:
@@ -1745,7 +1749,7 @@ def _save_settings(data: dict):
             merged = _read_settings_file()
             if _unread_settings_in_place():
                 _SETTINGS_STATE["save_failed"] = True
-                _SETTINGS_STATE["save_failed_cause"] = "other"
+                _SETTINGS_STATE["save_failed_cause"] = "unread"
                 raise SettingsSaveError("settings not saved: the file there could not be read")
             for key in set(data) | set(data._base):
                 mine = data.get(key, _MISSING)
@@ -6836,7 +6840,7 @@ class Plugin:
         between polls.
         """
         status["settings_unwritable"] = bool(_SETTINGS_STATE["save_failed"])
-        # Contract C27: why, while it stands ("link", "space" or "other").
+        # Contract C27: why, while it stands ("link", "space", "unread" or "other").
         if status["settings_unwritable"]:
             status["settings_unwritable_cause"] = _SETTINGS_STATE.get("save_failed_cause") or "other"
         else:
