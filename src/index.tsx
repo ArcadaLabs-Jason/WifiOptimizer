@@ -106,15 +106,17 @@ const NOT_RESPONDING_TEXT =
   "The WiFi card isn't responding. Restart the device, then use Copy diagnostics to report it.";
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
-// Auto-fix on wake stays on, as on a fresh install (main.py _reset_locked),
-// with nothing left for it to apply. The network settings are written to
-// the saved networks without a reconnect, so the connection in use keeps
-// them until WiFi next connects. The update channel and notices are kept,
-// and streaming auto mode starts again from its defaults. Allow WPA2 is only
-// recorded from 0.24.5-beta on (wpa2_uuids); that, the buffer and region
-// values and the command for the rest are in the README, not here.
+// Auto-fix on wake is turned on, as on a fresh install, even where it was
+// off (main.py _reset_locked), with nothing left for it to apply. The network
+// settings are written to the saved networks without a reconnect, so the
+// connection in use keeps them until WiFi next connects. A WiFi region chosen
+// in the plugin goes back, which can hide the 5 and 6 GHz channels it was
+// chosen for. The update channel and notices are kept, and streaming auto
+// mode starts again from its defaults. Allow WPA2 is only recorded from
+// 0.24.5-beta on (wpa2_uuids); that, the buffer values and the command for
+// the rest are in the README, not here.
 const RESET_CONFIRM_TEXT =
-  "Turns off every fix except Auto-fix on wake, which then applies nothing. The lock, band, DNS, IPv6 and Allow WPA2 come off your networks at the next connect. Streaming auto mode is cleared. Update settings are kept.";
+  "Turns every fix off and Auto-fix on wake on, which then applies nothing. The lock, band, DNS, IPv6 and Allow WPA2 come off your networks at the next connect, and the WiFi region goes back. Streaming auto mode is cleared. Update settings are kept.";
 // Move the lock often finds nothing clearly stronger and stays put, with no
 // reconnect, so its button does not promise one.
 const MOVE_WORKING_TEXT = "Working, WiFi may reconnect...";

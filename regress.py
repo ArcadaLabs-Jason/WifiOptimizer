@@ -6064,7 +6064,8 @@ try:
     # Pass 6 F2: the confirmation names what comes off; the buffer, CAKE and
     # region detail is in the README's Reset paragraph.
     # Pass 7 F9: every fix except Auto-fix on wake, which Reset leaves on.
-    ok(all(w in _rct for w in ("Turns off every fix except Auto-fix on wake", "lock", "band", "IPv6", "DNS"))
+    # Pass 8 F2: Reset turns Auto-fix on wake on, even where it was off.
+    ok(all(w in _rct for w in ("Turns every fix off and Auto-fix on wake on", "lock", "band", "IPv6", "DNS"))
        and "undoes buffer tuning and CAKE" in open("README.md").read(),
        "the confirmation says what a reset undoes")
     ok("Reset WiFi Optimizer?" in open("dist/index.js").read(), "and the built bundle carries it")
@@ -11533,7 +11534,8 @@ try:
     ok("0.24.5-beta" not in _p6f_rct and "this version or later" not in _p6f_rct,
        "Allow WPA2 is said to come off, with no version history at the prompt")
     ok(_p6f_rct and _p6f_words(_p6f_rct) < 70, f"under 70 words ({_p6f_words(_p6f_rct)})")
-    ok(all(w in _p6f_rct for w in ("every fix except Auto-fix on wake", "next connect", "Streaming auto mode is cleared.",
+    # Pass 8 F2: Auto-fix on wake is turned on, not left as it was.
+    ok(all(w in _p6f_rct for w in ("every fix off and Auto-fix on wake on", "next connect", "Streaming auto mode is cleared.",
                                    "Update settings are kept.")),
        "and keeps what stays on, when the network settings go, auto mode and the update settings")
 except Exception as _e:
@@ -11998,9 +12000,10 @@ except Exception as _e:
 section("F9 M-e pass 7 the Reset confirmation names Auto-fix on wake and drops the version caveat")
 try:
     _p7f_rc = _between(_between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n"), '"', '";')
-    ok("Turns off every fix except Auto-fix on wake, which then applies nothing." in _p7f_rc
+    # Pass 8 F2: Reset turns Auto-fix on wake on, even where it was off.
+    ok("Turns every fix off and Auto-fix on wake on, which then applies nothing." in _p7f_rc
        and "everything the plugin applied" not in _p7f_rc,
-       "Auto-fix on wake stays on, and the text no longer says everything")
+       "Auto-fix on wake is on after it, and the text no longer says everything")
     ok("0.24.5-beta" not in _p7f_rc and "next connect." in _p7f_rc,
        "no version history in front of the action (M-e); the README keeps it")
     ok(_p7f_rc and _p7f_words(_p7f_rc) < 50, f"under 50 words ({_p7f_words(_p7f_rc)})")
@@ -12330,6 +12333,23 @@ try:
        f"the restart comes first, and the copy after it ({_p8f_nr.strip()[-100:]!r})")
     ok("then restart" not in _p7f_flat(_between(_F_IX, "const disconnectedText =", ";\n")),
        "no other dead-card text asks for a copy before the restart")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F2 pass 8 the Reset confirmation and README say Reset turns Auto-fix on wake on, and the region goes back")
+try:
+    _p8f_rc = _between(_between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n"), '"', '";')
+    ok("Auto-fix on wake on" in _p8f_rc and "except Auto-fix" not in _p8f_rc,
+       f"the confirmation says Auto-fix on wake is on after it ({_p8f_rc[:80]!r})")
+    ok("WiFi region goes back" in _p8f_rc, "and that a region chosen in the plugin goes back")
+    ok(_p8f_rc and _p7f_words(_p8f_rc) < 50, f"under 50 words ({_p7f_words(_p8f_rc)})")
+    _p8f_up = _between(_F_RD, "**Before uninstalling:**", "\n\n")
+    ok("Reset turns Auto-fix on wake on" in _p8f_up and "Reset leaves Auto-fix on wake on" not in _F_RD,
+       "the README says Reset turns it on")
+    # What the text says is what Reset does: on even where it was off.
+    _p8f_rl = re.split(r"\n    (?:async )?def ", _between(_F_MAIN, "async def _reset_locked", "\nclass "))[0]
+    ok('settings["auto_fix_on_wake"] = installed' in _p8f_rl and "await undo(\"the region\"" in _p8f_rl,
+       "which is what _reset_locked does")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
