@@ -7872,6 +7872,9 @@ class Plugin:
             return False
         self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
         self._wake_early_running = True
+        # The panel says the lock is being checked after sleep, and a setter
+        # refused meanwhile says so too, as for the move after the connect.
+        self._wake_move_running = True
         try:
             if await asyncio.to_thread(self._backend_is_iwd):
                 return False
@@ -7921,6 +7924,7 @@ class Plugin:
             return False
         finally:
             self._wake_early_running = False
+            self._wake_move_running = False
             self._profile_change_depth = max(
                 0, getattr(self, "_profile_change_depth", 1) - 1
             )
@@ -13211,10 +13215,15 @@ class Plugin:
             status = await self.get_status()
             drifted = sorted(k for k, v in (status.get("drift") or {}).items() if v)
             link = await asyncio.to_thread(self._reapply_link_snapshot)
-            decky.logger.info(
+            line = _mask_addresses(
                 "Force reapply found "
                 + (f"{', '.join(drifted)} not holding" if drifted else "every setting holding")
                 + (f"; link: {link}" if link else ""))
+            decky.logger.info(line)
+            # And in the journal under the plugin's tag, which is where Copy
+            # diagnostics reads the plugin's lines from.
+            await asyncio.to_thread(
+                self._run_cmd, ["/usr/bin/logger", "-t", JOURNAL_TAG, "--", line], 3)
         except Exception as e:
             decky.logger.error(f"Force reapply could not read what it found: {e}")
 

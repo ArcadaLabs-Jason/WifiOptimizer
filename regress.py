@@ -11608,13 +11608,18 @@ section("F6 pass 6 the README says every time the lock moves on its own")
 try:
     _p6f_lr = _between(_F_RD, "| Stop background scanning |", "\n")
     ok("It moves on its own only after a wake, from a weak access point to a clearly stronger one" in _p6f_lr
+       and "After a wake it moves before WiFi reconnects where it can, so the move costs no extra reconnect" in _p6f_lr
        and "or when the pinned one has been out of reach for a minute." in _p6f_lr
        and "it only moves on its own after a wake, and only" not in _p6f_lr,
        "the row names the after-wake move and the stranded release together")
     # Merge p6: the list also says the LCD exception (K-d), so the parenthesis goes on.
-    ok("after a wake, moves the lock off a weak access point (never during a game or stream"
+    ok("after a wake, moves the lock off a weak access point if that was not done before WiFi reconnected (never during a game or stream"
        in _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n")),
        "and what runs without the panel includes the after-wake move")
+    # 0.24.7: and the early move, before WiFi reconnects.
+    ok("a check every second for a wake, which moves the access point lock off a weak or out of range access point before WiFi reconnects; a check every 20 seconds"
+       in _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n")),
+       "and the move before WiFi reconnects")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -22022,7 +22027,15 @@ try:
         ok(any("before reconnecting" in l and "signal 30" in l for l in _e7_logged),
            f"and one line says from what to what ({_e7_logged[-2:]})")
         ok(getattr(_e7, "_wake_move_outcome", (None,))[0] == "moved", "and the panel hears it moved")
-        ok(not _e7._profile_change_in_flight(), "and the guard is released")
+        ok(not _e7._profile_change_in_flight() and not _e7._wake_move_running,
+           "and the guard and the panel's after-sleep flag are released")
+        _e7_seen = []
+        class _W7Watch(_W7Early):
+            def _card_nm_device_state(self, iface):
+                _e7_seen.append(self._wake_move_running)
+                return super()._card_nm_device_state(iface)
+        _w6_locked(); asyncio.run(_W7Watch()._move_lock_before_connect())
+        ok(_e7_seen and all(_e7_seen), f"while it decides, the panel says the lock is being checked ({_e7_seen})")
 
         # (2) The pinned one not in the list: moved only after it stays missing.
         _w6_locked(); _e7 = _W7Early(scan="Net:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2\n")
@@ -22120,9 +22133,10 @@ section("0.24.7 Force reapply logs what it found before changing anything")
 try:
     class _R7(m.Plugin):
         def __init__(self, ps="Power save: on\n", dump=None):
-            super().__init__(); self.ps = ps; self.dump = dump
+            super().__init__(); self.ps = ps; self.dump = dump; self.cmds = []
         def _get_wifi_interface(self): return "wlan0"
         def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(list(cmd))
             if cmd[-2:] == ["get", "power_save"]:
                 return _ok(self.ps) if self.ps is not None else {"success": False, "stdout": "", "stderr": "x"}
             if cmd[-2:] == ["station", "dump"]:
@@ -22157,6 +22171,9 @@ try:
         _r7_res = asyncio.run(_r7.reapply_all())
         ok(_r7_logged and _r7_logged[0].startswith("Force reapply found power_save not holding; link: "),
            f"the first line says what was found ({_r7_logged[:1]})")
+        _r7_j = [c for c in _r7.cmds if c[:1] == ["/usr/bin/logger"]]
+        ok(_r7_j and _r7_j[0][-1] == _r7_logged[0] and m.JOURNAL_TAG in _r7_j[0],
+           f"and the same line goes to the journal under the plugin's tag, for Copy diagnostics ({_r7_j[:1]})")
         _r7_logged.clear()
         _r7 = _R7(dump=_r7_dump)
         async def _r7_status_fail(): raise RuntimeError("nmcli gone")
