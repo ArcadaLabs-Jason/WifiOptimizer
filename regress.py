@@ -10804,7 +10804,8 @@ except Exception as _e:
 
 section("F29 F30 F31 F32 F33 small panel text")
 try:
-    ok('band_preference: "Band preference"' in _F_IX, "F29 the drift list reads naturally")
+    # Pass 8 F24: named after the toggle that is on, 5 or 6 GHz.
+    ok('band_preference: "Force 5 GHz band"' in _F_IX, "F29 the drift list reads naturally")
     ok("README mockup" not in _F_TH, "F30 no comment about a mockup that does not exist")
     ok("parseInt(live.frequency" in _F_SG and "const freq = connected ? live.frequency" not in _F_SG,
        "F31 the frequency is shown as a number, once with MHz")
@@ -12278,8 +12279,9 @@ section("F21 to F31 pass 7 shorter notices, explanations and comments")
 try:
     _p7f_fx = _p7f_flat(_F_IX)
     _p7f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
-    ok(_p7f_w.startswith("{`A stronger access point (signal ${status.wpa2_only_stronger.signal} vs ${")
-       and "} of 100${" in _p7f_w and "offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi.`" in _p7f_w + "`"
+    # Pass 8 F22: the signals worded as the weaker-lock banner words them.
+    ok(_p7f_w.startswith("{`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${")
+       and "current_signal\n              }${" in _p7f_w and "offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi.`" in _p7f_w + "`"
        and "Reset settings undoes it" not in _p7f_w and "access point here" not in _p7f_w, "F21 WPA2 banner")
     ok("Reset puts the network back to WPA3 only" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
        "F21 the README row keeps the undo")
@@ -12690,6 +12692,41 @@ try:
     ok(0 <= _p8f_pm.find("<DialogButton") < _p8f_pm.find("{blocks.map("),
        "before the preview's blocks, so focus finds it first")
     ok("DialogButton," in _between(_P8F_SR, "import {", "} from \"@decky/ui\""), "from Decky's own components")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F18 to F24 pass 8 shorter explanations, the held line, the reconnect advice, the WPA2 banner and the band's drift name")
+try:
+    ok('explanation="Sleep and OS updates can reset WiFi settings. A script outside Decky reapplies yours each time WiFi reconnects. Uninstalling the plugin removes it."'
+       in _between(_F_IX, 'label="Auto-fix on wake"', "checked="), "F18 Auto-fix on wake (i)")
+    ok('explanation="Larger kernel network buffers, so bursty streaming traffic isn\'t dropped. Applies to every connection, wired too. '
+       'Lost on reboot; put back when the plugin starts, after a game launches, and on each reconnect if Auto-fix on wake is on."'
+       in _between(_F_IX, 'label="Network buffer tuning"', "checked="), "F19 Network buffer tuning (i)")
+    ok('"Held on by you, but no fixes are turned on."' in _between(_F_SS, "let stateText: string;", "return ("),
+       "F20 held with nothing to hold on")
+    ok("If WiFi won't reconnect, restart the device." in _src("src/components/PanelFooter.tsx")
+       and "reboot usually fixes it" not in _src("src/components/PanelFooter.tsx") + _F_RD,
+       "F21 the footer (and the README's heads-up) say restart the device")
+    _p8f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
+    ok(_p8f_w.startswith("{`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${")
+       and "vs ${" not in _p8f_w and ", address ends ${status.wpa2_only_stronger.bssid_tail}" in _p8f_w,
+       "F22 the WPA2 banner words the signals as the weaker-lock banner does")
+    ok("On the others they take effect when the driver loads (rtw89: and\n// at each resume) (C19)." in _F_SS,
+       "F23 the comment says rtw89 reads them at each resume too")
+    _p8f_dn = _between(_F_IX, "const driftNames =", ";\n")
+    ok('k === "band_preference" && on6GHz ? "Force 6 GHz band"' in _p8f_dn
+       and 'band_preference: "Force 5 GHz band"' in _F_IX, "F24 the band's drift name is the toggle that is on")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("pass 8 FRONT: the changed text is plain ASCII with no dashes as punctuation")
+try:
+    _p8f_all = _F_RD + _F_SEC + _P8F_INST + _F_ALL
+    ok(all(ord(ch) < 128 for ch in _p8f_all), "plain ASCII")
+    ok(not any(re.search(r"\w -{1,2} \w", _p8f_l)
+               for _p8f_l in (_F_SEC + _between(_F_RD, "## The problem", "## Building from source")).split("\n")
+               + [_l for _l in _P8F_INST.split("\n") if "echo " in _l]),
+       "no spaced hyphen used as a dash in SECURITY.md, the README's user sections or what install.sh prints")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 

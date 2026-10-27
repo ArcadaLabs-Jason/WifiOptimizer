@@ -154,7 +154,8 @@ const DRIFT_LABELS: Record<string, string> = {
   power_save: "Prevent lag spikes",
   bssid_lock: "Stop background scanning",
   buffer_tuning: "Network buffer tuning",
-  band_preference: "Band preference",
+  // The 5 GHz toggle's name; with 6 GHz set, driftNames names that one.
+  band_preference: "Force 5 GHz band",
   dns: "Custom DNS",
   ipv6: "Disable IPv6",
   cake: "Traffic shaping (CAKE)",
@@ -1435,8 +1436,10 @@ function Content() {
   // A band of 2.4 GHz is only reachable by editing the settings file, or
   // from an old version. Shown under the 5 GHz toggle, which is the one on.
   const onBg = !!s?.band_preference_enabled && s?.band_preference === "bg";
-  // What has drifted, by name.
-  const driftNames = Object.keys(status?.drift ?? {}).map((k) => DRIFT_LABELS[k] ?? k);
+  // What has drifted, by name. The band preference by the toggle that is on.
+  const driftNames = Object.keys(status?.drift ?? {}).map((k) =>
+    k === "band_preference" && on6GHz ? "Force 6 GHz band" : DRIFT_LABELS[k] ?? k,
+  );
   // "Steam Deck OLED, WiFi 6E (QCA206X)", leaving out whichever part is unknown.
   const deviceParts = [
     s?.device_label && s.device_label !== "Unknown Device" ? s.device_label : "",
@@ -1723,9 +1726,9 @@ function Content() {
         <Banner variant="info">
           {status?.wpa2_only_stronger && wpa2Shown && (
             <>
-              {`A stronger access point (signal ${status.wpa2_only_stronger.signal} vs ${
+              {`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${
                 status.wpa2_only_stronger.current_signal
-              } of 100${
+              }${
                 status.wpa2_only_stronger.bssid_tail
                   ? `, address ends ${status.wpa2_only_stronger.bssid_tail}`
                   : ""
