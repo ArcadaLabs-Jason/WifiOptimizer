@@ -59,8 +59,10 @@ jobs:
       # Some checks need Linux tools (procps pgrep, flock) and print SKIP on
       # a Mac. Here they must run: the update script a release ships is the
       # one that installs the next release, so it is run end to end here
-      # before any tag is published.
+      # before any tag is published. They run as root, as the plugin and its
+      # update script do on a device: the dispatcher's stuck-tool search only
+      # looks at root's processes, and its check needs root to start them.
       - name: Backend checks
         env:
           REGRESS_REQUIRE_LINUX: "1"
-        run: python3 regress.py
+        run: sudo env "PATH=$PATH" REGRESS_REQUIRE_LINUX=1 python3 regress.py
