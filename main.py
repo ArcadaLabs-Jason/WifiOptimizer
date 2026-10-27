@@ -2540,8 +2540,15 @@ WAKE_DRIVER_WINDOW = 300
 WAKE_EXIT_LEAD = 5
 # "1712345678.123456 kernel: PM: suspend exit" with -o short-unix and
 # --no-hostname. A host column, if a journalctl prints one anyway, is skipped.
+# The plugin's own lines (logger -t JOURNAL_TAG) are read too, for the one
+# below.
 _WAKE_LINE_RE = re.compile(
-    r"^([0-9]{9,11}(?:\.[0-9]+)?) (?:\S+ )?(kernel|NetworkManager\[[0-9]+\]): (.*)$")
+    r"^([0-9]{9,11}(?:\.[0-9]+)?) (?:\S+ )?(kernel|NetworkManager\[[0-9]+\]|"
+    + re.escape(JOURNAL_TAG) + r"(?:\[[0-9]+\])?): (.*)$")
+# What the plugin journals when its own after-wake lock move took WiFi down
+# and it did not come back (contract C24). WiFi was up after that wake, so
+# without this line the wake rule would never judge it.
+WAKE_MOVE_DOWN_LINE = "after-wake lock move: WiFi did not come back"
 # mac80211 says this once the radio has joined an access point.
 _WAKE_KERNEL_UP_RE = re.compile(r"^wl[\w.-]*: associated\b")
 # NetworkManager saying a WiFi device came up, for drivers that do their own
@@ -2577,14 +2584,19 @@ _WAKE_ERROR_RE = re.compile(
 )
 # Of a driver's lines with an error word, the ones that mean the card did
 # not come back: powering on, the PCIe or MDIO registers, leaving its power
-# save states, firmware that crashed, a resume that failed, and the OLED's
-# MHI bus. rtw88 also logs "timed out to flush queue" or "failed to get tx
-# report" on a card that works, and those count only when NetworkManager
-# then tried a network and failed.
+# save states (rtw88's lps, ips and idle state), firmware that crashed or
+# did not start (mt7921e's driver and firmware own, iwlwifi's RT and INIT
+# ucode), a resume that failed, and the OLED's MHI bus. rtw88 also logs
+# "timed out to flush queue", "failed to send h2c command" or "failed to get
+# tx report" on a card that works, and those count only when NetworkManager
+# then tried a network and failed, or WiFi never came up again after the
+# wake (see _wake_failure_at).
 _WAKE_FATAL_RE = re.compile(
     r"(?i)\bpower (?:on|up)\b|failed to (?:read|write)(?: to)? (?:DBI|MDIO)|"
     r"hardware became unavailable|firmware crash|\bleav(?:e|ing) (?:lps|ips)\b|"
-    r"failed to read ASPM|failed to poll|failed to resume|resume failed|^mhi mhi[0-9]+[ :]"
+    r"failed to read ASPM|failed to poll|failed to resume|resume failed|^mhi mhi[0-9]+[ :]|"
+    r"driver own failed|firmware own failed|Timeout for (?:driver own|initializing firmware)|"
+    r"start RT ucode|run INIT ucode|leave idle state"
 )
 # A kernel WARN from a WiFi driver, mac80211 or cfg80211: the line that says
 # where it fired. Its headline, the line before it, carries no driver name.
@@ -2609,7 +2621,8 @@ _WAKE_HEADLINE_RE = re.compile("|".join(re.escape(h) for h in _WAKE_HEADLINES))
 # own lines, which come from the window around the wake instead.
 _WAKE_EVENT_GREP = (r"PM: suspend (entry|exit)|ACPI: PM: Waking up|: associated|"
                     r"state change: |Activation: starting|rfkill|wireless-enabled|radio|"
-                    r"sleep requested|wake requested|state is now")
+                    r"sleep requested|wake requested|state is now|"
+                    + re.escape(WAKE_MOVE_DOWN_LINE))
 # Everything _wake_events can count as a WiFi error, and nothing it cannot
 # use, as one pattern journalctl --grep takes.
 _WAKE_DRIVER_GREP = (
@@ -2872,7 +2885,10 @@ def _wake_events(text: str) -> list:
             continue
         stamp, who, message = float(found.group(1)), found.group(2), found.group(3)
         kind = "line"
-        if who == "kernel":
+        if who.startswith(JOURNAL_TAG):
+            if message.startswith(WAKE_MOVE_DOWN_LINE):
+                kind = "move_down"
+        elif who == "kernel":
             if message.startswith("PM: suspend exit"):
                 kind = "wake"
             elif message.startswith("PM: suspend entry"):
@@ -2906,6 +2922,18 @@ def _wake_events(text: str) -> list:
     return events
 
 
+def _wake_ups(events: list) -> list:
+    """Indexes of the events where WiFi came up and stayed up as far as the
+    wake rule can tell: not the ones between a wake and the plugin's line
+    that its after-wake lock move then took WiFi down for good."""
+    lost = set()
+    for down in (i for i, (_t, kind) in enumerate(events) if kind == "move_down"):
+        woke = next((i for i in range(down - 1, -1, -1) if events[i][1] == "wake"), None)
+        if woke is not None:
+            lost.update(range(woke + 1, down))
+    return [i for i, (_t, kind) in enumerate(events) if kind == "up" and i not in lost]
+
+
 def _wake_candidate(events: list) -> tuple | None:
     """(where the sleep began, where it woke) as indexes into events, for
     the first wake after WiFi was last up, or None.
@@ -2914,8 +2942,11 @@ def _wake_candidate(events: list) -> tuple | None:
     sleeps and wakes again to retry, and that second wake is not the one
     that failed. The sleep began at its "PM: suspend entry", or at "ACPI: PM:
     Waking up" when that line is missing, both after WiFi was last up.
+    WiFi coming up after a wake does not count when the plugin's after-wake
+    lock move then took it down for good (WAKE_MOVE_DOWN_LINE): that wake is
+    the one judged.
     """
-    ups = [i for i, (_t, kind) in enumerate(events) if kind == "up"]
+    ups = _wake_ups(events)
     if not ups:
         return None
     wake = next((i for i in range(ups[-1] + 1, len(events)) if events[i][1] == "wake"), None)
@@ -2945,16 +2976,20 @@ def _wake_failure_at(text: str, ended_at: float = 0) -> int:
         suspend exit". That is a WiFi driver's or mhi's line on the fatal
         list, a WARN from the WiFi stack, or a headline such as "Hardware
         became unavailable upon resume" (see _wake_error_line); a driver's
-        other error lines count only when NetworkManager then tried a
-        network and failed. Lines from going to sleep do not count, nor do
-        another driver's errors (mmc, usb) or a driver's ordinary lines
-        (ath11k is probed afresh after a wake on a Steam Deck OLED).
-        Or, with no such error: NetworkManager was put to sleep before the
-        sleep and logged neither its wake nor a connected state after it
+        other error lines count when NetworkManager then tried a network and
+        failed, or when WiFi never came up after the wake (a radio that came
+        back dead never scans, so NetworkManager never tries). Lines from
+        going to sleep do not count, nor do another driver's errors (mmc,
+        usb) or a driver's ordinary lines (ath11k is probed afresh after a
+        wake on a Steam Deck OLED). The plugin's own line saying its
+        after-wake lock move left WiFi down (WAKE_MOVE_DOWN_LINE) counts
+        too. Or, with no such error: NetworkManager was put to sleep before
+        the sleep and logged neither its wake nor a connected state after it
         (it missed the resume, and stays asleep);
       - the radio was on after the wake: still on when the boot ended, or on
         for WAKE_MIN_SECONDS or more before it was turned off. Turned off
-        straight after waking and left off, nothing failed;
+        straight after waking and left off, nothing failed, unless it was the
+        after-wake move's own radio cycle that left it off;
       - the boot went on for WAKE_MIN_SECONDS or more after the wake.
     NetworkManager trying a network is not needed: it tries only once a scan
     finds a saved network, and a radio that came back dead never scans. The
@@ -2975,8 +3010,14 @@ def _wake_failure_at(text: str, ended_at: float = 0) -> int:
                      if events[i][0] >= woke_at - WAKE_EXIT_LEAD or i == wake)
     window = [kind for stamp, kind in events[first:] if stamp <= woke_at + WAKE_DRIVER_WINDOW]
     tried_and_failed = any(kind == "attempt_failed" for _s, kind in events[wake + 1:])
-    driver_failed = "error" in window or ("soft_error" in window and tried_and_failed)
-    ups = [i for i, (_t, kind) in enumerate(events) if kind == "up"]
+    came_up = any(kind == "up" for _s, kind in events[wake + 1:])
+    # The after-wake move's line for this wake: before the next sleep.
+    after = next((i for i in range(wake + 1, len(events)) if events[i][1] in ("sleep", "wake")),
+                 len(events))
+    moved_down = any(events[i][1] == "move_down" for i in range(wake + 1, after))
+    driver_failed = ("error" in window or moved_down
+                     or ("soft_error" in window and (tried_and_failed or not came_up)))
+    ups = _wake_ups(events)
     nm_slept = any(events[i][1] == "nm_sleep" for i in range(ups[-1] + 1, wake))
     nm_back = any(kind in ("nm_wake", "nm_connected") for _s, kind in events[wake + 1:])
     if not driver_failed and not (nm_slept and not nm_back):
@@ -2988,7 +3029,7 @@ def _wake_failure_at(text: str, ended_at: float = 0) -> int:
             on_long = on_long or stamp - on_since >= WAKE_MIN_SECONDS
         elif kind == "radio_on" and not radio_on:
             radio_on, on_since = True, stamp
-    if not (radio_on or on_long):
+    if not (radio_on or on_long or moved_down):
         return 0
     if max(events[-1][0], ended_at) - woke_at < WAKE_MIN_SECONDS:
         return 0
@@ -5831,9 +5872,10 @@ class Plugin:
         "Each value is the module parameter as it reads now. The driver acts on it "
         "at its own moment: rtw88's disable_aspm at each PCIe power change, except "
         "its CLKREQ part, set only when the driver loads; its "
-        "disable_lps_deep when the interface next starts, rtw89's at probe and "
-        "resume, mt7921e's only at probe. So a Y written after that is not yet in "
-        "force; plugin_load_values_* say what the driver loaded with."
+        "disable_lps_deep each time the radio powers on (interface up, leaving "
+        "idle, resume); rtw89's at probe and resume; mt7921e's only at probe. So a "
+        "Y written after that is not yet in force; plugin_load_values_* say what "
+        "the driver loaded with."
     )
 
     def _diagnostic_extras(self, driver: str, iface: str) -> dict:
@@ -6027,10 +6069,9 @@ class Plugin:
                 self._diag_first_stamp(first))
         return extras
 
-    def _diag_pcie(self, iface: str, read) -> tuple:
-        """(the card's PCIe power files, its link registers and its port's),
-        for the diagnostics. read reads one sysfs file as text."""
-        pcie, link = {}, {}
+    def _card_device(self, iface: str | None) -> str | None:
+        """The sysfs device of the WiFi card, for its PCIe power state: the
+        card the fixes are for, otherwise iface's. None when there is none."""
         # The card the fixes are for, not a USB adapter that happens to be
         # the interface in use.
         card = self._driver_interface()
@@ -6039,11 +6080,17 @@ class Plugin:
         # their link registers are the evidence a report needs.
         phy = None if card else self._managed_phy()
         card = card or (None if phy else iface)
-        device = None
         if phy:
-            device = os.path.realpath(os.path.join(SYSFS_IEEE80211, phy, "device"))
-        elif card and card != "none" and IFACE_RE.match(card):
-            device = os.path.realpath(os.path.join(SYSFS_NET, card, "device"))
+            return os.path.realpath(os.path.join(SYSFS_IEEE80211, phy, "device"))
+        if card and card != "none" and IFACE_RE.match(card):
+            return os.path.realpath(os.path.join(SYSFS_NET, card, "device"))
+        return None
+
+    def _diag_pcie(self, iface: str, read) -> tuple:
+        """(the card's PCIe power files, its link registers and its port's),
+        for the diagnostics. read reads one sysfs file as text."""
+        pcie, link = {}, {}
+        device = self._card_device(iface)
         if device:
             for name in ("l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
                          "l1_1_pcipm", "l1_2_pcipm"):
@@ -7134,6 +7181,72 @@ class Plugin:
         except (OSError, AttributeError):
             return None
 
+    # The start of the line _wake_card_check journals.
+    WAKE_CARD_LINE = "WiFi not connected after a wake, the card:"
+    # The card's power files that line carries.
+    _WAKE_CARD_FILES = (("power_state", ("power_state",)), ("clkpm", ("link", "clkpm")),
+                        ("l1_aspm", ("link", "l1_aspm")), ("l1_1_aspm", ("link", "l1_1_aspm")),
+                        ("l1_2_aspm", ("link", "l1_2_aspm")))
+
+    async def _wake_card_check(self):
+        """Once per wake, _WAKE_CONNECT_WAIT seconds after it, journal the
+        card's PCIe power state if NetworkManager is not connected by then.
+
+        Diagnostics are collected after the restart that brought WiFi back,
+        so what they read describes the healthy boot. This line, read back
+        as plugin_log_previous_boot, is the failed boot's own: whether the
+        card still answered (lspci's "(rev ff)" when it did not), its link
+        state, Clock PM and its D-state. Runs whether or not the lock is on,
+        from the background watch; never fails the lock check after it.
+        """
+        try:
+            offset = self._suspend_offset()
+            if offset is None:
+                return
+            last = getattr(self, "_card_offset_seen", None)
+            self._card_offset_seen = offset
+            if last is not None and offset - last > self._WAKE_JUMP_SECONDS:
+                self._card_wake_at = time.monotonic()
+            woke = getattr(self, "_card_wake_at", None)
+            if woke is None or time.monotonic() - woke < self._WAKE_CONNECT_WAIT:
+                return
+            self._card_wake_at = None
+            state, radio = await asyncio.to_thread(self._nm_general_state)
+            if (state or "").startswith("connected") or radio == "disabled":
+                return
+            line = await asyncio.to_thread(self._wake_card_line)
+            decky.logger.info(line)
+            result = await asyncio.to_thread(
+                self._run_cmd, ["/usr/bin/logger", "-t", JOURNAL_TAG, "--", line], 3)
+            if not result.get("success"):
+                decky.logger.error(
+                    f"Could not journal the card's state: {_tool_text((result.get('stderr') or '')[:120])}")
+        except Exception as e:
+            decky.logger.error(f"Card state after a wake not read: {e}")
+
+    def _wake_card_line(self) -> str:
+        """The line _wake_card_check journals: the card's power files, then
+        lspci's first line and LnkSta for it. Addresses masked."""
+        device = self._card_device(self._get_wifi_interface())
+        if not device:
+            return f"{self.WAKE_CARD_LINE} no WiFi card found"
+        fields = []
+        for label, parts in self._WAKE_CARD_FILES:
+            try:
+                with open(os.path.join(device, *parts), "r") as f:
+                    value = f.read(32).strip() or "empty"
+            except OSError:
+                value = "missing"
+            fields.append(f"{label}={value}")
+        bdf = os.path.basename(device)
+        words = [f"{self.WAKE_CARD_LINE} {' '.join(fields)}"]
+        if self._PCIE_BDF_RE.match(bdf):
+            words += [entry for entry in self._pcie_link_lines(bdf)
+                      if entry.startswith("LnkSta:") or not entry.startswith(self._PCIE_LINK_KEYS)]
+        else:
+            words.append("not a PCIe device")
+        return _mask_addresses(_tool_text(" | ".join(words)))[:self._DIAG_LINE_MAX * 2]
+
     async def _wake_lock_check(self):
         """Once per wake, move the access point lock to a clearly stronger
         access point of the same network, without the panel open.
@@ -7147,6 +7260,7 @@ class Plugin:
         attempt per wake, once NetworkManager is connected again (given up
         after _WAKE_CONNECT_WAIT seconds).
         """
+        await self._wake_card_check()
         offset = self._suspend_offset()
         if offset is None:
             return
@@ -15488,13 +15602,13 @@ class Plugin:
         "collect_failed": "Couldn't put the report together. Try again in a moment.",
         "too_large": "The report is too large to send. Use Copy diagnostics and post it on GitHub instead.",
         "stale": "That report is out of date. Select Send report to the developer again.",
-        "queued": "No connection. It will be sent when WiFi is back.",
+        "queued": "No connection. Your report is saved and will be sent when WiFi is back.",
         "queued_unreachable": "Couldn't reach the report service. Your report is saved and will be sent later.",
         "queued_busy": "The report service is busy. Your report is saved and will be sent later.",
         "queued_limited": "The report service is busy. Your report is saved and will be sent later.",
         "queued_unexpected": "Couldn't send the report. It is saved and will be tried again later.",
         "not_kept": "Couldn't send the report or save it. Try again when WiFi is back.",
-        "refused": "The report wasn't accepted, so it was not sent. Use Copy diagnostics and post it on GitHub instead.",
+        "refused": "The report service refused this report. Use Copy diagnostics and post it on GitHub instead.",
         "unexpected": "Couldn't send the report. Try again later, or use Copy diagnostics and post it on GitHub.",
     }
     # How a send that is kept for later is worded, by how it ended.
@@ -15518,13 +15632,13 @@ class Plugin:
             return "rate_limited"
         if code == "408" or code.startswith("5"):
             return "unavailable"
-        if code == "404":
-            # Not the report service at that address (a URL this version
-            # has wrong, or a route moved): nothing about the report, so it
-            # is kept and tried later rather than dropped as refused.
-            return "unexpected"
-        if code.startswith("4"):
+        if code == "400":
+            # The report service's own answer to a report it will never
+            # take: the one refusal that drops it.
             return "refused"
+        # Any other 4xx says nothing about the report: a route moved (404),
+        # a firewall, a proxy or a captive portal in the way (401, 403, 407,
+        # 451). It is kept and tried later, and dropped only with age.
         return "unexpected"
 
     def _post_report(self, path: str) -> dict:
@@ -15820,7 +15934,10 @@ class Plugin:
     # read it: kernel and NetworkManager lines, Unix times, no host name.
     _WAKE_READ = ["/usr/bin/journalctl", "-b", "-1", "--no-hostname", "-o", "short-unix",
                   "--no-pager", "-n", WAKE_JOURNAL_MAX]
-    _WAKE_SOURCES = ["_TRANSPORT=kernel", "+", "_SYSTEMD_UNIT=NetworkManager.service"]
+    # The plugin's own lines are root's only, as Copy diagnostics reads them:
+    # anyone can log under its tag.
+    _WAKE_SOURCES = ["_TRANSPORT=kernel", "+", "_SYSTEMD_UNIT=NetworkManager.service",
+                     "+", f"SYSLOG_IDENTIFIER={JOURNAL_TAG}", "_UID=0"]
     # journalctl's words for a boot it has no record of: an answer, not a
     # read that failed.
     _NO_PREVIOUS_BOOT_RE = re.compile(r"(?i)specified boot|no journal boot entry|no such boot")

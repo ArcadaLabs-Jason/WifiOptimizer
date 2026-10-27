@@ -10351,8 +10351,9 @@ try:
     _stuck = _t18[_t18.index("NETLINK_STUCK=0"):_t18.index("# Apply power save")]
     # Pass 5 D9: root's only, and the plugin's other netlink commands too.
     # Pass 6 D2: the pattern is named once, for the search and its repeat.
-    ok('NETLINK_RE="^([^ ]*/)?(iw (dev $IFACE( |\\$)|reg |phy[^ ]* )|tc qdisc |ip link set )"' in _stuck
-       and 'search pgrep -u 0 -O 8 -f "$NETLINK_RE"' in _stuck
+    # Pass 7 D3: a bare iw dev too. Pass 7 D4: real and effective user root.
+    ok('NETLINK_RE="^([^ ]*/)?(iw (dev( $IFACE( |\\$)|\\$)|reg |phy[^ ]* )|tc qdisc |ip link set )"' in _stuck
+       and 'search pgrep -u 0 -U 0 -O 8 -f "$NETLINK_RE"' in _stuck
        and "NETLINK_STUCK=1" in _stuck,
        "an iw on this interface still running after seconds is what marks the netlink path stuck")
 except Exception as _e:
@@ -11965,7 +11966,7 @@ try:
     _pv = asyncio.run(_p.preview_report())
     _sr = asyncio.run(_p.send_report(_pv["id"]))
     ok(_sr.get("status") == "queued"
-       and _sr.get("message") == "No connection. It will be sent when WiFi is back.",
+       and _sr.get("message") == "No connection. Your report is saved and will be sent when WiFi is back.",
        "with no connection the report is kept and the panel says when it will go")
     ok(os.path.exists(_pending_path()) and open(_pending_path()).read() == _p.bodies[0],
        "the waiting report is exactly what was shown")
@@ -17822,9 +17823,12 @@ try:
                     (4000, "kernel", "PM: suspend exit"), _off10]
     _c10 = _b10[:-1] + [(4030, "kernel", "rtw_8822ce 0000:01:00.0: failed to get tx report from firmware"), _off10]
     _got10 = [m._wake_failure_at(_dv6_l(r)) for r in (_a10, _b10, _c10)]
-    ok(_got10 == [0, 0, 0],
-       f"01's three journals (s2idle flush timeout at sleep, S3 before resume, a tx report line after): "
-       f"no notice ({_got10})")
+    # Pass 7 D1: a soft line after the wake with WiFi never up again counts
+    # (a radio that came back dead never scans, so NetworkManager never
+    # tries); lines from going to sleep still do not.
+    ok(_got10 == [0, 0, 1761004000],
+       f"01's journals: an s2idle flush timeout at sleep and one in S3 before resume are no notice; "
+       f"a tx report line after the wake with WiFi never back is one ({_got10})")
     _d10 = _c10[:-1] + [(4040, _NM10, "<info>  [1.0] device (wlan0): state change: config -> failed "
                                       "(reason 'supplicant-timeout', managed-type: 'full')"), _off10]
     ok(m._wake_failure_at(_dv6_l(_d10)) == 1761004000,
@@ -17946,6 +17950,308 @@ finally:
         pass
 
 # ---- QA pass 6 merge: where two owners' work meets ----
+section("D1 pass 7 the wake rule reads mt7921e's and iwlwifi's dead-card lines, a soft-only death and the after-wake move's line")
+try:
+    _W71 = _P4_U + 4001
+    _FATAL71 = ("mt7921e 0000:04:00.0: driver own failed",
+                "mt7921e 0000:04:00.0: Timeout for driver own",
+                "mt7921e 0000:04:00.0: firmware own failed",
+                "mt7921e 0000:04:00.0: Timeout for initializing firmware",
+                "iwlwifi 0000:00:14.3: Failed to start RT ucode: -110",
+                "iwlwifi 0000:00:14.3: Failed to run INIT ucode: -110",
+                "rtw_8822ce 0000:01:00.0: leave idle state failed",
+                "rtw_8822ce 0000:01:00.0: failed to leave idle state")
+    for _l71 in _FATAL71:
+        _g71 = _dv5_wake(_P4_UP + _p4_cycle(1000, errors=(_l71,), attempt=False))
+        ok(m._wake_error_line(_l71) and _g71 == _W71,
+           f"09's row '{_l71.split(': ', 1)[1]}' is on the fatal list and the wake is a failed one ({_g71})")
+    ok(not m._wake_error_line("rtw_8822ce 0000:01:00.0: failed to send h2c command")
+       and m._wake_soft_error_line("rtw_8822ce 0000:01:00.0: failed to send h2c command"),
+       "rtw88's h2c line stays off the fatal list (it logs it on working cards)")
+    # 01's soft-only boot: NetworkManager woke, rtw88 logged h2c and a flush
+    # timeout, and nothing came for 700 s.
+    _SOFT71 = ("rtw_8822ce 0000:01:00.0: failed to send h2c command",
+               "rtw_8822ce 0000:01:00.0: timed out to flush queue 1")
+    _NMW71 = [(999.0, _P4_NM, "<info>  [1.0] manager: sleep: sleep requested (sleeping: no  enabled: yes)"),
+              (4002.0, _P4_NM, "<info>  [1.0] manager: sleep: wake requested (sleeping: yes  enabled: yes)")]
+    _g71 = _dv5_wake(_P4_UP + _NMW71 + _p4_cycle(1000, errors=_SOFT71, attempt=False, end=700))
+    ok(_g71 == _W71, f"01's soft-only boot (h2c and a flush timeout, then nothing for 700 s): a failed wake ({_g71})")
+    _g71 = _dv5_wake(_P4_UP + _NMW71 + _p4_cycle(1000, errors=_SOFT71, associate=True, end=700))
+    ok(_g71 == 0, f"the same soft lines with WiFi up after the wake: no notice ({_g71})")
+    _g71 = [_dv5_wake(_P4_UP + _p4_cycle(1000, reprobe=True, attempt=_a, end=700)) for _a in (False, True)]
+    ok(_g71 == [0, 0], f"the OLED's ath11k probed afresh after the wake, away from every network: no notice ({_g71})")
+
+    # C24: the plugin's own line, read from the journal the way journalctl
+    # takes match groups (terms AND within a group, "+" between groups).
+    class _J71(m.Plugin):
+        def __init__(self, rows):
+            super().__init__(); self.rows = sorted(rows, key=lambda r: r[0]); self.cmds = []
+        @staticmethod
+        def _fields(who, uid):
+            if who == "kernel":
+                return {"_TRANSPORT": "kernel", "_UID": "0"}
+            name = who.split("[")[0]
+            unit = "NetworkManager.service" if name == "NetworkManager" else "plugin_loader.service"
+            return {"_TRANSPORT": "syslog", "SYSLOG_IDENTIFIER": name, "_SYSTEMD_UNIT": unit, "_UID": str(uid)}
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(list(cmd))
+            if cmd[0] != "/usr/bin/journalctl":
+                return _ok()
+            valued = ("-b", "-o", "-n", "--grep", "--since", "--until", "-t", "-u")
+            opts, groups, i = {}, [[]], 1
+            while i < len(cmd):
+                a = cmd[i]
+                if a in valued:
+                    opts[a] = cmd[i + 1]; i += 2; continue
+                if a == "+":
+                    groups.append([])
+                elif "=" in a and not a.startswith("-"):
+                    groups[-1].append(tuple(a.split("=", 1)))
+                elif a == "-k":
+                    opts["-k"] = True
+                i += 1
+            rows = []
+            for row in self.rows:
+                t, who, msg = row[:3]
+                f = self._fields(who, row[3] if len(row) > 3 else 0)
+                if opts.get("-k") and f["_TRANSPORT"] != "kernel":
+                    continue
+                if any(g for g in groups) and not any(all(f.get(k) == v for k, v in g) for g in groups if g):
+                    continue
+                if "--grep" in opts and not re.search(opts["--grep"], msg):
+                    continue
+                if "--since" in opts and _P4_U + t < float(opts["--since"][1:]):
+                    continue
+                if "--until" in opts and _P4_U + t > float(opts["--until"][1:]):
+                    continue
+                rows.append((t, who, msg))
+            if "-n" in opts:
+                rows = rows[-int(opts["-n"]):]
+            return _ok("".join(f"{_P4_U + t:.6f} {who}: {msg}\n" for t, who, msg in rows))
+    _DOWN71 = "after-wake lock move: WiFi did not come back"
+    _moved71 = _P4_UP + _p4_cycle(1000, associate=True, end=900)
+    _g71 = _J71(_moved71 + [(4060.0, "wifi-optimizer[4242]", _DOWN71, 0)])._read_wake_failure()
+    ok(_g71 == _W71,
+       f"WiFi up after the wake, then root's '{_DOWN71}' line: that wake is a failed one ({_g71})")
+    _g71 = _J71(_moved71 + [(4060.0, "wifi-optimizer[4242]", _DOWN71, 1000)])._read_wake_failure()
+    ok(_g71 == 0, f"the same line logged under the tag by another user counts for nothing ({_g71})")
+    _g71 = _J71(_moved71)._read_wake_failure()
+    ok(_g71 == 0, f"and with no such line the wake that reconnected is no notice ({_g71})")
+    _again71 = _moved71 + [(4060.0, "wifi-optimizer[4242]", _DOWN71, 0),
+                           (4300.0, "kernel", "PM: suspend entry (deep)"),
+                           (4400.0, "kernel", "PM: suspend exit"),
+                           (4500.0, _P4_NM, "<info>  [1.0] manager: NetworkManager state is now DISCONNECTED")]
+    _g71 = _J71(_again71)._read_wake_failure()
+    ok(_g71 == _W71, f"a sleep and wake to retry after it: the wake judged is still the one the move followed ({_g71})")
+    _back71 = _moved71 + [(4060.0, "wifi-optimizer[4242]", _DOWN71, 0), (4200.0, "kernel", "wlan0: associated")]
+    _g71 = _J71(_back71)._read_wake_failure()
+    ok(_g71 == 0, f"WiFi back later in the boot (the user turned it off and on): no notice ({_g71})")
+    _off71 = _moved71 + [(4040.0, _P4_NM, '<info>  [1.0] audit: op="radio-control" arg="wireless-enabled:off" '
+                                          'pid=1 uid=0 result="success"'),
+                         (4060.0, "wifi-optimizer[4242]", _DOWN71, 0)]
+    _g71 = _J71(_off71)._read_wake_failure()
+    ok(_g71 == _W71, f"the move's own radio cycle left the radio off: still a failed wake ({_g71})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D2 pass 7 a wake that leaves WiFi down journals the card's PCIe power state, lock on or off")
+try:
+    _r72 = tempfile.mkdtemp()
+    _dev72 = os.path.join(_r72, "devices", "pci0000:00", "0000:00:1c.0", "0000:01:00.0")
+    os.makedirs(os.path.join(_dev72, "link")); os.makedirs(os.path.join(_dev72, "driver"))
+    for _f72, _v72 in (("power_state", "D3hot"), ("link/clkpm", "1"), ("link/l1_aspm", "0"),
+                       ("link/l1_1_aspm", "0"), ("link/l1_2_aspm", "0")):
+        open(os.path.join(_dev72, _f72), "w").write(_v72 + "\n")
+    os.makedirs(os.path.join(_r72, "modules", "rtw88_pci")); os.makedirs(os.path.join(_r72, "bus", "pci"))
+    os.symlink(os.path.join(_r72, "modules", "rtw88_pci"), os.path.join(_dev72, "driver", "module"))
+    os.symlink(os.path.join(_r72, "bus", "pci"), os.path.join(_dev72, "subsystem"))
+    os.makedirs(os.path.join(_r72, "net", "wlan0", "phy80211"))
+    os.symlink(_dev72, os.path.join(_r72, "net", "wlan0", "device"))
+    _bin72 = os.path.join(_r72, "bin"); os.makedirs(_bin72)
+    open(os.path.join(_bin72, "lspci"), "w").write("#!/bin/sh\n"); os.chmod(os.path.join(_bin72, "lspci"), 0o755)
+    _LSPCI72 = ("01:00.0 Network controller: Realtek Semiconductor Co., Ltd. RTL8822CE 802.11ac PCIe "
+                "Wireless Network Adapter (rev ff) (prog-if ff)\n\t!!! Unknown header type 7f\n"
+                "\tCapabilities: [170] Device Serial Number 3c-e9-f7-ff-fe-12-34-56\n"
+                "\tLnkCap:\tPort #0, Speed 2.5GT/s, Width x1, ASPM L0s L1\n"
+                "\tLnkSta:\tSpeed 2.5GT/s, Width x1\n\t\tTrErr- Train- SlotClk+ DLActive- BWMgmt- ABWMgmt-\n"
+                "\tLnkCtl:\tASPM Disabled; RCB 64 bytes, LnkDisable- CommClk+\n")
+
+    class _P72(m.Plugin):
+        def __init__(self, nm):
+            super().__init__(); self.nm = nm; self.cmds = []; self.offset = [100.0]
+        def _suspend_offset(self):
+            return self.offset[0]
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(list(cmd))
+            if cmd[0] == "/usr/bin/nmcli":
+                return _ok(self.nm)
+            if cmd[0].endswith("/lspci"):
+                return _ok(_LSPCI72)
+            return _ok()
+        def logged(self):
+            return [c[-1] for c in self.cmds if c[:4] == ["/usr/bin/logger", "-t", "wifi-optimizer", "--"]]
+
+    _keep72 = (m.SYSFS_NET, m.TOOL_DIRS, m.SETTINGS_FILE)
+    _off72, _restore72 = _dv5_clock()
+    try:
+        m.SYSFS_NET = os.path.join(_r72, "net"); m.TOOL_DIRS = (_bin72,)
+        m.SETTINGS_FILE = os.path.join(_r72, "settings.json")
+
+        def _run72(nm, lock):
+            open(m.SETTINGS_FILE, "w").write(json.dumps({"driver": "rtw88", "bssid_lock_enabled": lock}))
+            _p = _P72(nm)
+            asyncio.run(_p._wake_lock_check())          # before the sleep
+            _p.offset[0] += 600.0                        # slept ten minutes
+            asyncio.run(_p._wake_lock_check())          # the wake is seen
+            _early = list(_p.logged())
+            _off72[0] += _p._WAKE_CONNECT_WAIT + 5
+            asyncio.run(_p._wake_lock_check())
+            _off72[0] += 60
+            asyncio.run(_p._wake_lock_check())          # once per wake
+            return _early, _p.logged()
+        _early72, _l72 = _run72("disconnected:enabled", False)
+        _line72 = _l72[0] if _l72 else ""
+        ok(not _early72 and len(_l72) == 1,
+           f"lock off, NetworkManager not connected after the wait: one journal line, not before ({_l72})")
+        ok(all(f in _line72 for f in ("power_state=D3hot", "clkpm=1", "l1_aspm=0", "l1_1_aspm=0", "l1_2_aspm=0",
+                                       "(rev ff)", "Unknown header type 7f", "LnkSta: Speed 2.5GT/s, Width x1")),
+           f"with the D-state, Clock PM, the l1 ASPM files, lspci's first line and LnkSta ({_line72})")
+        ok("LnkCap" not in _line72 and "LnkCtl" not in _line72 and "Serial" not in _line72
+           and not re.search(r"(?i)(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}", _line72) and not m._IPV4_RE.search(_line72),
+           "and nothing else: no serial number, no hardware or IP address")
+        _, _l72b = _run72("disconnected:enabled", True)
+        ok(len(_l72b) == 1, f"the lock on: the same one line ({len(_l72b)})")
+        _, _l72c = _run72("connected:enabled", False)
+        ok(_l72c == [], f"NetworkManager connected by then: nothing ({_l72c})")
+        _, _l72d = _run72("disconnected:disabled", False)
+        ok(_l72d == [], f"WiFi switched off: nothing ({_l72d})")
+        _p72 = _P72("disconnected:enabled")
+        def _read72(path):
+            try:
+                return open(path).read().strip()
+            except OSError:
+                return "missing"
+        ok(m.Plugin._diag_pcie(_p72, "wlan0", _read72)[0].get("power_state") == "D3hot",
+           "Copy diagnostics still finds the same card for its PCIe files")
+    finally:
+        m.SYSFS_NET, m.TOOL_DIRS, m.SETTINGS_FILE = _keep72
+        _restore72()
+    _src72 = _src("main.py")
+    _check72 = _src72[_src72.index("    async def _wake_card_check(self):"):_src72.index("    def _wake_card_line(self)")]
+    ok("asyncio.to_thread(self._wake_card_line)" in _check72 and "asyncio.to_thread(self._nm_general_state)" in _check72
+       and re.search(r"asyncio\.to_thread\(\s*self\._run_cmd, \[\"/usr/bin/logger\"", _check72) is not None,
+       "the reads and the journal write run off the event loop")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D3 D4 pass 7 the dispatcher's stuck search sees a bare iw dev, and only processes root started")
+try:
+    _t734 = _d_template()
+    ok('NETLINK_RE="^([^ ]*/)?(iw (dev( $IFACE( |\\$)|\\$)|reg |phy[^ ]* )|tc qdisc |ip link set )"' in _t734,
+       "D3: the pattern takes a bare iw dev")
+    ok(_t734.count('search pgrep -u 0 -U 0 -O 8 -f "$NETLINK_RE"') == 2 and "pgrep -u 0 -O" not in _t734,
+       "D4: both searches ask for real and effective user root")
+    _pat734 = re.search(r'NETLINK_RE="([^"]*)"', _t734).group(1).replace("$IFACE", "wlan0").replace("\\$", "$")
+    _cases734 = {"/usr/bin/iw dev": True, "iw dev": True, "iw dev wlan0 link": True, "iw dev wlan0": True,
+                 "iw dev wlan1 link": False, "iw dev wlan01 link": False, "iw devices": False,
+                 "iw event": False, "ip monitor": False}
+    _got734 = {c: bool(re.search(_pat734, c)) for c in _cases734}
+    ok(_got734 == _cases734, f"what the pattern matches, as an extended regex ({_got734})")
+    _pg734 = _dv5_sh.which("pgrep")
+    _procps734 = bool(_pg734) and "procps" in _dv5_sp.run([_pg734, "--version"], capture_output=True, text=True).stdout
+    _perl734 = _dv5_sh.which("perl")
+    _need734 = [n for n, there in (("procps pgrep", _procps734), ("perl", bool(_perl734)),
+                                   ("root", os.geteuid() == 0)) if not there]
+    if _need734 and os.environ.get("REGRESS_REQUIRE_LINUX"):
+        ok(False, f"the real-pgrep half needs {', '.join(_need734)}, and CI must run it")
+    elif _need734:
+        print(f"SKIP  the real-pgrep half needs {', '.join(_need734)} (Linux, real pgrep and ps, root); CI runs it")
+    else:
+        _blk734 = _d_block("NETLINK_STUCK=0", "# Apply power save") + '\necho "STUCK=$NETLINK_STUCK"\n'
+        # Root's bare iw dev; root's iw for another card; and a process
+        # whose effective user is root but whose real user is 1001, as a
+        # setuid program another account started has, titled as root's iw.
+        _procs734 = {
+            "bare": _dv5_sp.Popen([_perl734, "-e", "$0 = 'iw dev'; sleep 14"]),
+            "other": _dv5_sp.Popen([_perl734, "-e", "$0 = 'iw dev wlan1 link'; sleep 14"]),
+            "setuid": _dv5_sp.Popen([_perl734, "-e", "$< = 1001; $0 = 'iw dev wlan3 link'; sleep 14"]),
+        }
+        try:
+            time.sleep(10)
+            _uid734 = open(f"/proc/{_procs734['setuid'].pid}/status").read()
+            _uid734 = re.search(r"^Uid:\s+(\S+)\s+(\S+)", _uid734, re.M)
+            def _stuck734(iface):
+                _o, _l = _d_run(_blk734, [f"IFACE={iface}", "LOG_TAG=t"], {"logger": 0}, tempfile.mkdtemp())
+                _s = re.search(r"STUCK=(\d)", _o)
+                return _s.group(1) if _s else _o.strip()[:80]
+            _a734 = _stuck734("wlan0")
+            _procs734["bare"].kill(); _procs734["bare"].wait()
+            _b734 = _stuck734("wlan0")
+            _c734 = _stuck734("wlan3")
+        finally:
+            for _pr734 in _procs734.values():
+                if _pr734.poll() is None:
+                    _pr734.kill()
+                _pr734.wait()
+        ok(_a734 == "1", f"D3: root's bare 'iw dev' running for 10 s is stuck ({_a734})")
+        ok(_b734 == "0", f"D3: root's 'iw dev wlan1 link' for 10 s, with IFACE wlan0, is not ({_b734})")
+        ok(_uid734 is not None and _uid734.groups() == ("1001", "0"),
+           f"the stand-in runs with real user 1001 and effective user root ({_uid734 and _uid734.groups()})")
+        ok(_c734 == "0", f"D4: so its 'iw dev wlan3 link' does not mark wlan3's netlink path stuck ({_c734})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D5 pass 7 the diagnostics note says rtw88 reads disable_lps_deep each time the radio powers on")
+try:
+    _n75 = m.Plugin._DIAG_PARAMS_NOTE
+    ok("each time the radio powers on (interface up, leaving idle, resume)" in _n75
+       and "when the interface next starts" not in _n75,
+       f"the note ({_n75})")
+    ok(all(ord(c) < 128 for c in _n75) and "—" not in _n75, "plain ASCII")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D6 D7 pass 7 only the report service's 400 drops a report; a proxy's 4xx keeps it, and the texts say so")
+try:
+    m.REPORT_URL = _REP_URL
+    _kinds76 = {c: m.Plugin._report_kind_for_code(RepStub(), c)
+                for c in ("400", "401", "403", "404", "407", "413", "415", "429", "451", "408", "503")}
+    ok(_kinds76 == {"400": "refused", "401": "unexpected", "403": "unexpected", "404": "unexpected",
+                    "407": "unexpected", "413": "too_large", "415": "unexpected", "429": "rate_limited",
+                    "451": "unexpected", "408": "unavailable", "503": "unavailable"},
+       f"how each answer ends a send ({_kinds76})")
+    for _code76 in ("403", "407"):
+        _rep_reset()
+        _p76 = RepStub(curl=[('<html>blocked</html>', _code76)])
+        _pv76 = asyncio.run(_p76.preview_report())
+        _sr76 = asyncio.run(_p76.send_report(_pv76["id"]))
+        ok(_sr76.get("status") == "queued" and os.path.exists(_pending_path()),
+           f"a {_code76} (a firewall or proxy in the way) keeps the report for later ({_sr76.get('status')})")
+        _bg76 = RepStub(curl=[('<html>blocked</html>', _code76)])
+        asyncio.run(_bg76._send_pending_report_if_due())
+        ok(os.path.exists(_pending_path()) and _bg76._report_retry_at - time.monotonic() > 3000,
+           f"and a waiting report answered {_code76} stays, tried again in an hour")
+    _rep_reset()
+    _p76 = RepStub(curl=[('{"ok":false,"error":"bad_request"}', "400")])
+    _pv76 = asyncio.run(_p76.preview_report())
+    _sr76 = asyncio.run(_p76.send_report(_pv76["id"]))
+    ok(_sr76.get("error") == "refused" and not os.path.exists(_pending_path()),
+       f"the service's own 400 drops it ({_sr76.get('error')})")
+    ok(_sr76.get("message") == "The report service refused this report. Use Copy diagnostics and post it on GitHub instead.",
+       f"D7: refused is said as it is ({_sr76.get('message')})")
+    _msgs76 = m.Plugin._REPORT_MESSAGES
+    ok(_msgs76["queued"] == "No connection. Your report is saved and will be sent when WiFi is back.",
+       f"D7: queued says the report is saved ({_msgs76['queued']})")
+    ok(not any("so it was not sent" in v for v in _msgs76.values()), "no message says 'so it was not sent'")
+    _rep_reset()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 section("merge p6: the panel and the README leave out the after-wake move where the backend skips it (K-d)")
 # FRONT keys the lock's (i) on settings.driver and the README names the
 # Steam Deck LCD; LIFECYCLE skips the move on the settings' driver (rtw88 in

@@ -278,11 +278,14 @@ fi
 # this connect, and NetworkManager's queue of dispatcher runs behind it. One
 # of the plugin's own netlink commands (or this script's), run by root, still
 # running after several seconds is that, not a slow command (the plugin's own
-# give up within five): iw for this interface, iw reg or iw phy, tc qdisc and
-# ip link set. Only root's, since anyone can start a process with any name;
-# never iw event or ip monitor, which run for good on purpose. The sysfs
-# writes below do not go through the driver's netlink path, so they still
-# run. A pgrep too old to know -O fails, which reads as nothing stuck.
+# give up within five): iw for this interface, a bare iw dev (the plugin's
+# list of interfaces, which asks every card), iw reg or iw phy, tc qdisc and
+# ip link set. Only processes whose real and effective user are root, since
+# anyone can start a process with any name (a setuid program another account
+# starts is root in its effective user only); never iw event or ip monitor,
+# which run for good on purpose. The sysfs writes below do not go through
+# the driver's netlink path, so they still run. A pgrep too old to know -O
+# fails, which reads as nothing stuck.
 #
 # The search itself reads every process's command line, and one of those
 # can hang behind the same wedged driver. So it runs as netlink() runs iw:
@@ -304,8 +307,8 @@ search() {
     exec 9<&-
     return "$sr_rc"
 }
-NETLINK_RE="^([^ ]*/)?(iw (dev $IFACE( |\$)|reg |phy[^ ]* )|tc qdisc |ip link set )"
-search pgrep -u 0 -O 8 -f "$NETLINK_RE"
+NETLINK_RE="^([^ ]*/)?(iw (dev( $IFACE( |\$)|\$)|reg |phy[^ ]* )|tc qdisc |ip link set )"
+search pgrep -u 0 -U 0 -O 8 -f "$NETLINK_RE"
 case $? in
     124)
         NETLINK_STUCK=1
@@ -337,7 +340,7 @@ case $? in
         done
         if [ "$NETLINK_STUCK" = 0 ] && [ -n "$UNSURE" ]; then
             sleep 1
-            search pgrep -u 0 -O 8 -f "$NETLINK_RE"
+            search pgrep -u 0 -U 0 -O 8 -f "$NETLINK_RE"
             sr=$?
             if [ "$sr" = 124 ]; then
                 NETLINK_STUCK=1
