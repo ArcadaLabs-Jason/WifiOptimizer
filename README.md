@@ -1,4 +1,4 @@
-# WiFi Optimizer v0.24.6-beta
+# WiFi Optimizer v0.24.7-beta
 
 > **Heads up:** This plugin modifies WiFi and network settings. Some optimizations (the access point lock, band preference, custom DNS, WiFi backend switch) can temporarily prevent WiFi from connecting. If this happens, restart the device. You can also try forgetting and rejoining your WiFi network from Steam settings.
 
