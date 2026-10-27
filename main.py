@@ -14522,7 +14522,7 @@ class Plugin:
                 return {"success": False, "message": blocked}
             if not isinstance(version, str) or len(version) > 64 or not VERSION_RE.match(version):
                 decky.logger.error(f"Update refused: approved version {version!r} malformed")
-                return {"success": False, "message": "Couldn't start the update. Tap Update again."}
+                return {"success": False, "message": "Couldn't start the update. Try again."}
             info = await self.check_for_update()
             # A check that could not reach GitHub is not "no update": said
             # as such, the panel's own re-check then contradicted it.
@@ -14540,7 +14540,7 @@ class Plugin:
             # made, a "Go back to" above all, so it has to be the same one.
             if latest != version:
                 decky.logger.error(f"Update refused: approved v{version}, GitHub now offers v{latest}")
-                return {"success": False, "message": "The update on offer changed. Tap Update again."}
+                return {"success": False, "message": "The update on offer changed. Try again."}
             plugin_dir = decky.DECKY_PLUGIN_DIR
             # By the release itself: the beta channel also offers stable
             # releases, and "Updated to beta v0.24.5" misnamed those.

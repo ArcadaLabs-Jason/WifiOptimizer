@@ -7459,8 +7459,8 @@ try:
         # What installs is what the user approved. GitHub is asked again
         # when they press the button, and a different answer, an older
         # signed release above all, must not be installed in its place.
-        _changed = "The update on offer changed. Tap Update again."
-        _again = "Couldn't start the update. Tap Update again."
+        _changed = "The update on offer changed. Try again."
+        _again = "Couldn't start the update. Try again."
         for _what, _approved, _msg in [
             ("an approval for an older version", "0.20.0-beta", _changed),
             ("an approval for a newer version", "0.22.0", _changed),
@@ -20614,14 +20614,16 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
-section("L4 pass 8 an update refused at the tap names the button to tap again")
+section("L4 pass 8 an update refused at the tap says to try again without naming a button")
 try:
     _t84 = ast.parse(open(m.__file__).read())
     _f84 = next(n for n in ast.walk(_t84) if isinstance(n, ast.AsyncFunctionDef) and n.name == "apply_update")
     _s84 = [n.value for n in ast.walk(_f84) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    ok("The update on offer changed. Tap Update again." in _s84
-       and "Couldn't start the update. Tap Update again." in _s84,
-       "the changed offer and a malformed approval both say to tap Update again")
+    ok("The update on offer changed. Try again." in _s84
+       and "Couldn't start the update. Try again." in _s84,
+       "the changed offer and a malformed approval both say to try again, naming no button (it may read Go back to)")
+    ok(not any("Tap Update" in t for t in _s84),
+       "no refusal names the Update button, which reads Go back to for an older release")
     ok(not any("Check again" in t or "Check for updates again" in t for t in _s84),
        "and none sends the user to Check for updates, hidden while an offer is shown")
 except Exception as _e:
