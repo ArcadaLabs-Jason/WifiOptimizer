@@ -11444,7 +11444,8 @@ except Exception as _e:
 section("F16 pass 5: the access point lock says it moves to a clearly stronger access point after a wake")
 try:
     # Pass 6 F7 and F6: the shorter texts. Pass 7 F20: on the card it runs on (C25).
-    ok("After a wake, with no game or stream running, it moves to a clearly stronger one."
+    # Pass 8 F5: from a weak link only, as the backend moves it.
+    ok("After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one."
        in _between(_F_IX, 'label="Stop background scanning"', "checked="), "in the lock's explanation")
     _p5f_l16r = _between(_F_RD, "| Stop background scanning |", "\n")
     ok("It moves on its own only after a wake, from a weak access point to a clearly stronger one (never during a game or stream"
@@ -11598,7 +11599,7 @@ section("F7 pass 6 reconnect times say up to half a minute, and the lock's (i) d
 try:
     _p6f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
     ok("You stay on that access point until you turn this off or move the lock" not in _p6f_li
-       and "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one." in _p6f_li  # Pass 7 F20
+       and "It stays there until you move it or turn the lock off. After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one." in _p6f_li  # Pass 7 F20
        and "Turning it on or off reconnects WiFi for up to half a minute." in _p6f_li,
        "the lock's explanation")
     ok("Moving reconnects WiFi." in _between(_F_IX, "{status?.lock_weaker && lockWeakerShown && (", "</>"),  # Pass 7 F22
@@ -12254,7 +12255,7 @@ try:
     _p7f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
     ok('const WAKE_MOVE_DRIVER = "ath11k";' in _F_IX and "s?.driver?.startsWith(WAKE_MOVE_DRIVER)" in _p7f_li,
        "the (i) is keyed on drivers starting ath11k, as the backend's allow list is")
-    ok('? "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one."\n'
+    ok('? "It stays there until you move it or turn the lock off. After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one."\n'
        '              : "It stays there until you move it or turn the lock off."' in _p7f_li,
        "the move is promised there, and nowhere else")
     ok(m.Plugin._module_profile("ath11k_pci").startswith("ath11k")
@@ -12262,10 +12263,11 @@ try:
        "the OLED's card is recorded under a name starting ath11k, and no other card the plugin knows is")
     _p7f_row = _between(_F_RD, "| Stop background scanning |", "\n")
     _p7f_list = _p7f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
-    ok("(never during a game or stream, and for now only on the Steam Deck OLED)" in _p7f_row
-       and "(never during a game or stream, and for now only on the Steam Deck OLED)" in _p7f_list
+    ok("(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _p7f_row
+       and "(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _p7f_list
        and "not yet on the Steam Deck LCD" not in _F_RD,
-       "both README places say for now only on the Steam Deck OLED")
+       # Pass 8 F3 (N-b (i), C28): the scope is said as the code keys it.
+       "both README places say for now only on Qualcomm ath11k cards such as the Steam Deck OLED's")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -12350,6 +12352,43 @@ try:
     _p8f_rl = re.split(r"\n    (?:async )?def ", _between(_F_MAIN, "async def _reset_locked", "\nclass "))[0]
     ok('settings["auto_fix_on_wake"] = installed' in _p8f_rl and "await undo(\"the region\"" in _p8f_rl,
        "which is what _reset_locked does")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F3 pass 8 the README says the after-wake move runs on ath11k cards such as the OLED's, as the code keys it (N-b, C28)")
+try:
+    _p8f_scope = "(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)"
+    _p8f_row = _between(_F_RD, "| Stop background scanning |", "\n")
+    _p8f_list = _p7f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
+    ok(_p8f_scope in _p8f_row and _p8f_scope in _p8f_list,
+       "both README places name ath11k cards, the OLED's as the example")
+    ok("for now only on the Steam Deck OLED)" not in _p7f_flat(_F_RD),
+       "and neither says only the Steam Deck OLED, which the ath11k test is wider than")
+    ok(m.Plugin._no_wake_move_driver(m.Plugin(), "ath11k_pci") is False
+       and 'const WAKE_MOVE_DRIVER = "ath11k";' in _F_IX,
+       "which is the test the backend and the (i) make")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F4 pass 8 the README's list of what runs with the panel closed names the after-wake card note")
+try:
+    _p8f_list = _p7f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
+    ok("notes the WiFi card's state" in _p8f_list
+       and "when WiFi is still down a minute and a half after a wake" in _p8f_list,
+       f"the 20-second check is said to note the card's state after a failed wake ({_p8f_list[200:420]!r})")
+    ok("a check every 20 seconds that, while the access point lock or a band preference is on, releases a pin" in _p8f_list,
+       "and the lock or band condition is on the pin release, not on the whole check")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F5 pass 8 the lock's (i) promises the after-wake move only from a weak link")
+try:
+    _p8f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
+    ok("After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one." in _p8f_li
+       and "After a wake, with no game" not in _p8f_li,
+       "the (i) says the move is from a weak link")
+    ok(isinstance(getattr(m.Plugin, "_STRONG_ENOUGH_DBM", None), int),
+       "which the backend's own threshold decides")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -16778,7 +16817,7 @@ try:
     _mp5l_rd = _between(_F_RD, "| Stop background scanning |", "\n")
     # Pass 6 F6 and F7: the shorter texts say the same. Pass 7 F20: the (i)
     # says it where the move runs (C25).
-    ok("After a wake, with no game or stream running, it moves to a clearly stronger one." in _mp5l_ix
+    ok("After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one." in _mp5l_ix
        and "It moves on its own only after a wake, from a weak access point to a clearly "
        "stronger one (never during a game or stream" in _mp5l_rd,
        "the panel and the README say it moves after a wake, from weak to clearly stronger, not during a game")
@@ -18845,9 +18884,10 @@ try:
        f"and moves exactly where the driver starts with the panel's prefix ({_mp6k_got})")
     _mp6k_row = _between(_F_RD, "| Stop background scanning |", "\n")
     _mp6k_list = _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
-    ok("(never during a game or stream, and for now only on the Steam Deck OLED)" in _mp6k_row
-       and "(never during a game or stream, and for now only on the Steam Deck OLED)" in _mp6k_list,
-       "both README places that name the after-wake move say for now only on the Steam Deck OLED")
+    ok("(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _mp6k_row
+       and "(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _mp6k_list,
+       # Pass 8 F3 (N-b (i), C28): said as the code keys it, on ath11k.
+       "both README places that name the after-wake move say for now only on ath11k cards such as the OLED's")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")

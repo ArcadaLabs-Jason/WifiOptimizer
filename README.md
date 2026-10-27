@@ -62,7 +62,7 @@ Want to go further? The remaining optimizations are available as individual togg
 | Optimization | What it does |
 |---|---|
 | Prevent lag spikes | Disables WiFi power management and PCIe power states that cause packet batching, latency spikes, and throughput degradation during sustained streaming. On some cards part of it needs a restart to take effect. |
-| Stop background scanning | The access point lock. Pins your connection to one access point so your device stops scanning now and then for a better access point of your network. On a mesh it pins the strongest access point your network offers rather than whichever one you happen to be on, preferring 5 GHz where the signal is equal, and stays put if the one you are on is already healthy. If the stronger one turns out not to accept the connection, the previous one is restored. After that the lock keeps you on that one access point, so if you carry your device somewhere a much stronger one is in range, the panel says so and **Move the lock** moves it. It moves on its own only after a wake, from a weak access point to a clearly stronger one (never during a game or stream, and for now only on the Steam Deck OLED), or when the pinned one has been out of reach for a minute. It only applies to the network it was turned on for, so other networks you join are left alone. Disable it if you need to roam between access points. Needs the `wpa_supplicant` backend: under `iwd`, NetworkManager can't reconnect a network pinned this way, so the lock is paused, and its pins removed, while `iwd` is in use. |
+| Stop background scanning | The access point lock. Pins your connection to one access point so your device stops scanning now and then for a better access point of your network. On a mesh it pins the strongest access point your network offers rather than whichever one you happen to be on, preferring 5 GHz where the signal is equal, and stays put if the one you are on is already healthy. If the stronger one turns out not to accept the connection, the previous one is restored. After that the lock keeps you on that one access point, so if you carry your device somewhere a much stronger one is in range, the panel says so and **Move the lock** moves it. It moves on its own only after a wake, from a weak access point to a clearly stronger one (never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's), or when the pinned one has been out of reach for a minute. It only applies to the network it was turned on for, so other networks you join are left alone. Disable it if you need to roam between access points. Needs the `wpa_supplicant` backend: under `iwd`, NetworkManager can't reconnect a network pinned this way, so the lock is paused, and its pins removed, while `iwd` is in use. |
 | Auto-fix on wake | Installs a script that reapplies your settings every time WiFi reconnects. Works even if Decky isn't running. |
 | Network buffer tuning | Increases kernel buffer sizes to handle bursty streaming traffic without dropping packets |
 
@@ -112,11 +112,13 @@ The plugin has two parts:
 
 The panel polls for live status only while it is open. A few things run
 without it: the dispatcher script, whenever WiFi reconnects; a reapply of the
-volatile settings shortly after a game launches; a check every 20 seconds,
-while the access point lock or a band preference is on, that releases a pin
+volatile settings shortly after a game launches; a check every 20 seconds
+that, while the access point lock or a band preference is on, releases a pin
 keeping the device offline and, after a wake, moves the lock off a weak access
-point (never during a game or stream, and for now only on the Steam Deck OLED); and the update check twice a day, unless **Tell me
-about updates** is off. In streaming auto mode the plugin also checks every few
+point (never during a game or stream, and for now only on Qualcomm ath11k cards
+such as the Steam Deck OLED's), and that, when WiFi is still down a minute and a
+half after a wake, notes the WiFi card's state in the log once; and the update
+check twice a day, unless **Tell me about updates** is off. In streaming auto mode the plugin also checks every few
 seconds whether a streaming app is running.
 
 ## Uninstall

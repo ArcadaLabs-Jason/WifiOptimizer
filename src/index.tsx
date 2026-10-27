@@ -83,8 +83,8 @@ const IWD_PIN_NOTICE = "Paused under iwd. Switch to wpa_supplicant in Advanced t
 const IWD_OFF_NOTICE = "Needs wpa_supplicant. Switch to it in Advanced.";
 const BACKEND_POLL_MAX_FAILURES = 5;
 // The lock moves by itself after a wake only on drivers whose names start
-// with this, the Steam Deck OLED's ath11k, the one card it was measured on
-// (C25, the same test as the backend's).
+// with this: Qualcomm ath11k, measured on the Steam Deck OLED's card (C25,
+// C28, the same test as the backend's).
 const WAKE_MOVE_DRIVER = "ath11k";
 // How long the backend keeps an after-wake move's outcome at most (C22).
 const WAKE_MOVE_KEPT_S = 12 * 60 * 60;
@@ -1882,11 +1882,12 @@ function Content() {
         <InfoRow
           label="Stop background scanning"
           subtitle="The access point lock: pins one access point. Turn off to roam."
-          // The move after a wake runs only on the card it was measured on
-          // (C25), so the (i) promises it nowhere else.
+          // The move after a wake runs only on ath11k cards (C25), and only
+          // from a weak link (main.py _STRONG_ENOUGH_DBM), so the (i)
+          // promises it nowhere else.
           explanation={`Stops the scans for a better access point, which make a stream stutter, by pinning the strongest access point of this network. Only for the network you turn it on for. ${
             s?.driver?.startsWith(WAKE_MOVE_DRIVER)
-              ? "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one."
+              ? "It stays there until you move it or turn the lock off. After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one."
               : "It stays there until you move it or turn the lock off."
           } Turning it on or off reconnects WiFi for up to half a minute.`}
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
