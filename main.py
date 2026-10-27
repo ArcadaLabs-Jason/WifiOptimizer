@@ -4633,16 +4633,21 @@ class Plugin:
     def _take_detected_driver(detected, saved, pci_now) -> bool:
         """Whether a load or Reset records the driver detected now over the
         one saved. With the radio missing ("unknown"), only when nothing was
-        saved. Over a driver the plugin has a profile for, only one it has a
-        profile for too, and only while a WiFi card is on PCI: with the
-        built-in card gone after a bad wake, the detected one is a USB
-        adapter's, and taking it would drop the built-in card's fixes (its
-        modprobe options) at the next boot."""
+        saved. Over a driver the plugin has a profile for, only while a WiFi
+        card is on PCI: with the built-in card gone after a bad wake, the
+        detected one is a USB adapter's, and taking it would drop the
+        built-in card's fixes (its modprobe options) at the next boot.
+
+        With a card on PCI the detected driver is that card's
+        (_detect_wifi_driver reads it first), so it is taken whether or not
+        the plugin has a profile for it: a card swapped for one it has none
+        for (an MT7925, a QCA6174) is then named and treated as unknown
+        hardware, not as the old card."""
         if detected == "unknown":
             return saved in (None, "", "unknown")
         if saved not in DRIVER_PROFILES:
             return True
-        return detected in DRIVER_PROFILES and bool(pci_now)
+        return bool(pci_now)
 
     def _pci_wifi_interface(self) -> str | None:
         """The wireless netdev on PCI, for telling which card a device is

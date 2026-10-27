@@ -21539,6 +21539,102 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+# ---- QA pass 9, LIFECYCLE (L1-L15) ----
+# Each section is named after its item in session-artifacts/qa-0.24.4/pass9-triage.md.
+
+
+section("L1 pass 9 a card swapped for one the plugin has no profile for is taken at a load and Reset; every older case holds")
+try:
+    _sys901 = m.SYSFS_NET
+    _d901, _restore901 = _l_paths()
+    try:
+        def _p901_netdevs(*devs):
+            """A sysfs with one wireless netdev per (name, bus, module)."""
+            root = tempfile.mkdtemp()
+            m.SYSFS_NET = os.path.join(root, "net")
+            os.makedirs(m.SYSFS_NET)
+            for i, (name, bus, module) in enumerate(devs):
+                dev = os.path.join(root, "devices", f"dev{i}")
+                os.makedirs(os.path.join(m.SYSFS_NET, name, "phy80211"))
+                open(os.path.join(m.SYSFS_NET, name, "phy80211", "name"), "w").write(f"phy{i}\n")
+                os.makedirs(os.path.join(dev, "driver"))
+                os.makedirs(os.path.join(root, "bus", bus), exist_ok=True)
+                os.makedirs(os.path.join(root, "module", module), exist_ok=True)
+                os.symlink(os.path.join(root, "bus", bus), os.path.join(dev, "subsystem"))
+                os.symlink(os.path.join(root, "module", module), os.path.join(dev, "driver", "module"))
+                os.symlink(dev, os.path.join(m.SYSFS_NET, name, "device"))
+
+        class _L901(_LReset):
+            """A load and a Reset that detect the driver from the sysfs above
+            (the real get_device_info and _detect_wifi_driver); `iw phy` lists
+            a 6 GHz channel, as a 6E or 7 card does."""
+            get_device_info = m.Plugin.get_device_info
+            def _get_wifi_interface(self):
+                names = m.Plugin._wireless_netdevs()
+                return names[0] if names else None
+            def _detect_device_family(self): return ("Jupiter", "deck_lcd", "Steam Deck LCD")
+            def _run_cmd(self, cmd, timeout=5):
+                self.cmds.append(cmd)
+                if cmd[:2] == ["/usr/bin/iw", "phy"]:
+                    return _ok("Wiphy phy0\n\tBand 4:\n\t\tFrequencies:\n\t\t\t* 5955 MHz [1] (disabled)\n")
+                return _ok()
+
+        _base901 = {k: v for k, v in base_ap.items() if k not in ("driver", "chip_label", "supports_6ghz")}
+
+        def _p901(saved, devs, how):
+            _p901_netdevs(*devs)
+            m._save_settings({**_base901, "driver": saved, "chip_label": "WiFi 5 (RTL8822CE)",
+                              "supports_6ghz": False})
+            p = _L901()
+            if how == "load":
+                asyncio.run(p._main())
+            else:
+                asyncio.run(p.reset_settings())
+            s = m._load_settings()
+            return s.get("driver"), s.get("chip_label"), s.get("supports_6ghz"), p._get_support_tier()
+
+        # The item: the LCD's RTL8822CE swapped for an MT7925 (mt7925e) or a QCA6174 (ath10k_pci).
+        for _how in ("load", "Reset"):
+            _got = _p901("rtw88", [("wlan0", "pci", "mt7925e")], _how)
+            ok(_got == ("mt7925e", "unknown", True, 3),
+               f"{_how}: rtw88 saved, an MT7925 on PCI -> its driver, no old chip name, 6 GHz from the card, tier 3 ({_got})")
+            _got = _p901("rtw88", [("wlan0", "pci", "ath10k_pci")], _how)
+            ok(_got[0] == "ath10k_pci" and _got[3] == 3,
+               f"{_how}: rtw88 saved, a QCA6174 on PCI -> ath10k_pci, tier 3 ({_got})")
+        # Every case the driver recording handled before (v0.24.5-beta's "any
+        # detected driver but unknown", and pass 8's USB guard) still holds.
+        _old901 = {
+            # (saved, devices, how): driver kept or taken
+            ("rtw88", (), "load"): "rtw88",                     # radio missing: the saved one kept
+            ("rtw88", (), "Reset"): "rtw88",
+            ("mt7925e", (), "load"): "mt7925e",                 # also when it has no profile
+            ("", (), "load"): "unknown",                        # nothing saved: unknown recorded
+            ("unknown", (), "Reset"): "unknown",
+            ("mt7921e", (("wlan1", "usb", "rtw89_8852bu"),), "load"): "mt7921e",   # pass 8 L10: USB only
+            ("mt7921e", (("wlan1", "usb", "rtw89_8852bu"),), "Reset"): "mt7921e",
+            ("mt7921e", (("wlan1", "usb", "rtw88_8822cu"),), "load"): "mt7921e",   # a USB one with a profile
+            ("mt7921e", (("wlan1", "usb", "mt7921u"),), "Reset"): "mt7921e",       # a USB one without
+            ("", (("wlan1", "usb", "rtw89_8852bu"),), "load"): "rtw89",            # none saved: taken
+            ("mt7921e", (("wlan0", "pci", "rtw89_8852be"),), "load"): "rtw89",     # profiled swap
+            ("mt7925e", (("wlan0", "pci", "rtw88_8822ce"),), "Reset"): "rtw88",    # swapped back
+            ("rtw88", (("wlan0", "pci", "rtw88_8822ce"),), "load"): "rtw88",       # same card
+            ("rtw88", (("wlan1", "usb", "rtw89_8852bu"), ("wlan0", "pci", "mt7925e")), "load"): "mt7925e",  # the item, USB listed first
+        }
+        _bad901 = {}
+        for (_saved, _devs, _how), _want in _old901.items():
+            _got = _p901(_saved, list(_devs), _how)[0]
+            if _got != _want:
+                _bad901[(_saved, _devs, _how)] = _got
+        ok(not _bad901, f"every older case keeps its answer (wrong: {_bad901})")
+    finally:
+        _restore901()
+        m.SYSFS_NET = _sys901
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
