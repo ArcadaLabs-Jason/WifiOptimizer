@@ -22116,5 +22116,61 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+section("0.24.7 Force reapply logs what it found before changing anything")
+try:
+    class _R7(m.Plugin):
+        def __init__(self, ps="Power save: on\n", dump=None):
+            super().__init__(); self.ps = ps; self.dump = dump
+        def _get_wifi_interface(self): return "wlan0"
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[-2:] == ["get", "power_save"]:
+                return _ok(self.ps) if self.ps is not None else {"success": False, "stdout": "", "stderr": "x"}
+            if cmd[-2:] == ["station", "dump"]:
+                return _ok(self.dump) if self.dump is not None else {"success": False, "stdout": "", "stderr": "x"}
+            return _ok()
+    _r7_dump = ("Station d8:07:b6:90:c7:d1 (on wlan0)\n\tinactive time:\t12 ms\n"
+                "\trx bytes:\t1000\n\ttx retries:\t5321\n\ttx failed:\t17\n"
+                "\trx drop misc:\t4\n\tsignal:  \t-42 [-42, -45] dBm\n\tsignal avg:\t-43 [-43, -46] dBm\n"
+                "\ttx bitrate:\t780.0 MBit/s VHT-MCS 8 80MHz short GI VHT-NSS 2\n"
+                "\trx bitrate:\t173.4 MBit/s VHT-MCS 9 VHT-NSS 2\n"
+                "\tbeacon loss:\t3\n\tconnected time:\t2400 seconds\n")
+    _r7_snap = _R7(dump=_r7_dump)._reapply_link_snapshot()
+    for _r7_want in ("power_save=on", "signal=-42", "signal_avg=-43", "tx_bitrate=780.0/80MHz",
+                     "rx_bitrate=173.4", "tx_retries=5321", "tx_failed=17", "rx_drop_misc=4",
+                     "beacon_loss=3", "connected_time=2400"):
+        ok(_r7_want in _r7_snap.split(), f"the snapshot carries {_r7_want} ({_r7_snap})")
+    ok("d8:07" not in _r7_snap.lower(), "and no address")
+    _r7_bad = _R7(ps=None, dump=None)._reapply_link_snapshot()
+    ok(_r7_bad == "power_save=unread station=unread", f"unreadable says so ({_r7_bad})")
+
+    # The line comes first, with the drift the panel shows, and a failure to
+    # read never stops the reapply.
+    _r7_logged = []
+    _r7_real_info, _r7_real_err = m.decky.logger.info, m.decky.logger.error
+    m.decky.logger.info = staticmethod(lambda msg: _r7_logged.append(str(msg)))
+    m.decky.logger.error = staticmethod(lambda msg: _r7_logged.append("E " + str(msg)))
+    try:
+        m._save_settings(dict(base_ap))
+        _r7 = _R7(dump=_r7_dump)
+        async def _r7_status(): return {"drift": {"power_save": True, "cake": False}}
+        _r7.get_status = _r7_status
+        _r7_res = asyncio.run(_r7.reapply_all())
+        ok(_r7_logged and _r7_logged[0].startswith("Force reapply found power_save not holding; link: "),
+           f"the first line says what was found ({_r7_logged[:1]})")
+        _r7_logged.clear()
+        _r7 = _R7(dump=_r7_dump)
+        async def _r7_status_fail(): raise RuntimeError("nmcli gone")
+        _r7.get_status = _r7_status_fail
+        _r7_res = asyncio.run(_r7.reapply_all())
+        ok(any(l.startswith("E Force reapply could not read") for l in _r7_logged)
+           and _r7_res.get("success"), f"a failed read is logged and the reapply goes on ({_r7_res})")
+    finally:
+        m.decky.logger.info, m.decky.logger.error = _r7_real_info, _r7_real_err
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

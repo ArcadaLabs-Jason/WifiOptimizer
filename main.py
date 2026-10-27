@@ -13048,6 +13048,7 @@ class Plugin:
             if self._profile_change_refused():
                 return self._busy_result()
 
+            await self._log_reapply_found()
             settings = _load_settings()
             results = {}
             applied = 0
@@ -13197,6 +13198,56 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"reapply_all error: {e}")
             return self._unexpected_response(e)
+
+    async def _log_reapply_found(self):
+        """One log line before Force reapply changes anything: the settings
+        that had stopped holding (the drift the panel shows) and the link as
+        it stood. People press Force reapply when the connection has gone
+        bad, and its radio cycle wipes every trace of why: a stream that
+        collapsed after 40 minutes and came back at once on a reapply to the
+        same access point left nothing else to tell a setting that slipped
+        from a link that stalled. Never stops the reapply."""
+        try:
+            status = await self.get_status()
+            drifted = sorted(k for k, v in (status.get("drift") or {}).items() if v)
+            link = await asyncio.to_thread(self._reapply_link_snapshot)
+            decky.logger.info(
+                "Force reapply found "
+                + (f"{', '.join(drifted)} not holding" if drifted else "every setting holding")
+                + (f"; link: {link}" if link else ""))
+        except Exception as e:
+            decky.logger.error(f"Force reapply could not read what it found: {e}")
+
+    # What _reapply_link_snapshot keeps from `iw dev <if> station dump`.
+    _REAPPLY_STATION_FIELDS = ("signal", "signal avg", "tx bitrate", "rx bitrate",
+                               "tx retries", "tx failed", "rx drop misc", "beacon loss",
+                               "connected time")
+
+    def _reapply_link_snapshot(self) -> str:
+        """Power save and the station's numbers (signal, rates, retries,
+        failures, beacon loss), "" when there is no WiFi interface. A bitrate
+        keeps its value and channel width only. In a worker thread: iw."""
+        iface = self._get_wifi_interface()
+        if not iface or not IFACE_RE.match(iface):
+            return ""
+        words = []
+        ps = self._run_cmd(["/usr/bin/iw", "dev", iface, "get", "power_save"], timeout=3)
+        found = re.search(r"Power save:\s*(\w+)", ps.get("stdout", "")) if ps.get("success") else None
+        words.append(f"power_save={found.group(1) if found else 'unread'}")
+        dump = self._run_cmd(["/usr/bin/iw", "dev", iface, "station", "dump"], timeout=3)
+        if not dump.get("success"):
+            words.append("station=unread")
+        else:
+            for line in dump.get("stdout", "").split("\n"):
+                key, sep, value = line.strip().partition(":")
+                if not sep or key not in self._REAPPLY_STATION_FIELDS:
+                    continue
+                value = value.split()
+                keep = value[:1]
+                if key.endswith("bitrate"):
+                    keep += [w for w in value if w.endswith("MHz")][:1]
+                words.append(f"{key.replace(' ', '_')}={'/'.join(keep) or '?'}")
+        return _mask_addresses(_tool_text(" ".join(words)))[:400]
 
     def _reapply_context(self, backend: bool = True) -> tuple:
         """(active profile, its network, whether iwd is in use) for
