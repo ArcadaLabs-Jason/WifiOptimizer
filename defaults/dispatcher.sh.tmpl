@@ -36,8 +36,9 @@ if [ ! -d "$PLUGIN_DIR" ]; then
     rm -f "$0"
     rm -f /etc/NetworkManager/conf.d/99-wifi-optimizer.conf
     rm -f /etc/modprobe.d/99-wifi-optimizer.conf
-    # A report waiting to be sent, and the wake notice's record of the
-    # wake it last showed: nothing is left to send them or read them.
+    # A report waiting to be sent, and what was sent: nothing is left to
+    # send or show them. The wake notice's record in /run stays until the
+    # next boot, so a reinstall does not ask about an answered wake again.
     rm -rf /var/lib/wifi-optimizer
     exit 0
 fi
@@ -87,13 +88,53 @@ if [ -f "$SETTINGS_FILE" ] && [ -r "$SETTINGS_FILE" ]; then
     # The path is passed as an argument rather than pasted into the program
     # text, so a directory name containing a quote cannot alter what runs. The
     # read is capped so a large file cannot stall every WiFi connect, does not
-    # follow a link or block on a FIFO planted at the name, and takes only a
-    # regular file. -I keeps Python from importing anything from the
-    # environment or the current directory.
+    # block on a FIFO planted at the name, and takes only a regular file. -I
+    # keeps Python from importing anything from the environment or the
+    # current directory. The path is walked the way the plugin walks it: one
+    # directory at a time from /, a link followed only while every directory
+    # so far is root's and no one else can write it, and the link itself
+    # root's (Bazzite's /home). Any other link on the way, or at the name,
+    # and the defaults apply, as they do in the plugin: the two act on the
+    # same settings.
     SETTINGS_RAW=$(python3 -I -c '
-import json, os, sys
+import json, os, stat, sys
+
+def root_only(st):
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+def open_settings(path):
+    parts = [p for p in os.path.abspath(path).split("/") if p]
+    name = parts.pop()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    links = 0
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    trusted = root_only(os.fstat(fd))
+    try:
+        while parts:
+            part = parts.pop(0)
+            try:
+                nxt = os.open(part, flags, dir_fd=fd)
+            except OSError:
+                st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or not trusted or links >= 8:
+                    raise
+                links += 1
+                target = os.readlink(part, dir_fd=fd)
+                if target.startswith("/"):
+                    top = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+                    os.close(fd)
+                    fd = top
+                parts = [p for p in target.split("/") if p] + parts
+                continue
+            os.close(fd)
+            fd = nxt
+            trusted = trusted and root_only(os.fstat(fd))
+        return os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=fd)
+    finally:
+        os.close(fd)
+
 try:
-    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    fd = open_settings(sys.argv[1])
     with os.fdopen(fd, "rb") as fh:
         if (os.fstat(fh.fileno()).st_mode & 0o170000) != 0o100000:
             raise ValueError("not a regular file")
