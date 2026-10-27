@@ -38,6 +38,11 @@ m.AT_LOAD_MARKER = os.path.join(_run_dir, "at-load-logged")
 # And the lock the plugin and the dispatcher share while the fixes change.
 m.APPLY_LOCK_FILE = os.path.join(_run_dir, "apply.lock")
 m.PROC_DIR = os.path.join(tempfile.mkdtemp(), "no-proc")
+# Nor the host's own sysctl files (what buffer tuning puts back without a
+# baseline, D8 pass 8), nor its /run for the wake notice's record (D9 pass 8).
+m.SYSCTL_D_DIRS = (os.path.join(tempfile.mkdtemp(), "no-sysctl.d"),)
+m.SYSCTL_CONF_FILE = os.path.join(tempfile.mkdtemp(), "no-sysctl.conf")
+m.WAKE_SEEN_FILE = os.path.join(_run_dir, "wake-notice-seen")
 # Nor the host's radios or radio switches: the backend switch's interface
 # recovery lists every wiphy, and the not-connected reason reads rfkill.
 m.SYSFS_IEEE80211 = os.path.join(tempfile.mkdtemp(), "no-ieee80211")
@@ -10215,6 +10220,10 @@ try:
     def _rep_reset():
         import shutil
         shutil.rmtree(_rep_dir, ignore_errors=True)
+        # The wake notice's record lives in /run since pass 8 (D9), where
+        # removing the report folder no longer takes it.
+        if os.path.exists(getattr(m, "WAKE_SEEN_FILE", "")):
+            os.remove(m.WAKE_SEEN_FILE)
 
     def _pending_path(): return os.path.join(_rep_dir, getattr(m, "REPORT_PENDING_NAME", "pending-report.json"))
 
@@ -20474,6 +20483,635 @@ try:
     ok("Couldn't install the auto-fix script. Restart the device, then try again." in _src813
        and "The filesystem may be read-only." not in _src813,
        "L15: the auto-fix install failure says what to do, as the panel's own text")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
+section("D1 pass 8 the after-wake card line carries NetworkManager's, the card interface's and iw's state, and the port's link")
+try:
+    _r81 = tempfile.mkdtemp()
+    _dev81 = os.path.join(_r81, "devices", "pci0000:00", "0000:00:1c.0", "0000:01:00.0")
+    os.makedirs(os.path.join(_dev81, "link")); os.makedirs(os.path.join(_dev81, "driver"))
+    for _f81, _v81 in (("power_state", "D0"), ("link/clkpm", "1"), ("link/l1_aspm", "0"),
+                       ("link/l1_1_aspm", "0"), ("link/l1_2_aspm", "0")):
+        open(os.path.join(_dev81, _f81), "w").write(_v81 + "\n")
+    os.makedirs(os.path.join(_r81, "modules", "rtw88_pci")); os.makedirs(os.path.join(_r81, "bus", "pci"))
+    os.symlink(os.path.join(_r81, "modules", "rtw88_pci"), os.path.join(_dev81, "driver", "module"))
+    os.symlink(os.path.join(_r81, "bus", "pci"), os.path.join(_dev81, "subsystem"))
+    os.makedirs(os.path.join(_r81, "net", "wlan0", "phy80211"))
+    os.symlink(_dev81, os.path.join(_r81, "net", "wlan0", "device"))
+    _bin81 = os.path.join(_r81, "bin"); os.makedirs(_bin81)
+    open(os.path.join(_bin81, "lspci"), "w").write("#!/bin/sh\n"); os.chmod(os.path.join(_bin81, "lspci"), 0o755)
+    # The card still on the bus (H1, firmware stuck), the port above it with
+    # its data link down.
+    _CARD81 = ("01:00.0 Network controller: Realtek Semiconductor Co., Ltd. RTL8822CE 802.11ac PCIe "
+               "Wireless Network Adapter\n"
+               "\tLnkCap:\tPort #0, Speed 2.5GT/s, Width x1, ASPM L0s L1\n"
+               "\tLnkSta:\tSpeed 5GT/s, Width x1\n\t\tTrErr- Train- SlotClk+ DLActive+ BWMgmt- ABWMgmt-\n")
+    _PORT81 = ("00:1c.0 PCI bridge: Advanced Micro Devices, Inc. [AMD] Device 1634\n"
+               "\tLnkCap:\tPort #2, Speed 8GT/s, Width x1, ASPM L1\n"
+               "\tLnkSta:\tSpeed 2.5GT/s (downgraded), Width x1\n"
+               "\t\tTrErr- Train- SlotClk+ DLActive- BWMgmt- ABWMgmt-\n")
+
+    class _P81(m.Plugin):
+        def __init__(self, general):
+            super().__init__(); self.general = general; self.cmds = []; self.offset = [100.0]
+        def _suspend_offset(self):
+            return self.offset[0]
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(list(cmd))
+            if cmd[0] == "/usr/bin/nmcli" and cmd[-1] == "general":
+                return _ok(self.general + "\n")
+            if cmd[0] == "/usr/bin/nmcli" and cmd[-2:] == ["device", "status"]:
+                return _ok("lo:loopback:unmanaged\nwlan0:wifi:unavailable\np2p-dev-wlan0:wifi-p2p:disconnected\n")
+            if cmd[0].endswith("/lspci"):
+                return _ok(_PORT81 if cmd[-1] == "0000:00:1c.0" else _CARD81)
+            return _ok()
+        def logged(self):
+            return [c[-1] for c in self.cmds if c[:4] == ["/usr/bin/logger", "-t", "wifi-optimizer", "--"]]
+
+    _keep81 = (m.SYSFS_NET, m.TOOL_DIRS, m.SETTINGS_FILE)
+    _off81, _restore81 = _dv5_clock()
+    _stuck81 = None
+    try:
+        m.SYSFS_NET = os.path.join(_r81, "net"); m.TOOL_DIRS = (_bin81,)
+        m.SETTINGS_FILE = os.path.join(_r81, "settings.json")
+        open(m.SETTINGS_FILE, "w").write(json.dumps({"driver": "rtw88"}))
+
+        def _run81(general, stuck):
+            global _stuck81
+            _p = _P81(general)
+            if stuck:
+                # A real iw left behind stuck in the driver, as _run_cmd
+                # records one: still running.
+                _stuck81 = _dv5_sp.Popen(["sleep", "30"])
+                _p._abandoned_record().append(("iw", _stuck81))
+            asyncio.run(_p._wake_lock_check())          # before the sleep
+            _p.offset[0] += 600.0                        # slept ten minutes
+            asyncio.run(_p._wake_lock_check())          # the wake is seen
+            _off81[0] += _p._WAKE_CONNECT_WAIT + 5
+            asyncio.run(_p._wake_lock_check())
+            if _stuck81 is not None:
+                _stuck81.kill(); _stuck81.wait(); _stuck81 = None
+            return _p.logged()
+        _l81 = _run81("disconnected:enabled", True)
+        _line81 = _l81[0] if _l81 else ""
+        ok(len(_l81) == 1 and "nm=disconnected radio=enabled wlan=unavailable iw_stuck=yes" in _line81,
+           f"NetworkManager disconnected, the card's interface unavailable, an iw stuck: all on the line ({_line81})")
+        ok("LnkSta: Speed 5GT/s, Width x1 TrErr- Train- SlotClk+ DLActive+" in _line81
+           and "port LnkSta: Speed 2.5GT/s (downgraded), Width x1 TrErr- Train- SlotClk+ DLActive-" in _line81
+           and "power_state=D0" in _line81,
+           "with the card's LnkSta, and the port's LnkSta named as the port's")
+        ok("Port #" not in _line81 and "LnkCap" not in _line81 and "PCI bridge" not in _line81
+           and not re.search(r"(?i)(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}", _line81)
+           and not m._IPV4_RE.search(_line81) and len(_line81.encode()) <= 1024,
+           f"nothing else of the port, no address, and within logger's 1 KiB ({len(_line81.encode())})")
+        _l81b = _run81("asleep:enabled", False)
+        _line81b = _l81b[0] if _l81b else ""
+        ok("nm=asleep radio=enabled wlan=unavailable iw_stuck=no" in _line81b,
+           f"NetworkManager that missed the resume reads differently from a stuck card ({_line81b})")
+    finally:
+        if _stuck81 is not None:
+            _stuck81.kill(); _stuck81.wait()
+        m.SYSFS_NET, m.TOOL_DIRS, m.SETTINGS_FILE = _keep81
+        _restore81()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D4 pass 8 the card line never describes a USB adapter in place of the card that died")
+try:
+    _r84 = tempfile.mkdtemp()
+    # The USB adapter in use: its netdev and wiphy are all that is left.
+    _usb84 = _d_netdev(_r84, "wlan1", "rtw88_8821cu", bus="usb")
+    open(os.path.join(_usb84, "power_state"), "w").write("D0\n")
+    os.makedirs(os.path.join(_r84, "ieee80211", "phy1"))
+    os.symlink(_usb84, os.path.join(_r84, "ieee80211", "phy1", "device"))
+
+    class _P84(m.Plugin):
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0] == "/usr/bin/nmcli" and cmd[-2:] == ["device", "status"]:
+                return _ok("wlan1:wifi:disconnected\n")
+            return _ok()
+    _keep84 = (m.SYSFS_NET, m.SYSFS_IEEE80211, m.SETTINGS_FILE)
+    try:
+        m.SYSFS_NET = os.path.join(_r84, "net"); m.SYSFS_IEEE80211 = os.path.join(_r84, "ieee80211")
+        m.SETTINGS_FILE = os.path.join(_r84, "settings.json")
+        open(m.SETTINGS_FILE, "w").write(json.dumps({"driver": "rtw88"}))
+        _p84 = _P84(); _p84._wake_card_nm = ("disconnected", "enabled")
+        _line84 = _p84._wake_card_line()
+        ok("no rtw88 card found" in _line84 and "power_state" not in _line84
+           and "not a PCIe device" not in _line84 and "wlan=" not in _line84,
+           f"rtw88's card gone (netdev and wiphy), a USB wlan1 up: said so, nothing of wlan1's ({_line84})")
+        # Its wiphy still there with the PCI device under it: that is described.
+        _card84 = os.path.join(_r84, "devices", "pci0000:00", "0000:00:1c.0", "0000:01:00.0")
+        os.makedirs(os.path.join(_card84, "driver"))
+        open(os.path.join(_card84, "power_state"), "w").write("D3hot\n")
+        os.makedirs(os.path.join(_r84, "modules", "rtw88_pci"))
+        os.symlink(os.path.join(_r84, "modules", "rtw88_pci"), os.path.join(_card84, "driver", "module"))
+        os.makedirs(os.path.join(_r84, "bus", "pci"), exist_ok=True)
+        os.symlink(os.path.join(_r84, "bus", "pci"), os.path.join(_card84, "subsystem"))
+        os.makedirs(os.path.join(_r84, "ieee80211", "phy0"))
+        os.symlink(_card84, os.path.join(_r84, "ieee80211", "phy0", "device"))
+        _line84b = _P84()._wake_card_line()
+        ok("power_state=D3hot" in _line84b and "wlan=none" in _line84b and "no rtw88 card found" not in _line84b,
+           f"the card's wiphy outlived its netdev: the card itself is described ({_line84b})")
+        # No driver profile known: the interface in use is all there is to go by.
+        open(m.SETTINGS_FILE, "w").write(json.dumps({"driver": "unknown"}))
+        import shutil as _sh84
+        _sh84.rmtree(os.path.join(_r84, "ieee80211", "phy0"))
+        _line84c = _P84()._wake_card_line()
+        ok("power_state=D0" in _line84c and "wlan=disconnected" in _line84c,
+           f"with no driver profile the interface in use is described, as before ({_line84c})")
+    finally:
+        m.SYSFS_NET, m.SYSFS_IEEE80211, m.SETTINGS_FILE = _keep84
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D2 pass 8 the wake rule reads the plugin's card line: a dead card, and WiFi that came up then died")
+try:
+    class _P82J(m.Plugin):
+        """The previous boot's journal, answering journalctl's match groups
+        the way it takes them (terms AND within a group, "+" between groups),
+        so a line under the plugin's tag counts only as root's."""
+        def __init__(self, rows):
+            super().__init__(); self.rows = sorted(rows, key=lambda r: r[0])
+        @staticmethod
+        def _fields(who, uid):
+            if who == "kernel":
+                return {"_TRANSPORT": "kernel", "_UID": "0"}
+            name = who.split("[")[0]
+            unit = "NetworkManager.service" if name == "NetworkManager" else "plugin_loader.service"
+            return {"_TRANSPORT": "syslog", "SYSLOG_IDENTIFIER": name, "_SYSTEMD_UNIT": unit, "_UID": str(uid)}
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[0] != "/usr/bin/journalctl":
+                return _ok()
+            valued = ("-b", "-o", "-n", "--grep", "--since", "--until", "-t", "-u")
+            opts, groups, i = {}, [[]], 1
+            while i < len(cmd):
+                a = cmd[i]
+                if a in valued:
+                    opts[a] = cmd[i + 1]; i += 2; continue
+                if a == "+":
+                    groups.append([])
+                elif "=" in a and not a.startswith("-"):
+                    groups[-1].append(tuple(a.split("=", 1)))
+                elif a == "-k":
+                    opts["-k"] = True
+                i += 1
+            rows = []
+            for row in self.rows:
+                t, who, msg = row[:3]
+                f = self._fields(who, row[3] if len(row) > 3 else 0)
+                if opts.get("-k") and f["_TRANSPORT"] != "kernel":
+                    continue
+                if any(g for g in groups) and not any(all(f.get(k) == v for k, v in g) for g in groups if g):
+                    continue
+                if "--grep" in opts and not re.search(opts["--grep"], msg):
+                    continue
+                if "--since" in opts and _P4_U + t < float(opts["--since"][1:]):
+                    continue
+                if "--until" in opts and _P4_U + t > float(opts["--until"][1:]):
+                    continue
+                rows.append((t, who, msg))
+            if "-n" in opts:
+                rows = rows[-int(opts["-n"]):]
+            return _ok("".join(f"{_P4_U + t:.6f} {who}: {msg}\n" for t, who, msg in rows))
+
+    def _w82(rows):
+        return _P82J(rows)._read_wake_failure()
+    _W82 = _P4_U + 4001
+    _CL82 = getattr(m, "WAKE_CARD_LINE", "WiFi not connected after a wake, the card:")
+    _HEALTHY82 = (_CL82 + " nm=disconnected radio=enabled wlan=unavailable iw_stuck=no power_state=D0 clkpm=1 "
+                  "l1_aspm=0 l1_1_aspm=0 l1_2_aspm=0 | 01:00.0 Network controller: Realtek Semiconductor Co., "
+                  "Ltd. RTL8822CE 802.11ac PCIe Wireless Network Adapter | LnkSta: Speed 2.5GT/s, Width x1")
+    _REVFF82 = (_CL82 + " nm=disconnected radio=enabled wlan=unavailable iw_stuck=no power_state=D0 clkpm=1 "
+                "l1_aspm=0 l1_1_aspm=0 l1_2_aspm=0 | 01:00.0 Network controller: Realtek Semiconductor Co., "
+                "Ltd. RTL8822CE 802.11ac PCIe Wireless Network Adapter (rev ff) (prog-if ff) | "
+                "!!! Unknown header type 7f")
+    _NMW82 = [(999.0, _P4_NM, "<info>  [1.0] manager: sleep: sleep requested (sleeping: no  enabled: yes)"),
+              (4002.0, _P4_NM, "<info>  [1.0] manager: sleep: wake requested (sleeping: yes  enabled: yes)"),
+              (4003.0, _P4_NM, "<info>  [1.0] device (wlan0): state change: unavailable -> disconnected "
+                               "(reason 'supplicant-available', sys-iface-state: 'managed')")]
+    # (a) 01's silent dead radio: no driver line, NetworkManager woke, and
+    # nothing more for 1000 s; the plugin's line 90 s after the wake.
+    _a82 = _P4_UP + _NMW82 + _p4_cycle(1000, attempt=False, end=1000)
+    _g82 = _w82(_a82 + [(4091.0, "wifi-optimizer[4242]", _REVFF82, 0)])
+    ok(_g82 == _W82, f"(a) a card line showing the card off the bus (rev ff): a failed wake ({_g82})")
+    for _dead82 in ("power_state=D3cold", "power_state=D3hot"):
+        _g82 = _w82(_a82 + [(4091.0, "wifi-optimizer[4242]", _HEALTHY82.replace("power_state=D0", _dead82), 0)])
+        ok(_g82 == _W82, f"(a) a card line with {_dead82}: a failed wake ({_g82})")
+    _g82 = _w82(_a82 + [(4091.0, "wifi-optimizer[4242]", _CL82 + " no rtw88 card found nm=disconnected radio=enabled", 0)])
+    ok(_g82 == _W82, f"(a) a card line that found no rtw88 card: a failed wake ({_g82})")
+    _g82 = _w82(_a82 + [(4091.0, "wifi-optimizer[4242]", _HEALTHY82, 0)])
+    ok(_g82 == 0, f"(a) the same with the card in D0 and answering, and no driver line: no notice "
+                  f"(away from every network looks the same) ({_g82})")
+    _g82 = _w82(_a82 + [(4091.0, "wifi-optimizer[4242]", _REVFF82, 1000)])
+    ok(_g82 == 0, f"(a) a dead-card line under the tag from uid 1000 counts for nothing ({_g82})")
+
+    # (b) 01's reassociated, then died: up at +10 s, rtw88's soft errors at
+    # +60 s, the device drops, one attempt fails, nothing came up again.
+    _SOFT82 = ("rtw_8822ce 0000:01:00.0: timed out to flush queue 1",
+               "rtw_8822ce 0000:01:00.0: failed to send h2c command")
+    _died82 = [(4061.0 + i / 10, "kernel", e) for i, e in enumerate(_SOFT82)]
+    _drop82 = [(4062.0, _P4_NM, "<info>  [1.0] device (wlan0): state change: activated -> disconnected "
+                                "(reason 'supplicant-disconnect', sys-iface-state: 'managed')"),
+               (4070.0, _P4_NM, "<info>  [1.0] device (wlan0): Activation: starting connection "
+                                "'Home' (1b2c3d4e-0000-0000-0000-000000000001)"),
+               (4095.0, _P4_NM, "<info>  [1.0] device (wlan0): state change: config -> failed "
+                                "(reason 'supplicant-timeout', sys-iface-state: 'managed')")]
+    _b82 = _P4_UP + _p4_cycle(1000, associate=True, end=3600) + _died82 + _drop82
+    _g82 = _w82(_b82 + [(4091.0, "wifi-optimizer[4242]", _HEALTHY82, 0)])
+    ok(_g82 == _W82, f"(b) up after the wake, soft errors, a failed attempt, then the card line: a failed wake ({_g82})")
+    _g82 = _w82(_b82)
+    ok(_g82 == 0, f"(b) the same with no card line (WiFi was connected 90 s after the wake): no notice ({_g82})")
+    _later82 = [(4200.0, "kernel", "wlan0: associated"),
+                (4201.0, _P4_NM, "<info>  [1.0] device (wlan0): state change: secondaries -> activated "
+                                 "(reason 'none', sys-iface-state: 'managed')")]
+    _g82 = _w82(_b82 + [(4091.0, "wifi-optimizer[4242]", _HEALTHY82, 0)] + _later82)
+    ok(_g82 == 0, f"(b) and with WiFi up again later: no notice ({_g82})")
+    _g82 = _w82(_P4_UP + _p4_cycle(1000, associate=True, end=3600) + _died82
+                + [(4091.0, "wifi-optimizer[4242]", _HEALTHY82, 0)])
+    ok(_g82 == _W82, f"(b) soft errors, no attempt, never up again after the card line: a failed wake ({_g82})")
+    _g82 = _w82(_b82 + [(4091.0, "wifi-optimizer[4242]", _HEALTHY82, 1000)])
+    ok(_g82 == 0, f"(b) the card line from uid 1000 is ignored ({_g82})")
+    ok(re.escape(_CL82) in getattr(m, "_WAKE_EVENT_GREP", ""),
+       "the events read asks journalctl for the card line by name")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D3 pass 8 only a line naming WiFi is read as WiFi switched off after a wake")
+try:
+    _W83 = _P4_U + 4001
+    _a83 = _P4_UP + _p4_cycle(1000, errors=_P4_LCD_ERRORS, attempt=False)
+    ok(_dv5_wake(_a83) == _W83, "a failed wake to start from")
+    for _l83, _who83 in (("<info>  [1.0] manager: rfkill: WWAN hardware radio set disabled", _P4_NM),
+                         ("<info>  [1.0] manager: rfkill: WWAN now disabled by radio killswitch", _P4_NM),
+                         ("rfkill: input handler disabled", "kernel"),
+                         ("<info>  [1.0] device (wlan0): supplicant interface state: disabled -> inactive", _P4_NM)):
+        _g83 = _dv5_wake(_a83 + [(4010.0, _who83, _l83)])
+        ok(_g83 == _W83, f"'{_l83.split('] ')[-1]}' after it: still a failed wake ({_g83})")
+    for _l83 in ("<info>  [1.0] manager: rfkill: Wi-Fi hardware radio set disabled",
+                 "<info>  [1.0] manager: rfkill: Wi-Fi now disabled by radio killswitch",
+                 '<info>  [1.0] audit: op="radio-control" arg="wireless-enabled:off" pid=1 uid=1000 result="success"'):
+        _g83 = _dv5_wake(_a83 + [(4010.0, _P4_NM, _l83)])
+        ok(_g83 == 0, f"'{_l83.split('] ')[-1]}' after it and left off: no notice, as before ({_g83})")
+    _g83 = _dv5_wake(_a83 + [(4010.0, _P4_NM, "<info>  [1.0] manager: rfkill: Wi-Fi hardware radio set disabled"),
+                             (4015.0, _P4_NM, "<info>  [1.0] manager: rfkill: Wi-Fi hardware radio set enabled")])
+    ok(_g83 == _W83, f"WiFi off and straight back on: still a failed wake ({_g83})")
+    _g83 = _dv5_wake(_a83 + [(4010.0, _P4_NM, "<info>  [1.0] manager: rfkill: Wi-Fi hardware radio set disabled"),
+                             (4015.0, _P4_NM, "<info>  [1.0] manager: rfkill: WWAN hardware radio set enabled")])
+    ok(_g83 == 0, f"WiFi off, then the WWAN radio on: WiFi is still off, no notice ({_g83})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D5 pass 8 with Auto-fix on wake off, rtw88's disable_aspm is set once WiFi connects")
+try:
+    _r85 = tempfile.mkdtemp(); _run85 = os.path.join(_r85, "run"); os.makedirs(_run85)
+    _sv85 = (m.SYSFS_NET, m.SYSFS_ROOT, m.PCIE_BASELINE_FILE, m.AT_LOAD_MARKER, m.ENFORCED_FILE)
+    _d85, _restore85p = _l_paths()
+    _restore85 = _dv5_sysmod(_r85)
+    _logs85 = []
+    _info85 = m.decky.logger.info
+
+    class _P85(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.nm = "disconnected:enabled"; self.ps = "Power save: on"; self.cmds = []
+        def _reload_nm_conf(self): pass
+        def _suspend_offset(self): return 100.0
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(list(cmd))
+            if cmd[0] == "/usr/bin/nmcli" and cmd[-1] == "general":
+                return _ok(self.nm + "\n")
+            if cmd[0] == "/usr/bin/iw" and cmd[-2:] == ["get", "power_save"]:
+                return _ok(self.ps + "\n")
+            if cmd[0] == "/usr/bin/iw" and cmd[-2:] == ["power_save", "off"]:
+                self.ps = "Power save: off"
+            return _ok()
+
+    def _oper85(state):
+        open(os.path.join(_r85, "net", "wlan0", "operstate"), "w").write(state + "\n")
+
+    def _connect85(p):
+        _oper85("up"); p.nm = "connected:enabled"; p.ps = "Power save: off"
+
+    try:
+        m.SYSFS_ROOT = os.path.realpath(_r85) + "/"
+        m.PCIE_BASELINE_FILE = os.path.join(_run85, "pcie-baseline")
+        m.AT_LOAD_MARKER = os.path.join(_run85, "at-load-logged")
+        m.ENFORCED_FILE = os.path.join(_run85, "last_enforced")
+        _d_netdev(_r85, "wlan0", "rtw88_8822ce", operstate="down")
+        m.SYSFS_NET = os.path.join(_r85, "net")
+        m.decky.logger.info = lambda msg, *a, **k: (_logs85.append(str(msg)), _info85(msg, *a, **k))
+
+        def _fresh85(dispatcher):
+            for _f in (m.AT_LOAD_MARKER, m.PCIE_BASELINE_FILE, m.DISPATCHER_PATH):
+                if os.path.exists(_f): os.remove(_f)
+            if dispatcher:
+                open(m.DISPATCHER_PATH, "w").write("#!/bin/bash\n")
+            _dv5_params(_r85); _oper85("down"); _logs85.clear()
+            m._save_settings({**m.DEFAULT_SETTINGS, "driver": "rtw88", "power_save_disabled": False,
+                              "auto_fix_on_wake": dispatcher})
+            return _P85()
+
+        _p85 = _fresh85(False)
+        _res85 = asyncio.run(_p85.set_power_save(True))
+        ok(_res85.get("success") is True and _dv5_param(_r85) == "N"
+           and _dv5_param(_r85, "rtw88_core/parameters/disable_lps_deep") == "Y",
+           f"Auto-fix off, disconnected, Prevent lag spikes on: disable_aspm not written yet ({_dv5_param(_r85)})")
+        ok(any("disable_aspm left until WiFi connects" in l for l in _logs85)
+           and not any("disable_aspm left for the next connect" in l for l in _logs85),
+           "and the log says it waits until WiFi connects, not for a connect nothing will act on")
+        asyncio.run(_p85._wake_lock_check())
+        ok(_dv5_param(_r85) == "N", "a watch pass while still disconnected writes nothing")
+        _p85.nm = "connected:enabled"; _oper85("up"); _p85.ps = "Power save: on"
+        asyncio.run(_p85._wake_lock_check())
+        ok(_dv5_param(_r85) == "N", "connected but iw reads power save on: nothing (contract C10)")
+        _connect85(_p85)
+        asyncio.run(_p85._wake_lock_check())
+        ok(_dv5_param(_r85) == "Y",
+           f"connected, the card up and iw reading power save off: the next watch pass writes Y ({_dv5_param(_r85)})")
+        _dv5_params(_r85)
+        asyncio.run(_p85._wake_lock_check())
+        ok(_dv5_param(_r85) == "N", "once: the next pass writes nothing more")
+
+        # Prevent lag spikes turned off before WiFi connected: nothing left to do.
+        _p85b = _fresh85(False)
+        asyncio.run(_p85b.set_power_save(True))
+        asyncio.run(_p85b.set_power_save(False))
+        _dv5_params(_r85); _connect85(_p85b)
+        asyncio.run(_p85b._wake_lock_check())
+        ok(_dv5_param(_r85) == "N", "turned off again before WiFi connected: the watch writes nothing")
+
+        # With the dispatcher installed, the connect is its to act on.
+        _p85c = _fresh85(True)
+        asyncio.run(_p85c.set_power_save(True))
+        ok(any("disable_aspm left for the next connect" in l for l in _logs85),
+           "Auto-fix on: left for the dispatcher at the next connect, as before")
+        _connect85(_p85c)
+        asyncio.run(_p85c._wake_lock_check())
+        ok(_dv5_param(_r85) == "N", "and the watch writes nothing")
+        _p85d = _fresh85(False)
+        asyncio.run(_p85d.set_power_save(True))
+        open(m.DISPATCHER_PATH, "w").write("#!/bin/bash\n")
+        _connect85(_p85d)
+        asyncio.run(_p85d._wake_lock_check())
+        ok(_dv5_param(_r85) == "N", "Auto-fix turned on before WiFi connected: the watch leaves it to the dispatcher")
+    finally:
+        m.decky.logger.info = _info85
+        _restore85(); _restore85p()
+        (m.SYSFS_NET, m.SYSFS_ROOT, m.PCIE_BASELINE_FILE, m.AT_LOAD_MARKER, m.ENFORCED_FILE) = _sv85
+        m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D6 pass 8 hex runs longer than an address (DUIDs, client ids, serials) are masked whole")
+try:
+    _DUID86 = "duid-ll 00:03:00:01:12:34:56:78:9a:bc"
+    _CID86 = "client-id ff:56:78:9a:bc:00:02:00:00:ab:11:12:34:56:78:9a:bc:de"
+    _SER86 = "Device Serial Number 3c-e9-f7-ff-fe-12-34-56"
+    for _t86 in (_DUID86, _CID86, _SER86):
+        _d86 = m.Plugin._redact_diagnostics(_t86)
+        _l86 = m._mask_addresses(_t86)
+        ok("<id>" in _d86 and not re.search(r"(?i)[0-9a-f]{2}[:-][0-9a-f]{2}[:-][0-9a-f]{2}", _d86),
+           f"diagnostics: '{_t86.split()[0]}' masked whole ({_d86})")
+        ok("<id>" in _l86 and not re.search(r"(?i)[0-9a-f]{2}[:-][0-9a-f]{2}[:-][0-9a-f]{2}", _l86),
+           f"plugin log: '{_t86.split()[0]}' masked whole, not left with six octets ({_l86})")
+    ok(m.Plugin._redact_diagnostics("bssid 02:11:22:33:44:55") == "bssid <mac>"
+       and m._mask_addresses("bssid 02:11:22:33:44:55") == "bssid xx:xx:xx:xx:44:55",
+       "an address is masked as before")
+    for _k86 in ("at 12:34:56", "channels 36:40:44", "fe80::1", "2001:db8::8a2e:370:7334",
+                 "fe80:0000:0000:0000:0204:61ff:fe9d:f156", "::"):
+        _exp86 = "<ip>" if ":" in _k86 and not _k86.startswith(("at", "channels")) and _k86 != "::" else _k86
+        _got86 = (m.Plugin._redact_diagnostics(_k86), m._mask_addresses(_k86))
+        ok(_got86 == (_exp86, _exp86), f"'{_k86}' as before ({_got86})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D7 pass 8 the dispatcher refuses the links the plugin refuses on the way to the settings")
+try:
+    import shutil as _sh87
+
+    def _ps_off87(calls):
+        return any(c.startswith("iw dev wlan0 set power_save off") for c in calls)
+
+    _OFF87 = json.dumps({"power_save_disabled": False, "driver": "rtw88"})
+    # The control: a real folder, Prevent lag spikes off in it.
+    _c87 = tempfile.mkdtemp()
+    _rc87, _t87, _calls87, _j87 = _dv5_dispatcher(_c87, _OFF87)
+    ok(_rc87 == 0 and not _ps_off87(_calls87), f"no link: the file's Prevent lag spikes off is honoured ({_calls87})")
+    # The settings folder behind a link of the user's: the plugin refuses it
+    # and acts on its defaults, and so does the dispatcher.
+    _u87 = tempfile.mkdtemp()
+    _real87 = os.path.join(_u87, "elsewhere", "WiFi Optimizer"); os.makedirs(_real87)
+    open(os.path.join(_real87, "settings.json"), "w").write(_OFF87)
+    os.makedirs(os.path.join(_u87, "settings"))
+    os.symlink(_real87, os.path.join(_u87, "settings", "WiFi Optimizer"))
+    if os.geteuid() == 0:
+        os.lchown(os.path.join(_u87, "settings", "WiFi Optimizer"), 1000, 1000)
+    _plugin_refuses87 = False
+    try:
+        os.close(m._open_dir_no_follow(os.path.join(_u87, "settings", "WiFi Optimizer")))
+    except OSError:
+        _plugin_refuses87 = True
+    _rc87, _t87, _calls87, _j87 = _dv5_dispatcher(_u87, None)
+    ok(_plugin_refuses87 and _rc87 == 0 and _ps_off87(_calls87),
+       f"a user's link to the settings folder: the dispatcher applies the defaults, as the plugin does "
+       f"(plugin refuses: {_plugin_refuses87}; {_calls87})")
+
+    # A link root made in a folder only root can write (Bazzite's /home ->
+    # /var/home) is followed, by both.
+    def _root_link87():
+        """(a path through a root-owned link whose target this user can
+        write in, cleanup) or (None, None)."""
+        for _cand in ("/tmp", "/var", "/var/tmp", "/var/lock", "/var/run/lock"):
+            try:
+                _st = os.lstat(_cand)
+                _parent = os.stat(os.path.dirname(_cand))
+            except OSError:
+                continue
+            if not (os.path.islink(_cand) and _st.st_uid == 0 and _parent.st_uid == 0
+                    and not _parent.st_mode & 0o022):
+                continue
+            _target = os.path.realpath(_cand)
+            # This run's own temporary folder when it lies under the link's
+            # target (macOS: /tmp and /var), else a new one there.
+            _made = os.path.realpath(tempfile.mkdtemp())
+            if not _made.startswith(_target + "/"):
+                _sh87.rmtree(_made, True)
+                try:
+                    _made = tempfile.mkdtemp(dir=_target)
+                except OSError:
+                    continue
+            return _cand + _made[len(_target):], (lambda _m=_made: _sh87.rmtree(_m, True))
+        if os.geteuid() == 0:
+            _top = tempfile.mkdtemp(prefix="p8dev-", dir="/")
+            os.chmod(_top, 0o755)
+            os.mkdir(os.path.join(_top, "real"), 0o755); os.chmod(os.path.join(_top, "real"), 0o755)
+            os.symlink("real", os.path.join(_top, "home"))
+            return os.path.join(_top, "home"), lambda: _sh87.rmtree(_top, True)
+        return None, None
+    _via87, _clean87 = _root_link87()
+    if _via87 is None:
+        if os.environ.get("REGRESS_REQUIRE_LINUX"):
+            ok(False, "no root-owned link to a writable folder here, and not root to make one")
+        else:
+            print("SKIP  no root-owned link to a writable folder here for the followed-link half")
+    else:
+        try:
+            _plugin_follows87 = True
+            try:
+                os.makedirs(os.path.join(_via87, "settings", "WiFi Optimizer"), exist_ok=True)
+                os.close(m._open_dir_no_follow(os.path.join(_via87, "settings", "WiFi Optimizer")))
+            except OSError:
+                _plugin_follows87 = False
+            _rc87, _t87, _calls87, _j87 = _dv5_dispatcher(_via87, _OFF87)
+            ok(_plugin_follows87 and _rc87 == 0 and not _ps_off87(_calls87),
+               f"a root-owned link above ({_via87.split('/')[1]}): followed, the file is honoured "
+               f"(plugin follows: {_plugin_follows87}; {_calls87})")
+        finally:
+            _clean87()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D8 pass 8 with no baseline for this kernel, buffer tuning off puts back the system's own sysctl files' values")
+try:
+    _r88 = tempfile.mkdtemp()
+    _dirs88 = tuple(os.path.join(_r88, d) for d in ("etc/sysctl.d", "run/sysctl.d", "usr/local/lib/sysctl.d",
+                                                     "usr/lib/sysctl.d"))
+    for _d in _dirs88:
+        os.makedirs(_d)
+    _sv88 = (getattr(m, "SYSCTL_D_DIRS", None), getattr(m, "SYSCTL_CONF_FILE", None))
+
+    class _P88(m.Plugin):
+        def __init__(self):
+            super().__init__(); self.writes = []
+        def _get_wifi_interface(self): return None
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[:2] == ["/usr/bin/sysctl", "-n"]:
+                return _ok(m.SYSCTL_PARAMS.get(cmd[2], "") + "\n")      # tuning in place
+            if cmd[:2] == ["/usr/bin/sysctl", "-w"]:
+                self.writes.append(cmd[2])
+            return _ok()
+
+    try:
+        m.SYSCTL_D_DIRS = _dirs88
+        m.SYSCTL_CONF_FILE = os.path.join(_r88, "etc", "sysctl.conf")
+        open(os.path.join(_dirs88[3], "70-x.conf"), "w").write("net.core.netdev_max_backlog = 16384\n")
+        # A kernel update: the baseline was taken on the old kernel, and with
+        # the dispatcher's tuning in place none can be read on this one.
+        _s88 = {**m.DEFAULT_SETTINGS, "buffer_tuning_enabled": True,
+                "sysctl_baseline": {"kernel": "6.1.52-old", "values": {"net.core.netdev_max_backlog": "2000"}}}
+        _p88 = _P88()
+        _p88._capture_sysctl_baseline(_s88)
+        _p88._revert_queue_tuning(_s88)
+        ok("net.core.netdev_max_backlog=16384" in _p88.writes,
+           f"/usr/lib/sysctl.d/70-x.conf's netdev_max_backlog is put back, not the kernel's 1000 ({_p88.writes})")
+        _stock88 = m._stock_sysctl_defaults(m._kernel_release())
+        ok(f"net.core.netdev_budget={_stock88['net.core.netdev_budget']}" in _p88.writes,
+           "a key no file sets gets the kernel's default")
+        # systemd-sysctl's order: the same name in /etc hides /usr/lib's,
+        # files go in name order across the directories, a later line wins,
+        # /etc/sysctl.conf last; "/" for "." and a leading "-" are allowed.
+        open(os.path.join(_dirs88[0], "70-x.conf"), "w").write("# the admin's own\nnet.core.netdev_budget = 700\n")
+        open(os.path.join(_dirs88[3], "80-y.conf"), "w").write(
+            "net/core/netdev_budget_usecs = 9000\n-net.core.rmem_default = 300000\nnet.core.wmem_default = big\n")
+        open(os.path.join(_dirs88[1], "10-a.conf"), "w").write("net.core.netdev_budget_usecs = 7000\n")
+        open(m.SYSCTL_CONF_FILE, "w").write("; old style\nnet.ipv4.tcp_slow_start_after_idle=0\n")
+        _v88 = _P88()._sysctl_restore_values(_s88)
+        ok(_v88["net.core.netdev_max_backlog"] == _stock88["net.core.netdev_max_backlog"]
+           and _v88["net.core.netdev_budget"] == "700" and _v88["net.core.netdev_budget_usecs"] == "9000"
+           and _v88["net.core.rmem_default"] == "300000"
+           and _v88["net.core.wmem_default"] == _stock88["net.core.wmem_default"]
+           and _v88["net.ipv4.tcp_slow_start_after_idle"] == "0",
+           f"read in systemd-sysctl's order ({_v88})")
+        # A baseline taken on this kernel still comes first.
+        _s88b = {**_s88, "sysctl_baseline": {"kernel": m._kernel_release(),
+                                             "values": {"net.core.netdev_budget": "650"}}}
+        _v88b = _P88()._sysctl_restore_values(_s88b)
+        ok(_v88b["net.core.netdev_budget"] == "650" and _v88b["net.core.netdev_budget_usecs"] == "9000",
+           f"a baseline from this kernel wins over the files ({_v88b['net.core.netdev_budget']})")
+    finally:
+        if _sv88[0] is not None:
+            m.SYSCTL_D_DIRS, m.SYSCTL_CONF_FILE = _sv88
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D9 pass 8 an uninstall and reinstall in the same boot keep the wake notice answered")
+try:
+    m.REPORT_URL = _REP_URL
+    _rep_reset()
+    _d89, _restore89 = _l_paths()
+    _wj89 = _p4_unix(_P4_UP + _p4_cycle(1000, errors=_P4_LCD_ERRORS))
+
+    class _P89(RepStub):
+        def _get_wifi_interface(self): return None
+    try:
+        _p89 = _P89(journal=_wj89, nm="disconnected:enabled")
+        _st89 = asyncio.run(_p89.get_report_state())
+        _dm89 = asyncio.run(_p89.dismiss_report_notice("wake"))
+        _st89b = asyncio.run(_p89.get_report_state())
+        ok(_st89.get("wake_failure") is True and _dm89.get("success") is True
+           and _st89b.get("wake_failure") is False, "the notice, dismissed")
+        asyncio.run(_p89._uninstall())
+        _st89c = asyncio.run(_P89(journal=_wj89, nm="disconnected:enabled").get_report_state())
+        ok(not os.path.exists(_rep_dir) and _st89c.get("wake_failure") is False,
+           f"uninstalled (report folder gone) and installed again: the same wake stays hidden ({_st89c})")
+        _seen89 = getattr(m, "WAKE_SEEN_FILE", "")
+        ok(os.path.isfile(_seen89) and (os.stat(_seen89).st_mode & 0o777) == 0o600,
+           "its record is a file only root can read, outside the report folder")
+        # A report about it that went: asked about again after a reinstall?
+        _rep_reset()
+        _p89s = _P89(curl=[(json.dumps({"ok": True, "ref": "WO-7K2M9Q"}), "200")], journal=_wj89)
+        _sr89 = asyncio.run(_p89s.send_report(asyncio.run(_p89s.preview_report())["id"]))
+        asyncio.run(_p89s._uninstall())
+        _st89d = asyncio.run(_P89(journal=_wj89).get_report_state())
+        ok(_sr89.get("status") == "sent" and _st89d.get("wake_failure") is False,
+           f"a report about it went, then uninstall and reinstall: not asked again ({_st89d})")
+        # Queued only, then uninstalled: nothing was sent, the notice is back.
+        _rep_reset()
+        _p89q = _P89(curl=[("", 7)], nm="disconnected:enabled", journal=_wj89)
+        _sr89q = asyncio.run(_p89q.send_report(asyncio.run(_p89q.preview_report())["id"]))
+        asyncio.run(_p89q._uninstall())
+        _st89e = asyncio.run(_P89(journal=_wj89, nm="disconnected:enabled").get_report_state())
+        ok(_sr89q.get("status") == "queued" and _st89e.get("wake_failure") is True,
+           f"a waiting report removed by the uninstall, never sent: the notice comes back ({_st89e})")
+        _self89 = _d_block('if [ ! -d "$PLUGIN_DIR" ]; then', "# Without python3")
+        ok("rm -rf /var/lib/wifi-optimizer" in _self89 and "/run/wifi-optimizer" not in _self89,
+           "the dispatcher's self-removal leaves the record in /run")
+    finally:
+        _restore89()
+        _rep_reset()
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("D10 pass 8 a direct send's reference is kept for the panel, as a waiting report's is (C29)")
+try:
+    m.REPORT_URL = _REP_URL
+    _rep_reset()
+    _wj810 = _p4_unix(_P4_UP + _p4_cycle(1000, errors=_P4_LCD_ERRORS))
+    _p810 = RepStub(curl=[(json.dumps({"ok": True, "ref": "WO-7K2M9Q"}), "200")], journal=_wj810)
+    _sr810 = asyncio.run(_p810.send_report(asyncio.run(_p810.preview_report())["id"]))
+    _st810 = asyncio.run(_p810.get_report_state())
+    ok(_sr810.get("status") == "sent" and _sr810.get("ref") == "WO-7K2M9Q"
+       and _st810.get("sent_ref") == "WO-7K2M9Q",
+       f"sent with a reference: get_report_state carries it, for a reply the panel never got ({_st810.get('sent_ref')!r})")
+    asyncio.run(_p810.dismiss_report_notice("sent"))
+    ok(asyncio.run(_p810.get_report_state()).get("sent_ref") == "", "until the panel has shown it")
+    _rep_reset()
+    _p810b = RepStub(curl=[(json.dumps({"ok": True}), "200")], journal=_wj810)
+    asyncio.run(_p810b.send_report(asyncio.run(_p810b.preview_report())["id"]))
+    ok(asyncio.run(_p810b.get_report_state()).get("sent_ref") == "", "taken with no reference: nothing kept")
+    _rep_reset()
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
