@@ -12634,6 +12634,65 @@ except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+section("F16 pass 8 a send with no answer is retired once nothing waits, and a reference shows once (C29)")
+try:
+    _p8f_fns = "".join(_p7f_fn(_P8F_SR, n) for n in ("update", "begin", "end", "refreshReportState", "send"))
+    _p8f_ssr = _p7f_fn(_P8F_SR, "shownSentRef") or (
+        # Before C29 the panel showed sent_ref whatever was on screen.
+        "function shownSentRef(state: any, outcome: any): string {\n"
+        "  return state?.sent_ref && state.sent_ref !== hidden.sentRef ? state.sent_ref : \"\";\n}\n")
+    _p8f_case = ("type ReportState = any; type ReportResult = any; type Outcome = any;\n"
+                 "class NoAnswer extends Error {}\n"
+                 "const CALL_TIMEOUT_MS = 1; const STATE_LIMIT_MS = 1;\n"
+                 "function withTimeout(p: any, _ms?: number) { return p; }\n"
+                 "let shared: any = {state: null, inFlight: 0, collecting: false, outcome: null, ready: null, cancelFailed: false};\n"
+                 "const listeners = new Set<() => void>(); let loading: any = null; let again: any = null;\n"
+                 "let actionSeq = 0; let loadingSeq = 0;\n"
+                 "const hidden = {wake: false, wakeDismissed: false, dropped: false, sentRef: ''};\n"
+                 "function schedulePoll() {}\n"
+                 + _between(_P8F_SR, "const SEND_FAIL_TEXT =", ";\n") + ";\n"
+                 + _between(_P8F_SR, "const SEND_SLOW_TEXT", ";\n") + ";\n"
+                 "let next: any = {enabled: true, pending: true, sent_ref: ''};\n"
+                 "const getReportState = () => Promise.resolve(next);\n"
+                 "let sendReport = (_id: string): Promise<any> => Promise.reject(new NoAnswer());\n"
+                 + _p8f_fns + _p8f_ssr +
+                 "(async () => {\n"
+                 # The send times out; the report is still waiting on the device.
+                 " await send('id1', 'footer'); const slowFirst = shared.outcome && shared.outcome.text === SEND_SLOW_TEXT;\n"
+                 # It went in the background: nothing waits, and its reference is kept.
+                 " next = {enabled: true, pending: false, sent_ref: 'R1'}; await refreshReportState();\n"
+                 " const slowAfter = !!(shared.outcome && shared.outcome.text === SEND_SLOW_TEXT);\n"
+                 " const shown1 = [shared.outcome && shared.outcome.text.includes('R1') ? 'outcome' : '', shownSentRef(shared.state, shared.outcome) === 'R1' ? 'line' : ''].filter(Boolean);\n"
+                 # A direct send answered with its reference, which the backend keeps too.
+                 " sendReport = () => Promise.resolve({success: true, status: 'sent', ref: 'R2', message: 'Report sent. Reference R2. Quote it if you post about this.'});\n"
+                 " next = {enabled: true, pending: false, sent_ref: 'R2'}; await send('id2', 'footer');\n"
+                 " const shown2 = [shared.outcome && shared.outcome.text.includes('R2') ? 'outcome' : '', shownSentRef(shared.state, shared.outcome) === 'R2' ? 'line' : ''].filter(Boolean);\n"
+                 " console.log(JSON.stringify({slowFirst, slowAfter, shown1, shown2})); })();\n")
+    _p8f_r = _p7f_run(_p8f_case)
+    if _p8f_r is None:
+        print("SKIP  no node or typescript here to run the report send; CI runs it")
+    else:
+        _p8f_o = _p7f_json(_p8f_r) or {}
+        ok(_p8f_o.get("slowFirst") is True and _p8f_o.get("slowAfter") is False,
+           f"a send that timed out says it may still be sending, until a read shows nothing waiting ({_p8f_o} {_p8f_r[2][-300:]})")
+        ok(_p8f_o.get("shown1") == ["line"], f"then its reference shows, once ({_p8f_o.get('shown1')})")
+        ok(_p8f_o.get("shown2") == ["outcome"], f"a direct send's reference shows once, in its outcome ({_p8f_o.get('shown2')})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F17 pass 8 the report preview has a Send above its text, so a controller need not step through every block")
+try:
+    _p8f_pm = _p7f_fn(_P8F_SR, "ReportPreviewModal")
+    _p8f_db = _between(_p8f_pm, "<DialogButton", "</DialogButton>")
+    ok(bool(_p8f_db) and "onSend();" in _p8f_db and "closeModal?.();" in _p8f_db and _p8f_db.rstrip().endswith("Send"),
+       "a Send button that sends and closes, as the modal's own does")
+    ok(0 <= _p8f_pm.find("<DialogButton") < _p8f_pm.find("{blocks.map("),
+       "before the preview's blocks, so focus finds it first")
+    ok("DialogButton," in _between(_P8F_SR, "import {", "} from \"@decky/ui\""), "from Decky's own components")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 # ---- QA pass 3 merge: where two owners' work meets ----
 section("merge: last_enforced and the streaming flag are never missing while the plugin rewrites them")
 # The dispatcher records the system's PCIe values only while last_enforced is

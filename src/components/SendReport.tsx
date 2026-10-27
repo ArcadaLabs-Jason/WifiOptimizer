@@ -1,4 +1,12 @@
-import { ButtonItem, ConfirmModal, Focusable, PanelSection, PanelSectionRow, showModal } from "@decky/ui";
+import {
+  ButtonItem,
+  ConfirmModal,
+  DialogButton,
+  Focusable,
+  PanelSection,
+  PanelSectionRow,
+  showModal,
+} from "@decky/ui";
 import { callable } from "@decky/api";
 import { useEffect, useState } from "react";
 import { previewBlocks, previewLines } from "../reportPreview";
@@ -53,7 +61,8 @@ const SEND_FAIL_TEXT =
   "Couldn't send the report. Try again later, or use Copy diagnostics and post it on GitHub.";
 const PREVIEW_FAIL_TEXT = "Couldn't put the report together. Try again in a moment.";
 // The report is saved before it is sent, so a send with no answer yet can
-// still go through.
+// still go through. Said until a state read shows nothing waiting (C29):
+// the reference shows then if it went.
 const SEND_SLOW_TEXT = "The report may still be sending. Check back here in a minute.";
 const CANCEL_FAIL_TEXT = "Couldn't delete the saved report. Try again in a moment.";
 const READY_TEXT = "Report ready to review.";
@@ -67,14 +76,16 @@ const STATE_LIMIT_MS = 60000;
 // send made in the background without the panel being reopened.
 const STATE_POLL_MS = 20000;
 
-// queued: a send saved to go later. seq: the actionSeq once that send had
-// ended, so only a state read started after it can retire the outcome.
+// queued: a send saved to go later, or one with no answer yet. seq: the
+// actionSeq once that send had ended, so only a state read started after it
+// can retire the outcome. ref: the reference a sent report's text carries.
 type Outcome = {
   text: string;
   tone: "success" | "info" | "error";
   from: "wake" | "footer";
   queued?: boolean;
   seq?: number;
+  ref?: string;
 };
 // A preview that came back while the panel was closed, kept to open here.
 type Ready = { id: string; text: string; from: Outcome["from"] };
@@ -214,7 +225,10 @@ function useReportState() {
 // Split into blocks the controller can step through: one long block of text
 // cannot be scrolled with the D-pad, but focus moving from block to block
 // scrolls the box along with it. previewBlocks keeps each block short enough
-// to fit the box, and the block in focus is outlined.
+// to fit the box, and the block in focus is outlined. A report with the
+// previous boot's logs runs to a hundred blocks or more, and the modal's own
+// Send comes after all of them, with no way to give it focus first. So a
+// Send of the same kind stands above the text, the first thing focus finds.
 function ReportPreviewModal({
   text,
   onSend,
@@ -235,6 +249,15 @@ function ReportPreviewModal({
       onOK={onSend}
       closeModal={closeModal}
     >
+      <DialogButton
+        style={{ marginTop: "8px" }}
+        onClick={() => {
+          onSend();
+          closeModal?.();
+        }}
+      >
+        Send
+      </DialogButton>
       <Focusable
         style={{
           maxHeight: "50vh",
@@ -286,7 +309,9 @@ async function send(id: string, from: Outcome["from"]) {
   if (noAnswer || status === "sent" || status === "queued") hidden.wake = true;
   end({
     outcome: noAnswer
-      ? { text: SEND_SLOW_TEXT, tone: "info", from }
+      ? // Waiting like a queued send: the first state read with nothing
+        // pending retires it, and shows the reference if it went (C29).
+        { text: SEND_SLOW_TEXT, tone: "info", from, queued: true, seq: actionSeq + 1 }
       : {
           text: typeof result?.message === "string" ? result.message : SEND_FAIL_TEXT,
           tone: status === "sent" ? "success" : status === "queued" ? "info" : "error",
@@ -294,6 +319,7 @@ async function send(id: string, from: Outcome["from"]) {
           queued: status === "queued",
           // end() counts this send as ended before it stores the outcome.
           seq: actionSeq + 1,
+          ref: status === "sent" && typeof result?.ref === "string" && result.ref ? result.ref : undefined,
         },
   });
   await refreshReportState();
@@ -352,6 +378,32 @@ async function cancelPending() {
 
 const rowStyle = { fontSize: theme.fontSize.small, color: theme.text.tertiary };
 
+// The sent reference to show on its own line: the backend keeps a direct
+// send's reference too (C29), which its outcome already shows. Only when no
+// outcome on screen carries it, and until dismissed.
+function shownSentRef(state: ReportState | null, outcome: Outcome | null): string {
+  const ref = state?.sent_ref ?? "";
+  if (!ref || ref === hidden.sentRef) return "";
+  if (outcome && (outcome.ref === ref || outcome.text.includes(ref))) return "";
+  return ref;
+}
+
+// Dismissing a sent report's outcome dismisses its reference too, or the
+// reference line took its place at once.
+async function forgetSentRef(ref: string | undefined) {
+  if (!ref) return;
+  hidden.sentRef = ref;
+  update({});
+  if (shared.state?.sent_ref !== ref) return;
+  try {
+    await withTimeout(dismissReportNotice("sent"), STATE_LIMIT_MS);
+  } catch (e) {
+    console.error("dismiss report notice error", e);
+  }
+  actionSeq += 1;
+  await refreshReportState();
+}
+
 function OutcomeRows({ outcome }: { outcome: Outcome }) {
   const color =
     outcome.tone === "success"
@@ -365,7 +417,13 @@ function OutcomeRows({ outcome }: { outcome: Outcome }) {
         <div style={{ ...rowStyle, color }}>{outcome.text}</div>
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => update({ outcome: null })}>
+        <ButtonItem
+          layout="below"
+          onClick={() => {
+            update({ outcome: null });
+            void forgetSentRef(outcome.ref);
+          }}
+        >
           Dismiss
         </ButtonItem>
       </PanelSectionRow>
@@ -393,7 +451,7 @@ export function SendReportRow() {
   const { state, inFlight, collecting, outcome, ready, cancelFailed } = useReportState();
   const working = inFlight > 0;
   if (!state?.enabled) return null;
-  const sentRef = state.sent_ref && state.sent_ref !== hidden.sentRef ? state.sent_ref : "";
+  const sentRef = shownSentRef(state, outcome);
   return (
     <>
       <PanelSectionRow>
@@ -538,7 +596,11 @@ export function WakeFailureNotice() {
           <PanelSectionRow>
             <ButtonItem
               layout="below"
-              onClick={() => (done ? void dismiss() : update({ outcome: null }))}
+              onClick={() => {
+                if (done) void dismiss();
+                else update({ outcome: null });
+                void forgetSentRef(fromHere.ref);
+              }}
             >
               Dismiss
             </ButtonItem>
