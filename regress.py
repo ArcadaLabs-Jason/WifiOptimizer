@@ -12009,7 +12009,8 @@ try:
     ok("Turns every fix off and Auto-fix on wake on, which then applies nothing." in _p7f_rc
        and "everything the plugin applied" not in _p7f_rc,
        "Auto-fix on wake is on after it, and the text no longer says everything")
-    ok("0.24.5-beta" not in _p7f_rc and "next connect." in _p7f_rc,
+    # Pass 8 F2: the region now follows "at the next connect".
+    ok("0.24.5-beta" not in _p7f_rc and "at the next connect" in _p7f_rc,
        "no version history in front of the action (M-e); the README keeps it")
     ok(_p7f_rc and _p7f_words(_p7f_rc) < 50, f"under 50 words ({_p7f_words(_p7f_rc)})")
     ok("0.24.5-beta or later" in _between(_F_RD, "| Allow WPA2 here |", "\n")
