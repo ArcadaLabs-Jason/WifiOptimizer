@@ -21977,5 +21977,144 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
+class _W7Early(_W6):
+    """_W6 just after a wake: the card back but NetworkManager not joined
+    yet. `nmcli con up` joins the pinned access point when it will have us,
+    as NetworkManager does; scan says what the cached list holds."""
+    def __init__(self, scan=None, state="disconnected", **kw):
+        super().__init__(**kw)
+        self.on = ""; self.state = state; self.ups = []; self.scans = 0
+        self.scan = scan if scan is not None else (
+            "Net:02\\:00\\:00\\:00\\:00\\:11:30:5745 MHz:WPA2\n"
+            "Net:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2\n")
+        self._WAKE_EARLY_POLL_SECONDS = 0
+        self._WAKE_EARLY_WINDOW = 0.3
+    def _card_nm_device_state(self, iface):
+        return "connected" if self.on else self.state
+    def _run_cmd(self, cmd, timeout=5):
+        if cmd[:3] == ["/usr/bin/nmcli", "con", "up"]:
+            self.ups.append(self.pin)
+            if self.reachable or self.pin.upper() == _W6WEAK:
+                self.on = self.pin.lower()
+            return _ok()
+        if "wifi" in cmd and "list" in cmd:
+            self.scans += 1
+            return _ok(self.scan)
+        return super()._run_cmd(cmd, timeout)
+
+
+section("0.24.7 the after-wake lock move happens before NetworkManager's first connect")
+try:
+    _e7_logged = []
+    _e7_real_info = m.decky.logger.info
+    m.decky.logger.info = staticmethod(lambda msg: _e7_logged.append(str(msg)))
+    try:
+        # (1) Pinned access point weak, a clearly stronger one in the list,
+        # card still disconnected: the pin moves, the device joins it, and no
+        # radio cycle is spent.
+        _w6_locked(); _e7 = _W7Early()
+        _e7_moved = asyncio.run(_e7._move_lock_before_connect())
+        ok(_e7_moved and _e7.pin.upper() == _W6STRONG and _e7.on.upper() == _W6STRONG,
+           f"weak pin, stronger one in range: moved and joined before any connect ({_e7.pin}, on {_e7.on})")
+        ok(not _e7.cycles, f"and no radio cycle ({_e7.cycles})")
+        ok(m._load_settings().get("bssid_lock_value") == _W6STRONG, "and the settings name the new one")
+        ok(m._load_settings().get("last_applied") == 1234, "and Last changed stays (C13)")
+        ok(any("before reconnecting" in l and "signal 30" in l for l in _e7_logged),
+           f"and one line says from what to what ({_e7_logged[-2:]})")
+        ok(getattr(_e7, "_wake_move_outcome", (None,))[0] == "moved", "and the panel hears it moved")
+        ok(not _e7._profile_change_in_flight(), "and the guard is released")
+
+        # (2) The pinned one not in the list: moved only after it stays missing.
+        _w6_locked(); _e7 = _W7Early(scan="Net:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2\n")
+        asyncio.run(_e7._move_lock_before_connect())
+        ok(_e7.pin.upper() == _W6STRONG and _e7.scans == _e7._WAKE_EARLY_ABSENT_READS,
+           f"pinned one out of range: moved after {_e7._WAKE_EARLY_ABSENT_READS} reads ({_e7.scans})")
+        ok(any("not in range" in l for l in _e7_logged), "and the line says it was not in range")
+
+        # (3) Within the margin: left for NetworkManager to join as pinned.
+        _w6_locked(); _e7 = _W7Early(scan="Net:02\\:00\\:00\\:00\\:00\\:11:85:5745 MHz:WPA2\n"
+                                          "Net:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2\n")
+        ok(not asyncio.run(_e7._move_lock_before_connect()) and _e7.pin.upper() == _W6WEAK
+           and not _e7.mods, f"pinned one close enough: nothing written ({_e7.mods})")
+
+        # (4) NetworkManager already joining: the move after the connect decides.
+        _w6_locked(); _e7 = _W7Early(state="connecting")
+        ok(not asyncio.run(_e7._move_lock_before_connect()) and not _e7.mods and not _e7.scans,
+           f"NetworkManager joining already: nothing looked at or written ({_e7.mods})")
+
+        # (5) The stronger one refuses: the previous pin goes back, the
+        # refusal is kept, and the device is on the old one.
+        _w6_locked(); _e7 = _W7Early(reachable=False, refused_stays=False)
+        ok(not asyncio.run(_e7._move_lock_before_connect()),
+           "the stronger one refuses: not reported as moved")
+        ok(_e7.pin.upper() == _W6WEAK and m._load_settings().get("bssid_lock_value") == _W6WEAK
+           and _e7.on.upper() == _W6WEAK,
+           f"and the previous pin is back and joined ({_e7.pin}, on {_e7.on})")
+        ok(_W6STRONG in _e7._wake_refusals(m._load_settings()),
+           "and the refusal is kept, so the next wake does not try it again")
+        _e7b = _W7Early()
+        asyncio.run(_e7b._move_lock_before_connect())
+        ok(_e7b.pin.upper() == _W6WEAK, f"and the next wake leaves it ({_e7b.pin})")
+
+        # (6) Not ath11k, lock off, iwd, a pin that is not the recorded one: nothing.
+        _w6_locked(); _e7 = _W7Early(card="rtw88_pci")
+        asyncio.run(_e7._move_lock_before_connect())
+        ok(not _e7.mods, f"another card: nothing written ({_e7.mods})")
+        _w6_locked(driver="rtw88"); _e7 = _W7Early()
+        asyncio.run(_e7._move_lock_before_connect())
+        ok(not _e7.mods and not _e7.scans, "another card in the settings: nothing looked at")
+        _w6_locked(bssid_lock_enabled=False); _e7 = _W7Early()
+        asyncio.run(_e7._move_lock_before_connect())
+        ok(not _e7.mods and not _e7.scans, "lock off: nothing looked at")
+        class _W7Iwd(_W7Early):
+            def _backend_is_iwd(self): return True
+        _w6_locked(); _e7 = _W7Iwd()
+        asyncio.run(_e7._move_lock_before_connect())
+        ok(not _e7.mods and not _e7.scans, "iwd: nothing looked at")
+        _w6_locked(); _e7 = _W7Early(); _e7.pin = "02:00:00:00:00:99"
+        asyncio.run(_e7._move_lock_before_connect())
+        ok(not _e7.scans and _e7.pin == "02:00:00:00:00:99", "a pin that is not ours: left alone")
+
+        # (7) Another profile change under way: refused, nothing taken.
+        _w6_locked(); _e7 = _W7Early(); _e7._profile_change_depth = 1
+        asyncio.run(_e7._move_lock_before_connect())
+        ok(not _e7.scans and _e7._profile_change_depth == 1, "busy: nothing looked at, guard untouched")
+
+        # (8) The move after the connect waits while the early one decides,
+        # and keeps its wake for the next pass.
+        _w6_locked(); _e7 = _W7Early()
+        _e7._wake_lock_pending = time.monotonic(); _e7._wake_early_running = True
+        async def _e7_no_move(): raise AssertionError("moved while the early one decides")
+        _e7._move_lock_after_wake = _e7_no_move
+        asyncio.run(_e7._wake_lock_check())
+        ok(getattr(_e7, "_wake_lock_pending", None) is not None, "after-connect move waits and keeps its wake")
+
+        # (9) The watch runs the early move once per wake, not between wakes.
+        _e7 = _W7Early(); _e7_offsets = iter([0.0, 0.0, 0.5, 60.0, 60.2, 60.4, 200.0])
+        _e7_calls = []
+        _e7._suspend_offset = lambda: next(_e7_offsets)
+        async def _e7_count(): _e7_calls.append(1); return False
+        _e7._move_lock_before_connect = _e7_count
+        async def _e7_watch():
+            try:
+                await _e7._wake_early_watch()
+            except StopIteration:
+                pass
+        try:
+            asyncio.run(_e7_watch())
+        except (StopIteration, RuntimeError):
+            pass
+        ok(len(_e7_calls) == 2, f"two wakes, two early moves ({len(_e7_calls)})")
+    finally:
+        m.decky.logger.info = _e7_real_info
+    _src7 = open("main.py").read()
+    ok('"_wake_early_task"' in _src7 and "self._wake_early_task = asyncio.create_task" in _src7,
+       "the early watch is started and cancelled at unload")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

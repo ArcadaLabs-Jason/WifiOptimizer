@@ -5083,6 +5083,7 @@ class Plugin:
             decky.logger.error(f"WiFi Optimizer _main error: {e}")
         if not self._tearing_down_now():
             self._stranded_task = asyncio.create_task(self._stranded_watch())
+            self._wake_early_task = asyncio.create_task(self._wake_early_watch())
 
     async def _startup_power_save_files(self):
         """Prevent lag spikes off, but the files that hold power save off
@@ -5204,7 +5205,8 @@ class Plugin:
     async def _unload(self):
         try:
             decky.logger.info("WiFi Optimizer unloading")
-            for name in ("_main_task", "_backend_switch_task", "_stranded_task", "_stream_task"):
+            for name in ("_main_task", "_backend_switch_task", "_stranded_task",
+                         "_wake_early_task", "_stream_task"):
                 task = getattr(self, name, None)
                 if task and not task.done() and task is not asyncio.current_task():
                     try:
@@ -7650,6 +7652,8 @@ class Plugin:
         pending = getattr(self, "_wake_lock_pending", None)
         if pending is None:
             return
+        if getattr(self, "_wake_early_running", False):
+            return   # the early move (_move_lock_before_connect) is still deciding
         if not _load_settings().get("bssid_lock_enabled"):
             self._wake_lock_pending = None
             return
@@ -7804,6 +7808,165 @@ class Plugin:
         if not result.get("success"):
             decky.logger.error(
                 f"Could not log the after-wake move's end: {_tool_text((result.get('stderr') or '')[:120])}")
+
+    # How often the early wake watch reads the clocks: two clock reads and
+    # nothing else until a wake. Fast enough to act in the seconds between
+    # the card coming back and NetworkManager joining.
+    _WAKE_EARLY_POLL_SECONDS = 1
+    # How long after a wake the early move looks, at most. By then
+    # NetworkManager has joined or given up, and the move after the connect
+    # (_wake_lock_check) is the one left.
+    _WAKE_EARLY_WINDOW = 30
+    # Reads of the scan list, a second apart, the pinned access point must
+    # be missing from before the early move counts it out of range: the
+    # first scans after the card comes back are partial.
+    _WAKE_EARLY_ABSENT_READS = 3
+
+    async def _wake_early_watch(self):
+        """Watch for a wake every second and run the early lock move
+        (_move_lock_before_connect) once per wake. The 20 s watch sees a wake
+        too late for it: NetworkManager has usually joined by then."""
+        last = self._suspend_offset()
+        if last is None:
+            return
+        while True:
+            await asyncio.sleep(self._WAKE_EARLY_POLL_SECONDS)
+            offset = self._suspend_offset()
+            if offset is None:
+                continue
+            woke = offset - last > self._WAKE_JUMP_SECONDS
+            last = offset
+            if not woke:
+                continue
+            try:
+                await self._move_lock_before_connect()
+            except Exception as e:
+                decky.logger.error(f"After waking, the early BSSID lock move stopped: {e}")
+
+    async def _move_lock_before_connect(self) -> bool:
+        """Once per wake, before NetworkManager joins anything: point the lock
+        at a clearly stronger access point of the same network when the
+        pinned one is weak or out of range.
+
+        Measured on a Deck OLED (0.24.6-beta): woken in another room with the
+        lock on a far access point, NetworkManager waited 21 s for that one
+        to show in a scan, its first authentication timed out and DHCP took
+        8 s on the weak link; 60 s after the wake the move after the connect
+        then cycled the radio to an access point at 95, a second drop. Its
+        other wakes took 7 to 13 s. Pointing the pin elsewhere while the card
+        is still disconnected costs no radio cycle, as nothing is connected
+        to drop, so no game or stream check either.
+
+        The same choice as every move (_lock_candidates with the after-wake
+        refusals, _AP_UPGRADE_MARGIN) and the same rollback when the new one
+        will not have us (_verify_lock_move). ath11k and wpa_supplicant only,
+        as the move after the connect. It stops as soon as NetworkManager
+        starts joining on its own: from there the move after the connect
+        decides. True when it moved the lock."""
+        settings = _load_settings()
+        if not settings.get("bssid_lock_enabled") or self._no_wake_move_driver(
+                settings.get("driver", "")):
+            return False
+        # Checked and taken in one synchronous span, as in _move_lock_after_wake.
+        if self._profile_change_refused():
+            return False
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
+        self._wake_early_running = True
+        try:
+            if await asyncio.to_thread(self._backend_is_iwd):
+                return False
+            uuid = settings.get("bssid_lock_connection_uuid", "")
+            pinned = settings.get("bssid_lock_value", "").upper()
+            if not uuid or not BSSID_RE.match(pinned):
+                return False
+            pin = await asyncio.to_thread(self._read_profile_field, uuid, "802-11-wireless.bssid")
+            if pin.replace("\\", "").upper() != pinned:
+                return False
+            ssid = await asyncio.to_thread(self._get_profile_ssid, uuid)
+            if not ssid:
+                return False
+            key_mgmt = await asyncio.to_thread(self._profile_key_mgmt, uuid)
+            deadline = time.monotonic() + self._WAKE_EARLY_WINDOW
+            absent = 0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(self._WAKE_EARLY_POLL_SECONDS)
+                iface = await asyncio.to_thread(self._get_wifi_interface)
+                if not iface or not IFACE_RE.match(iface):
+                    continue
+                if self._no_wake_move_driver(await asyncio.to_thread(self._iface_driver, iface)):
+                    return False
+                state = await asyncio.to_thread(self._card_nm_device_state, iface)
+                if state in ("none", "absent", "unread", "unavailable", "unmanaged"):
+                    continue   # the card is still coming back
+                if state != "disconnected":
+                    return False   # NetworkManager is joining or has joined
+                aps = await asyncio.to_thread(
+                    self._visible_access_points, iface, ssid, False, True)
+                candidates = self._lock_candidates(
+                    aps, ssid, _load_settings(), key_mgmt, after_wake=True)
+                if not candidates:
+                    continue
+                best = candidates[0]
+                if best[0] == pinned:
+                    return False
+                here = next((ap for ap in aps if ap[0] == pinned), None)
+                if here is not None:
+                    if best[1] - here[1] < self._AP_UPGRADE_MARGIN:
+                        return False
+                else:
+                    absent += 1
+                    if absent < self._WAKE_EARLY_ABSENT_READS:
+                        continue
+                return await self._repin_before_connect(iface, uuid, pinned, best, here)
+            return False
+        finally:
+            self._wake_early_running = False
+            self._profile_change_depth = max(
+                0, getattr(self, "_profile_change_depth", 1) - 1
+            )
+
+    async def _repin_before_connect(self, iface: str, uuid: str, previous: str,
+                                    best: tuple, here: tuple | None) -> bool:
+        """_move_lock_before_connect's move: the pin and the settings to
+        best, a connect, then _verify_lock_move, which puts previous back if
+        best will not have us."""
+        if self._tearing_down_now():
+            return False
+        written = await asyncio.to_thread(
+            self._nmcli_modify, uuid, "802-11-wireless.bssid", best[0])
+        if not written["success"]:
+            decky.logger.error(
+                "After waking, the BSSID lock could not be moved before reconnecting: "
+                f"{_tool_text(written.get('stderr', '')[:120])}")
+            return False
+        settings = _load_settings()
+        settings["bssid_lock_value"] = best[0]
+        try:
+            # A move a wake made on its own: "Last changed" stays (contract C13).
+            _save_settings(settings)
+        except SettingsSaveError as e:
+            decky.logger.error(
+                f"After waking, the settings could not record {best[0]}; "
+                f"putting the profile's pin back: {e}")
+            await asyncio.to_thread(
+                self._nmcli_modify, uuid, "802-11-wireless.bssid", previous)
+            return False
+        was = "not in range" if here is None else f"signal {here[1]}"
+        decky.logger.info(
+            f"After waking, moving the BSSID lock from {previous} ({was}) to {best[0]} "
+            f"(signal {best[1]}) before reconnecting")
+        await asyncio.to_thread(
+            self._run_cmd, ["/usr/bin/nmcli", "con", "up", "uuid", uuid], 15)
+        result = await self._verify_lock_move(
+            iface, uuid, previous, best[0], moving=True, after_wake=True)
+        outcome = None
+        if result.get("success"):
+            outcome = "moved"
+        elif result.get("error") == "move_failed":
+            outcome = "back" if result.get("restored") else "off"
+        if outcome:
+            self._wake_move_outcome = (outcome, int(time.time()), time.monotonic(), False)
+        return bool(result.get("success"))
 
     # How long after Steam starts or stops a game (poke_detection) a game
     # counts as running for the checks before a reconnect nobody asked for.
