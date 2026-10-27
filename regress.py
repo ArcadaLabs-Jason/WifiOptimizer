@@ -11060,7 +11060,9 @@ except Exception as _e:
 section("F17 pass 4: buffer tuning and CAKE say every time they are put back")
 try:
     _p4_t = "put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
-    ok(_p4_t in _between(_F_IX, 'label="Network buffer tuning"', "checked=")
+    # Pass 8 F19: buffer tuning's shorter (i) says the same three times.
+    ok("put back when the plugin starts, after a game launches, and on each reconnect if Auto-fix on wake is on."
+       in _between(_F_IX, 'label="Network buffer tuning"', "checked=")
        and _p4_t in _between(_F_IX, 'label="Traffic shaping (CAKE)"', "checked="),
        "at load, after a game launch, and at reconnect with Auto-fix on")
 except Exception as _e:
@@ -11212,7 +11214,8 @@ try:
     _p5f_st = _between(_F_RD, "**Streaming auto mode**", "## Hardware")
     ok(all(w in _p5f_st for w in ("Intel, MediaTek, and Realtek", "only take effect when the driver loads"))  # Pass 7 F6
        and "Realtek (rtw88)" not in _F_RD, "the README's streaming section says the same")
-    ok("On some cards part of it needs a restart to take effect."
+    # Pass 8 F6: the (i) says it in fewer words; the README in full.
+    ok("On some cards part of it needs a restart."
        in _between(_F_IX, 'label="Prevent lag spikes"', "checked=")
        and "On some cards part of it needs a restart to take effect."
        in _between(_F_RD, "| Prevent lag spikes |", "\n"),
@@ -12389,6 +12392,23 @@ try:
        "the (i) says the move is from a weak link")
     ok(isinstance(getattr(m.Plugin, "_STRONG_ENOUGH_DBM", None), int),
        "which the backend's own threshold decides")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F6 pass 8 Prevent lag spikes does not claim the WiFi hardware stays fully awake")
+try:
+    _p8f_pl = _between(_F_IX, 'label="Prevent lag spikes"', "checked=")
+    ok("stays fully awake" not in _p8f_pl and "turns most of it off" in _p8f_pl,
+       "most of it off: Clock PM and ath11k's own states stay as they are")
+    ok("On some cards part of it needs a restart." in _p8f_pl, "and some of it waits for a restart")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F7 pass 8 Force 5 GHz says it is only for the network it is turned on for")
+try:
+    _p8f_5 = _between(_F_IX, 'label="Force 5 GHz band"', "checked=")
+    ok("This is the band preference. Only for the network you turn it on for." in _p8f_5,
+       "the (i) states its scope, as the lock, DNS and IPv6 rows do")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 

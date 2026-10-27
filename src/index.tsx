@@ -1869,7 +1869,7 @@ function Content() {
         <InfoRow
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
-          explanation="The OS saves WiFi power in several places: the wireless chip, the PCIe link between the chip and the CPU, and low power modes in the driver. These can cause latency spikes, packets sent in batches, and lower throughput during a long stream. This turns them off, so the WiFi hardware stays fully awake. It uses a little more battery. On some cards part of it needs a restart to take effect."
+          explanation="Power saving in the WiFi chip, its driver and the PCIe link causes lag spikes and batched packets during streams. This turns most of it off, at a little more battery. On some cards part of it needs a restart."
           {...gatedBadge("power_save", s?.power_save_disabled)}
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
@@ -1914,7 +1914,7 @@ function Content() {
         <InfoRow
           label="Auto-fix on wake"
           subtitle="Reapplies settings after sleep"
-          explanation="The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
+          explanation="Sleep and OS updates can reset WiFi settings. A script outside Decky reapplies yours each time WiFi reconnects. Uninstalling the plugin removes it."
           {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
           disabled={isBusy || updating}
@@ -1927,7 +1927,7 @@ function Content() {
         <InfoRow
           label="Network buffer tuning"
           subtitle="Larger UDP buffers for streaming"
-          explanation="Increases the kernel's network buffer sizes to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
+          explanation="Larger kernel network buffers, so bursty streaming traffic isn't dropped. Applies to every connection, wired too. Lost on reboot; put back when the plugin starts, after a game launches, and on each reconnect if Auto-fix on wake is on."
           {...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled)}
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
@@ -2020,7 +2020,7 @@ function Content() {
         <InfoRow
           label="Force 5 GHz band"
           subtitle="Avoid 2.4 GHz Bluetooth interference"
-          explanation={`This is the band preference. Keeps WiFi on 5 GHz, away from Bluetooth on 2.4 GHz${
+          explanation={`This is the band preference. Only for the network you turn it on for. Keeps WiFi on 5 GHz, away from Bluetooth on 2.4 GHz${
             isDeckLcd ? ", which shares the antennas on the Steam Deck LCD" : ""
           }. Refused if no 5 GHz access point is in range; released after about a minute out of range. Reconnects WiFi for up to half a minute.${
             supports6GHz
