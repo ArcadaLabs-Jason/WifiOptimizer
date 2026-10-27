@@ -8246,7 +8246,7 @@ try:
        "the wording is plain ASCII")
     _dist = open("dist/index.js").read()
     ok('"move_bssid_lock"' in _dist and "Move the lock" in _dist
-       and "The lock holds you on a weak access point" in _dist,  # Pass 6 F7, merge p6: the rebuilt bundle
+       and "Locked to a weak access point" in _dist,  # Pass 7 F21-F31, merge p7: the rebuilt bundle
        "and the built bundle carries the notice and the button")
 except Exception as _e:
     import traceback; traceback.print_exc()
