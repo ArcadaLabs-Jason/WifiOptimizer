@@ -90,13 +90,16 @@ const WAKE_MOVE_DRIVER = "ath11k";
 const WAKE_MOVE_KEPT_S = 12 * 60 * 60;
 // The lock row's line for an after-wake move's outcome, once its banner is
 // gone (C22). lockOff: the lock is off now, so the move turned it off.
+// pinMoved: the pin was moved, then WiFi did not come back (C30).
 function wakeMoveRowText(
   outcome: "moved" | "back" | "off",
   at: number,
   lockOff: boolean = false,
+  pinMoved: boolean = false,
 ): string | undefined {
   const ago = timeAgo(at);
   if (outcome === "moved") return `Moved to a stronger access point after sleep, ${ago}.`;
+  if (outcome === "off" && pinMoved) return `Moved to a stronger access point after sleep, but WiFi didn't come back, ${ago}.`;
   if (outcome === "back") return `Stayed after sleep: the stronger access point refused, ${ago}.`;
   if (outcome === "off" && lockOff) return `Turned off after sleep: couldn't move to a stronger access point, ${ago}.`;
   if (outcome === "off") return `Couldn't move to a stronger access point after sleep, ${ago}.`;
@@ -1391,13 +1394,16 @@ function Content() {
   const wakeMove = status?.live?.lock_move_after_wake;
   const wakeMoveOutcome =
     wakeMove && Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000 ? wakeMove.outcome : null;
-  // One "off" for every end the move could not finish (C22). Any lock
-  // action of the user's clears the outcome, so a lock that is off while it
-  // is still held was turned off by the move.
-  const wakeMoveTurnedOff = wakeMove?.outcome === "off" && !status?.settings?.bssid_lock_enabled;
+  // One "off" for every end the move could not finish (C22), but one whose
+  // pin was moved before WiFi failed to come back says it moved (C30). Any
+  // lock action of the user's clears the outcome, so a lock that is off
+  // while it is still held was turned off by the move.
+  const wakeMovePinMoved = wakeMove?.outcome === "off" && wakeMove?.pin_moved === true;
+  const wakeMoveTurnedOff =
+    wakeMove?.outcome === "off" && !wakeMovePinMoved && !status?.settings?.bssid_lock_enabled;
   const wakeMoveLine =
     wakeMove && !wakeMoveOutcome && Date.now() / 1000 - wakeMove.at < WAKE_MOVE_KEPT_S
-      ? wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff)
+      ? wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff, wakeMovePinMoved)
       : undefined;
   const isBusy = busyState || changeRunning;
   const connected = status?.connected ?? false;
@@ -1559,15 +1565,19 @@ function Content() {
           freeing storage would not help there. Any folder on the path can
           be the link, ~/homebrew itself included. Both are the state now,
           read again at every status (C23). Storage space is only advised
-          when the disk was full; any other cause (or a backend that does
-          not say) gets the restart (C27). */}
+          when the disk was full. A settings file that could not be read
+          refuses every save until Reset settings writes a fresh one, so a
+          restart would not help there (C27). Any other cause (or a backend
+          that does not say) gets the restart. */}
       {(status?.settings_unwritable || status?.settings_link_refused) && (
         <Banner variant="warning">
           {status?.settings_link_refused || status?.settings_unwritable_cause === "link"
             ? "A folder on the way to the plugin's settings (~/homebrew/settings) is a link, which the plugin doesn't follow. Make it a real folder."
-            : status?.settings_unwritable_cause === "space"
-              ? "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."
-              : "The plugin couldn't save its settings, so changes may not last past a restart. Restart the device, then try again."}
+            : status?.settings_unwritable_cause === "unread"
+              ? "The plugin can't read its settings file, so changes aren't saved. Tap Reset settings under Actions."
+              : status?.settings_unwritable_cause === "space"
+                ? "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."
+                : "The plugin couldn't save its settings, so changes may not last past a restart. Restart the device, then try again."}
         </Banner>
       )}
 
@@ -1587,15 +1597,17 @@ function Content() {
           After sleep, a stronger access point refused the connection. The lock stayed.
         </Banner>
       )}
-      {/* The move failed and the old pin could not be put back, or the
-          radio did not come back on (C22). The lock may be off or still
-          on: only when it is off now does this say the move turned it
-          off. */}
+      {/* The move failed and the old pin could not be put back (C22), or
+          the pin was moved and then WiFi did not come back (C30). In the
+          first case the lock may be off or still on: only when it is off
+          now does this say the move turned it off. */}
       {wakeMoveOutcome === "off" && (
         <Banner variant="warning">
-          {wakeMoveTurnedOff
-            ? "After sleep, the lock couldn't move to a stronger access point and was turned off."
-            : "After sleep, the lock couldn't move to a stronger access point."}
+          {wakeMovePinMoved
+            ? "After sleep, the lock moved to a stronger access point, but WiFi didn't come back."
+            : wakeMoveTurnedOff
+              ? "After sleep, the lock couldn't move to a stronger access point and was turned off."
+              : "After sleep, the lock couldn't move to a stronger access point."}
         </Banner>
       )}
 
@@ -1726,7 +1738,7 @@ function Content() {
         <Banner variant="info">
           {status?.wpa2_only_stronger && wpa2Shown && (
             <>
-              {`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${
+              {`A stronger access point (signal ${status.wpa2_only_stronger.signal} of 100, the one in use ${
                 status.wpa2_only_stronger.current_signal
               }${
                 status.wpa2_only_stronger.bssid_tail
