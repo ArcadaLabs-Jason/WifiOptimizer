@@ -7402,9 +7402,10 @@ class Plugin:
         """One journal line under the plugin's tag (contract C24): the
         after-wake move's radio cycle left WiFi down, which the wake-failure
         rule cannot see on its own, since NetworkManager's "up" came before
-        the move."""
-        result = self._run_cmd(["/usr/bin/logger", "-t", JOURNAL_TAG, "--",
-                                "after-wake lock move: WiFi did not come back"], timeout=3)
+        the move. The text is WAKE_MOVE_DOWN_LINE, the one the wake rule
+        reads, so the two cannot drift apart."""
+        result = self._run_cmd(["/usr/bin/logger", "-t", JOURNAL_TAG, "--", WAKE_MOVE_DOWN_LINE],
+                               timeout=3)
         if not result.get("success"):
             decky.logger.error(
                 f"Could not log the after-wake move's end: {_tool_text((result.get('stderr') or '')[:120])}")

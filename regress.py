@@ -19830,6 +19830,56 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+section("merge p7: the after-wake move's journal line is the one the wake rule counts (C24)")
+# LIFECYCLE writes the line (L17), DEVICES counts it (D1). One definition of
+# the text, WAKE_MOVE_DOWN_LINE, so a one-character drift on either side
+# cannot silently stop the wake rule from seeing it.
+try:
+    _mp7w_tree = ast.parse(open(m.__file__).read())
+    _mp7w_fns = {n.name: n for n in ast.walk(_mp7w_tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    _mp7w_fn = _mp7w_fns.get("_log_wake_move_death")
+    ok(_mp7w_fn is not None
+       and any(isinstance(n, ast.Name) and n.id == "WAKE_MOVE_DOWN_LINE" for n in ast.walk(_mp7w_fn)),
+       "the writer logs the WAKE_MOVE_DOWN_LINE constant")
+    _mp7w_lits = [n for n in ast.walk(_mp7w_tree)
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                  and "did not come back" in n.value and n.value.startswith("after-wake lock move")]
+    ok(len(_mp7w_lits) == 1, f"and the text is written once in main.py, as that constant ({len(_mp7w_lits)})")
+
+    def _mp7w_logger_head(fn):
+        for n in ast.walk(fn):
+            if isinstance(n, ast.List) and n.elts and isinstance(n.elts[0], ast.Constant) \
+                    and n.elts[0].value == "/usr/bin/logger":
+                return [ast.unparse(e) for e in n.elts[:4]]
+        return None
+    _mp7w_h = _mp7w_logger_head(_mp7w_fn) if _mp7w_fn else None
+    ok(_mp7w_h is not None and _mp7w_h == _mp7w_logger_head(_mp7w_fns["_claim_at_load"])
+       and _mp7w_h == ["'/usr/bin/logger'", "'-t'", "JOURNAL_TAG", "'--'"],
+       f"through the same logger -t JOURNAL_TAG -- call as the driver parameters at load ({_mp7w_h})")
+
+    _mp7w_cmds = []
+    class _Mp7w(m.Plugin):
+        def _run_cmd(self, cmd, timeout=5):
+            _mp7w_cmds.append(list(cmd)); return _ok()
+    _Mp7w()._log_wake_move_death()
+    ok(_mp7w_cmds == [["/usr/bin/logger", "-t", m.JOURNAL_TAG, "--", m.WAKE_MOVE_DOWN_LINE]],
+       f"the real writer emits exactly that line ({_mp7w_cmds})")
+    # The reader: root's lines under the writer's tag, and the line as
+    # journalctl -o short-unix prints what the writer sent.
+    _mp7w_src = m.Plugin._WAKE_SOURCES
+    ok(f"SYSLOG_IDENTIFIER={m.JOURNAL_TAG}" in _mp7w_src
+       and _mp7w_src[_mp7w_src.index(f"SYSLOG_IDENTIFIER={m.JOURNAL_TAG}") + 1] == "_UID=0",
+       f"the wake read takes root's lines under that tag ({_mp7w_src})")
+    _mp7w_line = f"1761004100.250000 {m.JOURNAL_TAG}[4242]: {_mp7w_cmds[0][-1] if _mp7w_cmds else ''}"
+    ok(re.search(m._WAKE_EVENT_GREP, _mp7w_line) is not None
+       and [k for _t, k in m._wake_events(_mp7w_line)] == ["move_down"],
+       f"and counts the written line as the move taking WiFi down ({m._wake_events(_mp7w_line)})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 section("this file: no section rebinds a helper the others share")
 try:
     import ast as _hg_ast
