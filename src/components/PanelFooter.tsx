@@ -2,13 +2,18 @@ import { PanelSection, PanelSectionRow, ButtonItem, Navigation, ToggleField } fr
 import { theme } from "../theme";
 import * as backend from "../backend";
 import { useEffect, useRef, useState } from "react";
-import { withTimeout } from "../utils";
+import { timeAgo, withTimeout } from "../utils";
 import { SendReportRow } from "./SendReport";
 
 const KOFI_URL = "https://ko-fi.com/fanciestpeanut";
 
 interface PanelFooterProps {
   version: string;
+  // When the user last changed a setting, and when the fixes were last put
+  // back on their own. Down here beside the version: neither has a control,
+  // so they kept the first useful action off the first screen.
+  lastApplied: number;
+  lastEnforced?: number;
   // Every setting's explanation open at once, for reading with a controller.
   // Down here with the other secondary controls: the top of the panel is for
   // status and the first useful action, and the (i) next to each setting
@@ -17,7 +22,7 @@ interface PanelFooterProps {
   onShowDetails: (on: boolean) => void;
 }
 
-export function PanelFooter({ version, showDetails, onShowDetails }: PanelFooterProps) {
+export function PanelFooter({ version, lastApplied, lastEnforced, showDetails, onShowDetails }: PanelFooterProps) {
   const [diagState, setDiagState] = useState<
     "idle" | "copying" | "done" | "saved" | "error" | "save_failed"
   >("idle");
@@ -102,11 +107,23 @@ export function PanelFooter({ version, showDetails, onShowDetails }: PanelFooter
   return (
     <PanelSection>
       <PanelSectionRow>
-        <div style={rowStyle}>v{version} by jasonridesabike</div>
+        <div style={rowStyle}>
+          v{version} by jasonridesabike
+          <br />
+          Last changed: {timeAgo(lastApplied)}
+          {lastEnforced ? (
+            <>
+              <br />
+              Auto-applied: {timeAgo(lastEnforced)}
+            </>
+          ) : (
+            ""
+          )}
+        </div>
       </PanelSectionRow>
       <PanelSectionRow>
         <div style={rowStyle}>
-          If WiFi won't reconnect, a reboot usually fixes it.
+          If WiFi won't reconnect, restart the device.
           <br />
           Bugs? Report at github.com/ArcadaLabs-Jason/WifiOptimizer
         </div>

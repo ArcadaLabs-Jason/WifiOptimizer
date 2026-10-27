@@ -32,7 +32,8 @@ interface StreamingSectionProps {
 // the parameters are read at runtime and come off between streams (except
 // the CLKREQ part of disable_aspm, set only when the driver loads), and on
 // the Steam Deck LCD they are the ones that help WiFi come back after
-// sleep. On the others they only take effect when the driver loads (C19).
+// sleep. On the others they take effect when the driver loads (rtw89: and
+// at each resume) (C19).
 export const LOAD_TIME_DRIVERS = ["rtw88", "rtw89", "mt7921e", "iwlwifi"];
 const SLEEP_HELP_DRIVER = "rtw88";
 const SLEEP_HELP_AUTO_TEXT =
@@ -119,7 +120,7 @@ export function StreamingSection({
     stateText = `Streaming: ${app} (${process}).${fixesText}`;
   } else if (active && held) {
     const until = "until you turn off Keep fixes on or restart the device.";
-    stateText = governed.length ? `Held on by you. Fixes are on ${until}` : `Held on by you ${until}${fixesText}`;
+    stateText = governed.length ? `Held on by you. Fixes are on ${until}` : "Held on by you, but no fixes are turned on.";
   } else if (active) {
     // Flagged as running before the app has been named, just after a reload.
     stateText = `A stream is running.${fixesText}`;

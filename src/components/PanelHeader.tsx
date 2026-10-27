@@ -1,13 +1,10 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
 import { theme } from "../theme";
-import { timeAgo } from "../utils";
 import type { LiveStatus } from "../types";
 import { bandLabel } from "./StatsGrid";
 
 interface PanelHeaderProps {
   driver: string;
-  lastApplied: number;
-  lastEnforced?: number;
   deviceLabel?: string;
   streaming?: LiveStatus;
   // Whether any fix auto mode governs (Prevent lag spikes, buffer tuning,
@@ -28,8 +25,6 @@ export function connectionLine(live: LiveStatus | undefined): string {
 
 export function PanelHeader({
   driver,
-  lastApplied,
-  lastEnforced,
   deviceLabel,
   streaming,
   fixesOn,
@@ -40,10 +35,6 @@ export function PanelHeader({
     : driver && driver !== "unknown"
       ? driver
       : "Unknown WiFi card";
-  const rowStyle: React.CSSProperties = {
-    fontSize: theme.fontSize.tiny,
-    color: theme.text.muted,
-  };
   return (
     <PanelSection>
       <PanelSectionRow>
@@ -93,19 +84,6 @@ export function PanelHeader({
           </span>
         </PanelSectionRow>
       )}
-      <PanelSectionRow>
-        <div style={rowStyle}>
-          Last changed: {timeAgo(lastApplied)}
-          {lastEnforced ? (
-            <>
-              <br />
-              Auto-applied: {timeAgo(lastEnforced)}
-            </>
-          ) : (
-            ""
-          )}
-        </div>
-      </PanelSectionRow>
     </PanelSection>
   );
 }

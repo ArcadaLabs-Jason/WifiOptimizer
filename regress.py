@@ -6069,7 +6069,8 @@ try:
     # Pass 6 F2: the confirmation names what comes off; the buffer, CAKE and
     # region detail is in the README's Reset paragraph.
     # Pass 7 F9: every fix except Auto-fix on wake, which Reset leaves on.
-    ok(all(w in _rct for w in ("Turns off every fix except Auto-fix on wake", "lock", "band", "IPv6", "DNS"))
+    # Pass 8 F2: Reset turns Auto-fix on wake on, even where it was off.
+    ok(all(w in _rct for w in ("Turns every fix off and Auto-fix on wake on", "lock", "band", "IPv6", "DNS"))
        and "undoes buffer tuning and CAKE" in open("README.md").read(),
        "the confirmation says what a reset undoes")
     ok("Reset WiFi Optimizer?" in open("dist/index.js").read(), "and the built bundle carries it")
@@ -10633,8 +10634,8 @@ except Exception as _e:
 
 section("F10 a dead or missing card is not told to connect first")
 try:
-    # Pass 6 F12: Copy diagnostics comes before the restart.
-    ok("live?.wifi_state" in _F_IX and "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device." in _F_IX
+    # Pass 8 F1 (N-a): the restart comes before Copy diagnostics.
+    ok("live?.wifi_state" in _F_IX and "The WiFi card isn't responding. Restart the device, then use Copy diagnostics to report it." in _F_IX
        and "WiFi is off. Turn it on in Steam's settings." in _F_IX,
        "the disconnected banner follows wifi_state")
     ok('?? "disconnected"' in _F_IX and "wifi_state?:" in _F_TY, "a backend without it reads as disconnected")
@@ -10812,7 +10813,8 @@ except Exception as _e:
 
 section("F29 F30 F31 F32 F33 small panel text")
 try:
-    ok('band_preference: "Band preference"' in _F_IX, "F29 the drift list reads naturally")
+    # Pass 8 F24: named after the toggle that is on, 5 or 6 GHz.
+    ok('band_preference: "Force 5 GHz band"' in _F_IX, "F29 the drift list reads naturally")
     ok("README mockup" not in _F_TH, "F30 no comment about a mockup that does not exist")
     ok("parseInt(live.frequency" in _F_SG and "const freq = connected ? live.frequency" not in _F_SG,
        "F31 the frequency is shown as a number, once with MHz")
@@ -11068,7 +11070,9 @@ except Exception as _e:
 section("F17 pass 4: buffer tuning and CAKE say every time they are put back")
 try:
     _p4_t = "put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
-    ok(_p4_t in _between(_F_IX, 'label="Network buffer tuning"', "checked=")
+    # Pass 8 F19: buffer tuning's shorter (i) says the same three times.
+    ok("put back when the plugin starts, after a game launches, and on each reconnect if Auto-fix on wake is on."
+       in _between(_F_IX, 'label="Network buffer tuning"', "checked=")
        and _p4_t in _between(_F_IX, 'label="Traffic shaping (CAKE)"', "checked="),
        "at load, after a game launch, and at reconnect with Auto-fix on")
 except Exception as _e:
@@ -11220,7 +11224,8 @@ try:
     _p5f_st = _between(_F_RD, "**Streaming auto mode**", "## Hardware")
     ok(all(w in _p5f_st for w in ("Intel, MediaTek, and Realtek", "only take effect when the driver loads"))  # Pass 7 F6
        and "Realtek (rtw88)" not in _F_RD, "the README's streaming section says the same")
-    ok("On some cards part of it needs a restart to take effect."
+    # Pass 8 F6: the (i) says it in fewer words; the README in full.
+    ok("On some cards part of it needs a restart."
        in _between(_F_IX, 'label="Prevent lag spikes"', "checked=")
        and "On some cards part of it needs a restart to take effect."
        in _between(_F_RD, "| Prevent lag spikes |", "\n"),
@@ -11285,7 +11290,7 @@ try:
        "no_device has its own text")
     ok('connected && status?.live?.wifi_state === "not_responding" && (' in _F_IX
        and '<Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>' in _F_IX
-       and '"The WiFi card isn\'t responding. Copy diagnostics (bottom of this panel), then restart the device."' in _F_IX,  # Pass 6 F12
+       and '"The WiFi card isn\'t responding. Restart the device, then use Copy diagnostics to report it."' in _F_IX,  # Pass 8 F1
        "C1 (c): not_responding on the connected path shows the restart text")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -11452,7 +11457,8 @@ except Exception as _e:
 section("F16 pass 5: the access point lock says it moves to a clearly stronger access point after a wake")
 try:
     # Pass 6 F7 and F6: the shorter texts. Pass 7 F20: on the card it runs on (C25).
-    ok("After a wake, with no game or stream running, it moves to a clearly stronger one."
+    # Pass 8 F5: from a weak link only, as the backend moves it.
+    ok("After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one."
        in _between(_F_IX, 'label="Stop background scanning"', "checked="), "in the lock's explanation")
     _p5f_l16r = _between(_F_RD, "| Stop background scanning |", "\n")
     ok("It moves on its own only after a wake, from a weak access point to a clearly stronger one (never during a game or stream"
@@ -11542,7 +11548,8 @@ try:
     ok("0.24.5-beta" not in _p6f_rct and "this version or later" not in _p6f_rct,
        "Allow WPA2 is said to come off, with no version history at the prompt")
     ok(_p6f_rct and _p6f_words(_p6f_rct) < 70, f"under 70 words ({_p6f_words(_p6f_rct)})")
-    ok(all(w in _p6f_rct for w in ("every fix except Auto-fix on wake", "next connect", "Streaming auto mode is cleared.",
+    # Pass 8 F2: Auto-fix on wake is turned on, not left as it was.
+    ok(all(w in _p6f_rct for w in ("every fix off and Auto-fix on wake on", "next connect", "Streaming auto mode is cleared.",
                                    "Update settings are kept.")),
        "and keeps what stays on, when the network settings go, auto mode and the update settings")
 except Exception as _e:
@@ -11605,7 +11612,7 @@ section("F7 pass 6 reconnect times say up to half a minute, and the lock's (i) d
 try:
     _p6f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
     ok("You stay on that access point until you turn this off or move the lock" not in _p6f_li
-       and "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one." in _p6f_li  # Pass 7 F20
+       and "It stays there until you move it or turn the lock off. After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one." in _p6f_li  # Pass 7 F20
        and "Turning it on or off reconnects WiFi for up to half a minute." in _p6f_li,
        "the lock's explanation")
     ok("Moving reconnects WiFi." in _between(_F_IX, "{status?.lock_weaker && lockWeakerShown && (", "</>"),  # Pass 7 F22
@@ -11658,9 +11665,9 @@ try:
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
-section("F12 pass 6 a card that isn't responding: copy diagnostics before the restart")
+section("F12 pass 6 a card that isn't responding: the banner text (pass 8 F1: restart first)")
 try:
-    _p6f_nr = "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device."
+    _p6f_nr = "The WiFi card isn't responding. Restart the device, then use Copy diagnostics to report it."
     ok(f'const NOT_RESPONDING_TEXT =\n  "{_p6f_nr}";' in _F_IX,
        "the banner says it (the per-control error keeps the backend's own words)")
 except Exception as _e:
@@ -12007,10 +12014,12 @@ except Exception as _e:
 section("F9 M-e pass 7 the Reset confirmation names Auto-fix on wake and drops the version caveat")
 try:
     _p7f_rc = _between(_between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n"), '"', '";')
-    ok("Turns off every fix except Auto-fix on wake, which then applies nothing." in _p7f_rc
+    # Pass 8 F2: Reset turns Auto-fix on wake on, even where it was off.
+    ok("Turns every fix off and Auto-fix on wake on, which then applies nothing." in _p7f_rc
        and "everything the plugin applied" not in _p7f_rc,
-       "Auto-fix on wake stays on, and the text no longer says everything")
-    ok("0.24.5-beta" not in _p7f_rc and "next connect." in _p7f_rc,
+       "Auto-fix on wake is on after it, and the text no longer says everything")
+    # Pass 8 F2: the region now follows "at the next connect".
+    ok("0.24.5-beta" not in _p7f_rc and "at the next connect" in _p7f_rc,
        "no version history in front of the action (M-e); the README keeps it")
     ok(_p7f_rc and _p7f_words(_p7f_rc) < 50, f"under 50 words ({_p7f_words(_p7f_rc)})")
     ok("0.24.5-beta or later" in _between(_F_RD, "| Allow WPA2 here |", "\n")
@@ -12260,7 +12269,7 @@ try:
     _p7f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
     ok('const WAKE_MOVE_DRIVER = "ath11k";' in _F_IX and "s?.driver?.startsWith(WAKE_MOVE_DRIVER)" in _p7f_li,
        "the (i) is keyed on drivers starting ath11k, as the backend's allow list is")
-    ok('? "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one."\n'
+    ok('? "It stays there until you move it or turn the lock off. After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one."\n'
        '              : "It stays there until you move it or turn the lock off."' in _p7f_li,
        "the move is promised there, and nowhere else")
     ok(m.Plugin._module_profile("ath11k_pci").startswith("ath11k")
@@ -12268,10 +12277,11 @@ try:
        "the OLED's card is recorded under a name starting ath11k, and no other card the plugin knows is")
     _p7f_row = _between(_F_RD, "| Stop background scanning |", "\n")
     _p7f_list = _p7f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
-    ok("(never during a game or stream, and for now only on the Steam Deck OLED)" in _p7f_row
-       and "(never during a game or stream, and for now only on the Steam Deck OLED)" in _p7f_list
+    ok("(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _p7f_row
+       and "(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _p7f_list
        and "not yet on the Steam Deck LCD" not in _F_RD,
-       "both README places say for now only on the Steam Deck OLED")
+       # Pass 8 F3 (N-b (i), C28): the scope is said as the code keys it.
+       "both README places say for now only on Qualcomm ath11k cards such as the Steam Deck OLED's")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -12279,8 +12289,9 @@ section("F21 to F31 pass 7 shorter notices, explanations and comments")
 try:
     _p7f_fx = _p7f_flat(_F_IX)
     _p7f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
-    ok(_p7f_w.startswith("{`A stronger access point (signal ${status.wpa2_only_stronger.signal} vs ${")
-       and "} of 100${" in _p7f_w and "offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi.`" in _p7f_w + "`"
+    # Pass 8 F22: the signals worded as the weaker-lock banner words them.
+    ok(_p7f_w.startswith("{`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${")
+       and "current_signal\n              }${" in _p7f_w and "offers only WPA2. Allow WPA2 only if that access point is yours: it makes your WiFi password easier to attack. Reconnects WiFi.`" in _p7f_w + "`"
        and "Reset settings undoes it" not in _p7f_w and "access point here" not in _p7f_w, "F21 WPA2 banner")
     ok("Reset puts the network back to WPA3 only" in _between(_F_RD, "| Allow WPA2 here |", "\n"),
        "F21 the README row keeps the undo")
@@ -12325,6 +12336,407 @@ try:
     ok(not any(re.search(r"\w -{1,2} \w", _p7f_l)
                for _p7f_l in (_F_SEC + _between(_F_RD, "## The problem", "## Building from source")).split("\n")),
        "no spaced hyphen used as a dash in SECURITY.md or the README's user sections")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+# ---- QA pass 8: FRONT ----
+_P8F_PH = _src("src/components/PanelHeader.tsx"); _P8F_SR = _src("src/components/SendReport.tsx")
+_P8F_INST = _src("install.sh")
+
+section("F1 pass 8 a card that isn't responding: restart first, then Copy diagnostics (N-a)")
+try:
+    _p8f_nr = _between(_F_IX, "const NOT_RESPONDING_TEXT =", ";\n")
+    ok("Restart the device, then use Copy diagnostics" in _p8f_nr and "then restart" not in _p8f_nr,
+       f"the restart comes first, and the copy after it ({_p8f_nr.strip()[-100:]!r})")
+    ok("then restart" not in _p7f_flat(_between(_F_IX, "const disconnectedText =", ";\n")),
+       "no other dead-card text asks for a copy before the restart")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F2 pass 8 the Reset confirmation and README say Reset turns Auto-fix on wake on, and the region goes back")
+try:
+    _p8f_rc = _between(_between(_F_IX, "const RESET_CONFIRM_TEXT", ";\n"), '"', '";')
+    ok("Auto-fix on wake on" in _p8f_rc and "except Auto-fix" not in _p8f_rc,
+       f"the confirmation says Auto-fix on wake is on after it ({_p8f_rc[:80]!r})")
+    ok("WiFi region goes back" in _p8f_rc, "and that a region chosen in the plugin goes back")
+    ok(_p8f_rc and _p7f_words(_p8f_rc) < 50, f"under 50 words ({_p7f_words(_p8f_rc)})")
+    _p8f_up = _between(_F_RD, "**Before uninstalling:**", "\n\n")
+    ok("Reset turns Auto-fix on wake on" in _p8f_up and "Reset leaves Auto-fix on wake on" not in _F_RD,
+       "the README says Reset turns it on")
+    # What the text says is what Reset does: on even where it was off.
+    _p8f_rl = re.split(r"\n    (?:async )?def ", _between(_F_MAIN, "async def _reset_locked", "\nclass "))[0]
+    ok('settings["auto_fix_on_wake"] = installed' in _p8f_rl and "await undo(\"the region\"" in _p8f_rl,
+       "which is what _reset_locked does")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F3 pass 8 the README says the after-wake move runs on ath11k cards such as the OLED's, as the code keys it (N-b, C28)")
+try:
+    _p8f_scope = "(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)"
+    _p8f_row = _between(_F_RD, "| Stop background scanning |", "\n")
+    _p8f_list = _p7f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
+    ok(_p8f_scope in _p8f_row and _p8f_scope in _p8f_list,
+       "both README places name ath11k cards, the OLED's as the example")
+    ok("for now only on the Steam Deck OLED)" not in _p7f_flat(_F_RD),
+       "and neither says only the Steam Deck OLED, which the ath11k test is wider than")
+    ok(m.Plugin._no_wake_move_driver(m.Plugin(), "ath11k_pci") is False
+       and 'const WAKE_MOVE_DRIVER = "ath11k";' in _F_IX,
+       "which is the test the backend and the (i) make")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F4 pass 8 the README's list of what runs with the panel closed names the after-wake card note")
+try:
+    _p8f_list = _p7f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
+    ok("notes the WiFi card's state" in _p8f_list
+       and "when WiFi is still down a minute and a half after a wake" in _p8f_list,
+       f"the 20-second check is said to note the card's state after a failed wake ({_p8f_list[200:420]!r})")
+    ok("a check every 20 seconds that, while the access point lock or a band preference is on, releases a pin" in _p8f_list,
+       "and the lock or band condition is on the pin release, not on the whole check")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F5 pass 8 the lock's (i) promises the after-wake move only from a weak link")
+try:
+    _p8f_li = _between(_F_IX, 'label="Stop background scanning"', "checked=")
+    ok("After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one." in _p8f_li
+       and "After a wake, with no game" not in _p8f_li,
+       "the (i) says the move is from a weak link")
+    ok(isinstance(getattr(m.Plugin, "_STRONG_ENOUGH_DBM", None), int),
+       "which the backend's own threshold decides")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F6 pass 8 Prevent lag spikes does not claim the WiFi hardware stays fully awake")
+try:
+    _p8f_pl = _between(_F_IX, 'label="Prevent lag spikes"', "checked=")
+    ok("stays fully awake" not in _p8f_pl and "turns most of it off" in _p8f_pl,
+       "most of it off: Clock PM and ath11k's own states stay as they are")
+    ok("On some cards part of it needs a restart." in _p8f_pl, "and some of it waits for a restart")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F7 pass 8 Force 5 GHz says it is only for the network it is turned on for")
+try:
+    _p8f_5 = _between(_F_IX, 'label="Force 5 GHz band"', "checked=")
+    ok("This is the band preference. Only for the network you turn it on for." in _p8f_5,
+       "the (i) states its scope, as the lock, DNS and IPv6 rows do")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F8 pass 8 with WiFi down, the status banners come first, above the wake notice and the update offer")
+try:
+    _p8f_ret = _F_IX[_F_IX.find("<PanelHeader"):]
+    _p8f_at = {k: _p8f_ret.find(v) for k, v in {
+        "read failed": "{status?.success === false && (",
+        "disconnected": "<Banner variant=\"error\">{disconnectedText}</Banner>",
+        "stuck iw": "<Banner variant=\"warning\">{NOT_RESPONDING_TEXT}</Banner>",
+        "wake notice": "<WakeFailureNotice />",
+        "update offer": "`Update to v${updateInfo.latest_version}`",
+        "settings banner": "{(status?.settings_unwritable || status?.settings_link_refused) && (",
+    }.items()}
+    ok(all(v > 0 for v in _p8f_at.values()), f"every block is rendered ({_p8f_at})")
+    ok(all(_p8f_at[a] < _p8f_at[b] for a in ("read failed", "disconnected", "stuck iw")
+           for b in ("wake notice", "update offer", "settings banner")),
+       f"the status read, disconnected and stuck-iw banners come before the rest ({_p8f_at})")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F9 pass 8 Last changed and Auto-applied are in the footer, beside the version, not on the first screen")
+try:
+    _p8f_pf = _src("src/components/PanelFooter.tsx")
+    ok("Last changed" not in _P8F_PH and "Auto-applied" not in _P8F_PH,
+       "the header has neither line")
+    _p8f_vr = _between(_p8f_pf, "v{version} by jasonridesabike", "</PanelSectionRow>")
+    ok("Last changed: {timeAgo(lastApplied)}" in _p8f_vr and "Auto-applied: {timeAgo(lastEnforced)}" in _p8f_vr,
+       "the footer has both, in the version's row")
+    _p8f_fc = _between(_F_IX, "<PanelFooter", "/>")
+    ok("lastApplied={s?.last_applied ?? 0}" in _p8f_fc and "lastEnforced={status?.live?.last_enforced}" in _p8f_fc
+       and "lastApplied=" not in _between(_F_IX, "<PanelHeader", "/>"),
+       "and the panel hands them to the footer")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F10 pass 8 an after-wake move that turned the lock off says so, banner and row line (C22 amended)")
+try:
+    _p8f_bn = _p7f_flat(_between(_F_IX, '{wakeMoveOutcome === "off" && (', "</Banner>"))
+    ok('wakeMoveTurnedOff ? "After sleep, the lock couldn\'t move to a stronger access point and was turned off." '
+       ': "After sleep, the lock couldn\'t move to a stronger access point."' in _p8f_bn,
+       f"the banner says turned off only when the lock is off now ({_p8f_bn.strip()[-200:]!r})")
+    _p8f_to = _between(_F_IX, "const wakeMoveTurnedOff =", ";\n")
+    ok('wakeMove?.outcome === "off"' in _p8f_to and "!status?.settings?.bssid_lock_enabled" in _p8f_to,
+       "which is an 'off' outcome with the lock off")
+    ok("wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff)" in _between(_F_IX, "const wakeMoveLine =", ";\n"),
+       "the row line is told the same")
+    _p8f_wr = _p7f_fn(_F_IX, "wakeMoveRowText")
+    _p8f_r = _p7f_run(_p7f_fn(_P7F_UT, "timeAgo").replace("export function", "function") + _p8f_wr +
+                      "const t = Math.floor(Date.now() / 1000) - 300;\n"
+                      "console.log(JSON.stringify([(wakeMoveRowText as any)('off', t, true), (wakeMoveRowText as any)('off', t, false),"
+                      " (wakeMoveRowText as any)('moved', t, true)]));\n") if _p8f_wr else None
+    if _p8f_wr and _p8f_r is None:
+        print("SKIP  no node or typescript here to run the row line; CI runs it")
+    else:
+        _p8f_o = _p7f_json(_p8f_r) if _p8f_r else None
+        ok(_p8f_o == ["Turned off after sleep: couldn't move to a stronger access point, 5 min ago.",
+                      "Couldn't move to a stronger access point after sleep, 5 min ago.",
+                      "Moved to a stronger access point after sleep, 5 min ago."],
+           f"the row line for each branch ({_p8f_o} {(_p8f_r or ('', '', ''))[2][-200:]})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F11 pass 8 Force reapply all is explained in the README and, with Show details, under its button")
+try:
+    ok("**Force reapply all** applies every setting that is on again, the lock and network settings included, which can reconnect WiFi."
+       in _F_RD, "the README says what it does")
+    _p8f_as = _src("src/components/ActionsSection.tsx")
+    _p8f_fr = _between(_p8f_as, "<ButtonItem", "Force reapply all")
+    ok("useContext(DetailsContext)" in _p8f_as
+       and "description={showDetails ? FORCE_REAPPLY_DETAIL : undefined}" in _p8f_fr
+       and 'const FORCE_REAPPLY_DETAIL = "Applies every setting that is on again. Can reconnect WiFi.";' in _p8f_as,
+       "the button's description shows only with Show details")
+    ok("<DetailsContext.Provider value={showDetails}>" in _F_IX
+       and _F_IX.find("<DetailsContext.Provider") < _F_IX.find("<ActionsSection") < _F_IX.find("</DetailsContext.Provider>"),
+       "and the section reads the panel's Show details")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F12 pass 8 an update refusal stays at the top after the re-check finds no update")
+try:
+    _p8f_top = _between(_F_IX, "{/* Update available.", "{/* Updating */}")
+    _p8f_cond = re.search(r"\n      \{(\(?[^\n]*?)&& \(\n        <PanelSection>", _p8f_top)
+    _p8f_c = _p8f_cond.group(1) if _p8f_cond else ""
+    ok("updateError" in _p8f_c and "!updating" in _p8f_c
+       and not re.match(r"updateInfo\?\.update_available &&", _p8f_c.strip()),
+       f"the top section shows while a refusal is set, offer or not ({_p8f_c!r})")
+    _p8f_btn = _between(_p8f_top, "<PanelSection>", "onClick={handleApplyUpdate}")
+    ok("{updateInfo?.update_available && (" in _p8f_btn,
+       "the update button only with an offer")
+    ok("{updateError && (" in _p8f_top and "{updateError}" in _p8f_top, "and the refusal's row with or without it")
+    # The refusal is kept by the re-check that follows it (keepError).
+    ok("runUpdateCheck(true, true);" in _between(_F_IX, "const handleApplyUpdate = async", "\n  };")
+       and "if (info?.success && !keepError) setUpdateError(null);" in _F_IX,
+       "which keeps the refusal while it asks GitHub again")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F13 pass 8 a check for updates that fails no longer leaves 'Up to date' up")
+try:
+    _p8f_hc = _between(_F_IX, "const handleCheckForUpdate = async () => {", "\n  };")
+    _p8f_cf = _between(_F_IX, "const UPDATE_CHECK_FAILED_TEXT", ";\n")
+    ok(bool(_p8f_hc), "the handler is there")
+    _p8f_case = ("let info: any = null; const setUpdateInfo = (v: any) => { info = v; };\n"
+                 "const setCheckingUpdate = (_v: boolean) => {}; const setUpdateError = (_v: any) => {};\n"
+                 "const lastUpdateCheckAtRef = {current: 0}; const updateCheckSeqRef = {current: 0};\n"
+                 "const withTimeout = (p: any) => p;\n"
+                 "const backend: any = {checkForUpdate: () => Promise.resolve({success: true, update_available: false})};\n"
+                 + (_p8f_cf + ";\n" if _p8f_cf else "") + _p8f_hc + "\n  };\n"
+                 "(async () => {\n"
+                 " await handleCheckForUpdate(); const upToDate = info;\n"
+                 " backend.checkForUpdate = () => Promise.reject(new Error('offline'));\n"
+                 " await handleCheckForUpdate(); const failed = info;\n"
+                 # A check overtaken by a channel change leaves the new answer alone.
+                 " info = {success: true, update_available: false}; let rej: any = null;\n"
+                 " backend.checkForUpdate = () => new Promise((_r, j) => { rej = j; });\n"
+                 " const p = handleCheckForUpdate(); updateCheckSeqRef.current += 1; rej(new Error('late')); await p;\n"
+                 " console.log(JSON.stringify({upToDate, failed, overtaken: info})); })();\n")
+    _p8f_r = _p7f_run(_p8f_case) if _p8f_hc else None
+    if _p8f_hc and _p8f_r is None:
+        print("SKIP  no node or typescript here to run the update check; CI runs it")
+    else:
+        _p8f_o = (_p7f_json(_p8f_r) if _p8f_r else None) or {}
+        ok((_p8f_o.get("upToDate") or {}).get("success") is True
+           and _p8f_o.get("failed") == {"success": False, "update_available": False,
+                                        "message": "Couldn't check for updates. Try again in a moment."},
+           f"'Up to date', then a check that throws: the section is told it failed ({_p8f_o} {(_p8f_r or ('', '', ''))[2][-200:]})")
+        ok(_p8f_o.get("overtaken") == {"success": True, "update_available": False},
+           "a failed check overtaken by a channel change does not overwrite the newer answer")
+    _p8f_us = _between(_F_US, ") : (", "Check for updates")
+    ok("updateInfo && updateInfo.success === false && updateInfo.message" in _p8f_us
+       and 'updateInfo?.success && !updateInfo?.update_available\n                  ? "Up to date"' in _p8f_us,
+       "which the Updates section shows, with the button back to Check for updates")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F14 pass 8 the settings banner gives storage advice only for a full disk, else a restart (C27)")
+try:
+    _p8f_sb = _p7f_flat(_between(_F_IX, "{(status?.settings_unwritable || status?.settings_link_refused) && (", "</Banner>"))
+    ok('status?.settings_link_refused || status?.settings_unwritable_cause === "link" ? '
+       '"A folder on the way to the plugin\'s settings (~/homebrew/settings) is a link, which the plugin doesn\'t follow. Make it a real folder."'
+       in _p8f_sb, "link: the link text")
+    ok(': status?.settings_unwritable_cause === "space" ? "The plugin couldn\'t save its settings, so changes may not last past a restart. '
+       'Check that the device has free storage space, then try the change again."' in _p8f_sb, "space: the storage text")
+    ok(': "The plugin couldn\'t save its settings, so changes may not last past a restart. Restart the device, then try again."'
+       in _p8f_sb, "other or absent: the restart, with no storage advice")
+    ok('settings_unwritable_cause?: "link" | "space" | "other";' in _F_TY, "the panel reads the cause the backend sends")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+def _p8f_install(installed=None, tag="v0.24.3", files=None, download=True):
+    """Run the real install.sh against a stub GitHub serving tag's release
+    tarball (prefix WifiOptimizer-<version>/, its package.json carrying the
+    version), over a fake Decky with installed (a version) or nothing in
+    place. (rc, stdout + stderr)."""
+    import tarfile as _t, io as _io
+    _d = tempfile.mkdtemp()
+    _bin = os.path.join(_d, "bin"); os.mkdir(_bin)
+    _home = os.path.join(_d, "home"); _plugins = os.path.join(_home, "homebrew", "plugins")
+    os.makedirs(_plugins)
+    if installed:
+        _pd = os.path.join(_plugins, "WiFi Optimizer"); os.makedirs(_pd)
+        open(os.path.join(_pd, "package.json"), "w").write(
+            '{\n  "name": "wifi-optimizer",\n  "version": "' + installed + '",\n  "license": "BSD-3-Clause"\n}\n')
+        open(os.path.join(_pd, "main.py"), "w").write("old\n")
+    _ver = tag[1:]
+    _tgz = os.path.join(_d, "asset.tar.gz")
+    with _t.open(_tgz, "w:gz") as _tf:
+        for _f in (files or ("plugin.json", "package.json", "main.py", "decky.pyi", "dist/index.js",
+                             "defaults/dispatcher.sh.tmpl")):
+            _b = (('{\n  "name": "wifi-optimizer",\n  "version": "' + _ver + '",\n  "license": "BSD-3-Clause"\n}\n')
+                  if _f == "package.json" else "payload " + _f + "\n").encode()
+            _i = _t.TarInfo("WifiOptimizer-" + _ver + "/" + _f); _i.size = len(_b)
+            _tf.addfile(_i, _io.BytesIO(_b))
+    _rel = "https://github.com/ArcadaLabs-Jason/WifiOptimizer/releases"
+    _stubs = {
+        "id": '#!/bin/bash\n[ "$1" = "-u" ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n',
+        "getent": f'#!/bin/bash\necho "tester:x:1000:1000::{_home}:/bin/bash"\n',
+        "systemctl": "#!/bin/bash\nexit 0\n",
+        "curl": ('#!/bin/bash\nout=""; url=""; prev=""\n'
+                 'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; case "$a" in https://*) url="$a" ;; esac; prev="$a"; done\n'
+                 'case "$url" in\n'
+                 '  */releases/latest) printf "%s" "' + _rel + '/tag/' + tag + '"; exit 0 ;;\n'
+                 + ('  ' + _rel + '/download/' + tag + '/wifi-optimizer-' + tag + '.tar.gz) cp "' + _tgz + '" "$out"; exit 0 ;;\n'
+                    if download else "") +
+                 'esac\nexit 22\n'),
+    }
+    for _n, _body in _stubs.items():
+        open(os.path.join(_bin, _n), "w").write(_body); os.chmod(os.path.join(_bin, _n), 0o755)
+    _r = _p5f_sp.run([_p5f_sh.which("bash"), os.path.abspath("install.sh")], capture_output=True, text=True, timeout=60,
+                     env={**os.environ, "PATH": _bin + os.pathsep + os.environ.get("PATH", ""), "SUDO_USER": "tester"},
+                     cwd=_d)
+    return _r.returncode, _r.stdout + _r.stderr
+
+section("F15 pass 8 install.sh says which version it installed and which was there, never 'updated'")
+try:
+    _p8f_rc, _p8f_out = _p8f_install(installed="0.24.6-beta", tag="v0.24.3")
+    ok(_p8f_rc == 0 and "Installed v0.24.3 (was v0.24.6-beta)." in _p8f_out,
+       f"the 0.24.3 asset over a 0.24.6-beta install says so (rc {_p8f_rc}, {_p8f_out.strip()[-160:]!r})")
+    ok("updated!" not in _p8f_out and "preserved" not in _p8f_out and "Upgrading" not in _p8f_out,
+       "and claims neither an update nor kept settings")
+    _p8f_rc, _p8f_out = _p8f_install(installed="0.24.3", tag="v0.24.3")
+    ok(_p8f_rc == 0 and "Reinstalled v0.24.3." in _p8f_out, f"the same version says reinstalled ({_p8f_out.strip()[-80:]!r})")
+    _p8f_rc, _p8f_out = _p8f_install(installed=None, tag="v0.24.3")
+    ok(_p8f_rc == 0 and "WiFi Optimizer installed! Open the Quick Access Menu to configure." in _p8f_out,
+       "a fresh install keeps its line")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F25 pass 8 install.sh says plainly when the download fails, can't be unpacked or is incomplete")
+try:
+    _p8f_rc, _p8f_out = _p8f_install(tag="v0.24.3", download=False)
+    ok(_p8f_rc == 1 and "Error: Couldn't download v0.24.3. Try again in a few minutes." in _p8f_out,
+       f"a failed download ({_p8f_out.strip()[-100:]!r})")
+    _p8f_rc, _p8f_out = _p8f_install(tag="v0.24.3", files=("plugin.json", "package.json", "main.py"))
+    ok(_p8f_rc == 1 and "Error: The download is incomplete. Try again." in _p8f_out and "repo structure" not in _p8f_out,
+       f"a tarball missing files ({_p8f_out.strip()[-100:]!r})")
+    ok('{ echo "Error: Couldn\'t unpack $LATEST_TAG. Try again."; exit 1; }' in _P8F_INST, "one that won't unpack")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F16 pass 8 a send with no answer is retired once nothing waits, and a reference shows once (C29)")
+try:
+    _p8f_fns = "".join(_p7f_fn(_P8F_SR, n) for n in ("update", "begin", "end", "refreshReportState", "send"))
+    _p8f_ssr = _p7f_fn(_P8F_SR, "shownSentRef") or (
+        # Before C29 the panel showed sent_ref whatever was on screen.
+        "function shownSentRef(state: any, outcome: any): string {\n"
+        "  return state?.sent_ref && state.sent_ref !== hidden.sentRef ? state.sent_ref : \"\";\n}\n")
+    _p8f_case = ("type ReportState = any; type ReportResult = any; type Outcome = any;\n"
+                 "class NoAnswer extends Error {}\n"
+                 "const CALL_TIMEOUT_MS = 1; const STATE_LIMIT_MS = 1;\n"
+                 "function withTimeout(p: any, _ms?: number) { return p; }\n"
+                 "let shared: any = {state: null, inFlight: 0, collecting: false, outcome: null, ready: null, cancelFailed: false};\n"
+                 "const listeners = new Set<() => void>(); let loading: any = null; let again: any = null;\n"
+                 "let actionSeq = 0; let loadingSeq = 0;\n"
+                 "const hidden = {wake: false, wakeDismissed: false, dropped: false, sentRef: ''};\n"
+                 "function schedulePoll() {}\n"
+                 + _between(_P8F_SR, "const SEND_FAIL_TEXT =", ";\n") + ";\n"
+                 + _between(_P8F_SR, "const SEND_SLOW_TEXT", ";\n") + ";\n"
+                 "let next: any = {enabled: true, pending: true, sent_ref: ''};\n"
+                 "const getReportState = () => Promise.resolve(next);\n"
+                 "let sendReport = (_id: string): Promise<any> => Promise.reject(new NoAnswer());\n"
+                 + _p8f_fns + _p8f_ssr +
+                 "(async () => {\n"
+                 # The send times out; the report is still waiting on the device.
+                 " await send('id1', 'footer'); const slowFirst = shared.outcome && shared.outcome.text === SEND_SLOW_TEXT;\n"
+                 # It went in the background: nothing waits, and its reference is kept.
+                 " next = {enabled: true, pending: false, sent_ref: 'R1'}; await refreshReportState();\n"
+                 " const slowAfter = !!(shared.outcome && shared.outcome.text === SEND_SLOW_TEXT);\n"
+                 " const shown1 = [shared.outcome && shared.outcome.text.includes('R1') ? 'outcome' : '', shownSentRef(shared.state, shared.outcome) === 'R1' ? 'line' : ''].filter(Boolean);\n"
+                 # A direct send answered with its reference, which the backend keeps too.
+                 " sendReport = () => Promise.resolve({success: true, status: 'sent', ref: 'R2', message: 'Report sent. Reference R2. Quote it if you post about this.'});\n"
+                 " next = {enabled: true, pending: false, sent_ref: 'R2'}; await send('id2', 'footer');\n"
+                 " const shown2 = [shared.outcome && shared.outcome.text.includes('R2') ? 'outcome' : '', shownSentRef(shared.state, shared.outcome) === 'R2' ? 'line' : ''].filter(Boolean);\n"
+                 " console.log(JSON.stringify({slowFirst, slowAfter, shown1, shown2})); })();\n")
+    _p8f_r = _p7f_run(_p8f_case)
+    if _p8f_r is None:
+        print("SKIP  no node or typescript here to run the report send; CI runs it")
+    else:
+        _p8f_o = _p7f_json(_p8f_r) or {}
+        ok(_p8f_o.get("slowFirst") is True and _p8f_o.get("slowAfter") is False,
+           f"a send that timed out says it may still be sending, until a read shows nothing waiting ({_p8f_o} {_p8f_r[2][-300:]})")
+        ok(_p8f_o.get("shown1") == ["line"], f"then its reference shows, once ({_p8f_o.get('shown1')})")
+        ok(_p8f_o.get("shown2") == ["outcome"], f"a direct send's reference shows once, in its outcome ({_p8f_o.get('shown2')})")
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F17 pass 8 the report preview has a Send above its text, so a controller need not step through every block")
+try:
+    _p8f_pm = _p7f_fn(_P8F_SR, "ReportPreviewModal")
+    _p8f_db = _between(_p8f_pm, "<DialogButton", "</DialogButton>")
+    ok(bool(_p8f_db) and "onSend();" in _p8f_db and "closeModal?.();" in _p8f_db and _p8f_db.rstrip().endswith("Send"),
+       "a Send button that sends and closes, as the modal's own does")
+    ok(0 <= _p8f_pm.find("<DialogButton") < _p8f_pm.find("{blocks.map("),
+       "before the preview's blocks, so focus finds it first")
+    ok("DialogButton," in _between(_P8F_SR, "import {", "} from \"@decky/ui\""), "from Decky's own components")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("F18 to F24 pass 8 shorter explanations, the held line, the reconnect advice, the WPA2 banner and the band's drift name")
+try:
+    ok('explanation="Sleep and OS updates can reset WiFi settings. A script outside Decky reapplies yours each time WiFi reconnects. Uninstalling the plugin removes it."'
+       in _between(_F_IX, 'label="Auto-fix on wake"', "checked="), "F18 Auto-fix on wake (i)")
+    ok('explanation="Larger kernel network buffers, so bursty streaming traffic isn\'t dropped. Applies to every connection, wired too. '
+       'Lost on reboot; put back when the plugin starts, after a game launches, and on each reconnect if Auto-fix on wake is on."'
+       in _between(_F_IX, 'label="Network buffer tuning"', "checked="), "F19 Network buffer tuning (i)")
+    ok('"Held on by you, but no fixes are turned on."' in _between(_F_SS, "let stateText: string;", "return ("),
+       "F20 held with nothing to hold on")
+    ok("If WiFi won't reconnect, restart the device." in _src("src/components/PanelFooter.tsx")
+       and "reboot usually fixes it" not in _src("src/components/PanelFooter.tsx") + _F_RD,
+       "F21 the footer (and the README's heads-up) say restart the device")
+    _p8f_w = _between(_between(_F_IX, "{status?.wpa2_only_stronger && wpa2Shown && (", "</>"), "{`", "`}")
+    ok(_p8f_w.startswith("{`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${")
+       and "vs ${" not in _p8f_w and ", address ends ${status.wpa2_only_stronger.bssid_tail}" in _p8f_w,
+       "F22 the WPA2 banner words the signals as the weaker-lock banner does")
+    ok("On the others they take effect when the driver loads (rtw89: and\n// at each resume) (C19)." in _F_SS,
+       "F23 the comment says rtw89 reads them at each resume too")
+    _p8f_dn = _between(_F_IX, "const driftNames =", ";\n")
+    ok('k === "band_preference" && on6GHz ? "Force 6 GHz band"' in _p8f_dn
+       and 'band_preference: "Force 5 GHz band"' in _F_IX, "F24 the band's drift name is the toggle that is on")
+except Exception as _e:
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+section("pass 8 FRONT: the changed text is plain ASCII with no dashes as punctuation")
+try:
+    _p8f_all = _F_RD + _F_SEC + _P8F_INST + _F_ALL
+    ok(all(ord(ch) < 128 for ch in _p8f_all), "plain ASCII")
+    ok(not any(re.search(r"\w -{1,2} \w", _p8f_l)
+               for _p8f_l in (_F_SEC + _between(_F_RD, "## The problem", "## Building from source")).split("\n")
+               + [_l for _l in _P8F_INST.split("\n") if "echo " in _l]),
+       "no spaced hyphen used as a dash in SECURITY.md, the README's user sections or what install.sh prints")
 except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
@@ -16753,7 +17165,7 @@ try:
     _mp5l_rd = _between(_F_RD, "| Stop background scanning |", "\n")
     # Pass 6 F6 and F7: the shorter texts say the same. Pass 7 F20: the (i)
     # says it where the move runs (C25).
-    ok("After a wake, with no game or stream running, it moves to a clearly stronger one." in _mp5l_ix
+    ok("After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one." in _mp5l_ix
        and "It moves on its own only after a wake, from a weak access point to a clearly "
        "stronger one (never during a game or stream" in _mp5l_rd,
        "the panel and the README say it moves after a wake, from weak to clearly stronger, not during a game")
@@ -18820,9 +19232,10 @@ try:
        f"and moves exactly where the driver starts with the panel's prefix ({_mp6k_got})")
     _mp6k_row = _between(_F_RD, "| Stop background scanning |", "\n")
     _mp6k_list = _p6f_flat(_between(_F_RD, "The panel polls for live status", "\n\n"))
-    ok("(never during a game or stream, and for now only on the Steam Deck OLED)" in _mp6k_row
-       and "(never during a game or stream, and for now only on the Steam Deck OLED)" in _mp6k_list,
-       "both README places that name the after-wake move say for now only on the Steam Deck OLED")
+    ok("(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _mp6k_row
+       and "(never during a game or stream, and for now only on Qualcomm ath11k cards such as the Steam Deck OLED's)" in _mp6k_list,
+       # Pass 8 F3 (N-b (i), C28): said as the code keys it, on ath11k.
+       "both README places that name the after-wake move say for now only on ath11k cards such as the OLED's")
 except Exception as _e:
     import traceback; traceback.print_exc()
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
@@ -19942,8 +20355,15 @@ try:
     _mp7o_row = _mp7o_off.group(1) if _mp7o_off else ""
     ok(_mp7o_row == "Couldn't move to a stronger access point after sleep, ${ago}.",
        f"and so does its lock row line ({_mp7o_row!r})")
-    ok(not any(w in (_mp7o_banner + " " + _mp7o_row).lower() for w in ("turned off", "go back", "so it was")),
-       "neither says the lock was turned off or could not go back, which only some of those ends are")
+    # Pass 8 F10: "turned off" only in the branch where the lock is off now,
+    # which no action of the user's explains (each clears the outcome).
+    _mp7o_on = re.search(r'\?\s*"([^"]*)"\s*:\s*"([^"]*)"', _mp7o_banner)
+    _mp7o_lock_on = _mp7o_on.group(2) if _mp7o_on else _mp7o_banner
+    ok(not any(w in (_mp7o_lock_on + " " + _mp7o_row).lower() for w in ("turned off", "go back", "so it was")),
+       "with the lock still on, neither says the lock was turned off or could not go back")
+    ok((not _mp7o_on or "wakeMoveTurnedOff" in _between(_F_IX, '{wakeMoveOutcome === "off" && (', "?"))
+       and "!status?.settings?.bssid_lock_enabled" in _between(_F_IX, "const wakeMoveTurnedOff =", ";\n"),
+       "and the branch that says it is keyed on the lock being off now")
     # How long each side keeps it: the banner's two minutes and the 12 h cap.
     ok(m.Plugin._WAKE_MOVE_SHOWN_SECONDS == 120 and "const MESSAGE_TTL_MS = 2 * 60 * 1000;" in _F_IX
        and m.Plugin._WAKE_MOVE_KEPT_SECONDS == 12 * 3600 and "const WAKE_MOVE_KEPT_S = 12 * 60 * 60;" in _F_IX,

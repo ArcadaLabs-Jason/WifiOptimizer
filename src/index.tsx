@@ -83,36 +83,45 @@ const IWD_PIN_NOTICE = "Paused under iwd. Switch to wpa_supplicant in Advanced t
 const IWD_OFF_NOTICE = "Needs wpa_supplicant. Switch to it in Advanced.";
 const BACKEND_POLL_MAX_FAILURES = 5;
 // The lock moves by itself after a wake only on drivers whose names start
-// with this, the Steam Deck OLED's ath11k, the one card it was measured on
-// (C25, the same test as the backend's).
+// with this: Qualcomm ath11k, measured on the Steam Deck OLED's card (C25,
+// C28, the same test as the backend's).
 const WAKE_MOVE_DRIVER = "ath11k";
 // How long the backend keeps an after-wake move's outcome at most (C22).
 const WAKE_MOVE_KEPT_S = 12 * 60 * 60;
 // The lock row's line for an after-wake move's outcome, once its banner is
-// gone (C22).
-function wakeMoveRowText(outcome: "moved" | "back" | "off", at: number): string | undefined {
+// gone (C22). lockOff: the lock is off now, so the move turned it off.
+function wakeMoveRowText(
+  outcome: "moved" | "back" | "off",
+  at: number,
+  lockOff: boolean = false,
+): string | undefined {
   const ago = timeAgo(at);
   if (outcome === "moved") return `Moved to a stronger access point after sleep, ${ago}.`;
   if (outcome === "back") return `Stayed after sleep: the stronger access point refused, ${ago}.`;
+  if (outcome === "off" && lockOff) return `Turned off after sleep: couldn't move to a stronger access point, ${ago}.`;
   if (outcome === "off") return `Couldn't move to a stronger access point after sleep, ${ago}.`;
   return undefined;
 }
-// An iw stuck in the driver, or a card the system can no longer use. Copy
-// diagnostics first: after the restart they show the healthy boot's link and
-// NetworkManager state, not the failed one's.
+// An iw stuck in the driver, or a card the system can no longer use. The
+// restart comes first: with WiFi dead a copy has nowhere to go, and the
+// restart clears the clipboard. After it, Copy diagnostics still shows the
+// failure: the card's state is written to the journal 90 seconds after a
+// failed wake, and the previous boot's logs are taken around that wake.
 const NOT_RESPONDING_TEXT =
-  "The WiFi card isn't responding. Copy diagnostics (bottom of this panel), then restart the device.";
+  "The WiFi card isn't responding. Restart the device, then use Copy diagnostics to report it.";
 // What Reset undoes, said before it happens. It reaches every network the
 // plugin touched, so one stray press of the button should not be enough.
-// Auto-fix on wake stays on, as on a fresh install (main.py _reset_locked),
-// with nothing left for it to apply. The network settings are written to
-// the saved networks without a reconnect, so the connection in use keeps
-// them until WiFi next connects. The update channel and notices are kept,
-// and streaming auto mode starts again from its defaults. Allow WPA2 is only
-// recorded from 0.24.5-beta on (wpa2_uuids); that, the buffer and region
-// values and the command for the rest are in the README, not here.
+// Auto-fix on wake is turned on, as on a fresh install, even where it was
+// off (main.py _reset_locked), with nothing left for it to apply. The network
+// settings are written to the saved networks without a reconnect, so the
+// connection in use keeps them until WiFi next connects. A WiFi region chosen
+// in the plugin goes back, which can hide the 5 and 6 GHz channels it was
+// chosen for. The update channel and notices are kept, and streaming auto
+// mode starts again from its defaults. Allow WPA2 is only recorded from
+// 0.24.5-beta on (wpa2_uuids); that, the buffer values and the command for
+// the rest are in the README, not here.
 const RESET_CONFIRM_TEXT =
-  "Turns off every fix except Auto-fix on wake, which then applies nothing. The lock, band, DNS, IPv6 and Allow WPA2 come off your networks at the next connect. Streaming auto mode is cleared. Update settings are kept.";
+  "Turns every fix off and Auto-fix on wake on, which then applies nothing. The lock, band, DNS, IPv6 and Allow WPA2 come off your networks at the next connect, and the WiFi region goes back. Streaming auto mode is cleared. Update settings are kept.";
 // Move the lock often finds nothing clearly stronger and stays put, with no
 // reconnect, so its button does not promise one.
 const MOVE_WORKING_TEXT = "Working, WiFi may reconnect...";
@@ -145,7 +154,8 @@ const DRIFT_LABELS: Record<string, string> = {
   power_save: "Prevent lag spikes",
   bssid_lock: "Stop background scanning",
   buffer_tuning: "Network buffer tuning",
-  band_preference: "Band preference",
+  // The 5 GHz toggle's name; with 6 GHz set, driftNames names that one.
+  band_preference: "Force 5 GHz band",
   dns: "Custom DNS",
   ipv6: "Disable IPv6",
   cake: "Traffic shaping (CAKE)",
@@ -189,6 +199,8 @@ const UPDATE_SLOW_TEXT =
 // reports nothing: no update is running, so the panel says so at once
 // instead of "Starting the update..." for UPDATE_TIMEOUT_MS.
 const UPDATE_NOT_STARTED_TEXT = "Couldn't start the update. Try again in a moment.";
+// A check for updates the user asked for that got no answer.
+const UPDATE_CHECK_FAILED_TEXT = "Couldn't check for updates. Try again in a moment.";
 // The phases of a script that is still running (UPDATE_ACTIVE_PHASES in
 // main.py).
 const UPDATE_RUNNING_PHASES = ["downloading", "installing", "swapped", "loaded", "restarting"];
@@ -1279,7 +1291,11 @@ function Content() {
       const result = await withTimeout(backend.checkForUpdate());
       if (seq === updateCheckSeqRef.current) setUpdateInfo(result);
     } catch {
-      // refreshStatus has its own catch; no need to log here
+      // No answer, or the call failed. The answer from an earlier check
+      // stayed up, and read as "Up to date" after a check that failed.
+      if (seq === updateCheckSeqRef.current) {
+        setUpdateInfo({ success: false, update_available: false, message: UPDATE_CHECK_FAILED_TEXT });
+      }
     }
     setCheckingUpdate(false);
   };
@@ -1375,9 +1391,13 @@ function Content() {
   const wakeMove = status?.live?.lock_move_after_wake;
   const wakeMoveOutcome =
     wakeMove && Date.now() / 1000 - wakeMove.at < MESSAGE_TTL_MS / 1000 ? wakeMove.outcome : null;
+  // One "off" for every end the move could not finish (C22). Any lock
+  // action of the user's clears the outcome, so a lock that is off while it
+  // is still held was turned off by the move.
+  const wakeMoveTurnedOff = wakeMove?.outcome === "off" && !status?.settings?.bssid_lock_enabled;
   const wakeMoveLine =
     wakeMove && !wakeMoveOutcome && Date.now() / 1000 - wakeMove.at < WAKE_MOVE_KEPT_S
-      ? wakeMoveRowText(wakeMove.outcome, wakeMove.at)
+      ? wakeMoveRowText(wakeMove.outcome, wakeMove.at, wakeMoveTurnedOff)
       : undefined;
   const isBusy = busyState || changeRunning;
   const connected = status?.connected ?? false;
@@ -1416,8 +1436,10 @@ function Content() {
   // A band of 2.4 GHz is only reachable by editing the settings file, or
   // from an old version. Shown under the 5 GHz toggle, which is the one on.
   const onBg = !!s?.band_preference_enabled && s?.band_preference === "bg";
-  // What has drifted, by name.
-  const driftNames = Object.keys(status?.drift ?? {}).map((k) => DRIFT_LABELS[k] ?? k);
+  // What has drifted, by name. The band preference by the toggle that is on.
+  const driftNames = Object.keys(status?.drift ?? {}).map((k) =>
+    k === "band_preference" && on6GHz ? "Force 6 GHz band" : DRIFT_LABELS[k] ?? k,
+  );
   // "Steam Deck OLED, WiFi 6E (QCA206X)", leaving out whichever part is unknown.
   const deviceParts = [
     s?.device_label && s.device_label !== "Unknown Device" ? s.device_label : "",
@@ -1494,13 +1516,33 @@ function Content() {
     <DetailsContext.Provider value={showDetails}>
       <PanelHeader
         driver={s?.driver ?? ""}
-        lastApplied={s?.last_applied ?? 0}
-        lastEnforced={status?.live?.last_enforced}
         streaming={status?.live}
         fixesOn={!!(s?.power_save_disabled || s?.buffer_tuning_enabled || s?.cake_enabled)}
         deviceLabel={deviceParts.length ? deviceParts.join(", ") : undefined}
         connected={connected}
       />
+
+      {/* The WiFi state comes first, right under the header: with WiFi
+          dead, an update offer or a wake notice above it led to an action
+          that cannot work offline. */}
+      {/* Status read failed - say so rather than claiming disconnection */}
+      {status?.success === false && (
+        <Banner variant="error">
+          {status?.message ?? "Couldn't read WiFi status."} The panel keeps
+          trying. If this stays, restart the device.
+        </Banner>
+      )}
+
+      {/* Disconnected banner. A dead or missing card is not something
+          connecting fixes, so it says what to do for each case. */}
+      {status?.success !== false && !connected && (
+        <Banner variant="error">{disconnectedText}</Banner>
+      )}
+      {/* NetworkManager can still say connected while an iw is stuck in the
+          driver (C1 (c)), and nothing then works until a restart. */}
+      {status?.success !== false && connected && status?.live?.wifi_state === "not_responding" && (
+        <Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>
+      )}
 
       {/* A status read failed after the panel had loaded. What is shown is
           the last status that came through. */}
@@ -1516,12 +1558,16 @@ function Content() {
           A settings folder behind a link is refused on purpose (C16), and
           freeing storage would not help there. Any folder on the path can
           be the link, ~/homebrew itself included. Both are the state now,
-          read again at every status (C23). */}
+          read again at every status (C23). Storage space is only advised
+          when the disk was full; any other cause (or a backend that does
+          not say) gets the restart (C27). */}
       {(status?.settings_unwritable || status?.settings_link_refused) && (
         <Banner variant="warning">
-          {status?.settings_link_refused
+          {status?.settings_link_refused || status?.settings_unwritable_cause === "link"
             ? "A folder on the way to the plugin's settings (~/homebrew/settings) is a link, which the plugin doesn't follow. Make it a real folder."
-            : "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."}
+            : status?.settings_unwritable_cause === "space"
+              ? "The plugin couldn't save its settings, so changes may not last past a restart. Check that the device has free storage space, then try the change again."
+              : "The plugin couldn't save its settings, so changes may not last past a restart. Restart the device, then try again."}
         </Banner>
       )}
 
@@ -1543,11 +1589,13 @@ function Content() {
       )}
       {/* The move failed and the old pin could not be put back, or the
           radio did not come back on (C22). The lock may be off or still
-          on, so this says only that it could not move; the lock row
-          shows which. */}
+          on: only when it is off now does this say the move turned it
+          off. */}
       {wakeMoveOutcome === "off" && (
         <Banner variant="warning">
-          After sleep, the lock couldn't move to a stronger access point.
+          {wakeMoveTurnedOff
+            ? "After sleep, the lock couldn't move to a stronger access point and was turned off."
+            : "After sleep, the lock couldn't move to a stronger access point."}
         </Banner>
       )}
 
@@ -1577,16 +1625,20 @@ function Content() {
       <WakeFailureNotice />
 
       {/* Update available. A refusal is said here too: the Updates section
-          is far down the panel, and pressing this showed nothing. */}
-      {updateInfo?.update_available && !updating && (
+          is far down the panel, and pressing this showed nothing. The
+          refusal stays here after the check that follows it finds no
+          update, without the button: that check took the offer away. */}
+      {(updateInfo?.update_available || updateError) && !updating && (
         <PanelSection>
-          <PanelSectionRow>
-            <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleApplyUpdate}>
-              {updateInfo.is_downgrade
-                ? `Go back to v${updateInfo.latest_version}`
-                : `Update to v${updateInfo.latest_version}`}
-            </ButtonItem>
-          </PanelSectionRow>
+          {updateInfo?.update_available && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" disabled={isBusy || updating} onClick={handleApplyUpdate}>
+                {updateInfo.is_downgrade
+                  ? `Go back to v${updateInfo.latest_version}`
+                  : `Update to v${updateInfo.latest_version}`}
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
           {updateError && (
             <PanelSectionRow>
               <div style={{ fontSize: theme.fontSize.body, color: theme.warning.text }}>
@@ -1674,9 +1726,9 @@ function Content() {
         <Banner variant="info">
           {status?.wpa2_only_stronger && wpa2Shown && (
             <>
-              {`A stronger access point (signal ${status.wpa2_only_stronger.signal} vs ${
+              {`A stronger access point (${status.wpa2_only_stronger.signal} of 100, yours ${
                 status.wpa2_only_stronger.current_signal
-              } of 100${
+              }${
                 status.wpa2_only_stronger.bssid_tail
                   ? `, address ends ${status.wpa2_only_stronger.bssid_tail}`
                   : ""
@@ -1799,25 +1851,6 @@ function Content() {
         </PanelSection>
       )}
 
-      {/* Status read failed - say so rather than claiming disconnection */}
-      {status?.success === false && (
-        <Banner variant="error">
-          {status?.message ?? "Couldn't read WiFi status."} The panel keeps
-          trying. If this stays, restart the device.
-        </Banner>
-      )}
-
-      {/* Disconnected banner. A dead or missing card is not something
-          connecting fixes, so it says what to do for each case. */}
-      {status?.success !== false && !connected && (
-        <Banner variant="error">{disconnectedText}</Banner>
-      )}
-      {/* NetworkManager can still say connected while an iw is stuck in the
-          driver (C1 (c)), and nothing then works until a restart. */}
-      {status?.success !== false && connected && status?.live?.wifi_state === "not_responding" && (
-        <Banner variant="warning">{NOT_RESPONDING_TEXT}</Banner>
-      )}
-
       {/* Backend switch result banner */}
       {backendSwitch && !backendSwitch.in_progress && backendSwitch.result && (() => {
         const r = backendSwitch.result;
@@ -1865,7 +1898,7 @@ function Content() {
         <InfoRow
           label="Prevent lag spikes"
           subtitle="Disables WiFi power save and PCIe power states"
-          explanation="The OS saves WiFi power in several places: the wireless chip, the PCIe link between the chip and the CPU, and low power modes in the driver. These can cause latency spikes, packets sent in batches, and lower throughput during a long stream. This turns them off, so the WiFi hardware stays fully awake. It uses a little more battery. On some cards part of it needs a restart to take effect."
+          explanation="Power saving in the WiFi chip, its driver and the PCIe link causes lag spikes and batched packets during streams. This turns most of it off, at a little more battery. On some cards part of it needs a restart."
           {...gatedBadge("power_save", s?.power_save_disabled)}
           checked={s?.power_save_disabled ?? false}
           disabled={isBusy || updating}
@@ -1878,11 +1911,12 @@ function Content() {
         <InfoRow
           label="Stop background scanning"
           subtitle="The access point lock: pins one access point. Turn off to roam."
-          // The move after a wake runs only on the card it was measured on
-          // (C25), so the (i) promises it nowhere else.
+          // The move after a wake runs only on ath11k cards (C25), and only
+          // from a weak link (main.py _STRONG_ENOUGH_DBM), so the (i)
+          // promises it nowhere else.
           explanation={`Stops the scans for a better access point, which make a stream stutter, by pinning the strongest access point of this network. Only for the network you turn it on for. ${
             s?.driver?.startsWith(WAKE_MOVE_DRIVER)
-              ? "It stays there until you move it or turn the lock off. After a wake, with no game or stream running, it moves to a clearly stronger one."
+              ? "It stays there until you move it or turn the lock off. After a wake on a weak link, with no game or stream running, it moves to a clearly stronger one."
               : "It stays there until you move it or turn the lock off."
           } Turning it on or off reconnects WiFi for up to half a minute.`}
           {...(status?.live?.bssid_lock_other_network && !errors.bssid_lock
@@ -1909,7 +1943,7 @@ function Content() {
         <InfoRow
           label="Auto-fix on wake"
           subtitle="Reapplies settings after sleep"
-          explanation="The OS often resets WiFi settings after sleep or updates. This installs a small script that automatically re-applies your optimizations every time the WiFi reconnects. It runs outside of Decky, so it works even if Decky has issues. Removing the plugin will also remove this script."
+          explanation="Sleep and OS updates can reset WiFi settings. A script outside Decky reapplies yours each time WiFi reconnects. Uninstalling the plugin removes it."
           {...getBadge(undefined, status, errors.auto_fix ?? null)}
           checked={s?.auto_fix_on_wake ?? false}
           disabled={isBusy || updating}
@@ -1922,7 +1956,7 @@ function Content() {
         <InfoRow
           label="Network buffer tuning"
           subtitle="Larger UDP buffers for streaming"
-          explanation="Increases the kernel's network buffer sizes to handle the bursty UDP traffic that game streaming produces. Without this, packets can be dropped during high-bitrate moments, causing frame drops or brief quality dips. These settings apply to every network connection, wired ones too. They reset on every reboot, and are put back when the plugin starts, after a game launches, and when WiFi reconnects if Auto-fix on wake is on."
+          explanation="Larger kernel network buffers, so bursty streaming traffic isn't dropped. Applies to every connection, wired too. Lost on reboot; put back when the plugin starts, after a game launches, and on each reconnect if Auto-fix on wake is on."
           {...gatedBadge("buffer_tuning", s?.buffer_tuning_enabled)}
           checked={s?.buffer_tuning_enabled ?? false}
           disabled={isBusy || updating}
@@ -2015,7 +2049,7 @@ function Content() {
         <InfoRow
           label="Force 5 GHz band"
           subtitle="Avoid 2.4 GHz Bluetooth interference"
-          explanation={`This is the band preference. Keeps WiFi on 5 GHz, away from Bluetooth on 2.4 GHz${
+          explanation={`This is the band preference. Only for the network you turn it on for. Keeps WiFi on 5 GHz, away from Bluetooth on 2.4 GHz${
             isDeckLcd ? ", which shares the antennas on the Steam Deck LCD" : ""
           }. Refused if no 5 GHz access point is in range; released after about a minute out of range. Reconnects WiFi for up to half a minute.${
             supports6GHz
@@ -2284,6 +2318,8 @@ function Content() {
 
       <PanelFooter
         version={status?.version ?? "?"}
+        lastApplied={s?.last_applied ?? 0}
+        lastEnforced={status?.live?.last_enforced}
         showDetails={showDetails}
         onShowDetails={handleShowDetails}
       />
