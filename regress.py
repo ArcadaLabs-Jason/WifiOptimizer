@@ -22189,5 +22189,177 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+section("Fix stalled streams: the link watchdog (GitHub #9)")
+try:
+    _LW = getattr(m, "LinkWatch", None)
+    ok(_LW is not None, "LinkWatch exists")
+    def _lw_feed(w, t, n, rx, sig=-45, traffic=20.0, step=2.0):
+        out = []
+        for _ in range(n):
+            out.append(w.sample(t, rx, sig, traffic)); t += step
+        return out, t
+    # A healthy link learns its usual rate and never fires.
+    _w = _LW(); _v, _t = _lw_feed(_w, 0.0, 30, 866.7)
+    ok(_v.count("fire") == 0 and _w.baseline() == 866.7, f"healthy: no reconnect, usual rate {_w.baseline()}")
+    # The #9 collapse: 7.3 Mbit/s at a strong signal fires on the sixth reading of eight.
+    _v, _t = _lw_feed(_w, _t, 6, 7.3)
+    ok(_v[:5] == [None] * 5 and _v[5] == "fire", f"collapse fires after about 15 s ({_v})")
+    # Weak signal, no traffic, or a rate still high enough for a stream: never.
+    _w = _LW(); _lw_feed(_w, 0.0, 30, 866.7)
+    _v, _ = _lw_feed(_w, 60.0, 20, 7.3, sig=-70)
+    ok("fire" not in _v, "a weak signal never fires")
+    _w = _LW(); _lw_feed(_w, 0.0, 30, 866.7)
+    _v, _ = _lw_feed(_w, 60.0, 20, 7.3, traffic=1.0)
+    ok("fire" not in _v, "too little traffic to judge never fires")
+    _w = _LW(); _lw_feed(_w, 0.0, 30, 2401.9)
+    _v, _ = _lw_feed(_w, 60.0, 20, 400.0)
+    ok("fire" not in _v, "a rate that is a fraction of the usual but still plenty never fires")
+    _w = _LW(); _lw_feed(_w, 0.0, 30, 72.2)
+    _v, _ = _lw_feed(_w, 60.0, 8, 7.3)
+    ok(_v[-1] == "fire", f"a 2.4 GHz / 20 MHz link collapsing to MCS 0 fires ({_v})")
+    _w = _LW(); _lw_feed(_w, 0.0, 30, 72.2)
+    _v, _ = _lw_feed(_w, 60.0, 20, 40.0)
+    ok("fire" not in _v, "a 20 MHz link at its usual low rate does not (no fixed bar)")
+    # No usual rate yet: only a floor rate on a very strong signal.
+    _v, _ = _lw_feed(_LW(), 0.0, 8, 7.3, sig=-50)
+    ok(_v[-1] == "fire" and _v[:7] == [None] * 7, f"no baseline: 7.3 at -50 dBm fires once eight readings are in ({_v})")
+    _v, _ = _lw_feed(_LW(), 0.0, 20, 20.0, sig=-50)
+    ok("fire" not in _v, "no baseline: 20 Mbit/s is not a collapse")
+    _v, _ = _lw_feed(_LW(), 0.0, 20, 7.3, sig=-62)
+    ok("fire" not in _v, "no baseline: a signal under -60 dBm is not enough")
+    # No stream in between clears the stretch.
+    _w = _LW(); _lw_feed(_w, 0.0, 30, 866.7)
+    _v1, _t = _lw_feed(_w, 60.0, 5, 7.3); _w.idle()
+    _v2, _t = _lw_feed(_w, _t, 5, 7.3)
+    ok("fire" not in _v1 + _v2, "an idle look in between starts the count again")
+    # Limits: 2 min apart; a collapse back within 60 s doubles the wait.
+    _w = _LW(); _lw_feed(_w, 0.0, 30, 866.7)
+    _v, _t = _lw_feed(_w, 60.0, 6, 7.3); _w.fired(_t)
+    _f = _t
+    _v, _t = _lw_feed(_w, _t + 2, 8, 7.3)
+    ok(_v[-1] == "held" and _w.gap == 2 * _LW.MIN_GAP, f"back within a minute: held, wait doubled to {_w.gap}")
+    ok(_w.sample(_f + _LW.MIN_GAP + 10, 7.3, -45, 20.0) == "held", "still held after the normal gap")
+    ok(_w.sample(_f + 2 * _LW.MIN_GAP + 1, 7.3, -45, 20.0) == "fire", "fires once the doubled gap has passed")
+    _w2 = _LW(); _w2.fired(0.0); _w2.fired(300.0); _w2.fired(600.0)
+    _w2.window.extend([True] * 8)
+    ok(not _w2.allowed(900.0) and _w2.allowed(1801.0), "at most three in 30 minutes")
+    _w3 = _LW(); _w3.gap = _LW.MAX_GAP; _w3.last_collapse = 0.0
+    _w3.sample(_LW.CALM + 1, 866.7, -45, 20.0)
+    ok(_w3.gap == _LW.MIN_GAP, "ten calm minutes put the wait back to two")
+    _w4 = _LW(); _w4.gap = 10_000
+    for _i in range(5):
+        _w4.last_fire = _i * 30.0; _w4.relapsed = False; _w4.sample(_i * 30.0 + 5, 7.3, -45, 20.0)
+    ok(_w4.gap <= _LW.MAX_GAP, f"the wait never grows past {_LW.MAX_GAP} ({_w4.gap})")
+
+    # iw's station dump, as ath11k and newer cards print it.
+    _ps = m.Plugin._parse_station
+    _d = _ps("Station d8:07:b6:90:c7:d1 (on wlan0)\n\trx bytes:\t1\n\tsignal:  \t-45 [-45, -47] dBm\n"
+             "\trx bitrate:\t7.3 MBit/s VHT-MCS 0 VHT-NSS 1\n")
+    ok(_d == {"signal": -45, "rx_mbps": 7.3, "detail": "20 MHz, MCS 0, 1 stream"}, f"VHT at 20 MHz ({_d})")
+    _d = _ps("Station aa:bb:cc:dd:ee:ff (on wlan0)\n\tsignal:\t-52 dBm\n"
+             "\trx bitrate:\t1201.0 MBit/s 80MHz HE-MCS 11 HE-NSS 2 HE-GI 0 HE-DCM 0\n"
+             "Station 11:22:33:44:55:66 (on wlan0)\n\tsignal:\t-80 dBm\n\trx bitrate:\t6.0 MBit/s\n")
+    ok(_d == {"signal": -52, "rx_mbps": 1201.0, "detail": "80 MHz, MCS 11, 2 streams"}, f"HE at 80 MHz, first station only ({_d})")
+    _d = _ps("Station aa:bb:cc:dd:ee:ff (on wlan0)\n\trx bitrate:\t6.0 MBit/s\n")
+    ok(_d == {"rx_mbps": 6.0, "detail": ""}, f"legacy rate, no signal line ({_d})")
+
+    # The plugin side: reading the link, reconnecting, and saying so.
+    _lw_sys = tempfile.mkdtemp()
+    os.makedirs(os.path.join(_lw_sys, "wlan0", "statistics"))
+    _lw_real_sys = m.SYSFS_NET
+    class _LWP(m.Plugin):
+        def __init__(self, stream=True, up_ok=True):
+            super().__init__(); self.cmds = []; self.stream = stream; self.up_ok = up_ok
+        def _get_wifi_interface(self): return "wlan0"
+        def _get_active_connection_uuid(self): return "uuid-1"
+        def _stream_running(self, settings): return self.stream
+        def _run_cmd(self, cmd, timeout=5):
+            self.cmds.append(list(cmd))
+            if cmd[-2:] == ["station", "dump"]:
+                return _ok("Station d8:07:b6:90:c7:d1 (on wlan0)\n\tsignal:\t-45 dBm\n"
+                           "\trx bitrate:\t7.3 MBit/s VHT-MCS 0 VHT-NSS 1\n")
+            if cmd[:3] == ["/usr/bin/nmcli", "con", "up"] and not self.up_ok:
+                return {"success": False, "stdout": "", "stderr": "Error: timeout"}
+            return _ok("Power save: off\n")
+    def _lw_bytes(n):
+        with open(os.path.join(_lw_sys, "wlan0", "statistics", "rx_bytes"), "w") as f: f.write(str(n))
+    _lw_logged = []
+    _lw_real_info = m.decky.logger.info
+    m.decky.logger.info = staticmethod(lambda msg: _lw_logged.append(str(msg)))
+    m.SYSFS_NET = _lw_sys
+    try:
+        _p = _LWP(); _lw_bytes(1000)
+        ok(_p._link_reading() == {"kind": "skip"}, "the first look only takes the counter")
+        _p._link_prev = (time.monotonic() - 2, 1000, "wlan0"); _lw_bytes(1000 + 5_000_000)
+        _r = _p._link_reading()
+        ok(_r.get("kind") == "read" and _r.get("rx_mbps") == 7.3 and 15 < _r.get("traffic", 0) < 25,
+           f"with a stream and traffic it reads the station ({_r})")
+        _p._link_prev = (time.monotonic() - 2, 1000, "wlan0"); _lw_bytes(1100)
+        _n = len(_p.cmds)
+        ok(_p._link_reading() == {"kind": "skip"} and len(_p.cmds) == _n,
+           "too little traffic: skipped, and nothing is run")
+        _p = _LWP(stream=False); _p._link_prev = (time.monotonic() - 2, 1000, "wlan0"); _lw_bytes(1000 + 5_000_000)
+        ok(_p._link_reading() == {"kind": "idle"} and not any(c[-2:] == ["station", "dump"] for c in _p.cmds),
+           "traffic but no stream: idle, iw not run")
+        _p2 = _LWP(stream=None); _p2._link_prev = (time.monotonic() - 2, 1000, "wlan0")
+        ok(_p2._link_reading() == {"kind": "idle"}, "a stream not known counts as none")
+
+        # Firing: what it saw first, then nmcli con up on the profile in use, then the time it took.
+        m._save_settings({**m.DEFAULT_SETTINGS, "link_watchdog_enabled": True})
+        _p = _LWP(); _lw_logged.clear()
+        _read = {"kind": "read", "rx_mbps": 7.3, "signal": -45, "traffic": 20.0, "detail": "20 MHz, MCS 0, 1 stream"}
+        asyncio.run(_p._link_watch_fire(_read))
+        ok(["/usr/bin/nmcli", "con", "up", "uuid", "uuid-1"] in _p.cmds, "reconnects the profile in use")
+        ok(_lw_logged and _lw_logged[0].startswith(
+            "Link watchdog: downlink stuck at 7.3 Mbit/s (20 MHz, MCS 0, 1 stream) with signal -45 dBm"),
+           f"says first what it saw ({_lw_logged[:1]})")
+        ok("link: power_save=off" in _lw_logged[0] and "d8:07" not in _lw_logged[0].lower(),
+           "with the link snapshot, and no address")
+        ok(any(l.startswith("Link watchdog: reconnected in ") for l in _lw_logged), "and how long it took")
+        _jl = [c for c in _p.cmds if c[:1] == ["/usr/bin/logger"]]
+        ok(len(_jl) == 2 and all(m.JOURNAL_TAG in c for c in _jl), "both lines reach the journal under the plugin's tag")
+        ok(_p._profile_change_depth == 0, "the profile-change guard is released")
+        _lv = _p._link_watch_live(m._load_settings())
+        ok(_lv.get("link_watchdog_count") == 1 and _lv.get("link_watchdog_last"), f"the panel hears of it ({_lv})")
+        ok(_p._link_watch_live({**m.DEFAULT_SETTINGS}) == {}, "and nothing while the setting is off")
+        ok(_p._link_after_pending, "the rate after is logged at the next look")
+        # Beside another WiFi change: nothing.
+        _p = _LWP(); _p._profile_change_depth = 1
+        asyncio.run(_p._link_watch_fire(_read))
+        ok(not any(c[:3] == ["/usr/bin/nmcli", "con", "up"] for c in _p.cmds), "never beside another profile change")
+        _p = _LWP(); _p._update_running = lambda: True
+        asyncio.run(_p._link_watch_fire(_read))
+        ok(not any(c[:3] == ["/usr/bin/nmcli", "con", "up"] for c in _p.cmds), "never during an update")
+        # A failed profile reconnect falls back to the radio cycle.
+        _p = _LWP(up_ok=False); _lw_logged.clear()
+        asyncio.run(_p._link_watch_fire(_read))
+        ok(["/usr/bin/nmcli", "radio", "wifi", "off"] in _p.cmds and any("failed" in l for l in _lw_logged),
+           "a failed reconnect cycles the radio, and says so")
+        # The setter.
+        _p = _LWP()
+        async def _lw_set(v):
+            r = await _p.set_link_watchdog(v)
+            t = getattr(_p, "_link_task", None)
+            if t: t.cancel()
+            return r
+        _r = asyncio.run(_lw_set(True))
+        ok(_r.get("success") and m._load_settings().get("link_watchdog_enabled") is True, "turns on")
+        _r = asyncio.run(_lw_set("yes"))
+        ok(_r.get("success") and m._load_settings().get("link_watchdog_enabled") is False, "anything but True is off")
+    finally:
+        m.decky.logger.info = _lw_real_info
+        m.SYSFS_NET = _lw_real_sys
+    ok(m.DEFAULT_SETTINGS.get("link_watchdog_enabled") is False, "off by default, so Reset turns it off")
+    ok("link_watchdog_enabled" in m.Plugin._DIAG_SETTINGS, "and diagnostics show it")
+    ok("_link_task" in _between(_F_MAIN, "async def _unload", "_UNINSTALL_BUDGET"), "unload stops the watch")
+    _lw_ss = _src("src/components/StreamingSection.tsx")
+    ok('label="Fix stalled streams"' in _lw_ss and "backend.setLinkWatchdog(val)" in _lw_ss, "the panel has the toggle")
+    ok('callable<[enabled: boolean], MethodResult>("set_link_watchdog")' in _src("src/backend.ts"), "wired to the backend")
+    ok("Fix stalled streams" in _F_RD, "the README describes it")
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

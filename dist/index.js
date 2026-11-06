@@ -112,6 +112,7 @@ const getUpdateProgress = callable("get_update_progress");
 const startBackendSwitch = callable("start_backend_switch");
 const getBackendSwitchStatus = callable("get_backend_switch_status");
 const setStreamingMode = callable("set_streaming_mode");
+const setLinkWatchdog = callable("set_link_watchdog");
 const setStreamingHold = callable("set_streaming_hold");
 const setStreamingApp = callable("set_streaming_app");
 const setStreamingPatterns = callable("set_streaming_patterns");
@@ -1239,7 +1240,16 @@ function StreamingSection({ settings, live, disabled, errors, notices, onToggle,
     else {
         stateText = "No streaming app running. No fixes are turned on.";
     }
-    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Streaming auto mode", children: [SP_JSX.jsx(InfoRow, { label: "Only fix while streaming", subtitle: enabled
+    const watchdog = settings?.link_watchdog_enabled ?? false;
+    const fixedAt = live?.link_watchdog_last;
+    const fixedCount = live?.link_watchdog_count ?? 0;
+    let watchdogText = watchdog ? "Reconnects when a stream's link stalls" : "Off";
+    if (watchdog && fixedAt) {
+        const minutes = Math.max(0, Math.round((Date.now() / 1000 - fixedAt) / 60));
+        const ago = minutes < 1 ? "just now" : minutes === 1 ? "1 min ago" : `${minutes} min ago`;
+        watchdogText = `Reconnected a stalled link ${ago}${fixedCount > 1 ? ` (${fixedCount} times)` : ""}`;
+    }
+    return (SP_JSX.jsxs(DFL.PanelSection, { title: "Streaming", children: [SP_JSX.jsx(InfoRow, { label: "Only fix while streaming", subtitle: enabled
                     ? "Fixes apply while a streaming app runs"
                     : "Off: enabled fixes apply all the time", explanation: `Applies Prevent lag spikes, Network buffer tuning and Traffic shaping (CAKE) only while a streaming app is running, and takes them off afterwards to save battery. Background scanning, band, DNS and IPv6 stay as they are, because changing them reconnects WiFi and would drop the stream.${autoModeDriverText(settings?.driver ?? "")} If a stream is not picked up, turn on Keep fixes on, or add the app's process name below. Idea and first version by bassobr.`, checked: enabled, disabled: disabled, error: errors.streaming, notice: notices.streaming, onChange: (val) => onToggle("streaming", () => setStreamingMode(val)) }), enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
                                 fontSize: theme.fontSize.body,
@@ -1247,7 +1257,7 @@ function StreamingSection({ settings, live, disabled, errors, notices, onToggle,
                             }, children: stateText }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: "Keep fixes on", description: "For a stream that is not detected. Lasts until you restart the device.", checked: held, disabled: disabled, onChange: (val) => onToggle("streaming_hold", () => setStreamingHold(val)) }) }), SP_JSX.jsx(MessageRow, { error: errors.streaming_hold, notice: notices.streaming_hold }), apps.map((a) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ToggleField, { label: a.label, checked: a.watched, disabled: disabled, onChange: (val) => toggleApp(a.id, val) }) }, a.id))), SP_JSX.jsx(MessageRow, { error: errors.streaming_apps, notice: notices.streaming_apps }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "Other process names (space-separated)", value: patterns, onChange: (e) => {
                                 setPatternsDirty(true);
                                 setPatterns(e.target.value);
-                            } }) }), patternsDirty && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: savePatterns, children: "Save process names" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: cancelPatterns, children: "Cancel" }) })] })), SP_JSX.jsx(MessageRow, { error: errors.streaming_patterns, notice: notices.streaming_patterns })] }))] }));
+                            } }) }), patternsDirty && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: savePatterns, children: "Save process names" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: disabled, onClick: cancelPatterns, children: "Cancel" }) })] })), SP_JSX.jsx(MessageRow, { error: errors.streaming_patterns, notice: notices.streaming_patterns })] })), SP_JSX.jsx(InfoRow, { label: "Fix stalled streams", subtitle: watchdogText, explanation: "While a stream runs, watches the rate your access point sends at. If it drops to a fraction of its usual rate with a strong signal and stays there for about 15 seconds, reconnects WiFi, which clears it. The stream pauses for a few seconds while it reconnects. At most three times in 30 minutes, and less often when a reconnect doesn't help. Each one is noted in the log with what it saw. Idea and first version by Mrsoul83.", checked: watchdog, disabled: disabled, error: errors.link_watchdog, notice: notices.link_watchdog, onChange: (val) => onToggle("link_watchdog", () => setLinkWatchdog(val)) })] }));
 }
 
 // Follows a running update and, once the new files are in place, asks Decky

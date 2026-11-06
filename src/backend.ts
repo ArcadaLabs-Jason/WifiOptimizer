@@ -39,6 +39,7 @@ export const getUpdateProgress = callable<[], UpdateProgress>("get_update_progre
 export const startBackendSwitch = callable<[backend: string], BackendSwitchStartResult>("start_backend_switch");
 export const getBackendSwitchStatus = callable<[], BackendSwitchStatus>("get_backend_switch_status");
 export const setStreamingMode = callable<[enabled: boolean], MethodResult>("set_streaming_mode");
+export const setLinkWatchdog = callable<[enabled: boolean], MethodResult>("set_link_watchdog");
 export const setStreamingHold = callable<[held: boolean], MethodResult>("set_streaming_hold");
 export const setStreamingApp = callable<[appId: string, watched: boolean], MethodResult>("set_streaming_app");
 export const setStreamingPatterns = callable<[text: string], MethodResult>("set_streaming_patterns");

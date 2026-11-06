@@ -91,6 +91,12 @@ It watches for Moonlight, GeForce NOW, Chiaki (PS Remote Play), Steam Remote Pla
 
 Idea and first implementation by [bassobr](https://github.com/bassobr) ([#5](https://github.com/ArcadaLabs-Jason/WifiOptimizer/issues/5)).
 
+**Fix stalled streams**
+
+Off by default. Sometimes, in the middle of a stream and with a strong signal, the access point drops to the slowest rate it can send at and stays there until WiFi reconnects. None of the plugin's settings change when that happens, so nothing else in the panel notices. With this on, while a streaming app runs, the plugin checks every couple of seconds how fast your access point is sending. When that has dropped to a quarter or less of its usual rate (and 54 Mbit/s or less) with a strong signal for about 15 seconds, it reconnects WiFi to the same network, which clears it. The stream pauses for a few seconds while it reconnects. It reconnects at most three times in 30 minutes, waits longer after a reconnect that didn't help, and never while another WiFi change, an update or a backend switch is under way. It looks for the streaming apps auto mode lists: all of them while auto mode is off, and while it is on, the ones ticked there, any process names added, and Keep fixes on. Each reconnect is written to the log with what it saw, and the panel shows when it last did one. With nothing streaming it only reads a traffic counter.
+
+Thanks to [Mrsoul83](https://github.com/Mrsoul83) for the report and the first watchdog ([#9](https://github.com/ArcadaLabs-Jason/WifiOptimizer/issues/9)).
+
 ## Hardware support
 
 | Device | WiFi Chip | Driver | Notes |

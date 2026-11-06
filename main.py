@@ -403,6 +403,120 @@ STREAM_FLAG_FILE = "/run/wifi-optimizer/streaming"
 # The user's "keep fixes on", for a stream detection missed. Until reboot.
 STREAM_HOLD_FILE = "/run/wifi-optimizer/streaming-hold"
 STREAM_POLL_SECONDS = 5
+# The link watchdog (Fix stalled streams, GitHub #9). Some links drop to the
+# lowest rate the access point can send at (one stream, 20 MHz, MCS 0) with a
+# strong signal and stay there for good, mid-stream, while every setting of
+# the plugin still holds; a reconnect clears it at once. How often it looks
+# while traffic flows, and how often it checks a stream is what it is for.
+LINK_WATCH_SECONDS = 2
+LINK_WATCH_STREAM_SECONDS = 10
+
+
+class LinkWatch:
+    """The link watchdog's judgement, kept apart from the commands it reads
+    and runs so every case can be checked without a radio.
+
+    sample() takes one reading - the downlink rate (what the access point
+    sends at, in Mbit/s), the signal in dBm, and how much is arriving in
+    Mbit/s - and says "fire" when the link has been collapsed for long
+    enough and a reconnect is allowed, "held" when it has but the limits
+    below hold the reconnect back, else None.
+
+    Collapsed: traffic is flowing (with nothing arriving the rate the card
+    reports is stale), the signal is strong (a weak link is slow for a
+    reason a reconnect does not cure, and reconnecting there once landed the
+    reporter on the wrong access point), the rate is at most COLLAPSED_MBPS
+    (still plenty for a stream above that), and it is a quarter or less of
+    the link's own usual rate, the median of its recent healthy readings. A
+    fixed bar fired constantly on 20 MHz and 2.4 GHz links that normally sit
+    low. With too few healthy readings to know the usual rate (a stream that
+    started collapsed), only a rate as low as FLOOR_MBPS on a very strong
+    signal counts.
+    """
+
+    WINDOW = 8              # readings considered
+    BAD_NEEDED = 6          # collapsed ones among them to act: ~15 s at 2 s
+    MIN_TRAFFIC_MBPS = 2.0
+    MIN_SIGNAL_DBM = -65
+    COLLAPSED_MBPS = 54.0
+    RATIO = 0.25
+    BASELINE_NEEDED = 15
+    BASELINE_KEEP = 150     # about five minutes of healthy readings
+    FLOOR_MBPS = 15.0
+    FLOOR_SIGNAL_DBM = -60
+    # Limits on reconnecting. Each one pauses the stream for a few seconds.
+    MIN_GAP = 120.0         # seconds between reconnects
+    MAX_GAP = 960.0         # after doubling for reconnects that did not help
+    RELAPSE = 60.0          # collapsed again this soon: that one did not help
+    CALM = 600.0            # no collapse this long: back to MIN_GAP
+    PER_WINDOW = 3          # reconnects at most in
+    RATE_WINDOW = 1800.0
+
+    def __init__(self):
+        # Newest last, trimmed to WINDOW and BASELINE_KEEP.
+        self.window: list[bool] = []
+        self.healthy: list[float] = []
+        self.fires: list[float] = []
+        self.last_fire: float | None = None
+        self.last_collapse: float | None = None
+        self.gap = self.MIN_GAP
+        self.relapsed = False
+
+    def idle(self):
+        """No stream, or no reading: what was seen no longer adds up to a
+        stretch. The usual rate and the reconnect limits are kept."""
+        self.window.clear()
+
+    def baseline(self) -> float | None:
+        if len(self.healthy) < self.BASELINE_NEEDED:
+            return None
+        ordered = sorted(self.healthy)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+    def collapsed(self, rx_mbps: float, signal: int | None, traffic: float) -> bool:
+        if traffic < self.MIN_TRAFFIC_MBPS or signal is None or signal < self.MIN_SIGNAL_DBM:
+            return False
+        if rx_mbps > self.COLLAPSED_MBPS:
+            return False
+        base = self.baseline()
+        if base is None:
+            return rx_mbps <= self.FLOOR_MBPS and signal >= self.FLOOR_SIGNAL_DBM
+        return rx_mbps <= base * self.RATIO
+
+    def allowed(self, now: float) -> bool:
+        if self.last_fire is not None and now - self.last_fire < self.gap:
+            return False
+        recent = [t for t in self.fires if now - t < self.RATE_WINDOW]
+        return len(recent) < self.PER_WINDOW
+
+    def sample(self, now: float, rx_mbps: float | None, signal: int | None,
+               traffic: float | None) -> str | None:
+        if rx_mbps is None or traffic is None:
+            self.idle()
+            return None
+        bad = self.collapsed(rx_mbps, signal, traffic)
+        if bad:
+            if (self.last_fire is not None and not self.relapsed
+                    and now - self.last_fire <= self.RELAPSE):
+                self.relapsed = True
+                self.gap = min(self.gap * 2, self.MAX_GAP)
+            self.last_collapse = now
+        else:
+            if traffic >= self.MIN_TRAFFIC_MBPS:
+                self.healthy = (self.healthy + [rx_mbps])[-self.BASELINE_KEEP:]
+            if self.last_collapse is None or now - self.last_collapse >= self.CALM:
+                self.gap = self.MIN_GAP
+        self.window = (self.window + [bad])[-self.WINDOW:]
+        if len(self.window) < self.WINDOW or sum(self.window) < self.BAD_NEEDED:
+            return None
+        return "fire" if self.allowed(now) else "held"
+
+    def fired(self, now: float):
+        self.last_fire = now
+        self.fires = [t for t in self.fires if now - t < self.RATE_WINDOW] + [now]
+        self.relapsed = False
+        self.window.clear()
 # Passes without a stream before the fixes come off. A stream app that
 # restarts, or a pass that lands mid-exec, should not flap them.
 STREAM_MISSES_TO_CLOSE = 2
@@ -637,6 +751,8 @@ DEFAULT_SETTINGS = {
     "streaming_apps": {},
     # Extra process patterns, separated by spaces or commas.
     "streaming_custom_patterns": "",
+    # Fix stalled streams: reconnect when the link collapses mid-stream.
+    "link_watchdog_enabled": False,
     # The settings.json.corrupt the user has been told about, as its inode,
     # modification time in nanoseconds and size. Kept on disk rather than in
     # memory because Decky can reload the plugin between the file being set
@@ -5084,6 +5200,8 @@ class Plugin:
         if not self._tearing_down_now():
             self._stranded_task = asyncio.create_task(self._stranded_watch())
             self._wake_early_task = asyncio.create_task(self._wake_early_watch())
+            if _load_settings().get("link_watchdog_enabled"):
+                self._start_link_watch()
 
     async def _startup_power_save_files(self):
         """Prevent lag spikes off, but the files that hold power save off
@@ -5206,7 +5324,7 @@ class Plugin:
         try:
             decky.logger.info("WiFi Optimizer unloading")
             for name in ("_main_task", "_backend_switch_task", "_stranded_task",
-                         "_wake_early_task", "_stream_task"):
+                         "_wake_early_task", "_stream_task", "_link_task"):
                 task = getattr(self, name, None)
                 if task and not task.done() and task is not asyncio.current_task():
                     try:
@@ -5937,8 +6055,8 @@ class Plugin:
         "power_save_disabled", "auto_fix_on_wake", "bssid_lock_enabled",
         "band_preference_enabled", "band_preference", "dns_enabled",
         "dns_provider", "ipv6_disabled", "buffer_tuning_enabled",
-        "cake_enabled", "streaming_mode_enabled", "update_channel",
-        "settings_version", "regdomain",
+        "cake_enabled", "streaming_mode_enabled", "link_watchdog_enabled",
+        "update_channel", "settings_version", "regdomain",
     )
     # Kernel lines about the WiFi driver, its PCIe link and suspend/resume.
     # The interface and driver actually present are added at call time, so a
@@ -6824,6 +6942,7 @@ class Plugin:
                 status.setdefault("live", {}).update(
                     self._streaming_live(status["settings"])
                 )
+                status["live"].update(self._link_watch_live(status["settings"]))
             except Exception as e:
                 decky.logger.error(f"settings refresh error: {e}")
 
@@ -14187,6 +14306,229 @@ class Plugin:
             "streaming_app": match.get("app", ""),
             "streaming_process": match.get("process", ""),
         }
+
+    # Fix stalled streams: the link watchdog (GitHub #9). LinkWatch judges;
+    # what follows reads the link, reconnects and says what it did.
+
+    def _link_watch_state(self) -> "LinkWatch":
+        state = getattr(self, "_link_watch", None)
+        if state is None:
+            state = self._link_watch = LinkWatch()
+        return state
+
+    def _start_link_watch(self):
+        task = getattr(self, "_link_task", None)
+        if task is None or task.done():
+            self._link_task = asyncio.create_task(self._link_watch_loop())
+
+    async def _link_watch_loop(self):
+        """Look every LINK_WATCH_SECONDS for as long as the setting is on.
+        With nothing streaming a look is one read of the interface's byte
+        counter: the process search and iw only run while traffic flows."""
+        while True:
+            await asyncio.sleep(LINK_WATCH_SECONDS)
+            try:
+                if not _load_settings().get("link_watchdog_enabled"):
+                    # The defaults standing in for an unreadable file say off
+                    # too; the watch is kept until the file says so.
+                    if _SETTINGS_STATE["read_failed"]:
+                        continue
+                    self._link_watch_state().idle()
+                    self._link_prev = None
+                    return
+                await self._link_watch_pass()
+            except Exception as e:
+                self._log_throttled("link_watch", f"Link watchdog error: {e}")
+
+    async def _link_watch_pass(self):
+        state = self._link_watch_state()
+        reading = await asyncio.to_thread(self._link_reading)
+        kind = reading.get("kind")
+        if kind == "skip":
+            return
+        if kind != "read":
+            state.idle()
+            return
+        rx, signal = reading["rx_mbps"], reading.get("signal")
+        if getattr(self, "_link_after_pending", False):
+            self._link_after_pending = False
+            await self._journal(
+                f"Link watchdog: downlink now {rx:g} Mbit/s"
+                + (f" ({reading['detail']})" if reading.get("detail") else ""))
+        verdict = state.sample(time.monotonic(), rx, signal, reading["traffic"])
+        if verdict == "fire":
+            await self._link_watch_fire(reading)
+        elif verdict == "held":
+            self._log_throttled(
+                "link_watch_held",
+                "Link watchdog: the link is stalled again, but reconnects are spaced out "
+                "after ones that did not help")
+
+    def _link_reading(self) -> dict:
+        """One look at the link, in a worker thread. kind "skip": too little
+        arriving to judge (the rate the card reports is from the last frame
+        received), "idle": no WiFi or no stream, "read": the downlink rate
+        (rx_mbps), signal, traffic (Mbit/s arriving) and detail (width, MCS,
+        streams) from `iw dev <if> station dump`."""
+        iface = self._get_wifi_interface()
+        if not iface or not IFACE_RE.match(iface):
+            self._link_prev = None
+            return {"kind": "idle"}
+        now = time.monotonic()
+        try:
+            with open(os.path.join(SYSFS_NET, iface, "statistics", "rx_bytes")) as f:
+                count = int(f.read().strip())
+        except (OSError, ValueError):
+            self._link_prev = None
+            return {"kind": "idle"}
+        prev = getattr(self, "_link_prev", None)
+        self._link_prev = (now, count, iface)
+        if not prev or prev[2] != iface or count < prev[1] or now - prev[0] <= 0:
+            return {"kind": "skip"}
+        traffic = (count - prev[1]) * 8 / (now - prev[0]) / 1e6
+        if traffic < LinkWatch.MIN_TRAFFIC_MBPS:
+            return {"kind": "skip"}
+        if not self._link_stream_now():
+            return {"kind": "idle"}
+        dump = self._run_cmd(["/usr/bin/iw", "dev", iface, "station", "dump"], timeout=3)
+        if not dump.get("success"):
+            return {"kind": "skip"}
+        station = self._parse_station(dump.get("stdout", ""))
+        if station.get("rx_mbps") is None:
+            return {"kind": "skip"}
+        return {"kind": "read", "traffic": traffic, **station}
+
+    def _link_stream_now(self) -> bool:
+        """Whether a stream runs, from a process search at most
+        LINK_WATCH_STREAM_SECONDS old: the watchdog is for streams, and
+        searching every two seconds would cost more than it is worth. Not
+        known counts as no. In a worker thread."""
+        now = time.monotonic()
+        last = getattr(self, "_link_stream_seen", None)
+        if last is not None and now - last[0] < LINK_WATCH_STREAM_SECONDS:
+            return last[1]
+        running = self._stream_running(_load_settings()) is True
+        self._link_stream_seen = (now, running)
+        return running
+
+    _STATION_RATE_RE = re.compile(r"\s*([0-9]+(?:\.[0-9]+)?)\s*MBit/s(.*)")
+
+    @classmethod
+    def _parse_station(cls, dump: str) -> dict:
+        """The first station's signal (dBm), downlink rate (Mbit/s) and the
+        rate's width, MCS and spatial streams as words, from `iw dev <if>
+        station dump`. A field not there is left out. iw names no width for
+        20 MHz."""
+        out = {}
+        seen = False
+        for line in dump.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("Station "):
+                if seen:
+                    break
+                seen = True
+                continue
+            key, sep, value = stripped.partition(":")
+            if not sep:
+                continue
+            if key == "signal":
+                found = re.match(r"\s*(-?[0-9]+)", value)
+                if found:
+                    out["signal"] = int(found.group(1))
+            elif key == "rx bitrate":
+                found = cls._STATION_RATE_RE.match(value)
+                if not found:
+                    continue
+                out["rx_mbps"] = float(found.group(1))
+                rest = found.group(2)
+                words = []
+                width = re.search(r"\b([0-9]+)MHz\b", rest)
+                mcs = re.search(r"\bMCS ([0-9]+)", rest)
+                nss = re.search(r"\bNSS ([0-9]+)", rest)
+                if mcs:
+                    words.append(f"{width.group(1) if width else '20'} MHz")
+                    words.append(f"MCS {mcs.group(1)}")
+                    if nss:
+                        words.append(f"{nss.group(1)} stream{'s' if nss.group(1) != '1' else ''}")
+                out["detail"] = ", ".join(words)
+        return out
+
+    async def _journal(self, line: str):
+        """A line in the plugin's log and in the journal under its tag,
+        where Copy diagnostics reads the plugin's lines from."""
+        line = _mask_addresses(line)
+        decky.logger.info(line)
+        await asyncio.to_thread(
+            self._run_cmd, ["/usr/bin/logger", "-t", JOURNAL_TAG, "--", line], 3)
+
+    async def _link_watch_fire(self, reading: dict):
+        """Reconnect the profile in use, saying first what was seen. Not
+        beside another profile change, an update or a backend switch: it
+        waits for the next stretch rather than cut into one. The guard is
+        claimed straight after the check, with nothing awaited between, so
+        a setter cannot start in the gap."""
+        if self._profile_change_refused() or self._tearing_down_now():
+            self._log_throttled(
+                "link_watch_busy",
+                "Link watchdog: the link is stalled, but another WiFi change is under way")
+            return
+        self._profile_change_depth = getattr(self, "_profile_change_depth", 0) + 1
+        try:
+            state = self._link_watch_state()
+            uuid = await asyncio.to_thread(self._get_active_connection_uuid)
+            if not uuid:
+                return
+            base = state.baseline()
+            snapshot = await asyncio.to_thread(self._reapply_link_snapshot)
+            detail = f" ({reading['detail']})" if reading.get("detail") else ""
+            usual = f"usually {base:g} Mbit/s" if base else "usual rate not known yet"
+            await self._journal(
+                f"Link watchdog: downlink stuck at {reading['rx_mbps']:g} Mbit/s{detail} "
+                f"with signal {reading.get('signal')} dBm ({usual}); reconnecting"
+                + (f". link: {snapshot}" if snapshot else ""))
+            state.fired(time.monotonic())
+            self._link_prev = None
+            started = time.monotonic()
+            result = await asyncio.to_thread(
+                self._run_cmd, ["/usr/bin/nmcli", "con", "up", "uuid", uuid], 15)
+            if not result.get("success"):
+                await self._journal(
+                    "Link watchdog: reconnecting the profile failed ("
+                    + _tool_text(result.get("stderr", "")[:120]) + "); cycling the radio")
+                await self._reconnect(uuid)
+            took = time.monotonic() - started
+        finally:
+            self._profile_change_depth = max(0, getattr(self, "_profile_change_depth", 1) - 1)
+        await self._journal(f"Link watchdog: reconnected in {took:.1f} s")
+        self._link_after_pending = True
+        self._link_fired = {"at": time.time(), "count": self._link_fired_count() + 1}
+
+    def _link_fired_count(self) -> int:
+        return (getattr(self, "_link_fired", None) or {}).get("count", 0)
+
+    def _link_watch_live(self, settings: dict) -> dict:
+        """What the panel shows about the watchdog: when it last reconnected
+        since the plugin loaded, and how often."""
+        fired = getattr(self, "_link_fired", None)
+        if not settings.get("link_watchdog_enabled") or not fired:
+            return {}
+        return {"link_watchdog_last": fired["at"], "link_watchdog_count": fired["count"]}
+
+    async def set_link_watchdog(self, enabled: bool) -> dict:
+        """Turn Fix stalled streams on or off."""
+        # From the panel. Anything but a real True counts as False.
+        enabled = enabled is True
+        try:
+            settings = _load_settings()
+            settings["link_watchdog_enabled"] = enabled
+            _save_settings(settings)
+            decky.logger.info(f"Fix stalled streams {'on' if enabled else 'off'}")
+            if enabled:
+                self._start_link_watch()
+            return {"success": True, "enabled": enabled}
+        except Exception as e:
+            decky.logger.error(f"set_link_watchdog error: {e}")
+            return self._unexpected_response(e)
 
     async def set_streaming_mode(self, enabled: bool) -> dict:
         """Turn streaming auto mode on or off."""

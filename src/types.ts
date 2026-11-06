@@ -28,6 +28,7 @@ export interface PluginSettings {
   streaming_mode_enabled: boolean;
   streaming_apps: Record<string, boolean>;
   streaming_custom_patterns: string;
+  link_watchdog_enabled: boolean;
   last_applied: number;
 }
 
@@ -81,6 +82,11 @@ export interface LiveStatus {
   /** What was detected: the app's name and the process that matched. */
   streaming_app?: string;
   streaming_process?: string;
+  /** Fix stalled streams: when it last reconnected (seconds since the
+   * epoch) and how many times since the plugin loaded. Left out until it
+   * has. */
+  link_watchdog_last?: number;
+  link_watchdog_count?: number;
   /** While not connected: why. Older backends leave it out, which the
    * panel reads as "disconnected". While connected it is sent only as
    * "not_responding", for an iw stuck in the driver (C1 (c)). */

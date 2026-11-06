@@ -17,7 +17,8 @@ interface StreamingSectionProps {
   disabled: boolean;
   // The panel's errors and notices, by key: "streaming" for the mode itself,
   // "streaming_hold", "streaming_apps" and "streaming_patterns" for the
-  // controls below it, each shown under its own control.
+  // controls below it, each shown under its own control, and
+  // "link_watchdog" for Fix stalled streams.
   errors: Record<string, string>;
   notices: Record<string, string>;
   // The panel's own toggle handler, so busy state, errors and the status
@@ -132,8 +133,18 @@ export function StreamingSection({
     stateText = "No streaming app running. No fixes are turned on.";
   }
 
+  const watchdog = settings?.link_watchdog_enabled ?? false;
+  const fixedAt = live?.link_watchdog_last;
+  const fixedCount = live?.link_watchdog_count ?? 0;
+  let watchdogText = watchdog ? "Reconnects when a stream's link stalls" : "Off";
+  if (watchdog && fixedAt) {
+    const minutes = Math.max(0, Math.round((Date.now() / 1000 - fixedAt) / 60));
+    const ago = minutes < 1 ? "just now" : minutes === 1 ? "1 min ago" : `${minutes} min ago`;
+    watchdogText = `Reconnected a stalled link ${ago}${fixedCount > 1 ? ` (${fixedCount} times)` : ""}`;
+  }
+
   return (
-    <PanelSection title="Streaming auto mode">
+    <PanelSection title="Streaming">
       <InfoRow
         label="Only fix while streaming"
         subtitle={
@@ -214,6 +225,16 @@ export function StreamingSection({
           <MessageRow error={errors.streaming_patterns} notice={notices.streaming_patterns} />
         </>
       )}
+      <InfoRow
+        label="Fix stalled streams"
+        subtitle={watchdogText}
+        explanation="While a stream runs, watches the rate your access point sends at. If it drops to a fraction of its usual rate with a strong signal and stays there for about 15 seconds, reconnects WiFi, which clears it. The stream pauses for a few seconds while it reconnects. At most three times in 30 minutes, and less often when a reconnect doesn't help. Each one is noted in the log with what it saw. Idea and first version by Mrsoul83."
+        checked={watchdog}
+        disabled={disabled}
+        error={errors.link_watchdog}
+        notice={notices.link_watchdog}
+        onChange={(val: boolean) => onToggle("link_watchdog", () => backend.setLinkWatchdog(val))}
+      />
     </PanelSection>
   );
 }
