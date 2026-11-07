@@ -22354,11 +22354,17 @@ try:
         _p = _LWP(); _p._update_running = lambda: True
         asyncio.run(_p._link_watch_fire(_read))
         ok(not any(c[:3] == ["/usr/bin/nmcli", "con", "up"] for c in _p.cmds), "never during an update")
-        # A failed profile reconnect falls back to the radio cycle.
+        # A reconnect that fails or runs over is left to NetworkManager: no
+        # radio cycle on top (2026-11-07 incident), and the log says so.
         _p = _LWP(up_ok=False); _lw_logged.clear()
         asyncio.run(_p._link_watch_fire(_read))
-        ok(["/usr/bin/nmcli", "radio", "wifi", "off"] in _p.cmds and any("failed" in l for l in _lw_logged),
-           "a failed reconnect cycles the radio, and says so")
+        ok(not any(c[:3] == ["/usr/bin/nmcli", "radio", "wifi"] for c in _p.cmds)
+           and any("had not reconnected" in l for l in _lw_logged)
+           and not any("reconnected in" in l for l in _lw_logged)
+           and _p._profile_change_depth == 0,
+           "a failed reconnect is left to NetworkManager and logged as such, never a radio cycle")
+        ok(getattr(m, "LINK_WATCH_CONNECT_SECONDS", 0) >= 30,
+           "the reconnect gets at least 30 s before it is left to NetworkManager")
         # The setter.
         _p = _LWP()
         async def _lw_set(v):

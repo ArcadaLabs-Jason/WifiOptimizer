@@ -410,6 +410,8 @@ STREAM_POLL_SECONDS = 5
 # while traffic flows, and how often it checks a stream is what it is for.
 LINK_WATCH_SECONDS = 2
 LINK_WATCH_STREAM_SECONDS = 10
+# How long a reconnect may take before it is left to NetworkManager.
+LINK_WATCH_CONNECT_SECONDS = 30
 
 
 class LinkWatch:
@@ -14506,17 +14508,24 @@ class Plugin:
             state.fired(time.monotonic())
             self._link_prev = None
             started = time.monotonic()
+            # Up to LINK_WATCH_CONNECT_SECONDS for the activation. One that
+            # fails or runs over is left to NetworkManager, which keeps
+            # trying, and to the stranded-pin release when the lock's access
+            # point will not have us back; cycling the radio on top only cut
+            # into its attempts.
             result = await asyncio.to_thread(
-                self._run_cmd, ["/usr/bin/nmcli", "con", "up", "uuid", uuid], 15)
-            if not result.get("success"):
-                await self._journal(
-                    "Link watchdog: reconnecting the profile failed ("
-                    + _tool_text(result.get("stderr", "")[:120]) + "); cycling the radio")
-                await self._reconnect(uuid)
+                self._run_cmd, ["/usr/bin/nmcli", "con", "up", "uuid", uuid],
+                LINK_WATCH_CONNECT_SECONDS)
             took = time.monotonic() - started
         finally:
             self._profile_change_depth = max(0, getattr(self, "_profile_change_depth", 1) - 1)
-        await self._journal(f"Link watchdog: reconnected in {took:.1f} s")
+        if result.get("success"):
+            await self._journal(f"Link watchdog: reconnected in {took:.1f} s")
+        else:
+            await self._journal(
+                f"Link watchdog: WiFi had not reconnected after {took:.0f} s ("
+                + _tool_text(result.get("stderr", "")[:120])
+                + "); NetworkManager keeps trying")
         self._link_after_pending = True
         self._link_fired = {"at": time.time(), "count": self._link_fired_count() + 1}
 
