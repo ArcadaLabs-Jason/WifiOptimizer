@@ -1800,6 +1800,30 @@ d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"}, scan=DUAL)
 strand(d)
 ok(not rel(d, "802-11-wireless.bssid"),
    "a pinned access point still in range at full strength is not released")
+# ...for the first minutes. One still in view that will not have us back for
+# _STRANDED_REFUSED_SECONDS is the reason (2026-11-07, Jason's Deck: an Omada
+# 2.4 GHz radio ignored every authentication for six hours after a reconnect
+# while its 5 GHz radio, ruled out by the pin, was right there).
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"}, scan=DUAL)
+asyncio.run(d.get_status())
+d._offline_since = time.monotonic() - (getattr(d, "_STRANDED_REFUSED_SECONDS", 10**9) - 30)
+asyncio.run(d.get_status())
+_ref_early = rel(d, "802-11-wireless.bssid")
+d._offline_since = time.monotonic() - (getattr(d, "_STRANDED_REFUSED_SECONDS", 10**9) + 5)
+_ref_st = asyncio.run(d.get_status())
+ok(not _ref_early and rel(d, "802-11-wireless.bssid"),
+   "a pinned access point in view that keeps refusing us is released after three minutes offline")
+ok(_ref_st.get("external", {}).get("pin_released") is True,
+   "and the panel is told, as for any stranded release")
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"},
+            scan="TestNet:02\\:00\\:00\\:00\\:00\\:11:70:5180 MHz")
+asyncio.run(d.get_status())
+d._offline_since = time.monotonic() - (getattr(d, "_STRANDED_REFUSED_SECONDS", 10**9) + 5)
+asyncio.run(d.get_status())
+ok(not rel(d, "802-11-wireless.bssid"),
+   "but not when the pinned access point is the only one of the network in view: releasing widens nothing")
 FAR = ("TestNet:02\\:00\\:00\\:00\\:00\\:11:20:5180 MHz\n"
        "TestNet:02\\:00\\:00\\:00\\:00\\:12:80:5745 MHz")
 m._save_settings(off_settings())

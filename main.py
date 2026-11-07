@@ -8431,8 +8431,10 @@ class Plugin:
         if getattr(self, "_offline_since", None) is None:
             self._offline_since = now
             return []
-        if now - self._offline_since < self._STRANDED_SECONDS:
+        offline_for = now - self._offline_since
+        if offline_for < self._STRANDED_SECONDS:
             return []
+        refused = offline_for >= self._STRANDED_REFUSED_SECONDS
         visible = self._visible_networks()
         if not visible:
             return []
@@ -8448,7 +8450,7 @@ class Plugin:
             for enabled_key, list_key, prop, off_value in self._PIN_PROPERTIES:
                 if prop not in props or not live.get(prop):
                     continue
-                if not self._pin_rules_out(prop, live[prop], aps):
+                if not self._pin_rules_out(prop, live[prop], aps, refused=refused):
                     continue
                 out.append({
                     "kind": "pin_cleanup", "uuid": uuid,
@@ -8531,8 +8533,17 @@ class Plugin:
     # How much stronger another access point must be before a visible pinned
     # one counts as the reason we cannot connect.
     _STRANDED_SIGNAL_MARGIN = 20
+    # Offline this long with the network in range on another access point, an
+    # address pin counts as the reason even when its own access point is in
+    # view and as strong: one that is there but will not have us. Measured on
+    # Jason's Deck (2026-11-07): after a reconnect, the 2.4 GHz radio of an
+    # Omada access point ignored every authentication for six hours (band
+    # steering turns dual-band clients away from 2.4 GHz) while its 5 GHz
+    # radio, which the pin ruled out, was right there.
+    _STRANDED_REFUSED_SECONDS = 180
 
-    def _pin_rules_out(self, prop: str, value: str, aps: list) -> bool:
+    def _pin_rules_out(self, prop: str, value: str, aps: list,
+                       refused: bool = False) -> bool:
         """Whether this pin is what keeps us off a network that is in range.
 
         Not merely whether it excludes some access point: a router lists its
@@ -8540,12 +8551,18 @@ class Plugin:
         and would release on any outage at all - a changed password, a DHCP
         failure, the user disconnecting. An address pin is the reason when
         its access point is gone, or far weaker than one it rules out; a band
-        pin when nothing on that band is in range.
+        pin when nothing on that band is in range. refused: offline for
+        _STRANDED_REFUSED_SECONDS, long enough that an access point in view
+        is one refusing us, so an address pin is the reason whenever it rules
+        out another access point of the network. Releasing only ever widens
+        what NetworkManager may join, and the lock pins again once online.
         """
         if prop == "802-11-wireless.bssid":
             pinned = value.replace("\\", "").upper()
             mine = [sig for bssid, _f, sig in aps if bssid == pinned]
             if not mine:
+                return True
+            if refused and any(bssid != pinned for bssid, _f, _s in aps):
                 return True
             best_other = max((sig for bssid, _f, sig in aps if bssid != pinned),
                              default=0)
