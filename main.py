@@ -7306,6 +7306,19 @@ class Plugin:
         if resolved:
             pending[list_key] = [u for u in tracked if u != uuid]
             off_value = action.get("off_value", "")
+            if stranded and action.get("refused_bssid"):
+                # Skipped by the lock's choice for _AP_FAILURE_COOLDOWN, as
+                # an access point that refused a lock move is. Into pending,
+                # not _record_ap_failure: this pass saves its own copy of the
+                # settings afterwards, which would undo a save made here.
+                failures = {
+                    k: v for k, v in dict(pending.get(
+                        "ap_move_failures", settings.get("ap_move_failures") or {})).items()
+                    if isinstance(v, (int, float))}
+                failures[action["refused_bssid"]] = int(time.time())
+                pending["ap_move_failures"] = dict(sorted(
+                    failures.items(), key=lambda kv: kv[1], reverse=True
+                )[: self._MAX_TRACKED_AP_FAILURES])
             if stranded:
                 # Record the moment, not a bare flag: the panel should
                 # still be explaining this once WiFi returns, which is
@@ -8454,11 +8467,17 @@ class Plugin:
                     continue
                 if not self._pin_rules_out(prop, live[prop], aps, refused=refused):
                     continue
-                out.append({
+                action = {
                     "kind": "pin_cleanup", "uuid": uuid,
                     "property": prop, "list_key": list_key,
                     "off_value": off_value, "stranded": True,
-                })
+                }
+                # A pinned access point still in view is one refusing us: the
+                # lock is not to pin it straight back once we are online.
+                pinned = live[prop].replace("\\", "").upper()
+                if prop == "802-11-wireless.bssid" and any(b == pinned for b, _f, _s in aps):
+                    action["refused_bssid"] = pinned
+                out.append(action)
         return out
 
     def _nm_general_state(self) -> tuple:

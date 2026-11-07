@@ -1816,6 +1816,13 @@ ok(not _ref_early and rel(d, "802-11-wireless.bssid"),
    "a pinned access point in view that keeps refusing us is released after three minutes offline")
 ok(_ref_st.get("external", {}).get("pin_released") is True,
    "and the panel is told, as for any stranded release")
+ok("02:00:00:00:00:11" in (m._load_settings().get("ap_move_failures") or {}),
+   "and the access point that refused is remembered, so the lock does not pin it straight back")
+m._save_settings(off_settings())
+d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"}, scan="TestNet:02\\:00\\:00\\:00\\:00\\:12:80:5745 MHz")
+strand(d)
+ok(rel(d, "802-11-wireless.bssid") and not (m._load_settings().get("ap_move_failures") or {}),
+   "an access point that is simply gone is released without being counted as a refusal")
 m._save_settings(off_settings())
 d = Offline({"802-11-wireless.bssid": "02:00:00:00:00:11"},
             scan="TestNet:02\\:00\\:00\\:00\\:00\\:11:70:5180 MHz")
