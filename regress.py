@@ -22160,6 +22160,97 @@ except Exception as _e:
     ok(False, f"section raised: {type(_e).__name__}: {_e}")
 
 
+section("0.25.1 after a wake, a refused move off a pin that was not in range takes the pin off")
+try:
+    _e8_third = "02:00:00:00:00:61"
+
+    class _W8Gone(_W7Early):
+        """Woken where the pinned access point is gone: the stronger one
+        refuses, and a third one of the network takes any unpinned connect,
+        as NetworkManager does once nothing names an access point."""
+        def __init__(self, clear_ok=True, **kw):
+            super().__init__(
+                scan="Net:02\\:00\\:00\\:00\\:00\\:51:90:5180 MHz:WPA2\n"
+                     "Net:02\\:00\\:00\\:00\\:00\\:61:60:5500 MHz:WPA2\n",
+                reachable=False, refused_stays=False, **kw)
+            self.clear_ok = clear_ok
+        def _nmcli_modify(self, u, k, v, timeout=5):
+            if k == "802-11-wireless.bssid" and v == "" and not self.clear_ok:
+                self.mods.append((k, v))
+                return {"success": False, "stdout": "", "stderr": "nope"}
+            return super()._nmcli_modify(u, k, v, timeout)
+        def _join(self):
+            if not self.pin:
+                self.on = _e8_third
+            elif self.pin.upper() == _W6WEAK:
+                self.on = ""          # not in range: nothing to join
+        def _run_cmd(self, cmd, timeout=5):
+            if cmd[:3] == ["/usr/bin/nmcli", "con", "up"]:
+                self.ups.append(self.pin); self._join(); return _ok()
+            return super()._run_cmd(cmd, timeout)
+        def _hard_reconnect(self, uuid=None):
+            self.cycles.append(self.game); self._join(); return True
+
+    _e8_logged = []
+    _e8_real = (m.decky.logger.info, m.decky.logger.error)
+    m.decky.logger.info = staticmethod(lambda msg: _e8_logged.append(str(msg)))
+    m.decky.logger.error = staticmethod(lambda msg: _e8_logged.append(str(msg)))
+    try:
+        # (1) The case seen on a Deck OLED (0.25.0-beta, about 3 minutes
+        # offline): the pin is taken off rather than put back on the access
+        # point that was not in range, and WiFi joins what is.
+        _w6_locked(); _e8 = _W8Gone()
+        ok(not asyncio.run(_e8._move_lock_before_connect()),
+           "the stronger one refuses: not reported as moved")
+        _e8_s = m._load_settings()
+        ok(_e8.pin == "", f"the pin is off, not back on the one out of range ({_e8.pin!r})")
+        ok(_e8.on == _e8_third, f"and WiFi joined the access point in range ({_e8.on!r})")
+        ok(_e8_s.get("bssid_lock_enabled") is True and _e8_s.get("bssid_lock_value") == _W6WEAK
+           and _e8_s.get("bssid_lock_connection_uuid") == _W6U,
+           f"and the lock stays on, for the status pass to pin what it joined ({_e8_s.get('bssid_lock_value')})")
+        ok(_W6STRONG in _e8._wake_refusals(_e8_s), "and the refusal is kept")
+        ok(getattr(_e8, "_repoll_after_release", False) and getattr(_e8, "_pin_released_at", 0),
+           "and it is recorded as a release: the watch polls once WiFi is back, the panel says so")
+        ok(getattr(_e8, "_wake_move_outcome", (None,))[0] == "off"
+           and not _e8._wake_move_outcome[3],
+           f"and the panel hears the move failed, pin not moved ({getattr(_e8, '_wake_move_outcome', None)})")
+        ok(_e8_s.get("last_applied") == 1234, "and Last changed stays (C13)")
+        ok(any("was not in range, so taking the pin off" in l for l in _e8_logged)
+           and any("took the pin off" in l and "pins again once connected" in l for l in _e8_logged),
+           f"and the log says why ({_e8_logged[-3:]})")
+        ok(not any(f"restoring {_W6WEAK}" in l for l in _e8_logged), "and does not say it restored")
+        ok(not _e8._profile_change_in_flight() and not _e8._wake_move_running,
+           "and the guard and the panel's after-sleep flag are released")
+
+        # (2) The pin cannot be taken off: as before, the previous pin goes
+        # back, and the stranded-pin release is what frees it later.
+        _e8_logged.clear()
+        _w6_locked(); _e8 = _W8Gone(clear_ok=False)
+        asyncio.run(_e8._move_lock_before_connect())
+        ok(_e8.pin.upper() == _W6WEAK and m._load_settings().get("bssid_lock_value") == _W6WEAK,
+           f"the pin cannot come off: the previous one goes back ({_e8.pin})")
+        ok(any("could not take the pin off" in l for l in _e8_logged),
+           f"and the log says so ({_e8_logged[-3:]})")
+        ok(not getattr(_e8, "_repoll_after_release", False), "and no release is recorded")
+
+        # (3) The pinned one in range and only weak: put back as before.
+        _w6_locked(); _e8 = _W7Early(reachable=False, refused_stays=False)
+        asyncio.run(_e8._move_lock_before_connect())
+        ok(_e8.pin.upper() == _W6WEAK and _e8.on.upper() == _W6WEAK,
+           f"pinned one in range: still put back and joined ({_e8.pin}, on {_e8.on})")
+
+        # (4) Only the early move, which can see the pin missing, asks for it.
+        _src8 = open("main.py").read()
+        ok("previous_absent=here is None" in _src8 and _src8.count("previous_absent=") == 1,
+           "only the move before the connect passes previous_absent")
+    finally:
+        m.decky.logger.info, m.decky.logger.error = _e8_real
+    m._save_settings(dict(m.DEFAULT_SETTINGS))
+except Exception as _e:
+    import traceback; traceback.print_exc()
+    ok(False, f"section raised: {type(_e).__name__}: {_e}")
+
+
 section("0.24.7 Force reapply logs what it found before changing anything")
 try:
     class _R7(m.Plugin):

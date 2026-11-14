@@ -8096,7 +8096,8 @@ class Plugin:
         await asyncio.to_thread(
             self._run_cmd, ["/usr/bin/nmcli", "con", "up", "uuid", uuid], 15)
         result = await self._verify_lock_move(
-            iface, uuid, previous, best[0], moving=True, after_wake=True)
+            iface, uuid, previous, best[0], moving=True, after_wake=True,
+            previous_absent=here is None)
         outcome = None
         if result.get("success"):
             outcome = "moved"
@@ -11683,8 +11684,59 @@ class Plugin:
         again = await self._await_association(iface)
         return {} if again["bssid"] else {"wifi_not_back": True}
 
+    async def _release_pin_after_wake_move(self, iface: str, uuid: str, previous: str,
+                                           chosen: str, landed: dict, no_link: bool) -> dict | None:
+        """_verify_lock_move's after-wake rollback when the pin it would put
+        back was not in range at the wake (_move_lock_before_connect's absent
+        case). Putting that pin back strands the device until the stranded-pin
+        release takes it off a minute later: seen on a Deck OLED on
+        0.25.0-beta, about 3 minutes offline after a wake. Take the pin off
+        instead, as that release does. The lock stays on, NetworkManager
+        joins what is in range, and the status pass pins that access point
+        once connected (the bssid_repoint proposal). None when the pin could
+        not be taken off: the caller then puts previous back as before."""
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
+        cleared = await asyncio.to_thread(
+            self._nmcli_modify, uuid, "802-11-wireless.bssid", "")
+        if not cleared["success"]:
+            decky.logger.error(
+                f"After waking, could not take the pin off {uuid}: "
+                f"{_tool_text(cleared.get('stderr', '')[:120])}; restoring {previous} instead")
+            return None
+        if self._tearing_down_now():
+            return dict(self._TEARING_DOWN_RESULT)
+        settings = _load_settings()
+        settings["bssid_lock_value"] = previous
+        try:
+            # A move a wake made on its own: "Last changed" stays (contract C13).
+            _save_settings(settings)
+        except SettingsSaveError as e:
+            # The profile has no pin, so nothing strands the device; the
+            # status pass re-points and records the access point it joins.
+            decky.logger.error(f"BSSID lock: the settings could not record the release: {e}")
+        # The same record as the stranded-pin release, so the panel says the
+        # pin was let go and the background watch polls once WiFi is back,
+        # which is what re-points the lock with the panel closed.
+        self._pin_released_at = time.time()
+        self._released_at = {
+            **getattr(self, "_released_at", {}), "802-11-wireless.bssid": time.time()
+        }
+        self._repoll_after_release = True
+        decky.logger.info(
+            f"After waking, {chosen} refused and {previous} was not in range: took the "
+            f"pin off {uuid} so WiFi can join what is in range. The lock stays on and "
+            f"pins again once connected.")
+        if not landed["bssid"]:
+            if not await self._reconnect(uuid):
+                return dict(self._RADIO_OFF_RESULT)
+        return {"success": False, "error": "move_failed", "restored": False,
+                "released": True, "reconnected": True, "logged": True, "message": "",
+                **(await self._wifi_not_back(iface, no_link))}
+
     async def _verify_lock_move(self, iface: str, uuid: str, previous: str,
-                                chosen: str, moving: bool, after_wake: bool = False) -> dict:
+                                chosen: str, moving: bool, after_wake: bool = False,
+                                previous_absent: bool = False) -> dict:
         """Check a moved lock landed, and put the previous pin back if not.
 
         Moving is the one path that can strand the user: the access point we
@@ -11697,6 +11749,10 @@ class Plugin:
         after_wake: the move a wake made on its own. Nothing it saves stamps
         "Last changed", and the rollback's radio cycle is skipped while a
         game or stream has started and the device is connected anyway.
+
+        previous_absent: with after_wake, previous was not in range when the
+        move was made, so putting it back cannot connect. The pin is taken
+        off instead (_release_pin_after_wake_move).
         """
         save = _save_settings if after_wake else _save_settings_with_timestamp
         landed = await self._await_association(iface)
@@ -11714,16 +11770,23 @@ class Plugin:
                     "pin_moved": True}
         if self._tearing_down_now():
             return dict(self._TEARING_DOWN_RESULT)
+        release = after_wake and previous_absent
         decky.logger.error(
-            f"Could not associate to {chosen} after moving "
-            f"the lock; restoring {previous} and leaving it "
-            f"alone for a while"
+            f"Could not associate to {chosen} after moving the lock; "
+            + (f"{previous} was not in range, so taking the pin off"
+               if release else
+               f"restoring {previous} and leaving it alone for a while")
         )
         self._record_ap_failure(chosen, stamp=not after_wake, after_wake=after_wake)
         # Associated nowhere at all in the wait: WiFi may be dead rather than
         # the access point refusing, so the after-wake move looks again once
         # it has put the old pin back (contract C24).
         no_link = after_wake and not landed["bssid"]
+        if release:
+            released = await self._release_pin_after_wake_move(
+                iface, uuid, previous, chosen, landed, no_link)
+            if released is not None:
+                return released
         if self._tearing_down_now():
             return dict(self._TEARING_DOWN_RESULT)
         put_back = await asyncio.to_thread(
