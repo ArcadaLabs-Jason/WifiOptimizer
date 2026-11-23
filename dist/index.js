@@ -456,6 +456,18 @@ function BackendToggleRow({ status, backendSwitch, error, isBusy, onToggle, }) {
         })() }));
 }
 
+// Custom DNS servers are typed in a dialog of their own. The field used to
+// sit in the panel under the provider menu, shown by state the panel held
+// while the menu closed, and on the Steam Deck choosing Custom could leave
+// the menu back on the saved provider with no field to type in (GitHub #18).
+// A dialog keeps what is being typed out of the panel, so nothing the panel
+// does while the on-screen keyboard is up can replace it.
+function CustomDnsModal({ initial, onApply, onCancel, closeModal, }) {
+    const [servers, setServers] = SP_REACT.useState(initial);
+    const trimmed = servers.trim();
+    return (SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "Custom DNS", strDescription: "Up to six IPv4 addresses, with spaces between them. For example 1.1.1.1 9.9.9.9.", strOKButtonText: "Apply", strCancelButtonText: "Cancel", bOKDisabled: !trimmed, closeModal: closeModal, onOK: () => onApply(trimmed), onCancel: onCancel, children: SP_JSX.jsx(DFL.TextField, { label: "DNS servers", value: servers, onChange: (e) => setServers(e.target.value) }) }));
+}
+
 const CHANNEL_OPTIONS = [
     { data: "stable", label: "Stable" },
     { data: "beta", label: "Beta" },
@@ -1896,15 +1908,12 @@ function Content() {
     SP_REACT.useEffect(() => {
         refreshRegdomain();
     }, [refreshRegdomain]);
-    const [customDnsInput, setCustomDnsInput] = SP_REACT.useState("");
-    // Custom DNS is edited as a draft and applied with a button. Choosing
-    // Custom used to send the empty field straight to the backend, which
-    // refused it, so the field it gates never appeared and nobody starting
-    // from the defaults could ever enter servers. The dirty flag stops the
-    // status poll replacing what is being typed, which on the on-screen
-    // keyboard takes longer than one poll.
-    const [dnsCustomOpen, setDnsCustomOpen] = SP_REACT.useState(false);
-    const dnsDirtyRef = SP_REACT.useRef(false);
+    // Custom DNS servers are typed in CustomDnsModal and sent only on Apply.
+    // Choosing Custom used to send an empty list straight to the backend,
+    // which refused it, so nobody starting from the defaults could ever enter
+    // servers. Bumped to put the provider menu back on the saved provider
+    // after the dialog closes, as the menu keeps the last option picked.
+    const [dnsMenuKey, setDnsMenuKey] = SP_REACT.useState(0);
     // --- Update flow state ---
     const [updateInfo, setUpdateInfo] = SP_REACT.useState(null);
     const [checkingUpdate, setCheckingUpdate] = SP_REACT.useState(false);
@@ -1975,18 +1984,6 @@ function Content() {
                 return;
             setStatusFailed(false);
             setStatus(s);
-            if (s.settings) {
-                // Only adopt a stored value that exists. Older backends cleared
-                // dns_servers when DNS was turned off, and copying that empty string
-                // back over the field every few seconds made the setting impossible
-                // to re-enable: the servers field is only rendered while DNS is on,
-                // and turning it on with an empty custom list is rejected.
-                if (!dnsDirtyRef.current &&
-                    s.settings.dns_provider === "custom" &&
-                    s.settings.dns_servers) {
-                    setCustomDnsInput(s.settings.dns_servers);
-                }
-            }
         }
         catch (e) {
             console.error("WiFi Optimizer: failed to get status", e);
@@ -2514,7 +2511,6 @@ function Content() {
         setOptimizeResult(null);
         setErrors({});
         setNotices({});
-        resetDnsDraft();
         try {
             const result = await withTimeout(resetSettings());
             if (!isResult(result) || !result.success) {
@@ -2727,24 +2723,12 @@ function Content() {
         // panel offers nothing for the new channel until the next timed check.
         await handleCheckForUpdate();
     };
-    // Custom DNS draft handling
-    const resetDnsDraft = () => {
-        dnsDirtyRef.current = false;
-        setDnsCustomOpen(false);
-        setCustomDnsInput(status?.settings?.dns_provider === "custom" ? status.settings.dns_servers : "");
-    };
-    const applyCustomDns = async () => {
-        const result = await handleToggle("dns", async () => {
-            const r = await setDns(true, "custom", customDnsInput.trim());
-            // Before the refresh that follows, so it adopts the servers as the
-            // backend saved them. Cleared after it, Apply and Cancel stayed up
-            // until the next poll whenever the saved form differed from the typed.
-            if (r.success)
-                dnsDirtyRef.current = false;
-            return r;
-        });
-        if (result?.success)
-            setDnsCustomOpen(false);
+    // The saved custom servers, kept while DNS is off (see L33 in regress).
+    const savedCustomDns = () => status?.settings?.dns_provider === "custom" ? status.settings.dns_servers : "";
+    const openCustomDns = () => {
+        DFL.showModal(SP_JSX.jsx(CustomDnsModal, { initial: savedCustomDns(), onCancel: () => setDnsMenuKey((k) => k + 1), onApply: (servers) => {
+                void handleToggle("dns", () => setDns(true, "custom", servers)).finally(() => setDnsMenuKey((k) => k + 1));
+            } }));
     };
     // Don't render content until first status arrives (prevents disconnect flash).
     // A status marked initializing is the backend saying a collection is still
@@ -3001,26 +2985,19 @@ function Content() {
                                 : undefined), onChange: (val) => {
                             clearBandMessages();
                             handleToggle("band_6ghz", () => setBandPreference(val, "6GHz"));
-                        } })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Replaces this network's DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider's. Only for the network you set it on. Leave it off on a network with no IPv4. Each change reconnects WiFi for up to half a minute.", ...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
+                        } })), SP_JSX.jsx(InfoRow, { label: "Custom DNS", subtitle: "Override DNS servers for this network", explanation: "Replaces this network's DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider's. Only for the network you set it on. Leave it off on a network with no IPv4. Turn it off to use the network's own DNS again. Each change reconnects WiFi for up to half a minute.", ...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
                             ? otherNetworkBadge
                             : getBadge("dns", status, errors.dns ?? null)), checked: s?.dns_enabled ?? false, disabled: isBusy || updating || (!connected && !s?.dns_enabled), working: working === "dns", error: errors.dns, notice: notices.dns ??
                             (status?.live?.dns_other_network && s?.dns_enabled ? OTHER_NETWORK_TEXT : undefined), onChange: (val) => {
-                            if (!val)
-                                resetDnsDraft();
-                            handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput));
-                        }, children: s?.dns_enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "DNS provider", rgOptions: DNS_OPTIONS, selectedOption: dnsCustomOpen ? "custom" : s?.dns_provider ?? "cloudflare", disabled: isBusy || updating, onChange: (option) => {
+                            handleToggle("dns", () => setDns(val, s?.dns_provider ?? "cloudflare", savedCustomDns()));
+                        }, children: s?.dns_enabled && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.DropdownItem, { label: "DNS provider", rgOptions: DNS_OPTIONS, selectedOption: s?.dns_provider ?? "cloudflare", disabled: isBusy || updating, onChange: (option) => {
                                             if (option.data === "custom") {
-                                                // Open the editor; nothing is sent until Apply.
-                                                setDnsCustomOpen(true);
+                                                // Nothing is sent until Apply in the dialog.
+                                                openCustomDns();
                                                 return;
                                             }
-                                            resetDnsDraft();
                                             handleToggle("dns", () => setDns(true, option.data, ""));
-                                        } }) }), (dnsCustomOpen || s?.dns_provider === "custom") && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.TextField, { label: "DNS servers (space-separated)", value: customDnsInput, onChange: (e) => {
-                                                    dnsDirtyRef.current = true;
-                                                    setCustomDnsInput(e.target.value);
-                                                } }) }), (dnsCustomOpen ||
-                                            customDnsInput.trim() !== (s?.dns_servers ?? "")) && (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating || !customDnsInput.trim(), onClick: applyCustomDns, children: "Apply DNS servers" }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: isBusy || updating, onClick: resetDnsDraft, children: "Cancel" }) })] }))] }))] })) }), SP_JSX.jsx(InfoRow, { label: "Disable IPv6", subtitle: "Use IPv4 only on this network", explanation: "This is the IPv6 setting. Forces all traffic through IPv4. Only turn this on if this network's IPv6 is broken (slow lookups, timeouts). Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for up to half a minute.", ...(status?.live?.ipv6_other_network && s?.ipv6_disabled && !errors.ipv6
+                                        } }, dnsMenuKey) }), s?.dns_provider === "custom" && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx(DFL.ButtonItem, { layout: "below", description: s?.dns_servers, disabled: isBusy || updating, onClick: openCustomDns, children: "Edit DNS servers" }) }))] })) }), SP_JSX.jsx(InfoRow, { label: "Disable IPv6", subtitle: "Use IPv4 only on this network", explanation: "This is the IPv6 setting. Forces all traffic through IPv4. Only turn this on if this network's IPv6 is broken (slow lookups, timeouts). Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for up to half a minute.", ...(status?.live?.ipv6_other_network && s?.ipv6_disabled && !errors.ipv6
                             ? otherNetworkBadge
                             : getBadge("ipv6", status, errors.ipv6 ?? null)), notice: notices.ipv6 ??
                             (status?.external?.ipv6

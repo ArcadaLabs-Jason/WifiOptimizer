@@ -5245,8 +5245,27 @@ try:
     ok("failures >= BACKEND_POLL_MAX_FAILURES" in _bp, "one failed poll does not abandon a switch")
     ok("BACKEND_SWITCH_MAX_S" in _bp, "and a switch that never reports back releases the panel")
     _rs = _tsx[_tsx.index("backend.resetSettings()") - 400:_tsx.index("backend.resetSettings()")]
-    ok("resetDnsDraft();" in _rs and "setNotices({});" in _rs,
-       "Reset clears the DNS draft and the notices along with everything else")
+    ok("setNotices({});" in _rs, "Reset clears the notices along with everything else")
+    # GitHub #18: choosing Custom left the menu on the saved provider with no
+    # field to type in. The servers are typed in a dialog of their own now.
+    def _cut(text, start, end):
+        i = text.find(start)
+        return "" if i < 0 else text[i:text.find(end, i + len(start))]
+    _dn = _cut(_tsx, 'label="Custom DNS"', '<InfoRow\n          label="Disable IPv6"')
+    _oc = _cut(_tsx, "const openCustomDns = () => {", "\n  };")
+    ok('if (option.data === "custom") {' in _dn and "openCustomDns();" in _dn
+       and "<TextField" not in _dn and "dnsCustomOpen" not in _tsx,
+       "#18 choosing Custom opens the servers dialog, not a field the panel shows from its own state")
+    ok('selectedOption={s?.dns_provider ?? "cloudflare"}' in _dn and "key={dnsMenuKey}" in _dn
+       and "onCancel={() => setDnsMenuKey((k) => k + 1)}" in _oc
+       and ".finally(\n            () => setDnsMenuKey((k) => k + 1)" in _oc,
+       "#18 the provider menu goes back to the saved provider after the dialog closes")
+    ok('backend.setDns(true, "custom", servers)' in _oc and "initial={savedCustomDns()}" in _oc
+       and 'onClick={openCustomDns}' in _dn and "Edit DNS servers" in _dn,
+       "#18 Apply sends the typed servers, and saved ones can be edited from the panel")
+    _cm = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "components", "CustomDnsModal.tsx")).read()
+    ok("bOKDisabled={!trimmed}" in _cm and "onOK={() => onApply(trimmed)}" in _cm and "<TextField" in _cm,
+       "#18 the dialog's Apply is off until something is typed")
     ok(not re.search(r"<span[^>]*onClick=\{handle(AllowWpa2|RepairDrift)\}", _tsx)
        and "onClick={handleAllowWpa2}" in _tsx and "onClick={handleRepairDrift}" in _tsx,
        "Allow WPA2 and Fix now are buttons the D-pad can reach, not clickable text")
@@ -12364,7 +12383,7 @@ try:
         ok(_p7f_json(_p7f_r) == ["1 day ago", "3 days ago", "2 hr ago"], f"F27 timeAgo ({_p7f_r[1].strip()} {_p7f_r[2][-200:]})")
     ok("WiFi couldn't connect, so the plugin let go of its pin. The setting stays on and comes back once WiFi works." in _p7f_fx,
        "F28 pin released")
-    ok('explanation="Replaces this network\'s DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider\'s. Only for the network you set it on. Leave it off on a network with no IPv4. Each change reconnects WiFi for up to half a minute."' in _F_IX,
+    ok('explanation="Replaces this network\'s DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider\'s. Only for the network you set it on. Leave it off on a network with no IPv4. Turn it off to use the network\'s own DNS again. Each change reconnects WiFi for up to half a minute."' in _F_IX,
        "F29 Custom DNS (i)")
     ok('explanation="This is the IPv6 setting. Forces all traffic through IPv4. Only turn this on if this network\'s IPv6 is broken (slow lookups, timeouts). Most networks handle IPv6 fine. Turning it on or off reconnects WiFi for up to half a minute."' in _F_IX,
        "F29 Disable IPv6 (i), still naming the IPv6 setting")

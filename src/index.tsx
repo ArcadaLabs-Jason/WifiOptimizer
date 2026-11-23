@@ -12,7 +12,6 @@ import {
   PanelSectionRow,
   ButtonItem,
   DropdownItem,
-  TextField,
   ConfirmModal,
   showModal,
   staticClasses,
@@ -36,6 +35,7 @@ import { InfoRow, MessageRow, DetailsContext, WORKING_TEXT } from "./components/
 import { StatsGrid } from "./components/StatsGrid";
 import { Banner } from "./components/Banner";
 import { BackendToggleRow, backendResultText } from "./components/BackendToggleRow";
+import { CustomDnsModal } from "./components/CustomDnsModal";
 import { UpdatesSection } from "./components/UpdatesSection";
 import { PanelHeader } from "./components/PanelHeader";
 import { PanelFooter } from "./components/PanelFooter";
@@ -476,15 +476,12 @@ function Content() {
   useEffect(() => {
     refreshRegdomain();
   }, [refreshRegdomain]);
-  const [customDnsInput, setCustomDnsInput] = useState("");
-  // Custom DNS is edited as a draft and applied with a button. Choosing
-  // Custom used to send the empty field straight to the backend, which
-  // refused it, so the field it gates never appeared and nobody starting
-  // from the defaults could ever enter servers. The dirty flag stops the
-  // status poll replacing what is being typed, which on the on-screen
-  // keyboard takes longer than one poll.
-  const [dnsCustomOpen, setDnsCustomOpen] = useState(false);
-  const dnsDirtyRef = useRef(false);
+  // Custom DNS servers are typed in CustomDnsModal and sent only on Apply.
+  // Choosing Custom used to send an empty list straight to the backend,
+  // which refused it, so nobody starting from the defaults could ever enter
+  // servers. Bumped to put the provider menu back on the saved provider
+  // after the dialog closes, as the menu keeps the last option picked.
+  const [dnsMenuKey, setDnsMenuKey] = useState(0);
 
   // --- Update flow state ---
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
@@ -558,20 +555,6 @@ function Content() {
       if (seq !== statusSeqRef.current) return;
       setStatusFailed(false);
       setStatus(s);
-      if (s.settings) {
-        // Only adopt a stored value that exists. Older backends cleared
-        // dns_servers when DNS was turned off, and copying that empty string
-        // back over the field every few seconds made the setting impossible
-        // to re-enable: the servers field is only rendered while DNS is on,
-        // and turning it on with an empty custom list is rejected.
-        if (
-          !dnsDirtyRef.current &&
-          s.settings.dns_provider === "custom" &&
-          s.settings.dns_servers
-        ) {
-          setCustomDnsInput(s.settings.dns_servers);
-        }
-      }
     } catch (e) {
       console.error("WiFi Optimizer: failed to get status", e);
       if (seq === statusSeqRef.current) setStatusFailed(true);
@@ -1124,7 +1107,6 @@ function Content() {
     setOptimizeResult(null);
     setErrors({});
     setNotices({});
-    resetDnsDraft();
     try {
       const result = await withTimeout(backend.resetSettings());
       if (!isResult(result) || !result.success) {
@@ -1342,25 +1324,22 @@ function Content() {
     await handleCheckForUpdate();
   };
 
-  // Custom DNS draft handling
-  const resetDnsDraft = () => {
-    dnsDirtyRef.current = false;
-    setDnsCustomOpen(false);
-    setCustomDnsInput(
-      status?.settings?.dns_provider === "custom" ? status.settings.dns_servers : ""
-    );
-  };
+  // The saved custom servers, kept while DNS is off (see L33 in regress).
+  const savedCustomDns = () =>
+    status?.settings?.dns_provider === "custom" ? status.settings.dns_servers : "";
 
-  const applyCustomDns = async () => {
-    const result = await handleToggle("dns", async () => {
-      const r = await backend.setDns(true, "custom", customDnsInput.trim());
-      // Before the refresh that follows, so it adopts the servers as the
-      // backend saved them. Cleared after it, Apply and Cancel stayed up
-      // until the next poll whenever the saved form differed from the typed.
-      if (r.success) dnsDirtyRef.current = false;
-      return r;
-    });
-    if (result?.success) setDnsCustomOpen(false);
+  const openCustomDns = () => {
+    showModal(
+      <CustomDnsModal
+        initial={savedCustomDns()}
+        onCancel={() => setDnsMenuKey((k) => k + 1)}
+        onApply={(servers) => {
+          void handleToggle("dns", () => backend.setDns(true, "custom", servers)).finally(
+            () => setDnsMenuKey((k) => k + 1)
+          );
+        }}
+      />,
+    );
   };
 
   // Don't render content until first status arrives (prevents disconnect flash).
@@ -2141,7 +2120,7 @@ function Content() {
         <InfoRow
           label="Custom DNS"
           subtitle="Override DNS servers for this network"
-          explanation="Replaces this network's DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider's. Only for the network you set it on. Leave it off on a network with no IPv4. Each change reconnects WiFi for up to half a minute."
+          explanation="Replaces this network's DNS servers, including any it offers over IPv6, with the ones you pick. Public DNS like Cloudflare or Google can be faster and more reliable than your provider's. Only for the network you set it on. Leave it off on a network with no IPv4. Turn it off to use the network's own DNS again. Each change reconnects WiFi for up to half a minute."
           {...(status?.live?.dns_other_network && s?.dns_enabled && !errors.dns
             ? otherNetworkBadge
             : getBadge("dns", status, errors.dns ?? null))}
@@ -2154,9 +2133,8 @@ function Content() {
             (status?.live?.dns_other_network && s?.dns_enabled ? OTHER_NETWORK_TEXT : undefined)
           }
           onChange={(val: boolean) => {
-            if (!val) resetDnsDraft();
             handleToggle("dns", () =>
-              backend.setDns(val, s?.dns_provider ?? "cloudflare", customDnsInput)
+              backend.setDns(val, s?.dns_provider ?? "cloudflare", savedCustomDns())
             );
           }}
         >
@@ -2164,61 +2142,34 @@ function Content() {
             <>
               <PanelSectionRow>
                 <DropdownItem
+                  key={dnsMenuKey}
                   label="DNS provider"
                   rgOptions={DNS_OPTIONS}
-                  selectedOption={dnsCustomOpen ? "custom" : s?.dns_provider ?? "cloudflare"}
+                  selectedOption={s?.dns_provider ?? "cloudflare"}
                   disabled={isBusy || updating}
                   onChange={(option: { data: string }) => {
                     if (option.data === "custom") {
-                      // Open the editor; nothing is sent until Apply.
-                      setDnsCustomOpen(true);
+                      // Nothing is sent until Apply in the dialog.
+                      openCustomDns();
                       return;
                     }
-                    resetDnsDraft();
                     handleToggle("dns", () =>
                       backend.setDns(true, option.data, "")
                     );
                   }}
                 />
               </PanelSectionRow>
-              {(dnsCustomOpen || s?.dns_provider === "custom") && (
-                <>
-                  {/* No submit on blur: moving focus with the D-pad blurs
-                      the field, and each submit reconnects WiFi. */}
-                  <PanelSectionRow>
-                    <TextField
-                      label="DNS servers (space-separated)"
-                      value={customDnsInput}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-                        dnsDirtyRef.current = true;
-                        setCustomDnsInput(e.target.value);
-                      }}
-                    />
-                  </PanelSectionRow>
-                  {(dnsCustomOpen ||
-                    customDnsInput.trim() !== (s?.dns_servers ?? "")) && (
-                    <>
-                      <PanelSectionRow>
-                        <ButtonItem
-                          layout="below"
-                          disabled={isBusy || updating || !customDnsInput.trim()}
-                          onClick={applyCustomDns}
-                        >
-                          Apply DNS servers
-                        </ButtonItem>
-                      </PanelSectionRow>
-                      <PanelSectionRow>
-                        <ButtonItem
-                          layout="below"
-                          disabled={isBusy || updating}
-                          onClick={resetDnsDraft}
-                        >
-                          Cancel
-                        </ButtonItem>
-                      </PanelSectionRow>
-                    </>
-                  )}
-                </>
+              {s?.dns_provider === "custom" && (
+                <PanelSectionRow>
+                  <ButtonItem
+                    layout="below"
+                    description={s?.dns_servers}
+                    disabled={isBusy || updating}
+                    onClick={openCustomDns}
+                  >
+                    Edit DNS servers
+                  </ButtonItem>
+                </PanelSectionRow>
               )}
             </>
           )}
